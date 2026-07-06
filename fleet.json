@@ -1,0 +1,33 @@
+{
+  "ssh_options": [
+    "-o",
+    "ConnectTimeout=10",
+    "-o",
+    "BatchMode=yes"
+  ],
+  "machines": [
+    {
+      "name": "macbook",
+      "kind": "local",
+      "claude_projects": "/Users/blackthorne/.claude/projects",
+      "hermes_sessions": "/Users/blackthorne/.hermes/sessions",
+      "enabled": true
+    },
+    {
+      "name": "omarchy-precision",
+      "kind": "ssh",
+      "host": "omarchy-precision.tail5a1162.ts.net",
+      "claude_projects": "/home/blackthorne/.claude/projects",
+      "hermes_sessions": "/home/blackthorne/.hermes/sessions",
+      "enabled": true
+    },
+    {
+      "name": "omarchy-desktop",
+      "kind": "ssh",
+      "host": "omarchy-desktop.tail5a1162.ts.net",
+      "claude_projects": "/home/blackthorne/.claude/projects",
+      "hermes_sessions": "/home/blackthorne/.hermes/sessions",
+      "enabled": true
+    }
+  ]
+}

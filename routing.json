@@ -1,0 +1,361 @@
+{
+  "timezone": "Europe/Bucharest",
+  "clockify_user_id": "5f5b5121a551633f6dfa31e6",
+  "default_since_policy": "one_day_before_latest_clockify_entry",
+  "safety": {
+    "post_clockify_unattended": false,
+    "mutate_downstream_multica_issues_unattended": false,
+    "paste_full_session_content_to_multica": false
+  },
+  "session_routes": [
+    {
+      "pattern": "tstprep-com-site-codebase",
+      "project_name": "TST Prep Level 2",
+      "project_suffix": "bc17f7",
+      "tag_suffixes": [
+        "35aa9b54"
+      ],
+      "tag_names": [
+        "Technical development"
+      ],
+      "billable": true,
+      "confidence": "high"
+    },
+    {
+      "pattern": "tstprep-com",
+      "project_name": "TST Prep Level 1",
+      "project_suffix": "319d88",
+      "tag_suffixes": [
+        "2c078325"
+      ],
+      "tag_names": [
+        "Content writing"
+      ],
+      "billable": true,
+      "confidence": "medium"
+    },
+    {
+      "pattern": "serenichron-paperclip-command",
+      "action": "skip",
+      "reason": "Paperclip agent heartbeats/direct work too commingled"
+    },
+    {
+      "pattern": "paperclip-instances",
+      "action": "skip",
+      "reason": "Paperclip unattended/agent activity"
+    },
+    {
+      "pattern": "atelieruldevis",
+      "action": "skip",
+      "reason": "Personal/non-billable"
+    },
+    {
+      "pattern": "multica-command",
+      "project_name": "Serenichron Level 2",
+      "project_suffix": "775f9f",
+      "tag_suffixes": [
+        "35aa9afb"
+      ],
+      "tag_names": [
+        "System development"
+      ],
+      "billable": true,
+      "confidence": "high"
+    },
+    {
+      "pattern": "serenichron",
+      "project_name": "Serenichron Level 2",
+      "project_suffix": "775f9f",
+      "tag_suffixes": [
+        "35aa9afb"
+      ],
+      "tag_names": [
+        "System development"
+      ],
+      "billable": true,
+      "confidence": "medium"
+    },
+    {
+      "pattern": "clockify",
+      "project_name": "Serenichron Level 2",
+      "project_suffix": "775f9f",
+      "tag_suffixes": [
+        "35aa9b31"
+      ],
+      "tag_names": [
+        "Processes"
+      ],
+      "billable": true,
+      "confidence": "high"
+    },
+    {
+      "pattern": "n8n-workflows",
+      "project_name": "Serenichron Level 2",
+      "project_suffix": "775f9f",
+      "tag_suffixes": [
+        "35aa9afb"
+      ],
+      "tag_names": [
+        "System development"
+      ],
+      "billable": true,
+      "confidence": "medium"
+    },
+    {
+      "pattern": "lensofalex-com",
+      "project_name": "Lens of Alex Retainer",
+      "project_suffix": "1207d5",
+      "tag_suffixes": [
+        "3ad4b978"
+      ],
+      "tag_names": [
+        "Web content"
+      ],
+      "billable": true,
+      "confidence": "high"
+    },
+    {
+      "pattern": "kontas",
+      "project_name": "Kontas Level 1",
+      "project_suffix": "2632ca",
+      "tag_suffixes": [
+        "35aa9b54"
+      ],
+      "tag_names": [
+        "Technical development"
+      ],
+      "billable": true,
+      "confidence": "medium"
+    },
+    {
+      "pattern": "taxcamp",
+      "project_name": "TaxCamp Level 1",
+      "project_suffix": "a29a92",
+      "tag_suffixes": [
+        "35aa9b54"
+      ],
+      "tag_names": [
+        "Technical development"
+      ],
+      "billable": true,
+      "confidence": "medium"
+    },
+    {
+      "pattern": "fonduri-EU",
+      "project_name": "Serenichron Level 2",
+      "project_suffix": "775f9f",
+      "tag_suffixes": [
+        "35aa9b46"
+      ],
+      "tag_names": [
+        "Business development"
+      ],
+      "billable": true,
+      "confidence": "medium"
+    },
+    {
+      "pattern": "proposals",
+      "project_name": "Serenichron Level 2",
+      "project_suffix": "775f9f",
+      "tag_suffixes": [
+        "35aa9b46"
+      ],
+      "tag_names": [
+        "Business development"
+      ],
+      "billable": true,
+      "confidence": "medium"
+    },
+    {
+      "pattern": "stefaniazaharia",
+      "project_name": "Stefania Zaharia — B2B",
+      "project_suffix": "",
+      "tag_suffixes": [],
+      "tag_names": [],
+      "billable": true,
+      "confidence": "low"
+    },
+    {
+      "pattern": "mihaelabrailescu",
+      "action": "skip",
+      "reason": "Personal/non-billable"
+    },
+    {
+      "pattern": "family-bank",
+      "action": "skip",
+      "reason": "Personal/non-billable"
+    },
+    {
+      "pattern": "outstanding",
+      "action": "skip",
+      "reason": "Not yet assigned to a billable project"
+    },
+    {
+      "pattern": "hartacoruptiei",
+      "action": "skip",
+      "reason": "Separate Multica workspace; not Clockify-billable"
+    },
+    {
+      "pattern": "-Users-blackthorne",
+      "project_name": "Serenichron Level 2",
+      "project_suffix": "775f9f",
+      "tag_suffixes": [
+        "35aa9afb"
+      ],
+      "tag_names": [
+        "System development"
+      ],
+      "billable": true,
+      "confidence": "low"
+    },
+    {
+      "pattern": "session_",
+      "project_name": "Serenichron Level 2",
+      "project_suffix": "775f9f",
+      "tag_suffixes": [
+        "35aa9afb"
+      ],
+      "tag_names": [
+        "System development"
+      ],
+      "billable": true,
+      "confidence": "low"
+    },
+    {
+      "pattern": "llm-self",
+      "project_name": "Serenichron Level 1",
+      "project_suffix": "31b39a",
+      "tag_suffixes": [
+        "35aa9afb"
+      ],
+      "tag_names": [
+        "System development"
+      ],
+      "billable": true,
+      "confidence": "low"
+    },
+    {
+      "pattern": "cpu",
+      "project_name": "Serenichron Level 2",
+      "project_suffix": "775f9f",
+      "tag_suffixes": [
+        "35aa9afb"
+      ],
+      "tag_names": [
+        "System development"
+      ],
+      "billable": true,
+      "confidence": "low"
+    },
+    {
+      "pattern": "-home-blackthorne",
+      "project_name": "Serenichron Level 2",
+      "project_suffix": "775f9f",
+      "tag_suffixes": [
+        "35aa9afb"
+      ],
+      "tag_names": [
+        "System development"
+      ],
+      "billable": true,
+      "confidence": "low"
+    },
+    {
+      "pattern": "moldsign",
+      "project_name": "Serenichron Level 2",
+      "project_suffix": "775f9f",
+      "tag_suffixes": [
+        "35aa9afb"
+      ],
+      "tag_names": [
+        "System development"
+      ],
+      "billable": true,
+      "confidence": "low"
+    }
+  ],
+  "meeting_routes": [
+    {
+      "email_domain": "tstprep.com",
+      "project_name": "TST Prep Level 1",
+      "project_suffix": "319d88",
+      "tag_suffixes": [
+        "35aa9aef"
+      ],
+      "tag_names": [
+        "Project Management"
+      ],
+      "billable": true
+    },
+    {
+      "email_domain": "lensofalex.com",
+      "project_name": "Lens of Alex Retainer",
+      "project_suffix": "1207d5",
+      "tag_suffixes": [
+        "35aa9aef"
+      ],
+      "tag_names": [
+        "Project Management"
+      ],
+      "billable": true
+    },
+    {
+      "email_domain": "kontas.ro",
+      "project_name": "Kontas Level 1",
+      "project_suffix": "2632ca",
+      "tag_suffixes": [
+        "35aa9aef"
+      ],
+      "tag_names": [
+        "Project Management"
+      ],
+      "billable": true
+    },
+    {
+      "email_domain": "taxcamp.ro",
+      "project_name": "TaxCamp Level 1",
+      "project_suffix": "a29a92",
+      "tag_suffixes": [
+        "35aa9aef"
+      ],
+      "tag_names": [
+        "Project Management"
+      ],
+      "billable": true
+    },
+    {
+      "title_regex": "\\bdaily\\s*(stand-?up|meet)\\b",
+      "project_name": "Daily meetings",
+      "project_suffix": "89dab8",
+      "tag_suffixes": [
+        "35aa9aef"
+      ],
+      "tag_names": [
+        "Project Management"
+      ],
+      "billable": true
+    },
+    {
+      "title_regex": "\\b(Ava|Adrian Valerian|Demo|EZFuture|Sofiane|BizzOS|proposal|pitch)\\b",
+      "project_name": "Serenichron Level 2",
+      "project_suffix": "775f9f",
+      "tag_suffixes": [
+        "35aa9b46"
+      ],
+      "tag_names": [
+        "Business development"
+      ],
+      "billable": true
+    }
+  ],
+  "skip_rules": {
+    "min_minutes": 10,
+    "min_user_messages": 5,
+    "heartbeat_minutes": [
+      29,
+      44
+    ],
+    "existing_overlap_skip_ratio": 0.5,
+    "meeting_source_wins_overlap_ratio": 0.8
+  }
+}

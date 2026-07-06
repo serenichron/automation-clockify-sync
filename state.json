@@ -1,0 +1,38 @@
+{
+  "last_successful_run": "20260527T155613Z",
+  "last_posted_run": null,
+  "processed_run_ids": [],
+  "notes": "Autopilot is dry-run/approval-gated. Do not store secrets here.",
+  "multica": {
+    "workspace_id": "9234b844-2f69-4700-9d5b-034cd52362e9",
+    "operations_project_id": "1efb4e1e-4668-41d8-b3b0-d19df3eed268",
+    "aggregate_issue_identifier": "SER-106",
+    "aggregate_issue_id": "cea49192-fc16-4ebd-a787-fc45fec47134",
+    "clockify_analyst_agent_id": "65e964bf-2425-431f-a919-b7a77c81e0c4",
+    "autopilot_id": "f10f0de3-7288-4f41-ab28-495baae5371b",
+    "schedule_trigger_id": "79d429fe-2ab3-45d3-a8db-f4c122a17f6d",
+    "schedule": "30 18 * * 1-5 Europe/Bucharest",
+    "precision_agent_id": "11af6181-aa36-4c10-9c55-71aee5b38e6b",
+    "precision_autopilot_id": "6e1bd5f6-06ee-4824-9dd0-d06147574a7a",
+    "precision_trigger_id": "5ca60571-6007-465a-bb8e-3c49cd3641e3",
+    "precision_schedule": "0 7 * * 1-5 Europe/Bucharest",
+    "precision_agent_name": "Serenichron Clockify Analyst (Precision)"
+  },
+  "precision_last_run": "20260527T213334Z",
+  "last_run_fleet": {
+    "precision": {
+      "claude": 74,
+      "hermes": 26
+    },
+    "macbook": {
+      "claude": 31,
+      "hermes": 10
+    },
+    "desktop": {
+      "claude": 0,
+      "hermes": 0
+    },
+    "fathom": 4,
+    "clockify_existing": 12
+  }
+}
