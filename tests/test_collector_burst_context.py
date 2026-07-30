@@ -79,6 +79,52 @@ class CollectorBurstContextTests(unittest.TestCase):
         self.assertEqual(2, bursts[0]["duration_minutes"])
         self.assertEqual(2, bursts[1]["duration_minutes"])
 
+    def test_local_cross_midnight_bursts_keep_identity_in_clipped_windows(self) -> None:
+        broad_since = dt.datetime(2026, 7, 20, tzinfo=TZ)
+        clipped_since = dt.datetime(2026, 7, 21, tzinfo=TZ)
+        until = dt.datetime(2026, 7, 22, tzinfo=TZ)
+        expected_window = ("2026-07-20 23:58", "2026-07-21 00:02")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            claude_base = root / "projects"
+            claude_path = claude_base / "project-a" / "session.jsonl"
+            self.write_jsonl(claude_path, [
+                {"timestamp": "2026-07-20T20:58:00Z", "type": "user", "message": {"content": "Finish the midnight Claude task."}},
+                {"timestamp": "2026-07-20T21:02:00Z", "type": "user", "message": {"content": "Complete the same Claude task."}},
+            ])
+            codex_path = root / "rollout.jsonl"
+            self.write_jsonl(codex_path, [
+                {"type": "session_meta", "payload": {"id": "midnight-codex"}},
+                event("2026-07-20T20:58:00Z", "user_message", "Finish the midnight Codex task."),
+                event("2026-07-20T21:02:00Z", "user_message", "Complete the same Codex task."),
+            ])
+
+            sources = {
+                "claude": lambda since: collector.parse_claude_jsonl_file(
+                    claude_path, str(claude_base), since, until, "precision"
+                ),
+                "codex": lambda since: collector.parse_codex_rollout_file(
+                    codex_path, "precision", since, until
+                ),
+            }
+            for source, parse in sources.items():
+                with self.subTest(source=source):
+                    broad = parse(broad_since)
+                    clipped = parse(clipped_since)
+                    self.assertEqual(1, len(broad))
+                    self.assertEqual(1, len(clipped))
+                    self.assertEqual(expected_window, (broad[0]["start"], broad[0]["end"]))
+                    self.assertEqual(expected_window, (clipped[0]["start"], clipped[0]["end"]))
+                    self.assertEqual(
+                        collector._record_provenance(broad[0]),
+                        collector._record_provenance(clipped[0]),
+                    )
+                    self.assertEqual(
+                        collector._candidate_key(broad[0]),
+                        collector._candidate_key(clipped[0]),
+                    )
+
     def test_candidate_identity_uses_session_and_provenance(self) -> None:
         first = {"source": "codex", "machine": "precision", "session_id": "one", "start": "2026-07-21 08:00", "end": "2026-07-21 08:10", "label": "same-label", "path": "/tmp/one", "cwd": "/work/same-label"}
         second = {**first, "session_id": "two", "path": "/tmp/two"}
@@ -129,6 +175,63 @@ class CollectorBurstContextTests(unittest.TestCase):
         self.assertEqual("remote-session", bursts[0]["session_id"])
         self.assertEqual(str(path), bursts[0]["path"])
 
+    def test_remote_contracts_keep_full_cross_midnight_burst_boundaries(self) -> None:
+        clipped_since = dt.datetime(2026, 7, 21, tzinfo=TZ)
+        until = dt.datetime(2026, 7, 22, tzinfo=TZ)
+        expected_window = ("2026-07-20 23:58", "2026-07-21 00:02")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            claude_base = root / "projects"
+            claude_path = claude_base / "project-a" / "remote-session.jsonl"
+            self.write_jsonl(claude_path, [
+                {"timestamp": "2026-07-20T20:58:00Z", "type": "user", "message": {"content": "Finish the midnight remote Claude task."}},
+                {"timestamp": "2026-07-20T21:02:00Z", "type": "user", "message": {"content": "Complete the same remote Claude task."}},
+            ])
+            codex_home = root / "codex"
+            codex_home.mkdir()
+            rollout = root / "rollout.jsonl"
+            self.write_jsonl(rollout, [
+                {"type": "session_meta", "payload": {"id": "midnight-remote-codex"}},
+                event("2026-07-20T20:58:00Z", "user_message", "Finish the midnight remote Codex task."),
+                event("2026-07-20T21:02:00Z", "user_message", "Complete the same remote Codex task."),
+            ])
+            conn = sqlite3.connect(codex_home / "state_5.sqlite")
+            conn.execute("CREATE TABLE threads (id, rollout_path, cwd, title, first_user_message, thread_source, archived, updated_at)")
+            conn.execute(
+                "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("midnight-remote-codex", str(rollout), "/work/project-a", "", "", "user", 0, int(clipped_since.timestamp())),
+            )
+            conn.commit()
+            conn.close()
+            machine = {
+                "name": "remote-machine", "host": "example.invalid",
+                "claude_projects": str(claude_base), "hermes_sessions": "",
+                "hermes_db": "", "codex_home": str(codex_home),
+            }
+            captured: dict[str, list[str]] = {}
+
+            def fake_run(command: list[str], **_: object) -> object:
+                captured["command"] = command
+                return collector.subprocess.CompletedProcess(command, 0, '{"status":"ok"}', "")
+
+            with mock.patch.object(collector.subprocess, "run", side_effect=fake_run):
+                collector.collect_remote_sessions(machine, clipped_since, until, [])
+            generated = captured["command"][-1].split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+            scope: dict[str, object] = {}
+            with contextlib.redirect_stdout(io.StringIO()):
+                exec(generated, scope)
+            result = scope["res"]
+
+        self.assertEqual(1, len(result["claude_bursts"]))
+        self.assertEqual(1, len(result["codex_sessions"]))
+        for source, burst in (
+            ("claude", result["claude_bursts"][0]),
+            ("codex", result["codex_sessions"][0]),
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(expected_window, (burst["start"], burst["end"]))
+
     def test_remote_codex_contract_has_row_local_bursts_and_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             codex_home = Path(tmp) / "codex"
@@ -174,6 +277,58 @@ class CollectorBurstContextTests(unittest.TestCase):
         self.assertEqual("remote-codex-session", bursts[0]["session_id"])
         self.assertEqual(str(rollout), bursts[0]["path"])
         self.assertEqual("/work/project-a", bursts[0]["cwd"])
+
+    def test_os_account_home_credentials_are_found_with_an_isolated_task_home(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            task_home = Path(tmp) / "task-home"
+            account_home = Path(tmp) / "account-home"
+            clockify_env = account_home / ".config" / "serenichron" / "clockify.env"
+            fathom_env = account_home / ".config" / "serenichron" / "fathom.env"
+            clockify_env.parent.mkdir(parents=True)
+            clockify_env.write_text("CLOCKIFY_API_KEY=clockify-test-key\nCLOCKIFY_WORKSPACE_ID=workspace-id\n")
+            fathom_env.write_text("FATHOM_API_KEY=fathom-test-key\n")
+            account = mock.Mock(pw_dir=str(account_home))
+
+            with mock.patch.dict(collector.os.environ, {"HOME": str(task_home)}, clear=True), mock.patch.object(
+                collector.pwd, "getpwuid", return_value=account
+            ):
+                cenv = collector.load_env_file(
+                    collector.clockify_env_candidates(),
+                    ["CLOCKIFY_API_KEY", "CLOCKIFY_WORKSPACE_ID"],
+                )
+                fenv = collector.load_env_file(
+                    collector.fathom_env_candidates(), ["FATHOM_API_KEY"]
+                )
+
+        self.assertEqual(str(clockify_env), cenv["_env_file"])
+        self.assertEqual("clockify-test-key", cenv["CLOCKIFY_API_KEY"])
+        self.assertEqual(str(fathom_env), fenv["_env_file"])
+        self.assertEqual("fathom-test-key", fenv["FATHOM_API_KEY"])
+
+    def test_multica_env_only_configuration_needs_no_profile(self) -> None:
+        env = {
+            "MULTICA_TOKEN": "multica-test-token",
+            "MULTICA_SERVER_URL": "https://multica.example.test",
+            "MULTICA_WORKSPACE_ID": "workspace-id",
+        }
+        captured: dict[str, object] = {}
+
+        def fake_http_json(url: str, headers: dict[str, str]) -> dict[str, list[dict[str, str]]]:
+            captured["url"] = url
+            captured["headers"] = headers
+            return {"issues": [{"id": "issue-id", "key": "SER-1", "title": "Test", "status": "open"}]}
+
+        with mock.patch.dict(collector.os.environ, env, clear=True), mock.patch.object(
+            collector, "_home_candidates", side_effect=AssertionError("profile lookup must not run")
+        ), mock.patch.object(collector, "http_json", side_effect=fake_http_json):
+            result = collector.fetch_multica_issues()
+
+        self.assertEqual("ok", result["status"])
+        self.assertEqual("https://multica.example.test/api/issues?limit=100", captured["url"])
+        self.assertEqual(
+            {"Authorization": "Bearer multica-test-token", "X-Workspace-ID": "workspace-id"},
+            captured["headers"],
+        )
 
     def test_description_is_single_line_capped_and_ignores_sentinels(self) -> None:
         burst = {

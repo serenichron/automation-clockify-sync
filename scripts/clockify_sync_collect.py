@@ -13,6 +13,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import pwd
 import re
 import socket
 import subprocess
@@ -29,17 +30,38 @@ CLOCKIFY_API = "https://api.clockify.me/api/v1"
 FATHOM_API = "https://api.fathom.ai/external/v1"
 BUCHAREST = dt.timezone(dt.timedelta(hours=3))  # display timezone; DST precision is non-critical for first dry-run
 
-CLOCKIFY_ENV_CANDIDATES = [
-    os.environ.get("CLOCKIFY_ENV_FILE", ""),
-    str(Path.home() / ".config/serenichron/clockify.env"),
-    str(Path.home() / "Work/clockify/.env"),
-    "/home/blackthorne/Work/clockify/.env",
-]
-FATHOM_ENV_CANDIDATES = [
-    os.environ.get("FATHOM_ENV_FILE", ""),
-    str(Path.home() / ".config/serenichron/fathom.env"),
-]
 MULTICA_PROFILE = "desktop-api.multica.ai"
+
+
+def _home_candidates() -> list[Path]:
+    """Return task-local and OS-account homes without duplicates."""
+    homes = [Path.home()]
+    try:
+        homes.append(Path(pwd.getpwuid(os.getuid()).pw_dir))
+    except (KeyError, OSError):
+        pass
+    return list(dict.fromkeys(homes))
+
+
+def clockify_env_candidates() -> list[str]:
+    candidates = [os.environ.get("CLOCKIFY_ENV_FILE", "")]
+    for home in _home_candidates():
+        candidates.extend(
+            [
+                str(home / ".config/serenichron/clockify.env"),
+                str(home / "Work/clockify/.env"),
+            ]
+        )
+    return list(dict.fromkeys(candidates))
+
+
+def fathom_env_candidates() -> list[str]:
+    candidates = [os.environ.get("FATHOM_ENV_FILE", "")]
+    candidates.extend(
+        str(home / ".config/serenichron/fathom.env")
+        for home in _home_candidates()
+    )
+    return list(dict.fromkeys(candidates))
 
 
 def load_json(path: Path) -> Any:
@@ -753,7 +775,7 @@ def _extract_claude_events(path: Path, since: dt.datetime, until: dt.datetime) -
             except Exception:
                 continue
             t = parse_dt(obj.get("timestamp"))
-            if not t or not (since <= t.astimezone(BUCHAREST) < until):
+            if not t:
                 continue
             msg_type = obj.get("type", "")
             if msg_type not in ("user", "assistant"):
@@ -763,6 +785,16 @@ def _extract_claude_events(path: Path, since: dt.datetime, until: dt.datetime) -
     except Exception:
         pass
     return events
+
+
+def _window_overlaps(
+    start: dt.datetime,
+    end: dt.datetime,
+    since: dt.datetime,
+    until: dt.datetime,
+) -> bool:
+    """Keep full burst boundaries when any part intersects the evidence window."""
+    return end >= since and start < until
 
 
 def parse_claude_jsonl_file(path: Path | str, base: str, since: dt.datetime, until: dt.datetime, machine: str) -> list[dict[str, Any]]:
@@ -782,6 +814,8 @@ def parse_claude_jsonl_file(path: Path | str, base: str, since: dt.datetime, unt
         # activity determines the Clockify window, while assistant events supply
         # context and participate in burst-boundary detection.
         bs, be = burst_ts[0], burst_ts[-1]
+        if not _window_overlaps(bs, be, since, until):
+            continue
         cnt = len(burst_ts)
         raw_wallclock = max(1, int((be - bs).total_seconds() / 60))
         heartbeat = all(t.minute in (29, 44) for t in burst_ts)
@@ -919,7 +953,7 @@ def parse_claude(p):
             except Exception: continue
             t=parse_dt(o.get('timestamp'))
             role=o.get('type')
-            if not t or role not in ('user','assistant') or not (SINCE <= t.astimezone(BUCHAREST) < UNTIL): continue
+            if not t or role not in ('user','assistant'): continue
             events.append({'timestamp':t.astimezone(BUCHAREST),'role':role,'content':message_text(o.get('message',{}).get('content',''))})
     except Exception: return []
     users=sorted((event for event in events if event['role']=='user'), key=lambda event:event['timestamp'])
@@ -949,6 +983,7 @@ def parse_claude(p):
                 if candidate: last_assistant=candidate
         if not user_ts: continue
         bs,be=user_ts[0],user_ts[-1]
+        if be<SINCE or bs>=UNTIL: continue
         raw=max(1,int((be-bs).total_seconds()/60))
         active,method=active_duration(user_ts)
         out.append({'start':local_str(bs),'end':local_str(be),'duration_minutes':min(active,raw),'raw_wallclock_minutes':raw,'user_messages':len(user_ts),'label':label(p,CBASE),'session_id':Path(p).stem,'path':str(p),'first_user_message':first_user,'last_assistant_message':last_assistant,'evidence_level':method,'heartbeat_like':all(t.minute in (29,44) for t in user_ts),'source':'claude','machine':MACHINE})
@@ -978,7 +1013,7 @@ def _remote_codex_contract() -> str:
                         except Exception: continue
                         if o.get('type')!='event_msg': continue
                         p=o.get('payload',{}); kind=p.get('type'); t=parse_dt(o.get('timestamp'))
-                        if kind not in ('user_message','agent_message') or not t or not (SINCE <= t.astimezone(BUCHAREST) < UNTIL): continue
+                        if kind not in ('user_message','agent_message') or not t: continue
                         events.append({'timestamp':t.astimezone(BUCHAREST),'role':'user' if kind=='user_message' else 'assistant','content':p.get('message','')})
                     users=sorted((event for event in events if event['role']=='user'), key=lambda event:event['timestamp'])
                     if not users: continue
@@ -1005,6 +1040,7 @@ def _remote_codex_contract() -> str:
                                 if candidate: last_assistant=candidate
                         if not user_ts: continue
                         bs,be=user_ts[0],user_ts[-1]; raw=max(1,int((be-bs).total_seconds()/60)); active,method=active_duration(user_ts)
+                        if be<SINCE or bs>=UNTIL: continue
                         title=first_user or last_assistant or ''
                         res['codex_sessions'].append({'source':'codex','machine':MACHINE,'session_id':sid,'path':str(rollout_path),'cwd':cwd or '','title':title,'start':local_str(bs),'end':local_str(be),'duration_minutes':min(active,raw),'raw_wallclock_minutes':raw,'user_messages':len(user_ts),'first_user_message':first_user,'last_assistant_message':last_assistant,'evidence_level':method,'archived':bool(archived)})
                 except Exception: pass
@@ -1172,7 +1208,7 @@ def parse_codex_rollout_file(path: Path, machine: str, since: dt.datetime, until
         if event_type not in ("user_message", "agent_message"):
             continue
         t = parse_dt(obj.get("timestamp"))
-        if t and since <= t.astimezone(BUCHAREST) < until:
+        if t:
             events.append({
                 "timestamp": t.astimezone(BUCHAREST),
                 "role": "user" if event_type == "user_message" else "assistant",
@@ -1185,6 +1221,8 @@ def parse_codex_rollout_file(path: Path, machine: str, since: dt.datetime, until
         if not burst_ts:
             continue
         bs, be = burst_ts[0], burst_ts[-1]
+        if not _window_overlaps(bs, be, since, until):
+            continue
         cnt = len(burst_ts)
         raw_wallclock = max(1, int((be - bs).total_seconds() / 60))
         active_min, method, _segments = compute_active_duration(burst_ts)
@@ -1556,13 +1594,22 @@ def fetch_fathom(fenv: dict[str, str], since: dt.datetime, until: dt.datetime) -
 
 
 def multica_profile_config() -> dict[str, Any] | None:
-    p = Path.home() / f".multica/profiles/{MULTICA_PROFILE}/config.json"
-    if not p.exists():
-        return None
-    try:
-        return json.loads(p.read_text())
-    except Exception:
-        return None
+    env_config = {
+        "token": os.environ.get("MULTICA_TOKEN"),
+        "server_url": os.environ.get("MULTICA_SERVER_URL"),
+        "workspace_id": os.environ.get("MULTICA_WORKSPACE_ID"),
+    }
+    if all(env_config.values()):
+        return env_config
+    for home in _home_candidates():
+        path = home / f".multica/profiles/{MULTICA_PROFILE}/config.json"
+        if not path.exists():
+            continue
+        try:
+            return json.loads(path.read_text())
+        except Exception:
+            continue
+    return None
 
 
 def fetch_multica_issues() -> dict[str, Any]:
@@ -2029,8 +2076,8 @@ def write_markdown(run_dir: Path, report: dict[str, Any]) -> None:
 def run(args: argparse.Namespace) -> int:
     routing = load_json(ROOT / "routing.json")
     fleet = load_json(ROOT / "fleet.json")
-    cenv = load_env_file(CLOCKIFY_ENV_CANDIDATES, ["CLOCKIFY_API_KEY", "CLOCKIFY_WORKSPACE_ID"])
-    fenv = load_env_file(FATHOM_ENV_CANDIDATES, ["FATHOM_API_KEY"])
+    cenv = load_env_file(clockify_env_candidates(), ["CLOCKIFY_API_KEY", "CLOCKIFY_WORKSPACE_ID"])
+    fenv = load_env_file(fathom_env_candidates(), ["FATHOM_API_KEY"])
     since, until, reason = compute_range(args, routing, cenv)
     run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_dir = RUNS / run_id
