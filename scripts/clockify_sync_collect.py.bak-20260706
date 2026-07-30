@@ -128,8 +128,8 @@ def compute_range(args: argparse.Namespace, routing: dict[str, Any], cenv: dict[
             except Exception:
                 latest = None
         if latest:
-            since = (latest.astimezone(BUCHAREST) - dt.timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
-            reason = "7 days before latest Clockify entry"
+            since = (latest.astimezone(BUCHAREST) - dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            reason = "one day before latest Clockify entry"
         else:
             since = (dt.datetime.now(BUCHAREST) - dt.timedelta(days=3)).replace(hour=0, minute=0, second=0, microsecond=0)
             reason = "fallback last 3 days"
@@ -160,7 +160,7 @@ def label_from_claude_path(path: str, base: str) -> str:
 
 
 def is_skip_path(path: str) -> bool:
-    fragments = ["/subagents/", "multica-command", "claude-mem-observer", "/multica/"]
+    fragments = ["/subagents/", "paperclip-instances", "claude-mem-observer", "serenichron-paperclip-command"]
     return any(f in path for f in fragments)
 
 
@@ -218,54 +218,34 @@ def compute_active_duration(ts_list: list[dt.datetime], gap_engaged_sec: int = 1
 
 
 
-def _extract_claude_context(path: Path, since: dt.datetime, until: dt.datetime) -> tuple[list[dt.datetime], str, str]:
-    """Extract user message timestamps, first user message, and last assistant message from a Claude JSONL file."""
+def parse_claude_jsonl_file(path: Path | str, base: str, since: dt.datetime, until: dt.datetime, machine: str) -> list[dict[str, Any]]:
+    out = []
     ts_list: list[dt.datetime] = []
-    first_user = ""
-    last_assistant = ""
+    p = Path(path)
+    if is_skip_path(str(p)):
+        return out
     try:
-        for line in path.read_text(errors="ignore").splitlines():
+        for line in p.read_text(errors="ignore").splitlines():
             try:
                 obj = json.loads(line)
             except Exception:
                 continue
-            t = parse_dt(obj.get("timestamp"))
-            if not t or not (since <= t.astimezone(BUCHAREST) < until):
+            if obj.get("type") != "user":
                 continue
-            msg_type = obj.get("type", "")
-            msg = obj.get("message", {})
-            content = msg.get("content", "")
+            content = obj.get("message", {}).get("content", "")
+            # Filter auto-generated user messages (tool results, command echoes, system feedback)
             if isinstance(content, list):
-                text_parts = []
-                for item in content:
-                    if isinstance(item, dict):
-                        if item.get("type") == "text":
-                            text_parts.append(item.get("text", ""))
-                        elif item.get("type") == "tool_use":
-                            text_parts.append(f"[tool_use: {item.get('name', '?')}]")
-                        elif item.get("type") == "tool_result":
-                            text_parts.append("[tool_result]")
-                        elif item.get("type") == "thinking":
-                            text_parts.append("[thinking]")
-                content = "\n".join(text_parts)
-            content_str = str(content)
-            if msg_type == "user":
-                ts_list.append(t)
-                if not first_user:
-                    first_user = content_str[:500]
-            elif msg_type == "assistant" and content_str.strip():
-                last_assistant = content_str[:500]
+                if any(isinstance(c, dict) and c.get("type") in ("tool_result", "tool_reference") for c in content):
+                    continue
+            elif isinstance(content, str):
+                stripped = content.strip()
+                if stripped in ("[tool_result]", "[thinking]", "[tool_ref]", "") or stripped.startswith("<command-") or stripped.startswith("<local-command-") or stripped.startswith("<task-notification"):
+                    continue
+            t = parse_dt(obj.get("timestamp"))
+            if t and since <= t.astimezone(BUCHAREST) < until:
+                ts_list.append(t.astimezone(BUCHAREST))
     except Exception:
-        pass
-    return ts_list, first_user, last_assistant
-
-
-def parse_claude_jsonl_file(path: Path | str, base: str, since: dt.datetime, until: dt.datetime, machine: str) -> list[dict[str, Any]]:
-    out = []
-    p = Path(path)
-    if is_skip_path(str(p)):
         return out
-    ts_list, first_user, last_assistant = _extract_claude_context(p, since, until)
     ts_list.sort()
     if not ts_list:
         return out
@@ -296,13 +276,11 @@ def parse_claude_jsonl_file(path: Path | str, base: str, since: dt.datetime, unt
             "label": label,
             "start": local_dt_string(bs),
             "end": local_dt_string(be),
-            "duration_minutes": min(active_min, raw_wallclock),  # Capped at wall-clock span
+            "duration_minutes": active_min,  # Use computed active minutes
             "raw_wallclock_minutes": raw_wallclock,
             "user_messages": cnt,
             "heartbeat_like": heartbeat,
             "evidence_level": method,
-            "first_user_message": first_user,
-            "last_assistant_message": last_assistant,
         })
     return out
 
@@ -376,15 +354,12 @@ def collect_local_sessions(machine: dict[str, Any], since: dt.datetime, until: d
 
 def collect_remote_sessions(machine: dict[str, Any], since: dt.datetime, until: dt.datetime, ssh_options: list[str]) -> dict[str, Any]:
     host = machine["host"]
-    result = {"machine": machine["name"], "status": "unavailable",
-              "claude_bursts": [], "hermes_sessions": [], "hermes_db_sessions": [],
-              "codex_sessions": [], "errors": []}
-    remote_code = "\nimport datetime as dt, json\nfrom pathlib import Path\nBUCHAREST=dt.timezone(dt.timedelta(hours=3))\nMACHINE=__MACHINE__\nCBASE=__CBASE__\nHBASE=__HBASE__\nHDB=__HDB__\nCXBASE=__CXBASE__\nSINCE=dt.datetime.fromisoformat(__SINCE__)\nUNTIL=dt.datetime.fromisoformat(__UNTIL__)\ndef parse_dt(s):\n    if not s: return None\n    try:\n        x=dt.datetime.fromisoformat(str(s).replace('Z','+00:00'))\n        return x if x.tzinfo else x.replace(tzinfo=BUCHAREST)\n    except Exception: return None\ndef local_str(x):\n    return x.astimezone(BUCHAREST).strftime('%Y-%m-%d %H:%M') if x else None\ndef label(path, base):\n    rel=str(path).replace(base,'').lstrip('/')\n    top=rel.split('/')[0]\n    for pref in ['-Users-blackthorne-Work-','-Users-blackthorne-','-home-blackthorne-Work-','-home-blackthorne-']:\n        if top.startswith(pref): return top[len(pref):]\n    return top\ndef skip_path(p):\n    return any(f in str(p) for f in ['/subagents/','multica-runtime','claude-mem-observer','multica-command'])\ndef parse_claude(p):\n    if skip_path(p): return []\n    first_user=''; last_assistant=''; ts=[]\n    try:\n        for line in Path(p).read_text(errors='ignore').splitlines():\n            try: o=json.loads(line)\n            except Exception: continue\n            t=parse_dt(o.get('timestamp'))\n            if not t or not (SINCE <= t.astimezone(BUCHAREST) < UNTIL): continue\n            msg_type=o.get('type')\n            c=o.get('message',{}).get('content','')\n            if isinstance(c,list):\n                text_parts=[]\n                for item in c:\n                    if isinstance(item,dict):\n                        if item.get('type')=='text': text_parts.append(item.get('text',''))\n                        elif item.get('type')=='tool_use': text_parts.append('[tool_use: '+item.get('name','?')+']')\n                        elif item.get('type')=='tool_result': text_parts.append('[tool_result]')\n                        elif item.get('type')=='thinking': text_parts.append('[thinking]')\n                        elif item.get('type')=='tool_reference': text_parts.append('[tool_ref: '+item.get('tool_name','?')+']')\n                c='\\n'.join(text_parts)\n            c=str(c)\n            ts.append(t.astimezone(BUCHAREST))\n            if msg_type=='user' and not first_user: first_user=c[:300]\n            if msg_type=='assistant': last_assistant=c[:300]\n    except Exception: return []\n    if not ts: return []\n    ts.sort()\n    bursts=[]\n    start=end=ts[0]\n    count=1\n    for t in ts[1:]:\n        if (t-end).total_seconds()>1800:\n            bursts.append((start,end,count))\n            start=t; count=1\n        else: count+=1\n        end=t\n    bursts.append((start,end,count))\n    out=[]\n    for bs,be,cnt in bursts:\n        gap=(be-bs).total_seconds()\n        raw_wallclock=max(1,int(gap/60))\n        if gap>600:\n            active=int(cnt*2.5)\n            method='content heuristic'\n        else:\n            active=max(1,int(gap/60))\n            method='wall clock'\n        out.append({'start':local_str(bs),'end':local_str(be),'duration_minutes':min(active,raw_wallclock),'raw_wallclock_minutes':raw_wallclock,'user_messages':cnt,'label':label(p,CBASE),'first_user_message':first_user[:200],'last_assistant_message':last_assistant[:200],'evidence_level':method,'heartbeat_like':False,'source':'claude','machine':MACHINE})\n    return out\nres={'machine':MACHINE,'status':'ok','claude_bursts':[],'hermes_sessions':[],'hermes_db_sessions':[],'codex_sessions':[],'errors':[]}\ntry:\n    if CBASE and Path(CBASE).exists():\n        for p in Path(CBASE).glob('*/*.jsonl'):\n            res['claude_bursts'].extend(parse_claude(p))\n    else:\n        res['errors'].append('claude_projects not found: '+CBASE)\nexcept Exception as e: res['errors'].append('claude scan: '+str(e)[:200])\ntry:\n    if HBASE and Path(HBASE).exists():\n        for p in Path(HBASE).glob('request_dump_*.json'):\n            try:\n                obj=json.loads(p.read_text(errors='ignore'))\n                start=parse_dt(obj.get('session_start'))\n                last=parse_dt(obj.get('last_updated'))\n                touch=last or start\n                if not (touch and SINCE <= touch.astimezone(BUCHAREST) < UNTIL): continue\n                msgs=obj.get('messages',[])\n                user_count=sum(1 for m in msgs if m.get('role')=='user')\n                total_count=obj.get('message_count') or len(msgs)\n                if start and last:\n                    real_span_td=(last-start).total_seconds()/3600\n                else: real_span_td=0\n                if real_span_td>=4:\n                    est_minutes=int(user_count*7+(total_count-user_count)*0.5)\n                    est_start=start or touch\n                    est_end=est_start+dt.timedelta(minutes=est_minutes)\n                    evidence='session spans '+str(round(real_span_td,1))+'h but has only '+str(user_count)+' user msgs; estimated '+str(est_minutes)+'m via content heuristic'\n                else:\n                    est_start=start; est_end=last\n                    evidence='session_start/last_updated used (span='+str(round(real_span_td,1))+'h, '+str(user_count)+' user msgs)'\n                res['hermes_sessions'].append({'source':'hermes_legacy','machine':MACHINE,'session_id':obj.get('session_id') or p.stem,'path':str(p),'start':local_str(est_start),'end':local_str(est_end),'real_span_hours':round(real_span_td,2),'user_messages':user_count,'total_messages':total_count,'model':obj.get('model'),'platform':obj.get('platform'),'evidence_level':evidence})\n            except Exception as e: res['errors'].append('hermes legacy parse failed '+p.name+': '+str(e)[:200])\n    else:\n        res['errors'].append('hermes_sessions not found: '+HBASE)\nexcept Exception as e: res['errors'].append('hermes scan: '+str(e)[:200])\ntry:\n    if HDB and Path(HDB).exists():\n        import sqlite3\n        conn=sqlite3.connect(HDB)\n        since_ts=SINCE.timestamp()\n        until_ts=UNTIL.timestamp()\n        rows=conn.execute('SELECT id, started_at, ended_at, message_count, model, cwd, estimated_cost_usd, title, input_tokens, output_tokens FROM sessions WHERE started_at >= ? AND started_at < ? ORDER BY started_at', (since_ts, until_ts)).fetchall()\n        for row in rows:\n            sid, started_at, ended_at, msg_count, model, cwd, cost, title, in_tok, out_tok = row\n            if not started_at: continue\n            start_dt=dt.datetime.fromtimestamp(started_at, tz=BUCHAREST)\n            end_dt=dt.datetime.fromtimestamp(ended_at, tz=BUCHAREST) if ended_at else None\n            duration_m=int((end_dt-start_dt).total_seconds()/60) if end_dt else None\n            first_msg=conn.execute('SELECT content FROM messages WHERE session_id = ? AND role = \"user\" ORDER BY timestamp LIMIT 1', (sid,)).fetchone()\n            first_content=(first_msg[0][:300] if first_msg and first_msg[0] else '') if first_msg else ''\n            res['hermes_db_sessions'].append({'source':'hermes_db','machine':MACHINE,'session_id':sid,'start':local_str(start_dt),'end':local_str(end_dt) if end_dt else None,'duration_minutes':duration_m,'message_count':msg_count,'model':model,'cwd':cwd or '','estimated_cost_usd':cost or 0.0,'input_tokens':in_tok or 0,'output_tokens':out_tok or 0,'title':title or '','first_user_message':first_content})\n        conn.close()\n    else:\n        res['errors'].append('hermes_db not found: '+HDB)\nexcept Exception as e: res['errors'].append('hermes_db scan: '+str(e)[:200])\ntry:\n    if CXBASE and Path(CXBASE).exists():\n        db=Path(CXBASE)/'state_5.sqlite'\n        if db.exists():\n            import sqlite3\n            conn=sqlite3.connect('file:'+str(db)+'?mode=ro', uri=True)\n            lo=int((SINCE-dt.timedelta(days=1)).timestamp())\n            rows=conn.execute('SELECT id, rollout_path, cwd, title, first_user_message, thread_source, archived FROM threads WHERE updated_at >= ? ORDER BY updated_at', (lo,)).fetchall()\n            conn.close()\n            for sid, rollout_path, cwd, title, first_msg, thread_source, archived in rows:\n                if thread_source=='subagent': continue\n                if not rollout_path or not Path(rollout_path).exists(): continue\n                try:\n                    lines=Path(rollout_path).read_text(errors='ignore').splitlines()\n                    if not lines: continue\n                    meta=json.loads(lines[0])\n                    if meta.get('type')!='session_meta': continue\n                    ts_list=[]\n                    for line in lines[1:]:\n                        try: o=json.loads(line)\n                        except: continue\n                        if o.get('type')!='event_msg': continue\n                        p=o.get('payload',{})\n                        if p.get('type')!='user_message': continue\n                        t=parse_dt(o.get('timestamp'))\n                        if t and SINCE <= t.astimezone(BUCHAREST) < UNTIL: ts_list.append(t.astimezone(BUCHAREST))\n                    if not ts_list: continue\n                    ts_list.sort()\n                    bursts=[]\n                    start=end=ts_list[0]\n                    count=1\n                    for t in ts_list[1:]:\n                        if (t-end).total_seconds()>1800:\n                            bursts.append((start,end,count))\n                            start=t; count=1\n                        else: count+=1\n                        end=t\n                    bursts.append((start,end,count))\n                    for bs,be,cnt in bursts:\n                        gap=(be-bs).total_seconds()\n                        active=max(1,int(gap/60)) if gap<=600 else int(cnt*2.5)\n                        res['codex_sessions'].append({'source':'codex','machine':MACHINE,'session_id':sid,'cwd':cwd or '','title':title or first_msg or '','start':local_str(bs),'end':local_str(be),'duration_minutes':active,'user_messages':cnt,'archived':bool(archived)})\n                except Exception: pass\n        else:\n            res['errors'].append('codex state_5.sqlite not found')\n    else:\n        res['errors'].append('codex_home not found: '+CXBASE)\nexcept Exception as e: res['errors'].append('codex scan: '+str(e)[:200])\nprint(json.dumps(res))\n"
+    result = {"machine": machine["name"], "status": "unavailable", "claude_bursts": [], "hermes_sessions": [], "errors": []}
+    remote_code = "\nimport datetime as dt, json\nfrom pathlib import Path\nBUCHAREST=dt.timezone(dt.timedelta(hours=3))\nMACHINE=__MACHINE__\nCBASE=__CBASE__\nHBASE=__HBASE__\nCXBASE=__CXBASE__\nSINCE=dt.datetime.fromisoformat(__SINCE__)\nUNTIL=dt.datetime.fromisoformat(__UNTIL__)\ndef parse_dt(s):\n    if not s: return None\n    try:\n        x=dt.datetime.fromisoformat(str(s).replace('Z','+00:00'))\n        return x if x.tzinfo else x.replace(tzinfo=BUCHAREST)\n    except Exception: return None\ndef local_str(x):\n    return x.astimezone(BUCHAREST).strftime('%Y-%m-%d %H:%M') if x else None\ndef label(path, base):\n    rel=str(path).replace(base,'').lstrip('/')\n    top=rel.split('/')[0]\n    for pref in ['-Users-blackthorne-Work-','-Users-blackthorne-','-home-blackthorne-Work-','-home-blackthorne-']:\n        if top.startswith(pref): return top[len(pref):]\n    return top\ndef skip_path(p):\n    return any(f in str(p) for f in ['/subagents/','paperclip-instances','claude-mem-observer','serenichron-paperclip-command'])\ndef parse_claude(p):\n    if skip_path(p): return []\n    ts=[]\n    try:\n        for line in Path(p).read_text(errors='ignore').splitlines():\n            try: o=json.loads(line)\n            except Exception: continue\n            if o.get('type')!='user': continue\n            c=o.get('message',{}).get('content','')\n            if isinstance(c,list) and any(isinstance(i,dict) and i.get('type')=='tool_result' for i in c): continue\n            t=parse_dt(o.get('timestamp'))\n            if t and SINCE <= t.astimezone(BUCHAREST) < UNTIL: ts.append(t.astimezone(BUCHAREST))\n    except Exception: return []\n    ts.sort(); out=[]\n    if not ts: return out\n    bs=be=ts[0]; cnt=1; bursts=[]\n    for t in ts[1:]:\n        if (t-be).total_seconds()>1800:\n            bursts.append((bs,be,cnt)); bs=t; cnt=1\n        else: cnt+=1\n        be=t\n    bursts.append((bs,be,cnt)); lab=label(str(p), CBASE)\n    for bs,be,cnt in bursts:\n        inb=[t for t in ts if bs<=t<=be]\n        out.append({'source':'claude','machine':MACHINE,'session_id':Path(p).stem,'path':str(p),'label':lab,'start':local_str(bs),'end':local_str(be),'duration_minutes':max(1,int((be-bs).total_seconds()/60)),'user_messages':cnt,'heartbeat_like':all(t.minute in (29,44) for t in inb),'evidence_level':'remote timestamps+user_message_count'})\n    return out\nres={'machine':MACHINE,'status':'ok','claude_bursts':[],'hermes_sessions':[],'codex_sessions':[],'errors':[]}\ntry:\n    cb=Path(CBASE)\n    if cb.exists():\n        for p in cb.glob('*/*.jsonl'): res['claude_bursts'].extend(parse_claude(p))\n    else: res['errors'].append('claude_projects not found: '+CBASE)\nexcept Exception as e: res['errors'].append('claude parse: '+str(e)[:200])\ntry:\n    hb=Path(HBASE)\n    if hb.exists():\n        for p in hb.glob('session_*.json'):\n            try:\n                o=json.loads(p.read_text(errors='ignore'))\n                st=parse_dt(o.get('session_start')); lu=parse_dt(o.get('last_updated')); touch=lu or st\n                if not (touch and SINCE <= touch.astimezone(BUCHAREST) < UNTIL): continue\n                msgs=o.get('messages',[]); user_c=sum(1 for m in msgs if m.get('role')=='user')\n                total_c=o.get('message_count') or len(msgs)\n                if st and lu:\n                    span_h=(lu-st).total_seconds()/3600\n                else: span_h=0\n                if span_h>=4:\n                    est_m=int(user_c*7+(total_c-user_c)*0.5)\n                    est_e=st+dt.timedelta(minutes=est_m) if st else touch\n                    ev=f'session spans {span_h:.1f}h but has only {user_c} user msgs; estimated {est_m}m via content heuristic'\n                else:\n                    est_e=lu; ev=f'session_start/last_updated used (span={span_h:.1f}h, {user_c} user msgs)'\n                res['hermes_sessions'].append({'source':'hermes','machine':MACHINE,'session_id':o.get('session_id') or p.stem,'path':str(p),'start':local_str(st),'end':local_str(est_e),'real_span_hours':round(span_h,2),'user_messages':user_c,'total_messages':total_c,'model':o.get('model'),'platform':o.get('platform'),'evidence_level':ev})\n            except Exception as e: res['errors'].append('hermes parse failed '+p.name+': '+str(e)[:120])\n    else: res['errors'].append('hermes_sessions not found: '+HBASE)\nexcept Exception as e: res['errors'].append('hermes scan: '+str(e)[:200])\ntry:\n    cx=Path(CXBASE)\n    if CXBASE and cx.exists():\n        for p in cx.glob('sessions/*/*/*/rollout-*.jsonl'):\n            try:\n                lines=Path(p).read_text(errors='ignore').splitlines()\n                if not lines: continue\n                meta=json.loads(lines[0])\n                if meta.get('type')!='session_meta': continue\n                pl=meta.get('payload',{})\n                if pl.get('thread_source')=='subagent' or (isinstance(pl.get('source'),dict) and pl['source'].get('subagent')): continue\n                cwd=pl.get('cwd',''); sid=pl.get('id',Path(p).stem); ts=[]; titles=[]\n                for ln in lines[1:]:\n                    try: o=json.loads(ln)\n                    except Exception: continue\n                    if o.get('type')!='event_msg': continue\n                    pp=o.get('payload',{})\n                    if pp.get('type')!='user_message': continue\n                    t=parse_dt(o.get('timestamp'))\n                    if t and SINCE<=t.astimezone(BUCHAREST)<UNTIL: ts.append(t.astimezone(BUCHAREST)); titles.append(pp.get('message',''))\n                if not ts: continue\n                ts.sort(); title=''\n                for m in titles:\n                    s=(m or '').strip()\n                    if s and not s.startswith('<'): title=s[:120]; break\n                bs=be=ts[0]; cnt=1; bursts=[]\n                for t in ts[1:]:\n                    if (t-be).total_seconds()>1800: bursts.append((bs,be,cnt)); bs=t; cnt=1\n                    else: cnt+=1\n                    be=t\n                bursts.append((bs,be,cnt)); lab=cwd.rstrip('/').split('/')[-1] if cwd else (title or 'codex')\n                for bs,be,cnt in bursts:\n                    res['codex_sessions'].append({'source':'codex','machine':MACHINE,'session_id':sid,'path':str(p),'cwd':cwd,'label':lab,'title':title,'start':local_str(bs),'end':local_str(be),'duration_minutes':max(1,int((be-bs).total_seconds()/60)),'user_messages':cnt,'evidence_level':'remote rollout timestamps'})\n            except Exception: pass\n    elif CXBASE: res['errors'].append('codex_home not found: '+CXBASE)\nexcept Exception as e: res['errors'].append('codex scan: '+str(e)[:200])\nprint(json.dumps(res))\n"
     remote_code = (remote_code
         .replace('__MACHINE__', repr(machine['name']))
         .replace('__CBASE__', repr(machine.get('claude_projects', '')))
         .replace('__HBASE__', repr(machine.get('hermes_sessions', '')))
-        .replace('__HDB__', repr(machine.get('hermes_db', '')))
         .replace('__CXBASE__', repr(machine.get('codex_home', '')))
         .replace('__SINCE__', repr(since.isoformat()))
         .replace('__UNTIL__', repr(until.isoformat())))
@@ -961,114 +936,6 @@ def overlaps_existing(candidate: dict[str, Any], existing: list[dict[str, Any]])
     return False
 
 
-def _is_system_message(msg: str) -> bool:
-    """Return True if the message is a system/command/auto-generated message with no real context."""
-    lower = msg.strip().lower()
-    # Claude Code / Codex command messages
-    if lower.startswith("<command-") or lower.startswith("<local-command-"):
-        return True
-    if lower.startswith("<teammate-message"):
-        return True
-    if lower.startswith("[tool_") or lower.startswith("[image:"):
-        return True
-    if lower.startswith("[thinking]") or lower.startswith("[tool_result]"):
-        return True
-    # Image references (raw paths or markdown image syntax)
-    if lower.startswith("[image:") or lower.startswith("![") or lower.startswith("/home/") or lower.startswith("/users/"):
-        return True
-    # Pure XML/command noise
-    if lower.startswith("<") and ">" in lower[:50]:
-        return True
-    return False
-
-
-def _strip_command_wrapper(msg: str) -> str:
-    """Strip Claude Code command wrappers like <command-name>...</command-name> from a message,
-    returning the real user content if any exists after the wrapper."""
-    lines = msg.strip().split("\n")
-    cleaned = []
-    for line in lines:
-        stripped = line.strip()
-        # Skip lines that are pure XML tags
-        if stripped.startswith("<") and stripped.endswith(">"):
-            continue
-        # Skip lines that are just closing tags
-        if stripped.startswith("</") and stripped.endswith(">"):
-            continue
-        cleaned.append(stripped)
-    return "\n".join(cleaned).strip()
-
-
-def _make_description(project: str, burst: dict[str, Any], confidence: str = "medium", prefix: str = "SC") -> str:
-    """Build a human-readable description from session context.
-
-    Format: [PREFIX] — [concise action summary]
-    Prefix comes from the matched route in routing.json (e.g. SC, TSTP, LoA, Kontas, TaxCamp, SZ).
-    Unlabeled/low-confidence sessions get [NEEDS REVIEW] marker.
-    """
-    first = (burst.get("first_user_message") or "").strip()
-    last = (burst.get("last_assistant_message") or "").strip()
-    label = burst.get("label", "")
-    msgs = burst.get("user_messages", 0)
-    dur = burst.get("duration_minutes", 0)
-    machine = burst.get("machine", "")
-    source = burst.get("source", "claude")
-
-    # Check if this is an unlabeled/low-confidence session
-    is_unlabeled = (
-        label in ("Work", "-claude", "-home-blackthorne", "llm-self", "cpu", "-tmp", "session_")
-        or (label and label.startswith("-"))
-        or (label == "Work" and confidence == "low")
-    )
-
-    if is_unlabeled:
-        return f"[NEEDS REVIEW] — {prefix} — Unlabeled session on {machine} ({msgs} msgs, {dur}m). Requires investigation to determine work done."
-
-    # Try first_user_message — strip command wrappers, skip pure system noise
-    if first and len(first) > 10:
-        cleaned_first = _strip_command_wrapper(first)
-        if cleaned_first and len(cleaned_first) > 10 and not _is_system_message(cleaned_first):
-            summary = cleaned_first[:120]
-            if len(cleaned_first) > 120:
-                summary = summary[:summary.rfind(" ")] + "..."
-            return f"{prefix} — {summary}"
-
-    # Try last_assistant_message (what was accomplished)
-    if last and len(last) > 10 and not _is_system_message(last):
-        summary = last[:120]
-        if len(last) > 120:
-            summary = summary[:summary.rfind(" ")] + "..."
-        return f"{prefix} — {summary}"
-
-    # Try enriched context: if we have user_messages with content, use the first real one
-    user_msgs = burst.get("user_messages_detail", [])
-    if user_msgs:
-        for um in user_msgs:
-            content = (um.get("user_message") or "").strip()
-            if len(content) > 10 and not _is_system_message(content):
-                summary = content[:120]
-                if len(content) > 120:
-                    summary = summary[:summary.rfind(" ")] + "..."
-                return f"{prefix} — {summary}"
-
-    # Last resort: label-based
-    return f"{prefix} — {label} ({msgs} msgs, {dur}m)"
-
-
-def _make_rationale(burst: dict[str, Any]) -> str:
-    first = (burst.get("first_user_message") or "").strip()
-    if first and len(first) > 10 and not _is_system_message(first):
-        return f"Session context: {first[:200]}"
-    # Try enriched user messages
-    user_msgs = burst.get("user_messages_detail", [])
-    if user_msgs:
-        for um in user_msgs:
-            content = (um.get("user_message") or "").strip()
-            if len(content) > 10 and not _is_system_message(content):
-                return f"Session context: {content[:200]}"
-    return f"{burst.get('user_messages')} user messages across {burst.get('duration_minutes')}m; route matched {burst.get('label')}"
-
-
 def build_proposals(evidence: dict[str, Any], routing: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     proposals: list[dict[str, Any]] = []
     ambiguous: list[dict[str, Any]] = []
@@ -1108,8 +975,8 @@ def build_proposals(evidence: dict[str, Any], routing: dict[str, Any]) -> tuple[
                 "source": [f"claude:{b.get('machine')}"],
                 "source_label": b.get("label"),
                 "confidence": route.get("confidence", "medium"),
-                "description": _make_description(route.get('project_name'), b, route.get('confidence', 'medium'), route.get('prefix', 'SC')),
-                "rationale": _make_rationale(b),
+                "description": f"{route.get('project_name')} — {b.get('label')} ({b.get('user_messages')} msgs across {b.get('duration_minutes')}m)",
+                "rationale": f"{b.get('user_messages')} user messages across {b.get('duration_minutes')}m; route matched {b.get('label')}",
             }
             if overlaps_existing(cand, existing):
                 skipped.append({"id": rid_base, "source": "claude", "time": f"{b.get('start')}–{b.get('end')}", "label": b.get("label"), "reason": "covered by existing Clockify entry overlap"})
@@ -1149,7 +1016,7 @@ def build_proposals(evidence: dict[str, Any], routing: dict[str, Any]) -> tuple[
                 "source": [f"hermes:{hs.get('machine')}"],
                 "source_label": label,
                 "confidence": route.get("confidence", "medium"),
-                "description": f"{route.get('prefix', 'SC')} — {label} ({hs.get('user_messages',0)} user msgs across {est_duration or '?'}m, estimated)",
+                "description": f"{route.get('project_name')} — {label} ({hs.get('user_messages',0)} user msgs across {est_duration or '?'}m, estimated)",
                 "rationale": hs.get("evidence_level", "estimated duration"),
             }
             proposals.append(cand)
@@ -1189,7 +1056,7 @@ def build_proposals(evidence: dict[str, Any], routing: dict[str, Any]) -> tuple[
                 "source": [f"codex:{cs.get('machine','?')}"],
                 "source_label": route_label,
                 "confidence": "medium" if duration is not None else "low",
-                "description": f"{route.get('prefix', 'SC')} — {cs.get('title') or 'Codex session'}",
+                "description": f"{route.get('project_name')} — {cs.get('title') or 'Codex session'}",
                 "rationale": f"Codex session ({cs.get('user_messages','?')} user msgs): {cs.get('title') or cs.get('cwd','?')}",
             }
             proposals.append(cand)
@@ -1270,27 +1137,20 @@ def run(args: argparse.Namespace) -> int:
     # Enriched session context (user messages with prev/next assistant)
     if getattr(args, 'enrich', False):
         enriched = {"claude_contexts": [], "hermes_contexts": []}
-        for m in fleet.get("machines", []):
-            cbase = m.get("claude_projects", "")
-            if cbase:
-                cpath = Path(cbase)
-                if cpath.exists():
-                    for p in sorted(cpath.glob("*/*.jsonl")):
-                        sp = str(p)
-                        if any(f in sp for f in ["/subagents/", "multica-command", "claude-mem-observer", "/multica/"]):
-                            continue
-                        ctx = extract_claude_jsonl_context(p, since, until)
-                        if ctx and ctx.get("user_messages"):
-                            ctx["machine"] = m.get("name")
-                            enriched["claude_contexts"].append(ctx)
-            hdb = m.get("hermes_db")
-            if hdb and Path(hdb).exists():
-                hermes_ctx = extract_hermes_db_context(hdb, since, until)
-                for hc in hermes_ctx:
-                    hc["machine"] = m.get("name")
-                enriched["hermes_contexts"].extend(hermes_ctx)
+        cbase = Path(fleet["machines"][0].get("claude_projects", "")) if fleet.get("machines") else None
+        if cbase and cbase.exists():
+            for p in sorted(cbase.glob("*/*.jsonl")):
+                sp = str(p)
+                if any(f in sp for f in ["/subagents/", "paperclip-instances", "claude-mem-observer", "serenichron-paperclip-command"]):
+                    continue
+                ctx = extract_claude_jsonl_context(p, since, until)
+                if ctx and ctx.get("user_messages"):
+                    enriched["claude_contexts"].append(ctx)
+        hdb = fleet["machines"][0].get("hermes_db") if fleet.get("machines") else None
+        if hdb and Path(hdb).exists():
+            enriched["hermes_contexts"] = extract_hermes_db_context(hdb, since, until)
         evidence["enriched_context"] = enriched
-        print(f"Enriched: {len(enriched['claude_contexts'])} Claude, {len(enriched['hermes_contexts'])} Hermes sessions across {len(fleet.get('machines', []))} machines", file=sys.stderr)
+        print(f"Enriched: {len(enriched['claude_contexts'])} Claude, {len(enriched['hermes_contexts'])} Hermes sessions", file=sys.stderr)
 
     proposals, ambiguous, skipped = build_proposals(evidence, routing)
     report = {
@@ -1358,10 +1218,7 @@ def main() -> int:
     r = sub.add_parser("run")
     r.add_argument("--since", help="YYYY-MM-DD")
     r.add_argument("--until", help="YYYY-MM-DD inclusive")
-    r.add_argument("--enrich", action="store_true", default=True,
-                    help="Extract user message context (prev/next assistant) for enriched descriptions (default: on)")
-    r.add_argument("--no-enrich", action="store_false", dest="enrich",
-                    help="Disable enriched context extraction")
+    r.add_argument("--enrich", action="store_true", help="Extract user message context (prev/next assistant) for enriched descriptions")
     args = ap.parse_args()
     if args.cmd == "run":
         return run(args)

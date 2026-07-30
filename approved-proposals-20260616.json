@@ -1,0 +1,17 @@
+[
+  {"start": "2026-06-12 23:42", "end": "2026-06-13 03:25", "project": "bc17f7", "desc": "TSTPrep — LLM fine-tuning for article-writing (26 msgs)", "tags": ["35aa9afb"], "billable": true},
+  {"start": "2026-06-13 11:09", "end": "2026-06-13 12:08", "project": "bc17f7", "desc": "TSTPrep — LLM fine-tuning for article-writing (18 msgs)", "tags": ["35aa9afb"], "billable": true},
+  {"start": "2026-06-13 21:31", "end": "2026-06-13 22:06", "project": "bc17f7", "desc": "TSTPrep — LLM fine-tuning for article-writing (6 msgs)", "tags": ["35aa9afb"], "billable": true},
+  {"start": "2026-06-14 09:23", "end": "2026-06-14 09:41", "project": "bc17f7", "desc": "TSTPrep — LLM fine-tuning for article-writing (3 msgs)", "tags": ["35aa9afb"], "billable": true},
+  {"start": "2026-06-14 12:40", "end": "2026-06-14 13:07", "project": "bc17f7", "desc": "TSTPrep — LLM fine-tuning for article-writing (5 msgs)", "tags": ["35aa9afb"], "billable": true},
+  {"start": "2026-06-15 09:58", "end": "2026-06-15 10:14", "project": "bc17f7", "desc": "TSTPrep — LLM fine-tuning for article-writing (3 msgs)", "tags": ["35aa9afb"], "billable": true},
+  {"start": "2026-06-15 12:12", "end": "2026-06-15 13:14", "project": "bc17f7", "desc": "TSTPrep — LLM fine-tuning for article-writing (5 msgs)", "tags": ["35aa9afb"], "billable": true},
+  {"start": "2026-06-15 21:46", "end": "2026-06-15 22:02", "project": "319d88", "desc": "TSTPrep — Content writing (2 msgs)", "tags": ["2c078325"], "billable": true},
+  {"start": "2026-06-13 13:59", "end": "2026-06-13 16:58", "project": "31b39a", "desc": "Testing/benchmarking self-hosted language models (22 msgs)", "tags": ["35aa9afb"], "billable": true},
+  {"start": "2026-06-11 20:21", "end": "2026-06-11 21:27", "project": "31b39a", "desc": "Testing/benchmarking self-hosted language models (9 msgs)", "tags": ["35aa9afb"], "billable": true},
+  {"start": "2026-06-12 15:33", "end": "2026-06-12 15:38", "project": "31b39a", "desc": "Testing/benchmarking self-hosted language models (trimmed: BNI meeting 14:08-15:33)", "tags": ["35aa9afb"], "billable": true},
+  {"start": "2026-06-12 21:06", "end": "2026-06-12 22:09", "project": "31b39a", "desc": "Testing/benchmarking self-hosted language models (8 msgs)", "tags": ["35aa9afb"], "billable": true},
+  {"start": "2026-06-12 22:49", "end": "2026-06-12 23:26", "project": "31b39a", "desc": "Testing/benchmarking self-hosted language models (8 msgs)", "tags": ["35aa9afb"], "billable": true},
+  {"start": "2026-06-12 23:09", "end": "2026-06-12 23:42", "project": "775f9f", "desc": "honcho-codex work (trimmed: TSTPrep LLM fine-tuning 23:42-03:25)", "tags": ["35aa9afb"], "billable": true},
+  {"start": "2026-06-13 20:47", "end": "2026-06-13 21:01", "project": "775f9f", "desc": "Multica CLI work (11 msgs)", "tags": ["35aa9afb"], "billable": true}
+]

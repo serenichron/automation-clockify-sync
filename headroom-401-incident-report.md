@@ -1,0 +1,136 @@
+# Incident Report: Clockify Reconciliation Agents - HTTP 401 Headroom API Key
+
+## Status
+
+Fixed on 2026-06-11 13:45 Bucharest.
+
+The failing Hermes default-provider route was changed on both MacBook and omarchy-precision from the broken `headroom` OpenAI-compatible provider to the known-working `ollama-launch` DeepSeek cloud model. Precision's Hermes gateway was restarted and the MacBook Hermes app was gracefully reopened so dispatched Multica tasks load the new default.
+
+## Error
+
+```text
+hermes provider error: HTTP 401: Incorrect API key provided: headroom. You can find your API key at https://platform.openai.com/account/api-keys.
+```
+
+## Affected Autopilots
+
+| Autopilot | ID | Agent | Schedule | Runtime |
+| --- | --- | --- | --- | --- |
+| Precision dry run | `6e1bd5f6` | Serenichron Clockify Analyst (Precision) `11af6181` | Weekdays 07:00 Bucharest | Hermes (omarchy-precision) `85c344fe` - Linux |
+| MacBook dry run | `f10f0de3` | Serenichron Clockify Analyst `65e964bf` | Weekdays 18:30 Bucharest | Hermes (MacBookPro) `03957b8f` - macOS |
+
+## Affected Issue History
+
+| Issue | Autopilot | Trigger Time | Result |
+| --- | --- | --- | --- |
+| SER-257 | Precision | 2026-06-10 07:00 | 401 headroom; not processed; no proposals; no auto-close |
+| SER-260 | MacBook | 2026-06-10 18:30 | 401 headroom; not processed; no proposals; no auto-close |
+| SER-261 | Precision | 2026-06-11 07:00 | 401 headroom; not processed; no proposals; no auto-close |
+
+All 3 issues remained `todo` after the failed runs, with only a `hermes provider error` system comment.
+
+## Root Cause
+
+The Clockify collector and routing config were not the failing layer. The agents never reached the collector script.
+
+Multica-dispatched Hermes tasks inherited Hermes' top-level default model block from `~/.hermes/config.yaml`. On both MacBook and precision, that default pointed at:
+
+```yaml
+model:
+  provider: headroom
+  default: deepseek-v4-flash
+  base_url: http://127.0.0.1:8787/v1
+  api_key: headroom
+  api_mode: chat_completions
+```
+
+That config treats Headroom as an OpenAI-compatible chat-completions provider. In the current Blackthorne deployment, `headroom` is a local placeholder key, not a real OpenAI API key. When Hermes used this default, the OpenAI-compatible path rejected the placeholder with HTTP 401.
+
+Interactive Hermes sessions worked because they were manually using `ollama-launch` with the DeepSeek cloud model rather than the broken top-level default.
+
+## Fix Applied
+
+### MacBook
+
+Updated `~/.hermes/config.yaml`:
+
+```yaml
+model:
+  provider: ollama-launch
+  default: deepseek-v4-flash:cloud
+```
+
+Backup:
+
+```text
+/Users/blackthorne/.hermes/config.yaml.bak-clockify-headroom-401-20260611-134223
+```
+
+Restarted Hermes desktop app gracefully:
+
+```bash
+osascript -e 'tell application "Hermes" to quit'
+open -a Hermes
+```
+
+Verification:
+
+```bash
+hermes status
+# Model: deepseek-v4-flash:cloud
+# Provider: ollama-launch
+
+timeout 60 hermes -z 'Reply with OK only.'
+# OK
+```
+
+### omarchy-precision
+
+Updated `~/.hermes/config.yaml`:
+
+```yaml
+model:
+  provider: ollama-launch
+  default: deepseek-v4-flash-cloud-no-colon
+```
+
+Backup:
+
+```text
+/home/blackthorne/.hermes/config.yaml.bak-clockify-headroom-401-20260611-134220
+```
+
+Restarted Hermes gateway:
+
+```bash
+systemctl --user restart hermes-gateway.service
+```
+
+Verification:
+
+```bash
+/home/blackthorne/.hermes/hermes-agent/hermes status
+# Model: deepseek-v4-flash-cloud-no-colon
+# Provider: ollama-launch
+
+timeout 60 /home/blackthorne/.hermes/hermes-agent/hermes -z 'Reply with OK only.'
+# OK
+
+systemctl --user status hermes-gateway.service --no-pager
+# active (running), restarted 2026-06-11 13:43:40 EEST
+```
+
+## Follow-up Verification
+
+The next scheduled autopilot runs should no longer fail at provider initialization:
+
+| Autopilot | Next expected run |
+| --- | --- |
+| Precision dry run | 2026-06-12 07:00 Bucharest |
+| MacBook dry run | 2026-06-11 18:30 Bucharest |
+
+If another 401 appears, check whether the dispatcher is overriding the Hermes model/provider outside `~/.hermes/config.yaml`. The known-good direct Hermes smoke command on each host should continue returning `OK`.
+
+## Longer-Term Note
+
+The Hermes `headroom` provider block should not be used as an OpenAI-compatible `chat_completions` provider with `api_key: headroom` unless Headroom is also configured with a valid OpenAI-compatible upstream credential. For the current Blackthorne setup, the safe Hermes default is `ollama-launch`; Headroom remains valid for harnesses that are explicitly configured and tested for its supported route.

@@ -19,7 +19,8 @@
         "Technical development"
       ],
       "billable": true,
-      "confidence": "high"
+      "confidence": "high",
+      "prefix": "TSTP"
     },
     {
       "pattern": "tstprep-com",
@@ -32,22 +33,26 @@
         "Content writing"
       ],
       "billable": true,
-      "confidence": "medium"
+      "confidence": "medium",
+      "prefix": "TSTP"
     },
     {
-      "pattern": "serenichron-paperclip-command",
+      "pattern": "multica-command",
       "action": "skip",
-      "reason": "Paperclip agent heartbeats/direct work too commingled"
+      "reason": "Multica runtime and agent work must not be logged as Vlad's time",
+      "prefix": "SC"
     },
     {
-      "pattern": "paperclip-instances",
+      "pattern": "/multica/",
       "action": "skip",
-      "reason": "Paperclip unattended/agent activity"
+      "reason": "Multica unattended or agent activity",
+      "prefix": "SC"
     },
     {
       "pattern": "atelieruldevis",
       "action": "skip",
-      "reason": "Personal/non-billable"
+      "reason": "Personal/non-billable",
+      "prefix": "SC"
     },
     {
       "pattern": "multica-command",
@@ -60,7 +65,8 @@
         "System development"
       ],
       "billable": true,
-      "confidence": "high"
+      "confidence": "high",
+      "prefix": "SC"
     },
     {
       "pattern": "serenichron",
@@ -73,7 +79,8 @@
         "System development"
       ],
       "billable": true,
-      "confidence": "medium"
+      "confidence": "medium",
+      "prefix": "SC"
     },
     {
       "pattern": "clockify",
@@ -86,7 +93,8 @@
         "Processes"
       ],
       "billable": true,
-      "confidence": "high"
+      "confidence": "high",
+      "prefix": "SC"
     },
     {
       "pattern": "n8n-workflows",
@@ -99,7 +107,8 @@
         "System development"
       ],
       "billable": true,
-      "confidence": "medium"
+      "confidence": "medium",
+      "prefix": "SC"
     },
     {
       "pattern": "lensofalex-com",
@@ -112,7 +121,8 @@
         "Web content"
       ],
       "billable": true,
-      "confidence": "high"
+      "confidence": "high",
+      "prefix": "LoA"
     },
     {
       "pattern": "kontas",
@@ -125,7 +135,8 @@
         "Technical development"
       ],
       "billable": true,
-      "confidence": "medium"
+      "confidence": "medium",
+      "prefix": "Kontas"
     },
     {
       "pattern": "taxcamp",
@@ -138,7 +149,8 @@
         "Technical development"
       ],
       "billable": true,
-      "confidence": "medium"
+      "confidence": "medium",
+      "prefix": "TaxCamp"
     },
     {
       "pattern": "fonduri-EU",
@@ -151,7 +163,8 @@
         "Business development"
       ],
       "billable": true,
-      "confidence": "medium"
+      "confidence": "medium",
+      "prefix": "SC"
     },
     {
       "pattern": "proposals",
@@ -164,36 +177,42 @@
         "Business development"
       ],
       "billable": true,
-      "confidence": "medium"
+      "confidence": "medium",
+      "prefix": "SC"
     },
     {
       "pattern": "stefaniazaharia",
-      "project_name": "Stefania Zaharia — B2B",
+      "project_name": "Stefania Zaharia \u2014 B2B",
       "project_suffix": "",
       "tag_suffixes": [],
       "tag_names": [],
       "billable": true,
-      "confidence": "low"
+      "confidence": "low",
+      "prefix": "SZ"
     },
     {
       "pattern": "mihaelabrailescu",
       "action": "skip",
-      "reason": "Personal/non-billable"
+      "reason": "Personal/non-billable",
+      "prefix": "SC"
     },
     {
       "pattern": "family-bank",
       "action": "skip",
-      "reason": "Personal/non-billable"
+      "reason": "Personal/non-billable",
+      "prefix": "SC"
     },
     {
       "pattern": "outstanding",
       "action": "skip",
-      "reason": "Not yet assigned to a billable project"
+      "reason": "Not yet assigned to a billable project",
+      "prefix": "SC"
     },
     {
       "pattern": "hartacoruptiei",
       "action": "skip",
-      "reason": "Separate Multica workspace; not Clockify-billable"
+      "reason": "Separate Multica workspace; not Clockify-billable",
+      "prefix": "SC"
     },
     {
       "pattern": "-Users-blackthorne",
@@ -206,7 +225,8 @@
         "System development"
       ],
       "billable": true,
-      "confidence": "low"
+      "confidence": "low",
+      "prefix": "SC"
     },
     {
       "pattern": "session_",
@@ -219,7 +239,8 @@
         "System development"
       ],
       "billable": true,
-      "confidence": "low"
+      "confidence": "low",
+      "prefix": "SC"
     },
     {
       "pattern": "llm-self",
@@ -232,7 +253,8 @@
         "System development"
       ],
       "billable": true,
-      "confidence": "low"
+      "confidence": "low",
+      "prefix": "SC"
     },
     {
       "pattern": "cpu",
@@ -245,7 +267,8 @@
         "System development"
       ],
       "billable": true,
-      "confidence": "low"
+      "confidence": "low",
+      "prefix": "SC"
     },
     {
       "pattern": "-home-blackthorne",
@@ -258,7 +281,8 @@
         "System development"
       ],
       "billable": true,
-      "confidence": "low"
+      "confidence": "low",
+      "prefix": "SC"
     },
     {
       "pattern": "moldsign",
@@ -271,7 +295,140 @@
         "System development"
       ],
       "billable": true,
-      "confidence": "low"
+      "confidence": "low",
+      "prefix": "SC"
+    },
+    {
+      "pattern": "cloudron",
+      "project_name": "Serenichron Level 2",
+      "project_suffix": "775f9f",
+      "tag_suffixes": [
+        "35aa9afb"
+      ],
+      "tag_names": [
+        "System development"
+      ],
+      "billable": true,
+      "confidence": "medium",
+      "prefix": "SC"
+    },
+    {
+      "pattern": "cognee",
+      "project_name": "Serenichron Level 2",
+      "project_suffix": "775f9f",
+      "tag_suffixes": [
+        "35aa9afb"
+      ],
+      "tag_names": [
+        "System development"
+      ],
+      "billable": true,
+      "confidence": "low",
+      "prefix": "SC"
+    },
+    {
+      "pattern": "llm-emails",
+      "project_name": "Serenichron Level 2",
+      "project_suffix": "775f9f",
+      "tag_suffixes": [
+        "35aa9afb"
+      ],
+      "tag_names": [
+        "System development"
+      ],
+      "billable": true,
+      "confidence": "low",
+      "prefix": "SC"
+    },
+    {
+      "pattern": "leads-corina-geanca",
+      "project_name": "Serenichron Level 2",
+      "project_suffix": "775f9f",
+      "tag_suffixes": [
+        "35aa9b46"
+      ],
+      "tag_names": [
+        "Business development"
+      ],
+      "billable": true,
+      "confidence": "low",
+      "prefix": "SC"
+    },
+    {
+      "pattern": "drivescool",
+      "project_name": "Serenichron Level 2",
+      "project_suffix": "775f9f",
+      "tag_suffixes": [
+        "35aa9afb"
+      ],
+      "tag_names": [
+        "System development"
+      ],
+      "billable": true,
+      "confidence": "low",
+      "prefix": "SC"
+    },
+    {
+      "pattern": "-claude",
+      "project_name": "Serenichron Level 2",
+      "project_suffix": "775f9f",
+      "tag_suffixes": [
+        "35aa9afb"
+      ],
+      "tag_names": [
+        "System development"
+      ],
+      "billable": true,
+      "confidence": "low",
+      "prefix": "SC"
+    },
+    {
+      "pattern": "-tmp",
+      "project_name": "Serenichron Level 2",
+      "project_suffix": "775f9f",
+      "tag_suffixes": [
+        "35aa9afb"
+      ],
+      "tag_names": [
+        "System development"
+      ],
+      "billable": true,
+      "confidence": "low",
+      "prefix": "SC"
+    },
+    {
+      "pattern": "-private-tmp",
+      "action": "skip",
+      "reason": "Personal/non-billable",
+      "prefix": "SC"
+    },
+    {
+      "pattern": "Work",
+      "project_name": "Serenichron Level 2",
+      "project_suffix": "775f9f",
+      "tag_suffixes": [
+        "35aa9afb"
+      ],
+      "tag_names": [
+        "System development"
+      ],
+      "billable": true,
+      "confidence": "low",
+      "prefix": "SC"
+    },
+    {
+      "pattern": "multica",
+      "project_name": "Serenichron Level 2",
+      "project_suffix": "775f9f",
+      "tag_suffixes": [
+        "35aa9afb"
+      ],
+      "tag_names": [
+        "System development"
+      ],
+      "billable": true,
+      "confidence": "high",
+      "prefix": "SC"
     }
   ],
   "meeting_routes": [

@@ -1,0 +1,68 @@
+# Incident Report: Clockify Reconciliation Agents - HTTP 401 Headroom API Key
+
+## Status
+**Ongoing** - all 3 consecutive runs (June 10-11) have failed with the same error. No Clockify reconciliation has completed since June 9.
+
+## Error
+```
+hermes provider error: HTTP 401: Incorrect API key provided: headroom.
+You can find your API key at https://platform.openai.com/account/api-keys.
+```
+
+## Affected Autopilots and Schedule
+
+| Autopilot | ID | Agent | Schedule | Runtime |
+|---|---|---|---|---|
+| Precision dry run | 6e1bd5f6 | Serenichron Clockify Analyst (Precision) 11af6181 | Weekdays 07:00 Bucharest | Hermes (omarchy-precision) 85c344fe - Linux |
+| MacBook dry run | f10f0de3 | Serenichron Clockify Analyst 65e964bf | Weekdays 18:30 Bucharest | Hermes (MacBookPro) 03957b8f - macOS |
+
+## Affected Issue History
+
+| Issue | Autopilot | Trigger Time | Error | Result |
+|---|---|---|---|---|
+| SER-257 | Precision | 2026-06-10 07:00 | 401 headroom | Not processed. No proposals, no auto-close. |
+| SER-260 | MacBook | 2026-06-10 18:30 | 401 headroom | Not processed. No proposals, no auto-close. |
+| SER-261 | Precision | 2026-06-11 07:00 | 401 headroom | Not processed. No proposals, no auto-close. |
+
+All 3 issues remain in **todo** status, assigned to their respective agents, with only a `hermes provider error` system comment - no analysis, no proposal table, no auto-close.
+
+## Agent Details
+
+### Serenichron Clockify Analyst (Precision) - 11af6181
+- Runtime: Hermes (omarchy-precision) - 85c344fe-c6c2-455c-b7d5-cc634f8e1e86
+- Machine: omarchy-precision (Linux, always-on)
+- Model: (empty - relies on runtime default)
+- Local automation root: /Users/blackthorne/Work/serenichron/automation/clockify-sync/
+- Collector script: scripts/clockify_sync_collect.py
+- Agent instructions file: multica-clockify-analyst-agent-instructions.md
+- Routing config: routing.json
+- Fleet config: fleet.json
+- Clockify env: ~/.config/serenichron/clockify.env
+- Fathom env: ~/.config/serenichron/fathom.env
+- Aggregate issue: SER-106
+
+### Serenichron Clockify Analyst (MacBook) - 65e964bf
+- Runtime: Hermes (MacBookPro) - 03957b8f
+- Machine: MacBookPro (macOS, Vlad's interactive workstation)
+- Model: (empty - relies on runtime default)
+- Same automation root, scripts, and configs (Syncthing-synced)
+
+## What the agents do
+1. Run clockify_sync_collect.py
+2. Cross-reference sessions, Fathom meetings, existing Clockify entries, Multica issues
+3. Apply skip/overlap/routing rules
+4. Propose time-entry rows in a table comment on the Multica issue
+5. If proposals: @mention Vlad + rename issue + leave open
+6. If no proposals: auto-close
+
+## What breaks
+The agents never reach step 1 because the Hermes runtime fails at provider init with HTTP 401 "headroom". The collector script runs fine - the failure is in Hermes' LLM provider layer when the agent tries to use its model.
+
+## Key context
+- Interactive Hermes session (this one): uses deepseek-v4-flash:cloud via Ollama - works fine
+- Multica-dispatched agent tasks: use the runtime's default provider config, which has "headroom" configured with an expired/wrong OpenAI API key
+
+## Possible fixes
+Option A: Set explicit model on both agents to deepseek-v4-flash:cloud (currently empty)
+Option B: Fix headroom provider config in ~/.hermes/config.yaml on both machines
+Option C: Set HERMES_DEFAULT_PROVIDER=deepseek-v4-flash:cloud env var
