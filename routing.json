@@ -37,6 +37,20 @@
       "prefix": "TSTP"
     },
     {
+      "pattern": "tstprep.com",
+      "project_name": "TST Prep Level 1",
+      "project_suffix": "319d88",
+      "tag_suffixes": [
+        "2c078325"
+      ],
+      "tag_names": [
+        "Content writing"
+      ],
+      "billable": true,
+      "confidence": "medium",
+      "prefix": "TSTP"
+    },
+    {
       "pattern": "multica-command",
       "action": "skip",
       "reason": "Multica runtime and agent work must not be logged as Vlad's time",
@@ -109,6 +123,34 @@
       "billable": true,
       "confidence": "medium",
       "prefix": "SC"
+    },
+    {
+      "pattern": "lens-of-alex",
+      "project_name": "Lens of Alex Retainer",
+      "project_suffix": "1207d5",
+      "tag_suffixes": [
+        "3ad4b978"
+      ],
+      "tag_names": [
+        "Web content"
+      ],
+      "billable": true,
+      "confidence": "high",
+      "prefix": "LoA"
+    },
+    {
+      "pattern": "lensofalex.com",
+      "project_name": "Lens of Alex Retainer",
+      "project_suffix": "1207d5",
+      "tag_suffixes": [
+        "3ad4b978"
+      ],
+      "tag_names": [
+        "Web content"
+      ],
+      "billable": true,
+      "confidence": "high",
+      "prefix": "LoA"
     },
     {
       "pattern": "lensofalex-com",
@@ -434,6 +476,7 @@
   "meeting_routes": [
     {
       "email_domain": "tstprep.com",
+      "prefix": "TSTP",
       "project_name": "TST Prep Level 1",
       "project_suffix": "319d88",
       "tag_suffixes": [
@@ -446,6 +489,8 @@
     },
     {
       "email_domain": "lensofalex.com",
+      "title_regex": "\\b(Lens of Alex|LoA)\\b",
+      "prefix": "LoA",
       "project_name": "Lens of Alex Retainer",
       "project_suffix": "1207d5",
       "tag_suffixes": [
@@ -458,6 +503,7 @@
     },
     {
       "email_domain": "kontas.ro",
+      "prefix": "Kontas",
       "project_name": "Kontas Level 1",
       "project_suffix": "2632ca",
       "tag_suffixes": [
@@ -470,6 +516,7 @@
     },
     {
       "email_domain": "taxcamp.ro",
+      "prefix": "TaxCamp",
       "project_name": "TaxCamp Level 1",
       "project_suffix": "a29a92",
       "tag_suffixes": [
@@ -482,6 +529,7 @@
     },
     {
       "title_regex": "\\bdaily\\s*(stand-?up|meet)\\b",
+      "prefix": "SC",
       "project_name": "Daily meetings",
       "project_suffix": "89dab8",
       "tag_suffixes": [
@@ -494,6 +542,7 @@
     },
     {
       "title_regex": "\\b(Ava|Adrian Valerian|Demo|EZFuture|Sofiane|BizzOS|proposal|pitch)\\b",
+      "prefix": "SC",
       "project_name": "Serenichron Level 2",
       "project_suffix": "775f9f",
       "tag_suffixes": [
@@ -501,6 +550,19 @@
       ],
       "tag_names": [
         "Business development"
+      ],
+      "billable": true
+    },
+    {
+      "domains_type": "internal_only",
+      "prefix": "SC",
+      "project_name": "Serenichron Level 1",
+      "project_suffix": "31b39a",
+      "tag_suffixes": [
+        "35aa9aef"
+      ],
+      "tag_names": [
+        "Project Management"
       ],
       "billable": true
     }
@@ -512,6 +574,8 @@
       29,
       44
     ],
+    "weekend_short_max_minutes": 60,
+    "soft_overlap_minutes": 15,
     "existing_overlap_skip_ratio": 0.5,
     "meeting_source_wins_overlap_ratio": 0.8
   }

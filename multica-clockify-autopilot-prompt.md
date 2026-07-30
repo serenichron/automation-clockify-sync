@@ -3,24 +3,40 @@
 Run the Clockify reconciliation workflow in dry-run mode.
 
 Aggregate issue:
-- SER-106 — Clockify sync inbox / reconciliation autopilot
+- SER-651 — Clockify reconciliation review
 
 Default scope:
-- If no explicit date range is provided, use one day before the latest Clockify entry through now.
+- If no explicit date range is provided, use the collector's rolling seven-day evidence window.
 - Use Europe/Bucharest display time.
 
 Commands:
-1. Run:
-   python3 /Users/blackthorne/Work/serenichron/automation/clockify-sync/scripts/clockify_sync_collect.py run
-2. Read the generated run report path printed by the command.
-3. Reconcile evidence and prepare approval-ready proposals. Propose each row's duration already net of any overlapping already-logged meetings/entries (do not propose full spans that overlap logged meetings).
-4. Post a concise comment to the aggregate Clockify sync issue/current run issue with:
+1. Resolve the host-local root. Use `$CLOCKIFY_SYNC_ROOT` when set; otherwise
+   use the first existing path containing `scripts/clockify_review_run.py`:
+   `$HOME/Work/automation-clockify-sync`, then
+   `$HOME/Work/serenichron/automation/clockify-sync`. Fail closed if neither
+   exists.
+2. Run:
+   `python3 <resolved-root>/scripts/clockify_review_run.py`
+3. Read the emitted `autopilot-result.json` and `autopilot-summary.md`.
+4. Obey `action` exactly:
+   - `no_comment`: make no Multica mutation and end the run.
+   - `review_delta`: post one concise SER-651 comment using only `new` and
+     `changed`.
+   - `coverage_warning`: post one diagnostic comment with warning details and
+     delta counts; do not infer that missing sources contain no work.
+   - `blocked`: post one diagnostic comment and stop.
+5. A permitted comment must include:
    - date range checked
-   - evidence files written
-   - proposal table (durations already net of overlaps)
+   - runtime collector path and Git SHA
+   - new/changed proposal table using stable review item IDs
    - ambiguous rows requiring Vlad's decision
-   - skipped/covered summary
-   - approval instruction: "Reply with per-row decisions naming the row IDs — e.g. 'P001 accept, P002 trim, P003 log, P004 skip'. Any clear accept/log/post, trim, edit, or skip decision is honored; no special phrase required."
+   - carried-pending count without reprinting the unchanged backlog
+   - skipped/covered and coverage-warning summary
+   - approval instruction using the stable review item IDs.
+6. Never overwrite the SER-651 description or change its title, status,
+   assignment, or due date during a scheduled run. A healthy no-delta run
+   produces no comment.
 
 Do not post, edit, or delete Clockify entries unless a board (human) member has approved the specific rows in a comment (per-row decisions naming the row IDs — see the agent's "Approval recognition" rules). Treat "trim" as reduce-the-duration, never a description note alone.
+Do not update the reference Google Sheet from the quality step. Sheet writes require a separately approved, stable-ID patch workflow that preserves Status and Notes.
 Do not create/update downstream client or project issues unless explicitly authorized in the current task.

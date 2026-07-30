@@ -1,9 +1,14 @@
 # bak files
 *.bak
 *.bak2
+*.bak-*
+*.sync-conflict-*
 
 # run artifacts
 runs/
+
+# Mutable local review state
+state/review-items.json
 
 # Python cache
 __pycache__/

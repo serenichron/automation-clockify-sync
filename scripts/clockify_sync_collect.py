@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import urllib.error
@@ -48,6 +49,37 @@ def load_json(path: Path) -> Any:
 def write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False, default=str) + "\n")
+
+
+def collector_runtime_identity() -> dict[str, Any]:
+    """Record the exact local checkout that assembled a dry-run bundle."""
+    sha = None
+    dirty = None
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if proc.returncode == 0:
+            sha = proc.stdout.strip() or None
+        status = subprocess.run(
+            ["git", "-C", str(ROOT), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if status.returncode == 0:
+            dirty = bool(status.stdout.strip())
+    except Exception:
+        pass
+    return {
+        "collector_path": str(Path(__file__).resolve()),
+        "canonical_root": str(ROOT),
+        "git_sha": sha,
+        "git_dirty": dirty,
+    }
 
 
 def load_env_file(candidates: list[str], required_keys: list[str]) -> dict[str, Any]:
@@ -164,6 +196,499 @@ def is_skip_path(path: str) -> bool:
     return any(f in path for f in fragments)
 
 
+BURST_GAP_SECONDS = 30 * 60
+DESCRIPTION_LIMIT = 180
+CONTEXT_LIMIT = 320
+
+
+def _one_line(value: str, limit: int = CONTEXT_LIMIT) -> str:
+    """Normalize evidence text for a single Clockify description/table cell."""
+    value = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(value) <= limit:
+        return value
+    cut = value[: limit - 3].rsplit(" ", 1)[0]
+    return (cut or value[: limit - 3]).rstrip() + "..."
+
+
+def _plain_description_text(value: str, limit: int = CONTEXT_LIMIT) -> str:
+    """Remove presentation markup while retaining task-specific text."""
+    value = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", str(value or ""))
+    value = re.sub(r"```(?:[A-Za-z0-9_+-]+)?", " ", value)
+    value = re.sub(r"[`*_#]+", "", value)
+    value = re.sub(r"[★☆]\s*(?:Insight|Tip)?\s*[\u2500-\u257f]+", " ", value)
+    value = re.sub(r"[\u2500-\u257f]{3,}", " ", value)
+    value = re.sub(r"\s*\|\s*", " / ", value)
+    return _one_line(value, limit)
+
+
+def _is_system_message(msg: str) -> bool:
+    """Reject injected wrappers, tool noise, and other non-human session context."""
+    lower = _one_line(msg, 2000).lower()
+    if not lower:
+        return True
+    if re.fullmatch(r"(?:[a-z0-9]+_)*ok[.!]?", lower):
+        return True
+    if lower.startswith(("<command-", "<local-command-", "<teammate-message", "[tool_", "[image:", "[thinking]", "![", "/home/", "/users/")):
+        return True
+    if lower.startswith("<") and ">" in lower[:80]:
+        return True
+    if lower.startswith(
+        (
+            "you're out of usage credits",
+            "you’re out of usage credits",
+            "rate limit exceeded",
+            "you've hit your session limit",
+            "you’ve hit your session limit",
+            "this session is being continued from a previous conversation",
+            "reply with exactly ",
+            "reply exactly ",
+        )
+    ):
+        return True
+    return any(marker in lower for marker in (
+        "permissions instructions",
+        "codex agent history",
+        "<app-context>",
+        "# agents.md instructions",
+    ))
+
+
+def _strip_command_wrapper(msg: str) -> str:
+    """Retain actual text from a Claude command wrapper, if it contains any."""
+    cleaned = []
+    for line in str(msg or "").strip().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("<") and stripped.endswith(">"):
+            continue
+        cleaned.append(stripped)
+    result = "\n".join(cleaned).strip()
+    # Codex Desktop prepends file-context scaffolding to the actual request.
+    # Keep the request, not the generated file inventory.
+    marker = "# my request for codex:"
+    marker_index = result.lower().find(marker)
+    if marker_index >= 0:
+        result = result[marker_index + len(marker):].strip()
+    return result
+
+
+def _session_directive(msg: str) -> str:
+    """Recover the human task embedded in a session-scoped hook wrapper."""
+    match = re.search(
+        r'(?is)\bcondition:\s*["“](.+?)["”]\s*\.\s*'
+        r"Briefly acknowledge\b",
+        str(msg or ""),
+    )
+    if not match:
+        # Fleet collectors intentionally cap raw context. Preserve the useful
+        # beginning of a condition even when the closing wrapper was truncated.
+        match = re.search(
+            r'(?is)\bcondition:\s*["“](.+)$',
+            str(msg or ""),
+        )
+    if not match:
+        return ""
+    value = re.split(r"(?i)\bBriefly acknowledge\b", match.group(1), maxsplit=1)[0]
+    return _plain_description_text(value.strip(" \t\r\n\"“”"))
+
+
+def _is_low_information_context(msg: str) -> bool:
+    """Reject acknowledgements and setup-only directions as work summaries."""
+    value = _one_line(msg, 200).casefold()
+    return bool(
+        re.fullmatch(
+            r"(?:yes(?:,?\s+please)?(?:\s+do\s+that)?|"
+            r"ok(?:ay)?|approved|yes,?\s+approved|proceed|go\s+ahead|"
+            r"read\s+(?:the\s+)?.{0,40}\s+skills?\s+first)[.!]?",
+            value,
+        )
+    )
+
+
+def _looks_like_task_request(msg: str) -> bool:
+    """Identify direct work requests without trying to semantically summarize them."""
+    value = _one_line(msg, 240).casefold()
+    value = re.sub(
+        r"^(?:please|can you|could you|would you|i want you to|we need to)\s+",
+        "",
+        value,
+    )
+    return bool(
+        re.match(
+            r"^(?:analy[sz]e|audit|check|compare|configure|create|debug|"
+            r"diagnose|draft|fix|implement|investigate|prepare|research|"
+            r"review|test|troubleshoot|update|verify|write)\b",
+            value,
+        )
+    )
+
+
+def _explicit_context_heading(msg: str) -> str:
+    """Extract a concise task title embedded in otherwise generic prose."""
+    match = re.search(
+        r"(?i)(?:#{1,6}\s*)?\b(?:goal|task|objective)\s*:\s*"
+        r"(.+?)(?=\s+(?:\*\*|__)|[\r\n]|$)",
+        msg,
+    )
+    if not match:
+        match = re.search(r"(?i)(?:^|\s)/goal\s+(.+?)(?=[.\r\n]|$)", msg)
+    if not match:
+        return ""
+    return _plain_description_text(match.group(1).strip(" :-"))
+
+
+def _meaningful_context(msg: str) -> str:
+    msg = _strip_command_wrapper(msg)
+    if _is_system_message(msg):
+        return ""
+    result = (
+        _explicit_context_heading(msg)
+        or _session_directive(msg)
+        or _plain_description_text(msg)
+    )
+    return "" if _is_low_information_context(result) else result
+
+
+def _message_content(content: Any) -> str:
+    """Extract human-readable text only; tool payloads are never descriptions."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content or "")
+    return "\n".join(
+        str(item.get("text", ""))
+        for item in content
+        if isinstance(item, dict) and item.get("type") == "text"
+    )
+
+
+def _partition_bursts(events: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Group on direct user activity, then attach assistant context without bridging gaps."""
+    users = sorted(
+        (event for event in events if event.get("timestamp") and event.get("role") == "user"),
+        key=lambda event: event["timestamp"],
+    )
+    if not users:
+        return []
+    bursts: list[list[dict[str, Any]]] = []
+    for user in users:
+        if not bursts or (user["timestamp"] - bursts[-1][-1]["timestamp"]).total_seconds() > BURST_GAP_SECONDS:
+            bursts.append([user])
+        else:
+            bursts[-1].append(user)
+    # Each assistant result belongs to the current user burst only until the
+    # following burst starts. It can enrich context but never merge user work.
+    for event in events:
+        if event.get("role") != "assistant" or not event.get("timestamp"):
+            continue
+        for index, burst in enumerate(bursts):
+            start = burst[0]["timestamp"]
+            last_user = burst[-1]["timestamp"]
+            next_start = bursts[index + 1][0]["timestamp"] if index + 1 < len(bursts) else None
+            if (event["timestamp"] >= start
+                    and event["timestamp"] <= last_user + dt.timedelta(seconds=BURST_GAP_SECONDS)
+                    and (next_start is None or event["timestamp"] < next_start)):
+                burst.append(event)
+                break
+    return [sorted(burst, key=lambda event: event["timestamp"]) for burst in bursts]
+
+
+def _burst_context(events: list[dict[str, Any]]) -> tuple[str, str, list[dt.datetime]]:
+    """Return first meaningful user context, final useful assistant result, and user times."""
+    first_user = ""
+    last_assistant = ""
+    user_timestamps: list[dt.datetime] = []
+    for event in events:
+        if event["role"] == "user":
+            user_timestamps.append(event["timestamp"])
+            if not first_user:
+                candidate = _meaningful_context(event.get("content", ""))
+                # Acknowledgements such as "ok" or "yes" carry no billable
+                # work context; keep scanning within the same burst.
+                if len(candidate) >= 10:
+                    first_user = candidate
+        elif event["role"] == "assistant":
+            useful = _meaningful_context(event.get("content", ""))
+            if useful:
+                last_assistant = useful
+    return first_user, last_assistant, user_timestamps
+
+
+def _record_provenance(record: dict[str, Any]) -> dict[str, Any]:
+    """Stable, compact source identity used by review and durable deduplication."""
+    source_type = {
+        "claude_jsonl": "claude",
+        "hermes_legacy": "hermes",
+        "hermes_db": "hermes",
+    }.get(record.get("source"), record.get("source", "unknown"))
+    provenance = {
+        "source_type": source_type,
+        "source_machine": record.get("machine", "unknown"),
+        "source_session_id": record.get("session_id", ""),
+        "burst_start": record.get("start", ""),
+        "burst_end": record.get("end", ""),
+    }
+    evidence_path = record.get("path") or record.get("cwd")
+    if evidence_path:
+        provenance["path"] = evidence_path
+    return provenance
+
+
+def _candidate_key(record: dict[str, Any]) -> str:
+    provenance = _record_provenance(record)
+    # The session id deliberately participates: identical labels/times on different
+    # machines or sessions must remain independently reviewable candidates.
+    canonical = json.dumps(provenance, sort_keys=True, separators=(",", ":"))
+    return "ck-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:20]
+
+
+
+def _is_weekend_short_session(
+    record: dict[str, Any], rules: dict[str, Any]
+) -> bool:
+    start = parse_dt(record.get("start"))
+    duration = int(record.get("duration_minutes") or 0)
+    max_minutes = int(rules.get("weekend_short_max_minutes", 60))
+    return bool(start and start.weekday() >= 5 and duration <= max_minutes)
+
+
+def _replica_key(proposal: dict[str, Any]) -> tuple[str, str, str, str] | None:
+    """Identify the same synced session burst observed on multiple machines."""
+    provenance = proposal.get("provenance")
+    if not isinstance(provenance, dict):
+        return None
+    source_type = str(provenance.get("source_type") or "")
+    session_id = str(provenance.get("source_session_id") or "")
+    start = str(provenance.get("burst_start") or "")
+    end = str(provenance.get("burst_end") or "")
+    if not all((source_type, session_id, start, end)):
+        return None
+    return source_type, session_id, start, end
+
+
+def _dedupe_replicated_candidates(
+    proposals: list[dict[str, Any]], skipped: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for proposal in proposals:
+        key = _replica_key(proposal)
+        if key is None or key not in seen:
+            result.append(proposal)
+            if key is not None:
+                seen[key] = proposal
+            continue
+        kept = seen[key]
+        skipped.append(
+            {
+                "id": proposal.get("candidate_key"),
+                "source": proposal.get("source"),
+                "time": f"{proposal.get('start')}–{proposal.get('end')}",
+                "label": proposal.get("source_label"),
+                "reason": (
+                    "replicated session evidence already represented by "
+                    f"{kept.get('candidate_key')}"
+                ),
+            }
+        )
+    return result
+
+
+def _merge_adjacent_same_work(
+    proposals: list[dict[str, Any]], skipped: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Consolidate immediate same-description continuation sessions."""
+    result: list[dict[str, Any]] = []
+    for proposal in sorted(
+        proposals, key=lambda row: (str(row.get("start") or ""), str(row.get("id") or ""))
+    ):
+        start = parse_dt(proposal.get("start"))
+        merged = None
+        for prior in reversed(result):
+            prior_end = parse_dt(prior.get("end"))
+            if not start or not prior_end:
+                continue
+            gap = (start - prior_end).total_seconds()
+            if gap > BURST_GAP_SECONDS:
+                break
+            if gap < 0:
+                continue
+            same_work = (
+                prior.get("description") == proposal.get("description")
+                and prior.get("clockify_project_suffix")
+                == proposal.get("clockify_project_suffix")
+                and str((prior.get("provenance") or {}).get("source_type") or "")
+                == str((proposal.get("provenance") or {}).get("source_type") or "")
+            )
+            if same_work:
+                merged = prior
+                break
+        if merged is None:
+            result.append(proposal)
+            continue
+
+        component_keys = list(merged.get("merged_candidate_keys") or [])
+        if not component_keys:
+            component_keys.append(str(merged.get("candidate_key") or ""))
+        component_keys.append(str(proposal.get("candidate_key") or ""))
+        component_keys = sorted(set(key for key in component_keys if key))
+        merged["merged_candidate_keys"] = component_keys
+        canonical = json.dumps(component_keys, separators=(",", ":"))
+        merged["candidate_key"] = (
+            "ckm-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:20]
+        )
+        merged["end"] = proposal.get("end")
+        merged["duration_minutes"] = int(merged.get("duration_minutes") or 0) + int(
+            proposal.get("duration_minutes") or 0
+        )
+        provenance = merged.get("provenance") or {}
+        provenance["burst_end"] = proposal.get("end")
+        merged["provenance"] = provenance
+        skipped.append(
+            {
+                "id": proposal.get("candidate_key"),
+                "source": proposal.get("source"),
+                "time": f"{proposal.get('start')}–{proposal.get('end')}",
+                "label": proposal.get("source_label"),
+                "reason": (
+                    "adjacent same-work continuation merged into "
+                    f"{merged.get('candidate_key')}"
+                ),
+            }
+        )
+    for index, proposal in enumerate(result, start=1):
+        proposal["id"] = f"P{index:03d}"
+    return result
+
+
+def _resolve_candidate_overlaps(
+    proposals: list[dict[str, Any]],
+    skipped: list[dict[str, Any]],
+    rules: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Allocate focused candidates into non-conflicting review windows."""
+    soft_overlap_minutes = int(rules.get("soft_overlap_minutes", 15))
+    min_minutes = int(rules.get("min_minutes", 10))
+    confidence_rank = {"high": 0, "medium": 1, "low": 2}
+
+    def priority(row: dict[str, Any]) -> tuple[int, int, float, str]:
+        provenance = row.get("provenance") or {}
+        source_rank = 0 if provenance.get("source_type") == "fathom" else 1
+        start = parse_dt(row.get("start"))
+        end = parse_dt(row.get("end"))
+        span = (end - start).total_seconds() if start and end else float("inf")
+        return (
+            source_rank,
+            confidence_rank.get(str(row.get("confidence") or "low"), 3),
+            span,
+            str(row.get("start") or ""),
+        )
+
+    accepted: list[dict[str, Any]] = []
+    for proposal in sorted(proposals, key=priority):
+        start = parse_dt(proposal.get("start"))
+        end = parse_dt(proposal.get("end"))
+        if not start or not end or end <= start:
+            skipped.append(
+                {
+                    "id": proposal.get("candidate_key"),
+                    "source": proposal.get("source"),
+                    "time": f"{proposal.get('start')}–{proposal.get('end')}",
+                    "label": proposal.get("source_label"),
+                    "reason": "invalid proposal window during overlap allocation",
+                }
+            )
+            continue
+
+        occupied: list[tuple[dt.datetime, dt.datetime]] = []
+        for prior in accepted:
+            prior_start = parse_dt(prior.get("start"))
+            prior_end = parse_dt(prior.get("end"))
+            if not prior_start or not prior_end:
+                continue
+            left, right = max(start, prior_start), min(end, prior_end)
+            if right > left:
+                occupied.append((left, right))
+        if not occupied:
+            accepted.append(proposal)
+            continue
+
+        occupied.sort()
+        merged_occupied: list[list[dt.datetime]] = []
+        for left, right in occupied:
+            if not merged_occupied or left > merged_occupied[-1][1]:
+                merged_occupied.append([left, right])
+            else:
+                merged_occupied[-1][1] = max(merged_occupied[-1][1], right)
+        overlap_minutes = sum(
+            (right - left).total_seconds() / 60
+            for left, right in merged_occupied
+        )
+        if overlap_minutes < soft_overlap_minutes:
+            accepted.append(proposal)
+            continue
+
+        free: list[tuple[dt.datetime, dt.datetime]] = []
+        cursor = start
+        for left, right in merged_occupied:
+            if left > cursor:
+                free.append((cursor, left))
+            cursor = max(cursor, right)
+        if cursor < end:
+            free.append((cursor, end))
+        free = [
+            (left, right)
+            for left, right in free
+            if (right - left).total_seconds() / 60 >= min_minutes
+        ]
+        if not free:
+            skipped.append(
+                {
+                    "id": proposal.get("candidate_key"),
+                    "source": proposal.get("source"),
+                    "time": f"{proposal.get('start')}–{proposal.get('end')}",
+                    "label": proposal.get("source_label"),
+                    "reason": (
+                        "fully covered by higher-priority proposal windows during "
+                        "overlap allocation"
+                    ),
+                }
+            )
+            continue
+
+        free_start, free_end = max(
+            free,
+            key=lambda segment: (
+                (segment[1] - segment[0]).total_seconds(),
+                -segment[0].timestamp(),
+            ),
+        )
+        free_minutes = int((free_end - free_start).total_seconds() / 60)
+        original_window = f"{proposal.get('start')}–{proposal.get('end')}"
+        proposal["allocation"] = {
+            "original_window": original_window,
+            "overlap_minutes_removed": int(overlap_minutes),
+            "rule": "largest free segment after higher-priority candidates",
+        }
+        proposal["start"] = local_dt_string(free_start)
+        proposal["end"] = local_dt_string(free_end)
+        proposal["duration_minutes"] = min(
+            int(proposal.get("duration_minutes") or free_minutes), free_minutes
+        )
+        proposal["description"] = _one_line(
+            f"{proposal.get('description', '')} (trimmed around parallel work)",
+            DESCRIPTION_LIMIT,
+        )
+        proposal["rationale"] = (
+            f"{proposal.get('rationale', '')}; {int(overlap_minutes)}m overlap "
+            "removed by deterministic allocation"
+        ).strip("; ")
+        accepted.append(proposal)
+
+    accepted.sort(key=lambda row: (str(row.get("start") or ""), str(row.get("id") or "")))
+    for index, proposal in enumerate(accepted, start=1):
+        proposal["id"] = f"P{index:03d}"
+    return accepted
+
 
 def compute_active_duration(ts_list: list[dt.datetime], gap_engaged_sec: int = 120, sporadic_min: int = 4) -> tuple[int, str, list[dict]]:
     """Compute realistic active time from user message timestamps.
@@ -218,11 +743,9 @@ def compute_active_duration(ts_list: list[dt.datetime], gap_engaged_sec: int = 1
 
 
 
-def _extract_claude_context(path: Path, since: dt.datetime, until: dt.datetime) -> tuple[list[dt.datetime], str, str]:
-    """Extract user message timestamps, first user message, and last assistant message from a Claude JSONL file."""
-    ts_list: list[dt.datetime] = []
-    first_user = ""
-    last_assistant = ""
+def _extract_claude_events(path: Path, since: dt.datetime, until: dt.datetime) -> list[dict[str, Any]]:
+    """Extract timestamped Claude user/assistant events for per-burst attribution."""
+    events: list[dict[str, Any]] = []
     try:
         for line in path.read_text(errors="ignore").splitlines():
             try:
@@ -233,31 +756,13 @@ def _extract_claude_context(path: Path, since: dt.datetime, until: dt.datetime) 
             if not t or not (since <= t.astimezone(BUCHAREST) < until):
                 continue
             msg_type = obj.get("type", "")
-            msg = obj.get("message", {})
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                text_parts = []
-                for item in content:
-                    if isinstance(item, dict):
-                        if item.get("type") == "text":
-                            text_parts.append(item.get("text", ""))
-                        elif item.get("type") == "tool_use":
-                            text_parts.append(f"[tool_use: {item.get('name', '?')}]")
-                        elif item.get("type") == "tool_result":
-                            text_parts.append("[tool_result]")
-                        elif item.get("type") == "thinking":
-                            text_parts.append("[thinking]")
-                content = "\n".join(text_parts)
-            content_str = str(content)
-            if msg_type == "user":
-                ts_list.append(t)
-                if not first_user:
-                    first_user = content_str[:500]
-            elif msg_type == "assistant" and content_str.strip():
-                last_assistant = content_str[:500]
+            if msg_type not in ("user", "assistant"):
+                continue
+            content = _message_content(obj.get("message", {}).get("content", ""))
+            events.append({"timestamp": t.astimezone(BUCHAREST), "role": msg_type, "content": content})
     except Exception:
         pass
-    return ts_list, first_user, last_assistant
+    return events
 
 
 def parse_claude_jsonl_file(path: Path | str, base: str, since: dt.datetime, until: dt.datetime, machine: str) -> list[dict[str, Any]]:
@@ -265,25 +770,19 @@ def parse_claude_jsonl_file(path: Path | str, base: str, since: dt.datetime, unt
     p = Path(path)
     if is_skip_path(str(p)):
         return out
-    ts_list, first_user, last_assistant = _extract_claude_context(p, since, until)
-    ts_list.sort()
-    if not ts_list:
+    events = _extract_claude_events(p, since, until)
+    if not events:
         return out
-    bursts = []
-    start = end = ts_list[0]
-    count = 1
-    for t in ts_list[1:]:
-        if (t - end).total_seconds() > 30 * 60:
-            bursts.append((start, end, count))
-            start = t
-            count = 1
-        else:
-            count += 1
-        end = t
-    bursts.append((start, end, count))
     label = label_from_claude_path(str(p), base)
-    for bs, be, cnt in bursts:
-        burst_ts = [t for t in ts_list if bs <= t <= be]
+    for burst_events in _partition_bursts(events):
+        first_user, last_assistant, burst_ts = _burst_context(burst_events)
+        if not burst_ts:
+            continue
+        # Retain the established duration/window semantics: only direct user
+        # activity determines the Clockify window, while assistant events supply
+        # context and participate in burst-boundary detection.
+        bs, be = burst_ts[0], burst_ts[-1]
+        cnt = len(burst_ts)
         raw_wallclock = max(1, int((be - bs).total_seconds() / 60))
         heartbeat = all(t.minute in (29, 44) for t in burst_ts)
         # Compute active duration with the new engagement-aware algorithm
@@ -374,12 +873,167 @@ def collect_local_sessions(machine: dict[str, Any], since: dt.datetime, until: d
     return result
 
 
+def _remote_claude_contract() -> str:
+    """Remote stdlib-only Claude parser, kept behaviorally aligned with local bursts."""
+    return r'''def skip_path(p):
+    return any(f in str(p) for f in ['/subagents/','/multica/','multica-runtime','claude-mem-observer','multica-command'])
+def one_line(v, limit=320):
+    v=' '.join(str(v or '').split())
+    if len(v)<=limit: return v
+    cut=v[:limit-3].rsplit(' ',1)[0]
+    return (cut or v[:limit-3]).rstrip()+'...'
+def system_message(v):
+    v=one_line(v,2000).lower()
+    if not v: return True
+    if v.startswith(('<command-','<local-command-','<teammate-message','[tool_','[image:','[thinking]','![','/home/','/users/')): return True
+    if v.startswith('<') and '>' in v[:80]: return True
+    return any(marker in v for marker in ('permissions instructions','codex agent history','<app-context>','# agents.md instructions'))
+def clean_context(v):
+    lines=[]
+    for line in str(v or '').strip().splitlines():
+        line=line.strip()
+        if line.startswith('<') and line.endswith('>'): continue
+        lines.append(line)
+    v='\n'.join(lines)
+    return '' if system_message(v) else one_line(v)
+def message_text(content):
+    if isinstance(content,str): return content
+    if not isinstance(content,list): return str(content or '')
+    return '\n'.join(str(item.get('text','')) for item in content if isinstance(item,dict) and item.get('type')=='text')
+def active_duration(ts):
+    if len(ts)<=1: return 0,'single message — skipped'
+    total=240; engaged=0; sporadic=0
+    for i in range(1,len(ts)):
+        gap=(ts[i]-ts[i-1]).total_seconds()
+        if gap<=120:
+            total+=gap; engaged+=1
+        else:
+            total+=240; sporadic+=1
+    return max(1,round(total/60)), 'computed: '+str(engaged)+' engaged + '+str(sporadic)+' sporadic segments'
+def parse_claude(p):
+    if skip_path(p): return []
+    events=[]
+    try:
+        for line in Path(p).read_text(errors='ignore').splitlines():
+            try: o=json.loads(line)
+            except Exception: continue
+            t=parse_dt(o.get('timestamp'))
+            role=o.get('type')
+            if not t or role not in ('user','assistant') or not (SINCE <= t.astimezone(BUCHAREST) < UNTIL): continue
+            events.append({'timestamp':t.astimezone(BUCHAREST),'role':role,'content':message_text(o.get('message',{}).get('content',''))})
+    except Exception: return []
+    users=sorted((event for event in events if event['role']=='user'), key=lambda event:event['timestamp'])
+    if not users: return []
+    bursts=[]
+    for user in users:
+        if not bursts or (user['timestamp']-bursts[-1][-1]['timestamp']).total_seconds()>1800: bursts.append([user])
+        else: bursts[-1].append(user)
+    for event in events:
+        if event['role']!='assistant': continue
+        for i,burst in enumerate(bursts):
+            next_start=bursts[i+1][0]['timestamp'] if i+1<len(bursts) else None
+            last_user=burst[-1]['timestamp']
+            if event['timestamp']>=burst[0]['timestamp'] and event['timestamp']<=last_user+dt.timedelta(seconds=1800) and (next_start is None or event['timestamp']<next_start):
+                burst.append(event); break
+    out=[]
+    for burst in bursts:
+        burst.sort(key=lambda event:event['timestamp'])
+        first_user=''; last_assistant=''; user_ts=[]
+        for event in burst:
+            if event['role']=='user':
+                user_ts.append(event['timestamp'])
+                candidate=clean_context(event['content'])
+                if not first_user and len(candidate)>=10: first_user=candidate
+            else:
+                candidate=clean_context(event['content'])
+                if candidate: last_assistant=candidate
+        if not user_ts: continue
+        bs,be=user_ts[0],user_ts[-1]
+        raw=max(1,int((be-bs).total_seconds()/60))
+        active,method=active_duration(user_ts)
+        out.append({'start':local_str(bs),'end':local_str(be),'duration_minutes':min(active,raw),'raw_wallclock_minutes':raw,'user_messages':len(user_ts),'label':label(p,CBASE),'session_id':Path(p).stem,'path':str(p),'first_user_message':first_user,'last_assistant_message':last_assistant,'evidence_level':method,'heartbeat_like':all(t.minute in (29,44) for t in user_ts),'source':'claude','machine':MACHINE})
+    return out
+'''
+
+
+def _remote_codex_contract() -> str:
+    """Remote Codex extraction, using the same row-local user-burst context contract."""
+    return r'''try:
+    if CXBASE and Path(CXBASE).exists():
+        db=Path(CXBASE)/'state_5.sqlite'
+        if db.exists():
+            import sqlite3
+            conn=sqlite3.connect('file:'+str(db)+'?mode=ro', uri=True)
+            lo=int((SINCE-dt.timedelta(days=1)).timestamp())
+            rows=conn.execute('SELECT id, rollout_path, cwd, title, first_user_message, thread_source, archived FROM threads WHERE updated_at >= ? ORDER BY updated_at', (lo,)).fetchall()
+            conn.close()
+            for sid, rollout_path, cwd, session_title, first_msg, thread_source, archived in rows:
+                if thread_source=='subagent' or not rollout_path or not Path(rollout_path).exists(): continue
+                try:
+                    lines=Path(rollout_path).read_text(errors='ignore').splitlines()
+                    if not lines or json.loads(lines[0]).get('type')!='session_meta': continue
+                    events=[]
+                    for line in lines[1:]:
+                        try: o=json.loads(line)
+                        except Exception: continue
+                        if o.get('type')!='event_msg': continue
+                        p=o.get('payload',{}); kind=p.get('type'); t=parse_dt(o.get('timestamp'))
+                        if kind not in ('user_message','agent_message') or not t or not (SINCE <= t.astimezone(BUCHAREST) < UNTIL): continue
+                        events.append({'timestamp':t.astimezone(BUCHAREST),'role':'user' if kind=='user_message' else 'assistant','content':p.get('message','')})
+                    users=sorted((event for event in events if event['role']=='user'), key=lambda event:event['timestamp'])
+                    if not users: continue
+                    bursts=[]
+                    for user in users:
+                        if not bursts or (user['timestamp']-bursts[-1][-1]['timestamp']).total_seconds()>1800: bursts.append([user])
+                        else: bursts[-1].append(user)
+                    for event in events:
+                        if event['role']!='assistant': continue
+                        for i,burst in enumerate(bursts):
+                            next_start=bursts[i+1][0]['timestamp'] if i+1<len(bursts) else None
+                            last_user=burst[-1]['timestamp']
+                            if event['timestamp']>=burst[0]['timestamp'] and event['timestamp']<=last_user+dt.timedelta(seconds=1800) and (next_start is None or event['timestamp']<next_start):
+                                burst.append(event); break
+                    for burst in bursts:
+                        burst.sort(key=lambda event:event['timestamp'])
+                        first_user=''; last_assistant=''; user_ts=[]
+                        for event in burst:
+                            if event['role']=='user':
+                                user_ts.append(event['timestamp']); candidate=clean_context(event['content'])
+                                if not first_user and len(candidate)>=10: first_user=candidate
+                            else:
+                                candidate=clean_context(event['content'])
+                                if candidate: last_assistant=candidate
+                        if not user_ts: continue
+                        bs,be=user_ts[0],user_ts[-1]; raw=max(1,int((be-bs).total_seconds()/60)); active,method=active_duration(user_ts)
+                        title=first_user or last_assistant or ''
+                        res['codex_sessions'].append({'source':'codex','machine':MACHINE,'session_id':sid,'path':str(rollout_path),'cwd':cwd or '','title':title,'start':local_str(bs),'end':local_str(be),'duration_minutes':min(active,raw),'raw_wallclock_minutes':raw,'user_messages':len(user_ts),'first_user_message':first_user,'last_assistant_message':last_assistant,'evidence_level':method,'archived':bool(archived)})
+                except Exception: pass
+        else:
+            res['errors'].append('codex state_5.sqlite not found')
+    else:
+        res['errors'].append('codex_home not found: '+CXBASE)
+except Exception as e: res['errors'].append('codex scan: '+str(e)[:200])
+'''
+
+
 def collect_remote_sessions(machine: dict[str, Any], since: dt.datetime, until: dt.datetime, ssh_options: list[str]) -> dict[str, Any]:
     host = machine["host"]
     result = {"machine": machine["name"], "status": "unavailable",
               "claude_bursts": [], "hermes_sessions": [], "hermes_db_sessions": [],
               "codex_sessions": [], "errors": []}
     remote_code = "\nimport datetime as dt, json\nfrom pathlib import Path\nBUCHAREST=dt.timezone(dt.timedelta(hours=3))\nMACHINE=__MACHINE__\nCBASE=__CBASE__\nHBASE=__HBASE__\nHDB=__HDB__\nCXBASE=__CXBASE__\nSINCE=dt.datetime.fromisoformat(__SINCE__)\nUNTIL=dt.datetime.fromisoformat(__UNTIL__)\ndef parse_dt(s):\n    if not s: return None\n    try:\n        x=dt.datetime.fromisoformat(str(s).replace('Z','+00:00'))\n        return x if x.tzinfo else x.replace(tzinfo=BUCHAREST)\n    except Exception: return None\ndef local_str(x):\n    return x.astimezone(BUCHAREST).strftime('%Y-%m-%d %H:%M') if x else None\ndef label(path, base):\n    rel=str(path).replace(base,'').lstrip('/')\n    top=rel.split('/')[0]\n    for pref in ['-Users-blackthorne-Work-','-Users-blackthorne-','-home-blackthorne-Work-','-home-blackthorne-']:\n        if top.startswith(pref): return top[len(pref):]\n    return top\ndef skip_path(p):\n    return any(f in str(p) for f in ['/subagents/','multica-runtime','claude-mem-observer','multica-command'])\ndef parse_claude(p):\n    if skip_path(p): return []\n    first_user=''; last_assistant=''; ts=[]\n    try:\n        for line in Path(p).read_text(errors='ignore').splitlines():\n            try: o=json.loads(line)\n            except Exception: continue\n            t=parse_dt(o.get('timestamp'))\n            if not t or not (SINCE <= t.astimezone(BUCHAREST) < UNTIL): continue\n            msg_type=o.get('type')\n            c=o.get('message',{}).get('content','')\n            if isinstance(c,list):\n                text_parts=[]\n                for item in c:\n                    if isinstance(item,dict):\n                        if item.get('type')=='text': text_parts.append(item.get('text',''))\n                        elif item.get('type')=='tool_use': text_parts.append('[tool_use: '+item.get('name','?')+']')\n                        elif item.get('type')=='tool_result': text_parts.append('[tool_result]')\n                        elif item.get('type')=='thinking': text_parts.append('[thinking]')\n                        elif item.get('type')=='tool_reference': text_parts.append('[tool_ref: '+item.get('tool_name','?')+']')\n                c='\\n'.join(text_parts)\n            c=str(c)\n            ts.append(t.astimezone(BUCHAREST))\n            if msg_type=='user' and not first_user: first_user=c[:300]\n            if msg_type=='assistant': last_assistant=c[:300]\n    except Exception: return []\n    if not ts: return []\n    ts.sort()\n    bursts=[]\n    start=end=ts[0]\n    count=1\n    for t in ts[1:]:\n        if (t-end).total_seconds()>1800:\n            bursts.append((start,end,count))\n            start=t; count=1\n        else: count+=1\n        end=t\n    bursts.append((start,end,count))\n    out=[]\n    for bs,be,cnt in bursts:\n        gap=(be-bs).total_seconds()\n        raw_wallclock=max(1,int(gap/60))\n        if gap>600:\n            active=int(cnt*2.5)\n            method='content heuristic'\n        else:\n            active=max(1,int(gap/60))\n            method='wall clock'\n        out.append({'start':local_str(bs),'end':local_str(be),'duration_minutes':min(active,raw_wallclock),'raw_wallclock_minutes':raw_wallclock,'user_messages':cnt,'label':label(p,CBASE),'first_user_message':first_user[:200],'last_assistant_message':last_assistant[:200],'evidence_level':method,'heartbeat_like':False,'source':'claude','machine':MACHINE})\n    return out\nres={'machine':MACHINE,'status':'ok','claude_bursts':[],'hermes_sessions':[],'hermes_db_sessions':[],'codex_sessions':[],'errors':[]}\ntry:\n    if CBASE and Path(CBASE).exists():\n        for p in Path(CBASE).glob('*/*.jsonl'):\n            res['claude_bursts'].extend(parse_claude(p))\n    else:\n        res['errors'].append('claude_projects not found: '+CBASE)\nexcept Exception as e: res['errors'].append('claude scan: '+str(e)[:200])\ntry:\n    if HBASE and Path(HBASE).exists():\n        for p in Path(HBASE).glob('request_dump_*.json'):\n            try:\n                obj=json.loads(p.read_text(errors='ignore'))\n                start=parse_dt(obj.get('session_start'))\n                last=parse_dt(obj.get('last_updated'))\n                touch=last or start\n                if not (touch and SINCE <= touch.astimezone(BUCHAREST) < UNTIL): continue\n                msgs=obj.get('messages',[])\n                user_count=sum(1 for m in msgs if m.get('role')=='user')\n                total_count=obj.get('message_count') or len(msgs)\n                if start and last:\n                    real_span_td=(last-start).total_seconds()/3600\n                else: real_span_td=0\n                if real_span_td>=4:\n                    est_minutes=int(user_count*7+(total_count-user_count)*0.5)\n                    est_start=start or touch\n                    est_end=est_start+dt.timedelta(minutes=est_minutes)\n                    evidence='session spans '+str(round(real_span_td,1))+'h but has only '+str(user_count)+' user msgs; estimated '+str(est_minutes)+'m via content heuristic'\n                else:\n                    est_start=start; est_end=last\n                    evidence='session_start/last_updated used (span='+str(round(real_span_td,1))+'h, '+str(user_count)+' user msgs)'\n                res['hermes_sessions'].append({'source':'hermes_legacy','machine':MACHINE,'session_id':obj.get('session_id') or p.stem,'path':str(p),'start':local_str(est_start),'end':local_str(est_end),'real_span_hours':round(real_span_td,2),'user_messages':user_count,'total_messages':total_count,'model':obj.get('model'),'platform':obj.get('platform'),'evidence_level':evidence})\n            except Exception as e: res['errors'].append('hermes legacy parse failed '+p.name+': '+str(e)[:200])\n    else:\n        res['errors'].append('hermes_sessions not found: '+HBASE)\nexcept Exception as e: res['errors'].append('hermes scan: '+str(e)[:200])\ntry:\n    if HDB and Path(HDB).exists():\n        import sqlite3\n        conn=sqlite3.connect(HDB)\n        since_ts=SINCE.timestamp()\n        until_ts=UNTIL.timestamp()\n        rows=conn.execute('SELECT id, started_at, ended_at, message_count, model, cwd, estimated_cost_usd, title, input_tokens, output_tokens FROM sessions WHERE started_at >= ? AND started_at < ? ORDER BY started_at', (since_ts, until_ts)).fetchall()\n        for row in rows:\n            sid, started_at, ended_at, msg_count, model, cwd, cost, title, in_tok, out_tok = row\n            if not started_at: continue\n            start_dt=dt.datetime.fromtimestamp(started_at, tz=BUCHAREST)\n            end_dt=dt.datetime.fromtimestamp(ended_at, tz=BUCHAREST) if ended_at else None\n            duration_m=int((end_dt-start_dt).total_seconds()/60) if end_dt else None\n            first_msg=conn.execute('SELECT content FROM messages WHERE session_id = ? AND role = \"user\" ORDER BY timestamp LIMIT 1', (sid,)).fetchone()\n            first_content=(first_msg[0][:300] if first_msg and first_msg[0] else '') if first_msg else ''\n            res['hermes_db_sessions'].append({'source':'hermes_db','machine':MACHINE,'session_id':sid,'start':local_str(start_dt),'end':local_str(end_dt) if end_dt else None,'duration_minutes':duration_m,'message_count':msg_count,'model':model,'cwd':cwd or '','estimated_cost_usd':cost or 0.0,'input_tokens':in_tok or 0,'output_tokens':out_tok or 0,'title':title or '','first_user_message':first_content})\n        conn.close()\n    else:\n        res['errors'].append('hermes_db not found: '+HDB)\nexcept Exception as e: res['errors'].append('hermes_db scan: '+str(e)[:200])\ntry:\n    if CXBASE and Path(CXBASE).exists():\n        db=Path(CXBASE)/'state_5.sqlite'\n        if db.exists():\n            import sqlite3\n            conn=sqlite3.connect('file:'+str(db)+'?mode=ro', uri=True)\n            lo=int((SINCE-dt.timedelta(days=1)).timestamp())\n            rows=conn.execute('SELECT id, rollout_path, cwd, title, first_user_message, thread_source, archived FROM threads WHERE updated_at >= ? ORDER BY updated_at', (lo,)).fetchall()\n            conn.close()\n            for sid, rollout_path, cwd, title, first_msg, thread_source, archived in rows:\n                if thread_source=='subagent': continue\n                if not rollout_path or not Path(rollout_path).exists(): continue\n                try:\n                    lines=Path(rollout_path).read_text(errors='ignore').splitlines()\n                    if not lines: continue\n                    meta=json.loads(lines[0])\n                    if meta.get('type')!='session_meta': continue\n                    ts_list=[]\n                    for line in lines[1:]:\n                        try: o=json.loads(line)\n                        except: continue\n                        if o.get('type')!='event_msg': continue\n                        p=o.get('payload',{})\n                        if p.get('type')!='user_message': continue\n                        t=parse_dt(o.get('timestamp'))\n                        if t and SINCE <= t.astimezone(BUCHAREST) < UNTIL: ts_list.append(t.astimezone(BUCHAREST))\n                    if not ts_list: continue\n                    ts_list.sort()\n                    bursts=[]\n                    start=end=ts_list[0]\n                    count=1\n                    for t in ts_list[1:]:\n                        if (t-end).total_seconds()>1800:\n                            bursts.append((start,end,count))\n                            start=t; count=1\n                        else: count+=1\n                        end=t\n                    bursts.append((start,end,count))\n                    for bs,be,cnt in bursts:\n                        gap=(be-bs).total_seconds()\n                        active=max(1,int(gap/60)) if gap<=600 else int(cnt*2.5)\n                        res['codex_sessions'].append({'source':'codex','machine':MACHINE,'session_id':sid,'cwd':cwd or '','title':title or first_msg or '','start':local_str(bs),'end':local_str(be),'duration_minutes':active,'user_messages':cnt,'archived':bool(archived)})\n                except Exception: pass\n        else:\n            res['errors'].append('codex state_5.sqlite not found')\n    else:\n        res['errors'].append('codex_home not found: '+CXBASE)\nexcept Exception as e: res['errors'].append('codex scan: '+str(e)[:200])\nprint(json.dumps(res))\n"
+    remote_code = re.sub(
+        r"def skip_path\(p\):.*?(?=res=\{)",
+        lambda _match: _remote_claude_contract(),
+        remote_code,
+        flags=re.DOTALL,
+    )
+    remote_code = re.sub(
+        r"try:\n    if CXBASE.*?(?=print\(json\.dumps\(res\)\))",
+        lambda _match: _remote_codex_contract(),
+        remote_code,
+        flags=re.DOTALL,
+    )
     remote_code = (remote_code
         .replace('__MACHINE__', repr(machine['name']))
         .replace('__CBASE__', repr(machine.get('claude_projects', '')))
@@ -398,6 +1052,30 @@ def collect_remote_sessions(machine: dict[str, Any], since: dt.datetime, until: 
     except Exception as e:
         result["errors"].append(str(e))
     return result
+
+
+def machine_is_local(machine: dict[str, Any], hostname: str | None = None) -> bool:
+    """Resolve a fleet entry locally on its own host and through SSH elsewhere."""
+    kind = str(machine.get("kind") or "ssh").lower()
+    if kind == "local":
+        return True
+    if kind != "auto":
+        return False
+
+    current = (hostname or socket.gethostname()).lower().rstrip(".")
+    current_short = current.split(".", 1)[0]
+    aliases = {
+        str(machine.get("name") or "").lower().rstrip("."),
+        str(machine.get("host") or "").lower().rstrip("."),
+        str(machine.get("host") or "").lower().split(".", 1)[0],
+    }
+    aliases.update(
+        str(alias).lower().rstrip(".")
+        for alias in machine.get("local_hostnames", [])
+        if alias
+    )
+    alias_shorts = {alias.split(".", 1)[0] for alias in aliases}
+    return current in aliases or current_short in alias_shorts
 
 
 
@@ -450,20 +1128,6 @@ def collect_hermes_db_sessions(db_path: str, machine: str, since: dt.datetime, u
     return out
 
 
-def _codex_first_title(messages: list[str]) -> str:
-    """Pick the first human-looking user message as a session title."""
-    for m in messages:
-        s = (m or "").strip()
-        if not s or s.startswith("<"):
-            continue
-        # Skip injected harness/permission wrappers and agent-history prompts
-        low = s.lower()
-        if "permissions instructions" in low or "you are assessing" in low or "codex agent history" in low:
-            continue
-        return s[:120]
-    return ""
-
-
 def parse_codex_rollout_file(path: Path, machine: str, since: dt.datetime, until: dt.datetime,
                              cwd_override: str | None = None, title_override: str | None = None) -> list[dict[str, Any]]:
     """Parse a Codex rollout JSONL file into burst records.
@@ -495,8 +1159,7 @@ def parse_codex_rollout_file(path: Path, machine: str, since: dt.datetime, until
     if payload.get("thread_source") == "subagent" or (isinstance(payload.get("source"), dict) and payload["source"].get("subagent")):
         return out
 
-    ts_list: list[dt.datetime] = []
-    titles: list[str] = []
+    events: list[dict[str, Any]] = []
     for line in lines[1:]:
         try:
             obj = json.loads(line)
@@ -505,34 +1168,29 @@ def parse_codex_rollout_file(path: Path, machine: str, since: dt.datetime, until
         if obj.get("type") != "event_msg":
             continue
         p = obj.get("payload", {})
-        if p.get("type") != "user_message":
+        event_type = p.get("type")
+        if event_type not in ("user_message", "agent_message"):
             continue
         t = parse_dt(obj.get("timestamp"))
         if t and since <= t.astimezone(BUCHAREST) < until:
-            ts_list.append(t.astimezone(BUCHAREST))
-            titles.append(p.get("message", ""))
-    if not ts_list:
+            events.append({
+                "timestamp": t.astimezone(BUCHAREST),
+                "role": "user" if event_type == "user_message" else "assistant",
+                "content": p.get("message", ""),
+            })
+    if not events:
         return out
-    ts_list.sort()
-    title = title_override or _codex_first_title(titles)
-
-    bursts = []
-    start = end = ts_list[0]
-    count = 1
-    for t in ts_list[1:]:
-        if (t - end).total_seconds() > 30 * 60:
-            bursts.append((start, end, count))
-            start = t
-            count = 1
-        else:
-            count += 1
-        end = t
-    bursts.append((start, end, count))
-    label = cwd.rstrip("/").split("/")[-1] if cwd else (title or "codex")
-    for bs, be, cnt in bursts:
-        burst_ts = [t for t in ts_list if bs <= t <= be]
+    for burst_events in _partition_bursts(events):
+        first_user, last_assistant, burst_ts = _burst_context(burst_events)
+        if not burst_ts:
+            continue
+        bs, be = burst_ts[0], burst_ts[-1]
+        cnt = len(burst_ts)
         raw_wallclock = max(1, int((be - bs).total_seconds() / 60))
         active_min, method, _segments = compute_active_duration(burst_ts)
+        # The first real user context is per-burst, never the session-wide title.
+        title = first_user or _meaningful_context(title_override or "")
+        label = cwd.rstrip("/").split("/")[-1] if cwd else (title or "codex")
         out.append({
             "source": "codex",
             "machine": machine,
@@ -545,10 +1203,12 @@ def parse_codex_rollout_file(path: Path, machine: str, since: dt.datetime, until
             "model_provider": model_provider,
             "start": local_dt_string(bs),
             "end": local_dt_string(be),
-            "duration_minutes": active_min,
+            "duration_minutes": min(active_min, raw_wallclock),
             "raw_wallclock_minutes": raw_wallclock,
             "user_messages": cnt,
             "evidence_level": method,
+            "first_user_message": first_user,
+            "last_assistant_message": last_assistant,
         })
     return out
 
@@ -942,6 +1602,45 @@ def route_session(burst: dict[str, Any], routing: dict[str, Any]) -> dict[str, A
     return {"action": "ambiguous", "reason": "No route matched session label/path"}
 
 
+def route_meeting(meeting: dict[str, Any], routing: dict[str, Any]) -> dict[str, Any]:
+    """Route a Fathom meeting by invitee domain or title pattern."""
+    title = str(meeting.get("title") or "")
+    domains_type = str(meeting.get("calendar_invitees_domains_type") or "")
+    invitee_emails = [
+        str(invitee.get("email") or "").lower()
+        for invitee in meeting.get("calendar_invitees", [])
+        if isinstance(invitee, dict)
+    ]
+    invitees = [
+        invitee
+        for invitee in meeting.get("calendar_invitees", [])
+        if isinstance(invitee, dict)
+    ]
+    if (
+        not domains_type
+        and invitees
+        and all(not invitee.get("is_external") for invitee in invitees)
+    ):
+        domains_type = "internal_only"
+    for route in routing.get("meeting_routes", []):
+        domain = str(route.get("email_domain") or "").lower()
+        title_regex = route.get("title_regex")
+        required_domains_type = str(route.get("domains_type") or "")
+        if required_domains_type and required_domains_type != domains_type:
+            continue
+        if domain and any(email.endswith(f"@{domain}") for email in invitee_emails):
+            return {"action": "propose", **route}
+        if title_regex:
+            try:
+                if re.search(str(title_regex), title, flags=re.IGNORECASE):
+                    return {"action": "propose", **route}
+            except re.error:
+                continue
+        if required_domains_type and not domain and not title_regex:
+            return {"action": "propose", **route}
+    return {"action": "ambiguous", "reason": "No meeting route matched invitees/title"}
+
+
 def overlaps_existing(candidate: dict[str, Any], existing: list[dict[str, Any]]) -> bool:
     cs = parse_dt(candidate.get("start"))
     ce = parse_dt(candidate.get("end"))
@@ -959,44 +1658,6 @@ def overlaps_existing(candidate: dict[str, Any], existing: list[dict[str, Any]])
         if ov > 0 and ov / dur >= 0.50:
             return True
     return False
-
-
-def _is_system_message(msg: str) -> bool:
-    """Return True if the message is a system/command/auto-generated message with no real context."""
-    lower = msg.strip().lower()
-    # Claude Code / Codex command messages
-    if lower.startswith("<command-") or lower.startswith("<local-command-"):
-        return True
-    if lower.startswith("<teammate-message"):
-        return True
-    if lower.startswith("[tool_") or lower.startswith("[image:"):
-        return True
-    if lower.startswith("[thinking]") or lower.startswith("[tool_result]"):
-        return True
-    # Image references (raw paths or markdown image syntax)
-    if lower.startswith("[image:") or lower.startswith("![") or lower.startswith("/home/") or lower.startswith("/users/"):
-        return True
-    # Pure XML/command noise
-    if lower.startswith("<") and ">" in lower[:50]:
-        return True
-    return False
-
-
-def _strip_command_wrapper(msg: str) -> str:
-    """Strip Claude Code command wrappers like <command-name>...</command-name> from a message,
-    returning the real user content if any exists after the wrapper."""
-    lines = msg.strip().split("\n")
-    cleaned = []
-    for line in lines:
-        stripped = line.strip()
-        # Skip lines that are pure XML tags
-        if stripped.startswith("<") and stripped.endswith(">"):
-            continue
-        # Skip lines that are just closing tags
-        if stripped.startswith("</") and stripped.endswith(">"):
-            continue
-        cleaned.append(stripped)
-    return "\n".join(cleaned).strip()
 
 
 def _make_description(project: str, burst: dict[str, Any], confidence: str = "medium", prefix: str = "SC") -> str:
@@ -1021,24 +1682,33 @@ def _make_description(project: str, burst: dict[str, Any], confidence: str = "me
         or (label == "Work" and confidence == "low")
     )
 
+    def described(summary: str) -> str:
+        return _one_line(f"{prefix} — {summary}", DESCRIPTION_LIMIT)
+
+    explicit_first = _explicit_context_heading(first) or _session_directive(first)
+    cleaned_first = _meaningful_context(first)
+    cleaned_last = _meaningful_context(last)
+
     if is_unlabeled:
-        return f"[NEEDS REVIEW] — {prefix} — Unlabeled session on {machine} ({msgs} msgs, {dur}m). Requires investigation to determine work done."
+        context = (
+            explicit_first
+            or (cleaned_first if _looks_like_task_request(cleaned_first) else "")
+            or cleaned_last
+            or cleaned_first
+        )
+        if context:
+            return described(f"[NEEDS REVIEW] {context}")
+        return described(f"[NEEDS REVIEW] Unlabeled session on {machine} ({msgs} msgs, {dur}m)")
 
-    # Try first_user_message — strip command wrappers, skip pure system noise
-    if first and len(first) > 10:
-        cleaned_first = _strip_command_wrapper(first)
-        if cleaned_first and len(cleaned_first) > 10 and not _is_system_message(cleaned_first):
-            summary = cleaned_first[:120]
-            if len(cleaned_first) > 120:
-                summary = summary[:summary.rfind(" ")] + "..."
-            return f"{prefix} — {summary}"
+    if len(explicit_first) > 10:
+        return described(explicit_first)
 
-    # Try last_assistant_message (what was accomplished)
-    if last and len(last) > 10 and not _is_system_message(last):
-        summary = last[:120]
-        if len(last) > 120:
-            summary = summary[:summary.rfind(" ")] + "..."
-        return f"{prefix} — {summary}"
+    # Prefer the row-local assistant result because it describes what was
+    # accomplished; fall back to the row-local user request.
+    if len(cleaned_last) > 10:
+        return described(cleaned_last)
+    if len(cleaned_first) > 10:
+        return described(cleaned_first)
 
     # Try enriched context: if we have user_messages with content, use the first real one
     user_msgs = burst.get("user_messages_detail", [])
@@ -1046,18 +1716,16 @@ def _make_description(project: str, burst: dict[str, Any], confidence: str = "me
         for um in user_msgs:
             content = (um.get("user_message") or "").strip()
             if len(content) > 10 and not _is_system_message(content):
-                summary = content[:120]
-                if len(content) > 120:
-                    summary = summary[:summary.rfind(" ")] + "..."
-                return f"{prefix} — {summary}"
+                return described(content)
 
-    # Last resort: label-based
-    return f"{prefix} — {label} ({msgs} msgs, {dur}m)"
+    # Last resort: a label alone is not a safe description, even if routing
+    # confidence is otherwise high.
+    return described(f"[NEEDS REVIEW] {label} ({msgs} msgs, {dur}m)")
 
 
 def _make_rationale(burst: dict[str, Any]) -> str:
-    first = (burst.get("first_user_message") or "").strip()
-    if first and len(first) > 10 and not _is_system_message(first):
+    first = _meaningful_context(burst.get("first_user_message") or "")
+    if len(first) > 10:
         return f"Session context: {first[:200]}"
     # Try enriched user messages
     user_msgs = burst.get("user_messages_detail", [])
@@ -1075,11 +1743,102 @@ def build_proposals(evidence: dict[str, Any], routing: dict[str, Any]) -> tuple[
     skipped: list[dict[str, Any]] = []
     existing = evidence.get("clockify", {}).get("entries", [])
     rules = routing.get("skip_rules", {})
+
+    for meeting in evidence.get("fathom", {}).get("meetings", []):
+        start = meeting.get("start")
+        end = meeting.get("end")
+        start_dt = parse_dt(start)
+        end_dt = parse_dt(end)
+        if not start_dt or not end_dt or end_dt <= start_dt:
+            skipped.append({
+                "id": str(meeting.get("recording_id") or "fathom"),
+                "source": "fathom",
+                "time": f"{start}–{end}",
+                "label": meeting.get("title"),
+                "reason": "invalid or missing meeting time window",
+            })
+            continue
+        recording_id = str(meeting.get("recording_id") or "")
+        invitees = [
+            invitee
+            for invitee in meeting.get("calendar_invitees", [])
+            if isinstance(invitee, dict) and invitee.get("email")
+        ]
+        external_invitees = [invitee for invitee in invitees if invitee.get("is_external")]
+        title = str(meeting.get("title") or "Fathom meeting")
+        meeting_record = {
+            "source": "fathom",
+            "machine": "fathom",
+            "session_id": recording_id,
+            "path": meeting.get("share_url"),
+            "label": title,
+            "start": start,
+            "end": end,
+        }
+        if not external_invitees and len(invitees) <= 1 and re.search(
+            r"\bimpromptu\b", title, flags=re.IGNORECASE
+        ):
+            skipped.append({
+                "id": _candidate_key(meeting_record),
+                "source": "fathom",
+                "time": f"{start}–{end}",
+                "label": title,
+                "reason": "solo impromptu recording treated as recorder misfire",
+            })
+            continue
+        route = route_meeting(meeting, routing)
+        if route["action"] == "ambiguous":
+            ambiguous.append({
+                "id": f"A{len(ambiguous)+1:03d}",
+                "candidate_key": _candidate_key(meeting_record),
+                "provenance": _record_provenance(meeting_record),
+                "source": "fathom",
+                "time": f"{start}–{end}",
+                "label": title,
+                "reason": route["reason"],
+                "machine": "fathom",
+            })
+            continue
+        duration = max(1, int((end_dt - start_dt).total_seconds() / 60))
+        candidate = {
+            "id": f"P{len(proposals)+1:03d}",
+            "start": start,
+            "end": end,
+            "duration_minutes": duration,
+            "client_project": route.get("project_name"),
+            "clockify_project_suffix": route.get("project_suffix"),
+            "tag_suffixes": route.get("tag_suffixes", []),
+            "tag_names": route.get("tag_names", []),
+            "billable": route.get("billable", True),
+            "source": [f"fathom:{recording_id}"],
+            "source_label": title,
+            "confidence": "high",
+            "description": _one_line(
+                f"{route.get('prefix', 'SC')} — {title}", DESCRIPTION_LIMIT
+            ),
+            "rationale": f"Fathom recording {recording_id}; invitee/title route matched",
+            "candidate_key": _candidate_key(meeting_record),
+            "provenance": _record_provenance(meeting_record),
+        }
+        if overlaps_existing(candidate, existing):
+            skipped.append({
+                "id": candidate["candidate_key"],
+                "source": "fathom",
+                "time": f"{start}–{end}",
+                "label": title,
+                "reason": "covered by existing Clockify entry overlap",
+            })
+            continue
+        proposals.append(candidate)
+
     for machine in evidence.get("sessions", []):
         for b in machine.get("claude_bursts", []):
             rid_base = hashlib.sha1(json.dumps(b, sort_keys=True).encode()).hexdigest()[:8]
             if b.get("heartbeat_like"):
                 skipped.append({"id": rid_base, "source": "claude", "time": f"{b.get('start')}–{b.get('end')}", "label": b.get("label"), "reason": "heartbeat-like timestamp pattern"})
+                continue
+            if _is_weekend_short_session(b, rules):
+                skipped.append({"id": rid_base, "source": "claude", "time": f"{b.get('start')}–{b.get('end')}", "label": b.get("label"), "reason": "weekend session at or below 60 minutes"})
                 continue
             if b.get("duration_minutes", 0) < rules.get("min_minutes", 10) and b.get("user_messages", 0) < rules.get("min_user_messages", 5):
                 skipped.append({"id": rid_base, "source": "claude", "time": f"{b.get('start')}–{b.get('end')}", "label": b.get("label"), "reason": "trivial burst below duration/message threshold"})
@@ -1110,6 +1869,8 @@ def build_proposals(evidence: dict[str, Any], routing: dict[str, Any]) -> tuple[
                 "confidence": route.get("confidence", "medium"),
                 "description": _make_description(route.get('project_name'), b, route.get('confidence', 'medium'), route.get('prefix', 'SC')),
                 "rationale": _make_rationale(b),
+                "candidate_key": _candidate_key(b),
+                "provenance": _record_provenance(b),
             }
             if overlaps_existing(cand, existing):
                 skipped.append({"id": rid_base, "source": "claude", "time": f"{b.get('start')}–{b.get('end')}", "label": b.get("label"), "reason": "covered by existing Clockify entry overlap"})
@@ -1130,6 +1891,10 @@ def build_proposals(evidence: dict[str, Any], routing: dict[str, Any]) -> tuple[
             est_end = parse_dt(hs.get("end"))
             if est_start and est_end:
                 est_duration = max(3, int((est_end - est_start).total_seconds() / 60))
+            weekend_record = {**hs, "duration_minutes": est_duration or 0}
+            if _is_weekend_short_session(weekend_record, rules):
+                skipped.append({"id": rid_base, "source": "hermes", "time": f"{hs.get('start')}–{hs.get('end')}", "label": label, "reason": "weekend session at or below 60 minutes"})
+                continue
             if est_duration and est_duration < rules.get("min_minutes", 10) and hs.get("user_messages", 0) < rules.get("min_user_messages", 5):
                 skipped.append({"id": rid_base, "source": "hermes", "time": f"{hs.get('start')}–{hs.get('end')}", "label": label, "reason": "trivial burst below duration/message threshold"})
                 continue
@@ -1151,6 +1916,8 @@ def build_proposals(evidence: dict[str, Any], routing: dict[str, Any]) -> tuple[
                 "confidence": route.get("confidence", "medium"),
                 "description": f"{route.get('prefix', 'SC')} — {label} ({hs.get('user_messages',0)} user msgs across {est_duration or '?'}m, estimated)",
                 "rationale": hs.get("evidence_level", "estimated duration"),
+                "candidate_key": _candidate_key(hs),
+                "provenance": _record_provenance(hs),
             }
             proposals.append(cand)
         for cs in machine.get("codex_sessions", []):
@@ -1172,6 +1939,10 @@ def build_proposals(evidence: dict[str, Any], routing: dict[str, Any]) -> tuple[
                 continue
             end = cs.get("end") or start
             duration = cs.get("duration_minutes")
+            weekend_record = {**cs, "start": start, "duration_minutes": duration or 0}
+            if _is_weekend_short_session(weekend_record, rules):
+                skipped.append({"id": f"P{len(proposals)+1:03d}", "source": "codex", "time": f"{start}–{end}", "label": route_label, "reason": "weekend session at or below 60 minutes"})
+                continue
             # Skip trivial bursts (parity with Claude/Hermes thresholds)
             if duration is not None and duration < 10 and (cs.get("user_messages") or 0) < 5:
                 skipped.append({"id": f"P{len(proposals)+1:03d}", "source": "codex", "time": f"{start}–{end}", "label": route_label, "reason": "trivial burst below duration/message threshold"})
@@ -1189,10 +1960,15 @@ def build_proposals(evidence: dict[str, Any], routing: dict[str, Any]) -> tuple[
                 "source": [f"codex:{cs.get('machine','?')}"],
                 "source_label": route_label,
                 "confidence": "medium" if duration is not None else "low",
-                "description": f"{route.get('prefix', 'SC')} — {cs.get('title') or 'Codex session'}",
-                "rationale": f"Codex session ({cs.get('user_messages','?')} user msgs): {cs.get('title') or cs.get('cwd','?')}",
+                "description": _make_description(route.get('project_name'), cs, "medium" if duration is not None else "low", route.get('prefix', 'SC')),
+                "rationale": _make_rationale(cs),
+                "candidate_key": _candidate_key(cs),
+                "provenance": _record_provenance(cs),
             }
             proposals.append(cand)
+    proposals = _dedupe_replicated_candidates(proposals, skipped)
+    proposals = _merge_adjacent_same_work(proposals, skipped)
+    proposals = _resolve_candidate_overlaps(proposals, skipped, rules)
     return proposals, ambiguous, skipped
 
 
@@ -1202,6 +1978,13 @@ def write_markdown(run_dir: Path, report: dict[str, Any]) -> None:
     lines.append("")
     lines.append(f"Date range: {report['date_range']['since']} → {report['date_range']['until']} ({report['date_range']['reason']})")
     lines.append(f"Safety: dry-run only; no Clockify writes performed.")
+    identity = report.get("runtime_identity", {})
+    dirty_suffix = " dirty" if identity.get("git_dirty") else ""
+    lines.append(
+        f"Collector identity: {identity.get('collector_path')} "
+        f"(root: {identity.get('canonical_root')}; "
+        f"git: {identity.get('git_sha') or 'unavailable'}{dirty_suffix})"
+    )
     lines.append("")
     lines.append("## Evidence status")
     lines.append(f"- Clockify: {report['evidence']['clockify']['status']} ({len(report['evidence']['clockify'].get('entries', []))} existing entries)")
@@ -1239,7 +2022,7 @@ def write_markdown(run_dir: Path, report: dict[str, Any]) -> None:
         lines.append("- None")
     lines.append("")
     lines.append("## Approval instruction")
-    lines.append("Approve specific row IDs (for example: P001, P003) before any Clockify posting step. This run did not post entries.")
+    lines.append("Run-local proposal IDs (for example: P001) are not approval IDs. First ingest this run into review-snapshot.json; approve only the stable review item IDs created there. This run did not post entries.")
     (run_dir / "run-report.md").write_text("\n".join(lines) + "\n")
 
 
@@ -1262,9 +2045,9 @@ def run(args: argparse.Namespace) -> int:
     for m in fleet.get("machines", []):
         if not m.get("enabled", True):
             continue
-        if m.get("kind") == "local":
+        if machine_is_local(m):
             evidence["sessions"].append(collect_local_sessions(m, since, until))
-        elif m.get("kind") == "ssh":
+        elif m.get("kind") in ("ssh", "auto"):
             evidence["sessions"].append(collect_remote_sessions(m, since, until, fleet.get("ssh_options", [])))
 
     # Enriched session context (user messages with prev/next assistant)
@@ -1295,6 +2078,7 @@ def run(args: argparse.Namespace) -> int:
     proposals, ambiguous, skipped = build_proposals(evidence, routing)
     report = {
         "run_id": run_id,
+        "runtime_identity": collector_runtime_identity(),
         "date_range": {"since": local_dt_string(since), "until": local_dt_string(until), "reason": reason},
         "safety": {"dry_run": True, "clockify_posted": False},
         "paths": {"run_dir": str(run_dir), "report_json": str(run_dir / "run-report.json"), "report_md": str(run_dir / "run-report.md"), "proposals_json": str(run_dir / "proposals.json")},
