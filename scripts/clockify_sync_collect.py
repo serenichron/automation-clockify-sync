@@ -344,6 +344,27 @@ def _looks_like_task_request(msg: str) -> bool:
     )
 
 
+def _problem_context_summary(msg: str) -> str:
+    """Summarize a small set of recognizable error reports without guessing."""
+    lower = _one_line(msg, 1000).casefold()
+    if "stop hook error" in lower or "hook evaluator api error" in lower:
+        return "Troubleshoot Claude Code Stop hook evaluator error"
+    return ""
+
+
+def _is_contextless_description(description: Any) -> bool:
+    """Recognize generic rows even after the overlap allocator annotates them."""
+    description = str(description or "").removesuffix(
+        " (trimmed around parallel work)"
+    )
+    return bool(
+        re.search(
+            r" — \[NEEDS REVIEW\] Unlabeled session on .+ \(\d+ msgs, \d+m\)$",
+            description,
+        )
+    )
+
+
 def _explicit_context_heading(msg: str) -> str:
     """Extract a concise task title embedded in otherwise generic prose."""
     match = re.search(
@@ -1733,12 +1754,14 @@ def _make_description(project: str, burst: dict[str, Any], confidence: str = "me
         return _one_line(f"{prefix} — {summary}", DESCRIPTION_LIMIT)
 
     explicit_first = _explicit_context_heading(first) or _session_directive(first)
+    problem_first = _problem_context_summary(first)
     cleaned_first = _meaningful_context(first)
     cleaned_last = _meaningful_context(last)
 
     if is_unlabeled:
         context = (
             explicit_first
+            or problem_first
             or (cleaned_first if _looks_like_task_request(cleaned_first) else "")
             or cleaned_last
             or cleaned_first
@@ -2016,6 +2039,27 @@ def build_proposals(evidence: dict[str, Any], routing: dict[str, Any]) -> tuple[
     proposals = _dedupe_replicated_candidates(proposals, skipped)
     proposals = _merge_adjacent_same_work(proposals, skipped)
     proposals = _resolve_candidate_overlaps(proposals, skipped, rules)
+    reviewable_proposals = []
+    for proposal in proposals:
+        if _is_contextless_description(proposal.get("description")):
+            ambiguous.append(
+                {
+                    **proposal,
+                    "id": f"A{len(ambiguous)+1:03d}",
+                    "machine": (proposal.get("provenance") or {}).get(
+                        "source_machine"
+                    ),
+                    "time": f"{proposal.get('start')}–{proposal.get('end')}",
+                    "label": proposal.get("source_label"),
+                    "reason": (
+                        "No row-specific work context was recoverable; "
+                        "review, revise, or reject manually"
+                    ),
+                }
+            )
+            continue
+        reviewable_proposals.append(proposal)
+    proposals = reviewable_proposals
     return proposals, ambiguous, skipped
 
 

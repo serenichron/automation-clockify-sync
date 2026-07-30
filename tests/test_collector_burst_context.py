@@ -504,6 +504,96 @@ class CollectorBurstContextTests(unittest.TestCase):
         )
         self.assertNotIn("Fixed.", description)
 
+    def test_stop_hook_error_becomes_work_summary_without_goal_command(self) -> None:
+        burst = {
+            "first_user_message": (
+                "i am encountering this error: Ran 1 stop hook. "
+                "Stop hook error: Hook evaluator API error: "
+                "API Error: 400 Tool reference 'Bash' not found in available tools"
+            ),
+            "last_assistant_message": (
+                "TLDR: The failing Stop hook is Claude Code's built-in /goal "
+                "feature. /goal registers a session-scoped Stop hook."
+            ),
+            "label": "-claude",
+            "machine": "macbook",
+            "source": "claude",
+            "user_messages": 4,
+            "duration_minutes": 8,
+        }
+
+        description = collector._make_description(
+            "Serenichron Level 2", burst, confidence="low", prefix="SC"
+        )
+
+        self.assertEqual(
+            "SC — [NEEDS REVIEW] Troubleshoot Claude Code Stop hook evaluator error",
+            description,
+        )
+        self.assertNotIn("/goal", description)
+
+    def test_contextless_routed_session_moves_to_ambiguous_with_identity(self) -> None:
+        routing = {
+            "skip_rules": {
+                "min_minutes": 10,
+                "min_user_messages": 5,
+                "weekend_short_max_minutes": 60,
+            },
+            "session_routes": [
+                {
+                    "pattern": "cpu",
+                    "project_name": "Serenichron Level 2",
+                    "project_suffix": "775f9f",
+                    "tag_suffixes": ["35aa9afb"],
+                    "tag_names": ["System development"],
+                    "prefix": "SC",
+                    "confidence": "low",
+                }
+            ],
+        }
+        burst = {
+            "source": "claude",
+            "machine": "omarchy-precision",
+            "session_id": "contextless-session",
+            "path": "/home/blackthorne/.claude/projects/cpu/session.jsonl",
+            "label": "cpu",
+            "start": "2026-07-10 17:22",
+            "end": "2026-07-10 17:23",
+            "duration_minutes": 1,
+            "user_messages": 13,
+            "first_user_message": "",
+            "last_assistant_message": "",
+        }
+
+        proposals, ambiguous, skipped = collector.build_proposals(
+            {
+                "clockify": {"entries": []},
+                "sessions": [{"claude_bursts": [burst]}],
+            },
+            routing,
+        )
+
+        self.assertEqual([], proposals)
+        self.assertEqual([], skipped)
+        self.assertEqual(1, len(ambiguous))
+        self.assertTrue(ambiguous[0]["candidate_key"].startswith("ck-"))
+        self.assertEqual(
+            "contextless-session",
+            ambiguous[0]["provenance"]["source_session_id"],
+        )
+        self.assertEqual("Serenichron Level 2", ambiguous[0]["client_project"])
+        self.assertEqual("cpu", ambiguous[0]["label"])
+        self.assertEqual(
+            "2026-07-10 17:22–2026-07-10 17:23",
+            ambiguous[0]["time"],
+        )
+        self.assertIn("review, revise, or reject", ambiguous[0]["reason"])
+        self.assertTrue(
+            collector._is_contextless_description(
+                ambiguous[0]["description"] + " (trimmed around parallel work)"
+            )
+        )
+
     def test_usage_limit_response_and_setup_only_prompt_require_review(self) -> None:
         burst = {
             "first_user_message": "read multica skills first",
