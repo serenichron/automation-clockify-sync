@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime as dt
 import json
 from pathlib import Path
 import subprocess
@@ -158,6 +159,22 @@ def write_current_review_csv(path: Path, snapshot: dict[str, Any]) -> None:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         for item_id, item in sorted(rows_by_id.items()):
+            start = item.get("start")
+            end = item.get("end")
+            raw_time = str(item.get("time") or "")
+            if not start or not end:
+                if "–" in raw_time:
+                    start, end = raw_time.split("–", 1)
+                elif " - " in raw_time:
+                    start, end = raw_time.split(" - ", 1)
+            duration = item.get("duration_minutes")
+            if not duration and start and end:
+                try:
+                    start_dt = dt.datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+                    end_dt = dt.datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+                    duration = max(1, int((end_dt - start_dt).total_seconds() / 60))
+                except ValueError:
+                    duration = None
             source = item.get("source")
             if isinstance(source, list):
                 source = ", ".join(str(value) for value in source)
@@ -167,14 +184,14 @@ def write_current_review_csv(path: Path, snapshot: dict[str, Any]) -> None:
             writer.writerow(
                 {
                     "Review ID": item_id,
-                    "Start": item.get("start") or item.get("time"),
-                    "End": item.get("end"),
-                    "Duration (min)": item.get("duration_minutes"),
+                    "Start": start or raw_time,
+                    "End": end,
+                    "Duration (min)": duration,
                     "Project": item.get("client_project"),
                     "Tags": tags,
                     "Source": source,
                     "Confidence": item.get("confidence"),
-                    "Description": item.get("description"),
+                    "Description": item.get("description") or item.get("label"),
                     "Disposition": item.get("disposition"),
                     "Revision": item.get("revision"),
                     "Last Seen Run": item.get("last_seen_run"),

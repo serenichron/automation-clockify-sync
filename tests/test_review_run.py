@@ -180,6 +180,41 @@ class ReviewRunResultTests(unittest.TestCase):
         self.assertEqual("System development", rows[0]["Tags"])
         self.assertEqual("10", rows[1]["Duration (min)"])
 
+    def test_current_review_csv_normalizes_ambiguous_meeting_window_and_title(self):
+        for separator in ("–", " - "):
+            snapshot = {
+                "categories": {
+                    "new": [
+                        {
+                            **item("rvi-meeting", ""),
+                            "client_project": None,
+                            "description": None,
+                            "label": "Discovery call",
+                            "time": (
+                                f"2026-07-29 14:11{separator}2026-07-29 15:35"
+                            ),
+                            "duration_minutes": None,
+                            "source": "fathom",
+                            "disposition": "ambiguous",
+                            "revision": 1,
+                        }
+                    ],
+                    "changed": [],
+                    "carried_pending": [],
+                }
+            }
+
+            with self.subTest(separator=separator), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "review.csv"
+                review_run.write_current_review_csv(path, snapshot)
+                with path.open(newline="", encoding="utf-8") as handle:
+                    row = next(csv.DictReader(handle))
+
+                self.assertEqual("2026-07-29 14:11", row["Start"])
+                self.assertEqual("2026-07-29 15:35", row["End"])
+                self.assertEqual("84", row["Duration (min)"])
+                self.assertEqual("Discovery call", row["Description"])
+
 
 if __name__ == "__main__":
     unittest.main()
