@@ -1,11 +1,16 @@
 # Clockify reconciliation workflow
 
-Purpose: reconcile Vlad's direct interactive work and meetings against existing
-Clockify entries, then maintain a stable, approval-gated review queue.
+Purpose: reconstruct Vlad's direct interactive accomplishments and meetings
+from complete evidence, allocate honest non-overlapping effort, and progress
+from full-denominator shadow review to an exceptions-only, approval-gated
+Clockify review queue after measured acceptance gates pass.
 
 This repository is the canonical implementation. The collector lives only in
 `scripts/clockify_sync_collect.py`; the top-level `clockify_sync_collect.py` is
 a compatibility wrapper.
+
+The source audit and process-level failure inventory are recorded in
+`clockify-description-failure-taxonomy.md`.
 
 ## Safe local workflow
 
@@ -14,14 +19,46 @@ cd /Users/blackthorne/Work/automation-clockify-sync
 python3 scripts/clockify_review_run.py
 ```
 
-The orchestration command runs the collector, quality gate, and durable-state
-reconciliation in order. It prints the absolute path to
-`autopilot-result.json`. The lower-level commands remain available for targeted
-diagnosis.
+The orchestration command defaults to `--review-mode shadow_all` and runs the
+complete process:
+
+1. collect full cross-machine session events, commands, commit-backed artifacts,
+   existing Clockify entries, Multica issue context, and hydrated Fathom records;
+2. write and validate an immutable, content-addressed evidence ledger;
+3. classify noise and reconstruct atomic semantic accomplishments with a
+   tiered analyzer;
+4. route projects deterministically and render 8–14 word Caveman descriptions;
+5. allocate active effort around fixed Clockify and Fathom blocks without
+   overlap, gap filling, overnight bridging, or silent trimming;
+6. validate quality and ingest stable review identities; shadow evaluation
+   exposes the full denominator, while repeated runs emit only actionable
+   deltas. Exceptions-only operation is not activated until its measured gates
+   pass.
+
+It prints the absolute path to `autopilot-result.json`. Lower-level commands
+remain available for targeted diagnosis. Calendly is intentionally outside the
+current process.
 
 Outputs:
 
-- `runs/<run-id>/proposals.json`: raw candidates from this collection;
+- `runs/<run-id>/evidence/evidence-ledger.json`: immutable evidence and
+  completeness manifest;
+- `runs/<run-id>/semantic-analysis.json`: cited atomic activities, omissions,
+  and analyzer provenance;
+- `runs/<run-id>/work-accounting-result.json`: semantic, allocation, Fathom,
+  and exception contract;
+- `runs/<run-id>/allocation-report.json`: strict allocation and contested time;
+- `runs/<run-id>/fathom-reconciliation.json`: disposition for every eligible
+  meeting;
+- `runs/<run-id>/review-learning-cases.json`: generalized, sanitized correction
+  cases derived from the integrity-checked decision log;
+- `runs/<run-id>/review-regression-cases.json`: exact local-only expectations
+  bound to reviewed evidence; these are never sent to a model;
+- `runs/<run-id>/review-regression-results.json`: pass/fail evidence showing
+  whether previously corrected behavior was actually learned;
+- `runs/<run-id>/proposals.json`: final semantic allocation candidates;
+- `runs/<run-id>/legacy-*.json`: collector-only diagnostic candidates, never
+  reviewable output and never carried into durable state;
 - `runs/<run-id>/quality_report.json`: read-only quality findings;
 - `runs/<run-id>/review-snapshot.json`: actionable delta against durable state;
 - `runs/<run-id>/autopilot-result.json`: deterministic action contract;
@@ -29,25 +66,181 @@ Outputs:
 - `runs/<run-id>/review-current.csv`: stable-ID export of the complete active
   review for local inspection or an explicitly approved Sheet patch;
 - `state/review-items.json`: mutable local review state, intentionally ignored
-  by Git.
+  by Git;
+- `state/review-corrections.jsonl`: immutable evidence-bound approve, skip, and
+  modify decisions, intentionally ignored by Git.
+- `state/review-acceptance.jsonl`: integrity-linked shadow/guarded period
+  evidence controlling exceptions-only eligibility, intentionally ignored by Git.
+
+Models propose semantics only. Deterministic code owns evidence identity,
+project routing, descriptions, time allocation, review identity, and safety.
+Raw evidence may overlap; proposed and existing Clockify allocations may not.
+Each activity carries minimum, recommended, and maximum active-effort estimates.
+Allocation prioritizes semantic confidence and direct human-attention signals,
+then places only the recommended demand inside observed spans of the cited
+semantic workstream. Unrelated evidence elsewhere that day cannot widen that
+placement envelope.
+If capacity falls below the evidence-backed minimum, token allocations are
+rolled back completely. When recommended demand still cannot fit, the process
+emits `contested_time` with the full unmet demand instead of shrinking or
+discarding the work. Unused capacity stays explicit and empty time remains empty.
+
+The analyzer receives deterministic noise filtering before semantic work begins.
+System messages, tool transport, heartbeats, session-control commands, pure
+standing-by or approval-waiting messages, polling updates, and injected wrappers
+are excluded. Substantive accomplishments that merely mention words such as
+"heartbeat", "approval", or "polling" remain eligible.
+
+The primary analyzer must pass a minimal live probe and its structured response
+contract. A configured stronger fallback handles primary probe/call/schema
+failures, conflicting evidence, and low semantic or timing confidence. Without a
+usable fallback, primary probe/call/schema failures block the run. Conflicting or
+low-confidence claims that remain unresolved become explicit exceptions, never
+proposals.
+
+The `rendered_description` field is required on semantic activities and starts
+as `null`; deterministic routing and rendering populate it only for activities
+that can become proposals. Analyzer wording is never trusted as final text. The
+Caveman renderer regenerates it from prefix, action, object, and bounded outcome,
+then quality checks require proposal `description` to match it exactly.
+
+Fathom eligibility requires a valid meeting window and either Vlad as recorder
+or attendee. Recordings shorter than five minutes require a transcript. A
+title-only record remains an exception; it cannot support an invented outcome.
+Existing Clockify time reconciles a meeting only with reciprocal overlap of at
+least 80%; partial conflicts remain explicit fixed-block exceptions.
+
+Review corrections are immutable and bound to stable activity plus evidence
+identity. Only sanitized general rules reach the analyzer. Exact replacement
+values remain local-only regression cases. A reappearing skip is removed from
+every segment; a mismatching or missing reviewed activity produces one deduplicated
+`correction_regression` exception and no reviewable allocation. A split
+correction records the expected child count and an exact, non-overlapping
+partition of the parent evidence; replay fails visibly if a child is missing or
+evidence is lost, duplicated, or repartitioned.
+
+The immutable ledger is local-only. Private agent/session, meeting, or issue
+prose is denied to every analyzer transport by default. A minimal route probe
+contains no evidence and remains safe to run while the gate is closed. Sending
+the semantic projection requires a separate runtime decision:
+
+```bash
+export CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED=approved
+```
+
+Do not persist or enable that value merely because a route probe succeeded;
+setting it authorizes redacted private prose to leave the local machine for the
+configured analyzer endpoint. When explicitly enabled, cloud requests receive
+only a strict semantic projection: evidence IDs and spans, redacted
+user/assistant text, structured Fathom summary/action-item/transcript text,
+safe commit subjects, and artifact basenames. Tool-call inputs, tool-result
+bodies, credentials, emails, URLs, absolute paths, and hashes never cross that
+boundary. Safe text is not clipped; an individually oversized projected event
+blocks analysis.
+
+Fathom collection fetches the complete creation history through the requested
+end timestamp, then filters locally by recording or scheduled occurrence
+overlap. This prevents a meeting created earlier from disappearing from the
+accounting window. The inventory records its history floor, occurrence filter,
+pagination count, and completeness. Multica issue evidence is fully paginated
+and then bounded to issue activity in the requested accounting window.
 
 `review-snapshot.json` categorizes items as `new`, `changed`,
 `carried_pending`, or `resolved_disappeared`. A zero-candidate run never closes
 pending work. Source failures remain visible as coverage warnings.
 
-`autopilot-result.json` uses one of four actions:
+`autopilot-result.json` uses one of six actions:
 
 - `no_comment`: healthy coverage and no actionable delta;
 - `review_delta`: one or more new or changed review items;
+- `review_exceptions`: an accepted exceptions-only run has active ambiguous rows;
+- `review_batch`: an accepted exceptions-only run has a new/changed clean batch
+  and no new/changed exception;
 - `coverage_warning`: incomplete evidence, whether or not candidates exist;
 - `blocked`: quality identity/provenance failed and durable state was not
   updated.
 
 The compact summary never reproduces `carried_pending` row content.
 
+## Review modes and acceptance
+
+`shadow_all` is the default and remains the only usable mode today. It presents
+the full active denominator, including ambiguous rows. Every active item must
+receive an evidence-bound `approve`, `skip`, or `modify` decision before a
+period can support promotion.
+
+`exceptions_only` is fail-closed. It may be requested only with an acceptance
+ledger whose status reports `exceptions_only_eligible: true`:
+
+```bash
+python3 scripts/clockify_review_run.py \
+  --review-mode exceptions_only \
+  --acceptance-ledger state/review-acceptance.jsonl
+```
+
+Eligibility requires one complete `shadow_baseline` period with at least 90%
+unchanged approvals, followed by two distinct, later, consecutive `guarded`
+periods with at least 95%. Each period must have complete sources, passing
+quality, a stable second replay (`0 new / 0 changed`), complete dispositions
+for the full denominator (ambiguous rows included), assessments for every
+skip/modify decision, and zero critical routing, description-truth, meeting,
+or allocation errors. Every analyzer route used in a period must also have a
+passing digest-bound evaluation scorecard.
+
+Record and inspect those integrity-linked local periods with:
+
+```bash
+python3 scripts/review_acceptance.py record \
+  --run-dir /absolute/path/to/first-run \
+  --replay-run-dir /absolute/path/to/replay-run \
+  --decisions state/review-corrections.jsonl \
+  --critical-assessments /absolute/path/to/assessments.json \
+  --analyzer-scorecard /absolute/path/to/analyzer-scorecard.json \
+  --stage shadow_baseline \
+  --ledger state/review-acceptance.jsonl
+python3 scripts/review_acceptance.py status \
+  --ledger state/review-acceptance.jsonl
+```
+
+In `exceptions_only`, clean pending rows are represented by one
+content-addressed `clean_batch` count and ID; active ambiguous rows remain
+fully detailed only when new or changed. The machine contract retains the
+stable row IDs behind the batch digest so an explicit board approval of that
+exact batch can be verified without printing every clean description. The
+digest binds each stable review ID, revision, and evidence fingerprint, so any
+changed member produces a different batch ID. Neither
+mode writes to Clockify.
+
+## Analyzer evaluation
+
+A route probe only proves that the selected transport can return the minimal
+JSON contract. It contains no evidence. It is distinct from the offline,
+content-addressed evaluator:
+
+```bash
+python3 scripts/analyzer_evaluation.py \
+  --input /absolute/path/to/redacted-captured-replays.json \
+  --output /absolute/path/to/analyzer-scorecard.json
+```
+
+The evaluator has no provider transport. It checks redacted captured replays
+against the exact corpus coverage and expected evidence partitions, production
+schema/citation and atomicity validators, renderer/forbidden-description
+rules, and stable replay. Its digest-bound scorecard does not reproduce the
+captured prose. A successful probe is not an evaluation and does not authorize
+private-text egress.
+
 ## Safety contract
 
 - Collector, quality, and review-state steps do not write to Clockify.
+- Missing analyzer configuration, incomplete canonical remote evidence, invalid
+  correction logs, title-only meetings, and contract failures block or become
+  explicit exceptions; they never become invented work.
+- Private semantic prose cannot reach a configured analyzer unless
+  `CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED=approved` is explicitly present at
+  runtime; route-probe success is not privacy approval.
+- A blocked accounting stage still writes its local action contract and exits
+  nonzero so schedulers cannot mistake it for a healthy run.
 - The quality command never updates Google Sheets or any other external system.
 - Clockify posting requires an explicit board decision for each stable review
   item.
@@ -62,6 +255,14 @@ The compact summary never reproduces `carried_pending` row content.
 python3 -m unittest discover -s tests -v
 python3 -m py_compile \
   clockify_sync_collect.py \
+  scripts/evidence_ledger.py \
+  scripts/semantic_analyzer.py \
+  scripts/work_allocator.py \
+  scripts/caveman_renderer.py \
+  scripts/work_accounting_pipeline.py \
+  scripts/review_corrections.py \
+  scripts/review_acceptance.py \
+  scripts/analyzer_evaluation.py \
   scripts/clockify_sync_collect.py \
   scripts/clockify_sync_quality.py \
   scripts/clockify_review_state.py \
@@ -72,3 +273,6 @@ git diff --check
 The approval-gated production sequence and exact live IDs are documented in
 [`clockify-review-rollout.md`](clockify-review-rollout.md). Re-read live state
 before using it; the snapshot is intentionally not treated as current truth.
+The requirement-by-requirement distinction between local proof and missing live
+acceptance evidence is tracked in
+[`clockify-process-acceptance.md`](clockify-process-acceptance.md).

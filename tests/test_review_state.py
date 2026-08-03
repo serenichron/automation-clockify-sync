@@ -29,6 +29,29 @@ def proposal(description="SC — initial", project="Serenichron Level 2"):
     }
 
 
+def semantic_proposal(candidate_key, activity_id, evidence_ids, *, start="2026-07-28T09:00:00+03:00", end="2026-07-28T10:00:00+03:00"):
+    return {
+        "id": "S001",
+        "candidate_key": candidate_key,
+        "review_activity_key": f"wka-{activity_id}",
+        "allocation_segment": 1,
+        "activity_id": activity_id,
+        "workstream_id": "ws-clockify",
+        "start": start,
+        "end": end,
+        "source": [f"evidence:{value}" for value in evidence_ids],
+        "source_label": "Clockify review state",
+        "client_project": "Serenichron Level 2",
+        "description": "SC — Rebuilt stable review state for evidence-backed work",
+        "provenance": {
+            "source_type": "semantic_activity",
+            "source_session_id": activity_id,
+            "source_machine": "cross-machine",
+            "evidence_ids": evidence_ids,
+        },
+    }
+
+
 def ingest(tmp_path, run_name, proposals, ambiguous=()):
     run_dir = tmp_path / run_name
     write_json(run_dir / "proposals.json", list(proposals))
@@ -159,3 +182,105 @@ class ReviewStateTests(unittest.TestCase):
                 for warning in snapshot["coverage_warnings"]
             )
         )
+
+    def test_semantic_activity_segment_replay_keeps_rvi_and_evidence_view(self):
+        record = semantic_proposal("wk-segment-one", "act-clockify", ["ev-1", "ev-2"])
+        state, snapshot, _ = ingest(self.tmp_path, "run-one", [record])
+        item_id = next(iter(state["items"]))
+        run_dir = self.tmp_path / "run-two"
+        replay = dict(record, id="S999")
+        write_json(run_dir / "proposals.json", [replay])
+        write_json(run_dir / "ambiguous.json", [])
+        second = review_state.ingest_run(run_dir, state)
+        self.assertEqual([item_id], list(state["items"]))
+        self.assertEqual(0, second["summary"]["new"])
+        self.assertEqual("act-clockify", snapshot["categories"]["new"][0]["activity_id"])
+        self.assertEqual(["ev-1", "ev-2"], snapshot["categories"]["new"][0]["evidence_ids"])
+
+    def test_allocation_move_preserves_review_id_and_terminal_decision(self):
+        record = semantic_proposal("wks-first", "act-clockify", ["ev-1", "ev-2"])
+        state, _, _ = ingest(self.tmp_path, "run-one", [record])
+        item_id = next(iter(state["items"]))
+        review_state.set_disposition(state, item_id, "approved", "board-review")
+
+        moved = semantic_proposal(
+            "wks-first",
+            "act-clockify",
+            ["ev-1", "ev-2"],
+            start="2026-07-28T10:00:00+03:00",
+            end="2026-07-28T11:00:00+03:00",
+        )
+        run_dir = self.tmp_path / "run-moved"
+        write_json(run_dir / "proposals.json", [moved])
+        write_json(run_dir / "ambiguous.json", [])
+        snapshot = review_state.ingest_run(run_dir, state)
+
+        self.assertEqual([item_id], list(state["items"]))
+        self.assertEqual("approved", state["items"][item_id]["disposition"])
+        self.assertEqual(0, snapshot["summary"]["new"])
+        self.assertEqual(1, snapshot["summary"]["changed"])
+
+    def test_one_segment_becoming_multiple_keeps_one_activity_review_item(self):
+        original = semantic_proposal("wks-one", "act-clockify", ["ev-1", "ev-2"])
+        state, _, _ = ingest(self.tmp_path, "run-one", [original])
+        item_id = next(iter(state["items"]))
+        review_state.set_disposition(state, item_id, "rejected", "board-review")
+
+        first = semantic_proposal(
+            "wks-one",
+            "act-clockify",
+            ["ev-1", "ev-2"],
+            end="2026-07-28T09:30:00+03:00",
+        )
+        second = semantic_proposal(
+            "wks-two",
+            "act-clockify",
+            ["ev-1", "ev-2"],
+            start="2026-07-28T10:30:00+03:00",
+            end="2026-07-28T11:00:00+03:00",
+        )
+        second["allocation_segment"] = 2
+        run_dir = self.tmp_path / "run-split-allocation"
+        write_json(run_dir / "proposals.json", [second, first])
+        write_json(run_dir / "ambiguous.json", [])
+        snapshot = review_state.ingest_run(run_dir, state)
+
+        self.assertEqual([item_id], list(state["items"]))
+        self.assertEqual("rejected", state["items"][item_id]["disposition"])
+        self.assertEqual(2, len(state["items"][item_id]["current"]["allocation_segments"]))
+        self.assertEqual(0, snapshot["summary"]["new"])
+
+    def test_verified_split_links_children_and_supersedes_parent_without_id_reuse(self):
+        legacy = semantic_proposal("legacy-candidate", "legacy-activity", ["ev-1", "ev-2"])
+        legacy.pop("activity_id")
+        legacy["provenance"].pop("source_session_id")
+        state, _, _ = ingest(self.tmp_path, "run-legacy", [legacy])
+        parent_id = next(iter(state["items"]))
+        fingerprint = review_state._evidence_fingerprint(state["items"][parent_id]["current"])
+        child_one = semantic_proposal("wk-child-one", "act-child-one", ["ev-1"], end="2026-07-28T09:30:00+03:00")
+        child_two = semantic_proposal("wk-child-two", "act-child-two", ["ev-2"], start="2026-07-28T09:30:00+03:00")
+        for child in (child_one, child_two):
+            child["parent_review_item_id"] = parent_id
+            child["parent_evidence_fingerprint"] = fingerprint
+        run_dir = self.tmp_path / "run-split"
+        write_json(run_dir / "proposals.json", [child_one, child_two])
+        write_json(run_dir / "ambiguous.json", [])
+        snapshot = review_state.ingest_run(run_dir, state)
+        self.assertEqual("superseded", state["items"][parent_id]["disposition"])
+        child_ids = [item_id for item_id in state["items"] if item_id != parent_id]
+        self.assertEqual(2, len(child_ids))
+        self.assertTrue(all(state["items"][item_id]["parent_review_item_id"] == parent_id for item_id in child_ids))
+        self.assertEqual(2, snapshot["summary"]["new"])
+
+    def test_unproven_split_requires_explicit_migration_without_superseding_parent(self):
+        legacy = semantic_proposal("legacy-candidate", "legacy-activity", ["ev-1", "ev-2"])
+        state, _, _ = ingest(self.tmp_path, "run-legacy", [legacy])
+        parent_id = next(iter(state["items"]))
+        child = semantic_proposal("wk-child-one", "act-child-one", ["ev-1"])
+        child["parent_review_item_id"] = parent_id
+        run_dir = self.tmp_path / "run-unproven-split"
+        write_json(run_dir / "proposals.json", [child])
+        write_json(run_dir / "ambiguous.json", [])
+        snapshot = review_state.ingest_run(run_dir, state)
+        self.assertNotEqual("superseded", state["items"][parent_id]["disposition"])
+        self.assertTrue(any(warning["type"] == "migration_required" for warning in snapshot["coverage_warnings"]))

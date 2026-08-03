@@ -18,6 +18,7 @@
       "hermes_sessions": "/Users/blackthorne/.hermes/sessions",
       "hermes_db": "/Users/blackthorne/.hermes/state.db",
       "codex_home": "/Users/blackthorne/.codex",
+      "collector_root": "/Users/blackthorne/Work/automation-clockify-sync",
       "enabled": true
     },
     {
@@ -28,6 +29,7 @@
       "hermes_sessions": "/home/blackthorne/.hermes/sessions",
       "hermes_db": "/home/blackthorne/.hermes/state.db",
       "codex_home": "/home/blackthorne/.codex",
+      "collector_root": "/home/blackthorne/Work/serenichron/automation/clockify-sync",
       "enabled": true
     },
     {
@@ -38,6 +40,7 @@
       "hermes_sessions": "/home/blackthorne/.hermes/sessions",
       "hermes_db": "/home/blackthorne/.hermes/state.db",
       "codex_home": "/home/blackthorne/.codex",
+      "collector_root": "/home/blackthorne/Work/serenichron/automation/clockify-sync",
       "enabled": true
     }
   ]

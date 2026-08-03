@@ -1,6 +1,25 @@
 # Clockify review recovery rollout
 
-Status: prepared locally; no guarded action in this document has been executed.
+Status: superseded by the evidence-grounded accounting candidate; no guarded
+action in this document has been executed. The 2026-07-30 identifiers below are
+historical evidence and must be re-read before any rollout.
+
+## Candidate status — 2026-08-03
+
+The local candidate has not been committed, deployed, or routed live. There
+has been no analyzer route probe, private-text egress authorization, Sheet
+refresh, Clockify write, Multica mutation, or fleet mutation for this candidate.
+Calendly remains excluded. Clockify remains the system of record; the process
+only creates local review artifacts until separate guarded approval is granted.
+
+The standard local command is `python3 scripts/clockify_review_run.py`, which
+defaults to `--review-mode shadow_all`. In that mode the full active review
+denominator is visible, including ambiguous rows. `--review-mode
+exceptions_only --acceptance-ledger state/review-acceptance.jsonl` is locked
+until `scripts/review_acceptance.py status --ledger
+state/review-acceptance.jsonl` reports `exceptions_only_eligible: true`.
+Clean rows then appear only as a content-addressed batch count/ID; genuine
+ambiguous rows remain detailed. Neither mode writes Clockify or Google Sheets.
 
 ## Verified live baseline — 2026-07-30
 
@@ -34,6 +53,11 @@ Status: prepared locally; no guarded action in this document has been executed.
 
 ## Preconditions
 
+The candidate behavior and fail-closed contracts are defined in `README.md` and
+the versioned files under `schemas/`. This rollout document does not replace the
+noise, Fathom eligibility, analyzer fallback, deterministic description,
+allocation, or correction-regression contracts recorded there.
+
 1. Obtain direct board approval for publication, merge, deployment, Multica
    configuration changes, the one-time SER-651 migration, and manual canary.
 2. Re-read all IDs and statuses above. Abort on drift.
@@ -44,6 +68,12 @@ Status: prepared locally; no guarded action in this document has been executed.
    python3 -m py_compile \
      clockify_sync_collect.py \
      scripts/clockify_sync_collect.py \
+     scripts/evidence_ledger.py \
+     scripts/semantic_analyzer.py \
+     scripts/work_allocator.py \
+     scripts/caveman_renderer.py \
+     scripts/work_accounting_pipeline.py \
+     scripts/review_corrections.py \
      scripts/clockify_sync_quality.py \
      scripts/clockify_review_state.py \
      scripts/clockify_review_run.py
@@ -54,6 +84,25 @@ Status: prepared locally; no guarded action in this document has been executed.
    commit.
 5. Record the candidate SHA after commit. Every deployment and readback must use
    that exact SHA.
+6. Probe the intended analyzer route on Precision. Require an actual successful
+   JSON probe for the selected primary route and its fallback; configuration is
+   not proof. The probe carries no evidence and is separate from offline
+   `scripts/analyzer_evaluation.py`, which validates redacted captured replays,
+   exact corpus coverage/partitions, production validators, stable replay, and
+   a digest-bound scorecard.
+7. Obtain a separate explicit privacy decision before setting
+   `CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED=approved`. The minimal probe contains
+   no evidence and does not authorize private agent/session, meeting, or issue
+   prose to leave the machine.
+8. Run two complete July 1–August 3 read-only shadow runs plus stable replays.
+   Require complete canonical fleet evidence, Fathom reconciliation, strict
+   non-overlap, and `0 new / 0 changed` before any issue or Sheet refresh.
+9. Do not claim acceptance until all active rows, including ambiguous ones,
+   have approve/skip/modify dispositions and every skip/modify has a
+   criticality assessment. `exceptions_only` requires one complete >=90%
+   baseline followed by two distinct later consecutive >=95% guarded periods,
+   with complete sources, passing quality and analyzer scorecards, stable replay, and no critical
+   routing, description-truth, meeting, or allocation error.
 
 ## Guarded rollout order
 
@@ -84,18 +133,22 @@ Status: prepared locally; no guarded action in this document has been executed.
    credentials. The Desktop non-Git copy must be populated from an archive of
    the exact SHA and verified by a tracked-file hash manifest.
 6. On Precision only, create a fresh authoritative
-   `state/review-items.json` from a complete July 16–30 read-only backfill. Do
-   not copy the Mac state.
+   `state/review-items.json` from a complete July 1–current read-only shadow
+   backfill. Do not copy the Mac state.
 7. Run the same bundle through the durable state a second time and require:
    - `new=0`;
    - `changed=0`;
    - active items appear only as `carried_pending`;
    - action `no_comment`;
    - `should_comment=false`.
-8. Replace the stale SER-651 description once with the stable-ID review export
-   from the clean backfill and a compact workflow explanation. Do not append
-   another full audit backlog comment.
-9. Trigger one manual authoritative canary. It must perform no Clockify or
+8. Append and inspect each acceptance period with
+   `scripts/review_acceptance.py record` and
+   `scripts/review_acceptance.py status`; do not request exceptions-only mode
+   unless the integrity-checked ledger reports eligible.
+9. Refresh any approved review surface by stable ID only after the shadow run
+   passes. Preserve reviewer Status and Notes. Do not use a full-sheet overwrite
+   and do not publish transcript-derived legacy descriptions.
+10. Trigger one manual authoritative canary. It must perform no Clockify or
    Google Sheet write. With unchanged evidence it must make no SER-651
    mutation.
 
@@ -137,4 +190,5 @@ If agent execution or the canary fails:
 6. Do not restore the old always-comment/description-overwrite behavior merely
    to make the schedule appear active.
 
-Google Sheet and Clockify writes are excluded from this rollout.
+Google Sheet and Clockify writes remain separate guarded actions and are
+excluded from the implementation and shadow-evaluation stages.

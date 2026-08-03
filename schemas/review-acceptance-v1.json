@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "review-acceptance-v1.json",
+  "title": "Clockify review acceptance v1",
+  "type": "object",
+  "oneOf": [
+    {"$ref": "#/$defs/period"},
+    {"$ref": "#/$defs/gate"}
+  ],
+  "$defs": {
+    "period": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "stage", "run_id", "replay_run_id", "ledger_manifest_id",
+        "ledger_evidence_digest", "analyzer_versions", "analyzer_scorecard_digests",
+        "analyzer_evaluation_pass", "denominator_digest", "decision_ids",
+        "denominator_count", "approve_unchanged_count", "modify_count", "skip_count",
+        "missing_decision_count", "unassessed_changed_count", "unchanged_approval_rate",
+        "critical_errors", "critical_error_count", "source_complete", "quality_pass", "coverage_clean",
+        "replay_stable", "full_denominator_complete", "period_id", "previous_digest",
+        "record_digest"
+      ],
+      "properties": {
+        "schema_version": {"const": 1},
+        "stage": {"enum": ["shadow_baseline", "guarded"]},
+        "run_id": {"type": "string", "minLength": 1},
+        "replay_run_id": {"type": "string", "minLength": 1},
+        "ledger_manifest_id": {"type": "string", "minLength": 1},
+        "ledger_evidence_digest": {"type": "string", "minLength": 1},
+        "analyzer_versions": {"type": "array", "minItems": 1, "items": {"type": "object"}},
+        "analyzer_scorecard_digests": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+        },
+        "analyzer_evaluation_pass": {"type": "boolean"},
+        "denominator_digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+        "decision_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+        "denominator_count": {"type": "integer", "minimum": 1},
+        "approve_unchanged_count": {"type": "integer", "minimum": 0},
+        "modify_count": {"type": "integer", "minimum": 0},
+        "skip_count": {"type": "integer", "minimum": 0},
+        "missing_decision_count": {"type": "integer", "minimum": 0},
+        "unassessed_changed_count": {"type": "integer", "minimum": 0},
+        "unchanged_approval_rate": {"type": "number", "minimum": 0, "maximum": 1},
+        "critical_errors": {"type": "array", "items": {"type": "object"}},
+        "critical_error_count": {"type": "integer", "minimum": 0},
+        "source_complete": {"type": "boolean"},
+        "quality_pass": {"type": "boolean"},
+        "coverage_clean": {"type": "boolean"},
+        "replay_stable": {"type": "boolean"},
+        "full_denominator_complete": {"type": "boolean"},
+        "period_id": {"type": "string", "pattern": "^rperiod-[a-f0-9]{24}$"},
+        "previous_digest": {"type": ["string", "null"], "pattern": "^sha256:[a-f0-9]{64}$"},
+        "record_digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}
+      }
+    },
+    "gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "period_count", "baseline_90_passed", "guarded_95_period_ids", "exceptions_only_eligible"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "period_count": {"type": "integer", "minimum": 0},
+        "baseline_90_passed": {"type": "boolean"},
+        "guarded_95_period_ids": {"type": "array", "maxItems": 2, "items": {"type": "string"}},
+        "exceptions_only_eligible": {"type": "boolean"}
+      }
+    }
+  }
+}

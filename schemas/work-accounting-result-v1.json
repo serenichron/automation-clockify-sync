@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "work-accounting-result-v1.json",
+  "title": "Clockify work accounting result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "allocation_mode", "ledger_manifest", "semantic_analysis",
+    "proposals", "ambiguous", "skipped", "allocation", "fathom_reconciliation",
+    "correction_regression", "external_writes"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "allocation_mode": {"const": "non_overlapping_v1"},
+    "ledger_manifest": {"type": "object"},
+    "semantic_analysis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["prompt_version", "activity_count", "exception_count", "omission_count", "noise_count", "learning_case_count"],
+      "properties": {
+        "prompt_version": {"type": ["string", "null"]},
+        "activity_count": {"type": "integer", "minimum": 0},
+        "exception_count": {"type": "integer", "minimum": 0},
+        "omission_count": {"type": "integer", "minimum": 0},
+        "noise_count": {"type": "integer", "minimum": 0},
+        "learning_case_count": {"type": "integer", "minimum": 0}
+      }
+    },
+    "proposals": {"type": "array", "items": {"$ref": "#/$defs/proposal"}},
+    "ambiguous": {"type": "array", "items": {"type": "object"}},
+    "skipped": {"type": "array", "items": {"type": "object"}},
+    "allocation": {"type": "object"},
+    "fathom_reconciliation": {"type": "array", "items": {"type": "object"}},
+    "correction_regression": {"$ref": "#/$defs/correctionRegression"},
+    "external_writes": {"const": false}
+  },
+  "$defs": {
+    "correctionRegression": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "results", "summary"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "results": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "regression_case_id", "activity_id", "evidence_fingerprint",
+              "decision", "status", "failures"
+            ],
+            "properties": {
+              "regression_case_id": {"type": "string", "pattern": "^rcase-[a-f0-9]{24}$"},
+              "activity_id": {"type": "string", "pattern": "^act-[a-f0-9]{24}$"},
+              "evidence_fingerprint": {"type": "string", "pattern": "^evfp:sha256:[a-f0-9]{64}$"},
+              "decision": {"enum": ["approve", "skip", "modify"]},
+              "status": {"enum": ["pass", "fail", "not_applicable"]},
+              "failures": {"type": "array", "items": {"type": "string"}}
+            }
+          }
+        },
+        "summary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["pass", "fail", "not_applicable"],
+          "properties": {
+            "pass": {"type": "integer", "minimum": 0},
+            "fail": {"type": "integer", "minimum": 0},
+            "not_applicable": {"type": "integer", "minimum": 0}
+          }
+        }
+      }
+    },
+    "proposal": {
+      "type": "object",
+      "required": [
+        "id", "candidate_key", "review_activity_key", "allocation_segment",
+        "activity_id", "workstream_id", "start", "end",
+        "duration_minutes", "client_project", "description", "source", "allocation_mode",
+        "rendered_description", "effort", "provenance"
+      ],
+      "properties": {
+        "id": {"type": "string", "pattern": "^P[0-9]{3,}$"},
+        "candidate_key": {"type": "string", "pattern": "^wks-[a-f0-9]{24}$"},
+        "review_activity_key": {"type": "string", "pattern": "^wka-[a-f0-9]{24}$"},
+        "allocation_segment": {"type": "integer", "minimum": 1},
+        "activity_id": {"type": "string", "pattern": "^act-[a-f0-9]{24}$"},
+        "workstream_id": {"type": "string", "pattern": "^ws-[a-f0-9]{24}$"},
+        "start": {"type": "string"},
+        "end": {"type": "string"},
+        "duration_minutes": {"type": "integer", "minimum": 1},
+        "client_project": {"type": "string", "minLength": 1},
+        "description": {"type": "string", "minLength": 1},
+        "rendered_description": {"type": "string", "minLength": 1},
+        "source": {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^evidence:ev-[a-f0-9]{64}$"}},
+        "allocation_mode": {"const": "non_overlapping_v1"},
+        "effort": {"type": "object"},
+        "provenance": {"type": "object"}
+      }
+    }
+  }
+}

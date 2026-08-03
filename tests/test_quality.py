@@ -164,6 +164,98 @@ class QualityMatchingTests(unittest.TestCase):
             report["reviews"][0]["issues"],
         )
 
+    def test_semantic_segments_may_share_one_activity_description(self):
+        proposals = [
+            {
+                "id": "P001",
+                "activity_id": "act-one",
+                "description": "SC — Rebuilt Clockify review process for accurate automatic timesheets",
+            },
+            {
+                "id": "P002",
+                "activity_id": "act-one",
+                "description": "SC — Rebuilt Clockify review process for accurate automatic timesheets",
+            },
+        ]
+        self.assertEqual([], quality.find_duplicate_descriptions(proposals))
+
+    def test_quality_detects_proposal_overlap_with_existing_clockify(self):
+        overlaps = quality.find_time_overlaps(
+            [
+                {
+                    "id": "P001",
+                    "start": "2026-07-10T10:00:00+03:00",
+                    "end": "2026-07-10T11:00:00+03:00",
+                }
+            ],
+            [
+                {
+                    "start": "2026-07-10T10:30:00+03:00",
+                    "end": "2026-07-10T11:30:00+03:00",
+                }
+            ],
+        )
+        self.assertEqual([{"left": "P001", "right": "existing-1"}], overlaps)
+
+    def test_semantic_proposal_must_pass_caveman_contract(self):
+        row = proposal(
+            id="P001",
+            candidate_key="wk-one",
+            description="SC — [NEEDS REVIEW] raw prompt...",
+            start="2026-07-10T10:00:00+03:00",
+            end="2026-07-10T10:30:00+03:00",
+            duration_minutes=30,
+        )
+        row.update(
+            {
+                "activity_id": "act-one",
+                "workstream_id": "ws-one",
+                "review_activity_key": "wka-one",
+                "allocation_segment": 1,
+                "rendered_description": "SC — [NEEDS REVIEW] raw prompt...",
+                "allocation_mode": "non_overlapping_v1",
+                "provenance": {
+                    "source_type": "semantic_activity",
+                    "source_session_id": "act-one",
+                    "evidence_ids": ["ev-one"],
+                },
+            }
+        )
+        review = quality.review_proposal(row, {}, [])
+        self.assertTrue(review["has_issues"])
+        self.assertTrue(
+            any("Caveman description contract" in issue for issue in review["issues"])
+        )
+
+    def test_semantic_proposal_requires_matching_structured_render(self):
+        row = proposal(
+            id="P001",
+            candidate_key="wks-one",
+            description="SC — Rebuilt Clockify review process for accurate automatic timesheets",
+            start="2026-07-10T10:00:00+03:00",
+            end="2026-07-10T10:30:00+03:00",
+            duration_minutes=30,
+        )
+        row.update(
+            {
+                "activity_id": "act-one",
+                "workstream_id": "ws-one",
+                "review_activity_key": "wka-one",
+                "allocation_segment": 1,
+                "rendered_description": "SC — Different structured description that cannot be trusted",
+                "allocation_mode": "non_overlapping_v1",
+                "provenance": {
+                    "source_type": "semantic_activity",
+                    "source_session_id": "act-one",
+                    "evidence_ids": ["ev-one"],
+                },
+            }
+        )
+        review = quality.review_proposal(row, {}, [])
+        self.assertTrue(
+            any("rendered_description" in issue for issue in review["issues"])
+        )
+
 
 class QualityCliTests(unittest.TestCase):
     def test_dry_run_performs_no_write(self):

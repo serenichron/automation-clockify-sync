@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "semantic-analysis-v1.json",
+  "title": "Clockify semantic analysis v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "prompt_version",
+    "ledger_event_count",
+    "ledger_evidence_digest",
+    "activities",
+    "exceptions",
+    "omissions",
+    "analysis_chunks"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "prompt_version": {"const": "clockify-semantic-v1"},
+    "ledger_event_count": {"type": "integer", "minimum": 0},
+    "ledger_evidence_digest": {"type": "string", "pattern": "^led-[a-f0-9]{24}$"},
+    "activities": {"type": "array", "items": {"$ref": "#/$defs/activity"}},
+    "exceptions": {"type": "array", "items": {"$ref": "#/$defs/nonactivity"}},
+    "omissions": {"type": "array", "items": {"$ref": "#/$defs/nonactivity"}},
+    "analysis_chunks": {"type": "array", "items": {"$ref": "#/$defs/chunk"}},
+    "noise_classifications": {"type": "array", "items": {"type": "object"}}
+  },
+  "$defs": {
+    "evidenceIds": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^ev-[a-f0-9]{64}$"}
+    },
+    "effort": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["minimum_minutes", "recommended_minutes", "maximum_minutes"],
+      "properties": {
+        "minimum_minutes": {"type": "integer", "minimum": 1},
+        "recommended_minutes": {"type": "integer", "minimum": 1},
+        "maximum_minutes": {"type": "integer", "minimum": 1}
+      }
+    },
+    "activity": {
+      "type": "object",
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {"lifecycle": {"not": {"enum": ["planned", "noise"]}}},
+            "required": ["lifecycle"]
+          },
+          "then": {
+            "properties": {"split_rationale": {"type": "string", "minLength": 1}}
+          }
+        }
+      ],
+      "required": [
+        "activity_id", "workstream_id", "workstream", "lifecycle", "action", "object", "outcome",
+        "evidence_ids", "evidence_spans", "project_recommendation", "effort",
+        "semantic_confidence", "timing_confidence", "split_rationale", "merge_rationale",
+        "omit_rationale", "rendered_description", "analyzer_model", "analyzer_tier",
+        "prompt_version", "schema_version"
+      ],
+      "properties": {
+        "activity_id": {"type": "string", "pattern": "^act-[a-f0-9]{24}$"},
+        "workstream_id": {"type": "string", "pattern": "^ws-[a-f0-9]{24}$"},
+        "workstream": {"type": "string", "minLength": 1},
+        "lifecycle": {"enum": ["completed", "advanced", "investigated", "meeting", "planned", "blocked", "noise"]},
+        "action": {"type": "string"},
+        "object": {"type": "string"},
+        "outcome": {"type": "string"},
+        "evidence_ids": {"$ref": "#/$defs/evidenceIds"},
+        "evidence_spans": {"type": "array", "items": {"type": "object"}},
+        "project_recommendation": {"type": "object"},
+        "effort": {"$ref": "#/$defs/effort"},
+        "semantic_confidence": {"enum": ["low", "medium", "high"]},
+        "timing_confidence": {"enum": ["low", "medium", "high"]},
+        "split_rationale": {"type": "string"},
+        "merge_rationale": {"type": "string"},
+        "omit_rationale": {"type": "string"},
+        "rendered_description": {"type": ["string", "null"]},
+        "analyzer_model": {"type": "string"},
+        "analyzer_tier": {"enum": ["primary", "fallback", "fixture"]},
+        "prompt_version": {"const": "clockify-semantic-v1"},
+        "schema_version": {"const": 1}
+      }
+    },
+    "nonactivity": {
+      "type": "object",
+      "required": ["evidence_ids", "reason"],
+      "properties": {
+        "evidence_ids": {"$ref": "#/$defs/evidenceIds"},
+        "reason": {"type": "string"}
+      }
+    },
+    "chunk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["chunk", "event_count", "evidence_digest", "endpoint", "model", "tier"],
+      "properties": {
+        "chunk": {"type": "integer", "minimum": 1},
+        "event_count": {"type": "integer", "minimum": 1},
+        "evidence_digest": {"type": "string", "pattern": "^ech-[a-f0-9]{24}$"},
+        "endpoint": {"type": "string"},
+        "model": {"type": "string"},
+        "tier": {"enum": ["primary", "fallback"]}
+      }
+    }
+  }
+}

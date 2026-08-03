@@ -15,6 +15,11 @@ import re
 from pathlib import Path
 from typing import Any
 
+try:
+    from scripts import caveman_renderer
+except ModuleNotFoundError:
+    import caveman_renderer  # type: ignore[no-redef]
+
 ROOT = Path(__file__).resolve().parents[1]
 RUNS = ROOT / "runs"
 BUCHAREST = dt.timezone(dt.timedelta(hours=3))
@@ -329,6 +334,21 @@ def review_proposal(
     improved_description = None
     description = str(proposal.get("description") or "")
 
+    if proposal.get("allocation_mode") == "non_overlapping_v1":
+        try:
+            caveman_renderer.validate_description(description)
+        except caveman_renderer.CavemanValidationError as exc:
+            issues.append(f"Caveman description contract failed: {exc}")
+        if not proposal.get("activity_id") or not proposal.get("workstream_id"):
+            issues.append("Semantic proposal lacks stable activity/workstream identity")
+        provenance_ids = (_provenance(proposal).get("evidence_ids") or [])
+        if not provenance_ids:
+            issues.append("Semantic proposal lacks cited evidence IDs")
+        if not proposal.get("review_activity_key") or not proposal.get("allocation_segment"):
+            issues.append("Semantic proposal lacks durable activity/segment identity")
+        if proposal.get("rendered_description") != description:
+            issues.append("Structured rendered_description does not match description")
+
     prefix_warning = check_prefix_match(proposal, routes)
     if prefix_warning:
         issues.append(prefix_warning)
@@ -394,16 +414,56 @@ def review_proposal(
 
 
 def find_duplicate_descriptions(proposals: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    descriptions: dict[str, list[str]] = {}
+    descriptions: dict[str, list[dict[str, Any]]] = {}
     for proposal in proposals:
         description = _single_line(str(proposal.get("description") or ""), 1000)
         if description:
-            descriptions.setdefault(description, []).append(str(proposal.get("id")))
-    return [
-        {"row_ids": row_ids, "description": description}
-        for description, row_ids in descriptions.items()
-        if len(row_ids) > 1
-    ]
+            descriptions.setdefault(description, []).append(proposal)
+    duplicates = []
+    for description, rows in descriptions.items():
+        if len(rows) <= 1:
+            continue
+        activity_ids = {str(row.get("activity_id") or "") for row in rows}
+        if len(activity_ids) == 1 and "" not in activity_ids:
+            # One semantic activity may need multiple non-overlapping Clockify
+            # segments. Reusing its deterministic description is intentional.
+            continue
+        duplicates.append(
+            {
+                "row_ids": [str(row.get("id")) for row in rows],
+                "description": description,
+            }
+        )
+    return duplicates
+
+
+def find_time_overlaps(
+    proposals: list[dict[str, Any]], existing: list[dict[str, Any]] | None = None
+) -> list[dict[str, str]]:
+    intervals = []
+    for proposal in proposals:
+        start = parse_timestamp(proposal.get("start"))
+        end = parse_timestamp(proposal.get("end"))
+        if start and end and end > start:
+            intervals.append((start, end, str(proposal.get("id")), "proposal"))
+    for index, entry in enumerate(existing or [], 1):
+        start = parse_timestamp(entry.get("start"))
+        end = parse_timestamp(entry.get("end"))
+        if start and end and end > start:
+            intervals.append((start, end, f"existing-{index}", "existing_clockify"))
+    intervals.sort(key=lambda row: (row[0], row[1], row[2]))
+    overlaps = []
+    for index, left in enumerate(intervals):
+        for right in intervals[index + 1 :]:
+            if right[0] >= left[1]:
+                break
+            if left[0] < right[1] and right[0] < left[1]:
+                # Existing Clockify entries can overlap each other historically;
+                # the new process owns only conflicts involving a proposal.
+                if left[3] == right[3] == "existing_clockify":
+                    continue
+                overlaps.append({"left": left[2], "right": right[2]})
+    return overlaps
 
 
 def find_duplicate_candidate_keys(
@@ -444,6 +504,9 @@ def build_report(
     proposals: list[dict[str, Any]],
     enriched: dict[str, list[dict[str, Any]]],
     routes: list[dict[str, Any]],
+    *,
+    existing: list[dict[str, Any]] | None = None,
+    accounting: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     reviews = [review_proposal(proposal, enriched, routes) for proposal in proposals]
     duplicates = find_duplicate_descriptions(proposals)
@@ -461,8 +524,25 @@ def build_report(
     ]
     needs_review = sum("[NEEDS REVIEW]" in str(p.get("description") or "") for p in proposals)
     issue_count = sum(bool(review["issues"]) for review in reviews)
+    time_overlaps = find_time_overlaps(proposals, existing)
+    accounting_issues = []
+    if accounting is not None:
+        if accounting.get("allocation_mode") != "non_overlapping_v1":
+            accounting_issues.append("Missing strict non-overlapping allocation mode")
+        if accounting.get("external_writes") is not False:
+            accounting_issues.append("Work-accounting stage did not prove external_writes=false")
+        if not accounting.get("ledger_manifest", {}).get("manifest_id"):
+            accounting_issues.append("Work-accounting result lacks a validated ledger manifest")
 
-    if missing_keys or missing_provenance or issue_count or duplicates or duplicate_keys:
+    if (
+        missing_keys
+        or missing_provenance
+        or issue_count
+        or duplicates
+        or duplicate_keys
+        or time_overlaps
+        or accounting_issues
+    ):
         status = "blocked"
     elif needs_review:
         status = "review_required"
@@ -483,11 +563,15 @@ def build_report(
             "duplicate_candidate_key_groups": len(duplicate_keys),
             "missing_candidate_keys": len(missing_keys),
             "missing_structured_provenance": len(missing_provenance),
+            "time_overlap_conflicts": len(time_overlaps),
+            "accounting_contract_issues": len(accounting_issues),
         },
         "missing_candidate_key_rows": missing_keys,
         "missing_provenance_rows": missing_provenance,
         "duplicate_descriptions": duplicates,
         "duplicate_candidate_keys": duplicate_keys,
+        "time_overlaps": time_overlaps,
+        "accounting_contract_issues": accounting_issues,
         "route_improvement_suggestions": suggest_route_improvements(proposals, routes),
         "reviews": reviews,
     }
@@ -521,8 +605,24 @@ def main(argv: list[str] | None = None) -> int:
 
     proposals = get_proposals(run_dir)
     enriched = get_enriched_context(run_dir)
-    routes = get_routing(args.root).get("session_routes", [])
-    report = build_report(run_dir.name, proposals, enriched, routes)
+    routing = get_routing(args.root)
+    routes = [
+        *routing.get("session_routes", []),
+        *routing.get("meeting_routes", []),
+    ]
+    clockify_path = run_dir / "evidence" / "clockify-existing.json"
+    existing_document = load_json(clockify_path) if clockify_path.exists() else {}
+    existing = existing_document.get("entries", []) if isinstance(existing_document, dict) else []
+    accounting_path = run_dir / "work-accounting-result.json"
+    accounting = load_json(accounting_path) if accounting_path.exists() else None
+    report = build_report(
+        run_dir.name,
+        proposals,
+        enriched,
+        routes,
+        existing=existing,
+        accounting=accounting,
+    )
 
     if not args.dry_run:
         report_path = run_dir / "quality_report.json"

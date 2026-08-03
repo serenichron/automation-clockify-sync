@@ -162,6 +162,7 @@ class CollectorBurstContextTests(unittest.TestCase):
             with mock.patch.object(collector.subprocess, "run", side_effect=fake_run):
                 collector.collect_remote_sessions(machine, SINCE, UNTIL, [])
             generated = captured["command"][-1].split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+            self.assertIn("ZoneInfo('Europe/Bucharest')", generated)
             scope: dict[str, object] = {}
             with contextlib.redirect_stdout(io.StringIO()):
                 exec(generated, scope)
@@ -316,7 +317,11 @@ class CollectorBurstContextTests(unittest.TestCase):
         def fake_http_json(url: str, headers: dict[str, str]) -> dict[str, list[dict[str, str]]]:
             captured["url"] = url
             captured["headers"] = headers
-            return {"issues": [{"id": "issue-id", "key": "SER-1", "title": "Test", "status": "open"}]}
+            return {"issues": [{
+                "id": "issue-id", "key": "SER-1", "title": "Test",
+                "description": "Rebuild evidence accounting", "status": "open",
+                "updatedAt": "2026-08-01T10:00:00Z", "labels": ["clockify"],
+            }]}
 
         with mock.patch.dict(collector.os.environ, env, clear=True), mock.patch.object(
             collector, "_home_candidates", side_effect=AssertionError("profile lookup must not run")
@@ -324,11 +329,198 @@ class CollectorBurstContextTests(unittest.TestCase):
             result = collector.fetch_multica_issues()
 
         self.assertEqual("ok", result["status"])
-        self.assertEqual("https://multica.example.test/api/issues?limit=100", captured["url"])
+        self.assertEqual(
+            "https://multica.example.test/api/issues?limit=100&offset=0",
+            captured["url"],
+        )
         self.assertEqual(
             {"Authorization": "Bearer multica-test-token", "X-Workspace-ID": "workspace-id"},
             captured["headers"],
         )
+        self.assertEqual("Rebuild evidence accounting", result["issues"][0]["description"])
+        self.assertEqual("2026-08-01T10:00:00Z", result["issues"][0]["updated_at"])
+        self.assertEqual(["clockify"], result["issues"][0]["labels"])
+        self.assertTrue(result["complete"])
+
+    def test_multica_issue_collection_paginates_past_one_hundred(self) -> None:
+        env = {
+            "MULTICA_TOKEN": "test-token",
+            "MULTICA_SERVER_URL": "https://multica.example.test",
+            "MULTICA_WORKSPACE_ID": "workspace-id",
+        }
+        calls = []
+
+        def fake_http_json(url, headers):
+            calls.append(url)
+            if "offset=0" in url:
+                return {"issues": [{"id": f"issue-{index}"} for index in range(100)]}
+            if "offset=100" in url:
+                return {"issues": [{"id": "issue-100"}]}
+            raise AssertionError(url)
+
+        with mock.patch.dict(collector.os.environ, env, clear=True), mock.patch.object(
+            collector, "_home_candidates", side_effect=AssertionError("profile lookup must not run")
+        ), mock.patch.object(collector, "http_json", side_effect=fake_http_json):
+            result = collector.fetch_multica_issues()
+
+        self.assertEqual("ok", result["status"])
+        self.assertEqual(101, len(result["issues"]))
+        self.assertEqual(2, result["pages_fetched"])
+        self.assertTrue(result["complete"])
+        self.assertTrue(any("offset=100" in call for call in calls))
+
+    def test_multica_issue_collection_filters_to_requested_activity_window(self) -> None:
+        env = {
+            "MULTICA_TOKEN": "test-token",
+            "MULTICA_SERVER_URL": "https://multica.example.test",
+            "MULTICA_WORKSPACE_ID": "workspace-id",
+        }
+        items = [
+            {"id": "in", "updated_at": "2026-07-21T10:00:00Z"},
+            {"id": "old", "updated_at": "2026-06-20T10:00:00Z"},
+            {"id": "undated"},
+        ]
+        with mock.patch.dict(collector.os.environ, env, clear=True), mock.patch.object(
+            collector, "_home_candidates", side_effect=AssertionError("profile lookup must not run")
+        ), mock.patch.object(
+            collector, "http_json", return_value={"issues": items}
+        ):
+            result = collector.fetch_multica_issues(SINCE, UNTIL)
+
+        self.assertEqual(["in"], [issue["id"] for issue in result["issues"]])
+        self.assertEqual(SINCE.isoformat(), result["activity_window"]["since"])
+        self.assertEqual(UNTIL.isoformat(), result["activity_window"]["until"])
+
+    def test_clockify_collection_paginates_all_existing_fixed_blocks(self) -> None:
+        calls = []
+
+        def fake_get(path, env):
+            calls.append(path)
+            if "page=1&" in path:
+                return [
+                    {
+                        "id": f"clockify-{index:03d}",
+                        "timeInterval": {
+                            "start": "2026-07-21T07:00:00Z",
+                            "end": "2026-07-21T07:05:00Z",
+                        },
+                    }
+                    for index in range(200)
+                ]
+            if "page=2&" in path:
+                return [
+                    {
+                        "id": "clockify-200",
+                        "timeInterval": {
+                            "start": "2026-07-21T08:00:00Z",
+                            "end": "2026-07-21T08:05:00Z",
+                        },
+                    }
+                ]
+            raise AssertionError(path)
+
+        with mock.patch.object(collector, "clockify_get", side_effect=fake_get):
+            result = collector.fetch_clockify(
+                {"CLOCKIFY_WORKSPACE_ID": "workspace", "CLOCKIFY_API_KEY": "not-logged"},
+                {"clockify_user_id": "user"},
+                SINCE,
+                UNTIL,
+            )
+
+        self.assertEqual("ok", result["status"])
+        self.assertTrue(result["complete"])
+        self.assertEqual(2, result["pages_fetched"])
+        self.assertEqual(201, len(result["entries"]))
+        self.assertTrue(any("page=2&" in call for call in calls))
+
+    def test_clockify_pagination_failure_marks_source_incomplete(self) -> None:
+        with mock.patch.object(collector, "clockify_get", side_effect=OSError("offline")):
+            result = collector.fetch_clockify(
+                {"CLOCKIFY_WORKSPACE_ID": "workspace", "CLOCKIFY_API_KEY": "not-logged"},
+                {"clockify_user_id": "user"},
+                SINCE,
+                UNTIL,
+            )
+        self.assertEqual("error", result["status"])
+        self.assertFalse(result["complete"])
+        self.assertEqual([], result["entries"])
+
+    def test_running_clockify_entry_is_preserved_and_blocks_accounting(self) -> None:
+        def fake_get(path, env):
+            self.assertIn("page=1&", path)
+            return [
+                {
+                    "id": "completed-entry",
+                    "timeInterval": {
+                        "start": "2026-07-21T07:00:00Z",
+                        "end": "2026-07-21T07:30:00Z",
+                    },
+                },
+                {
+                    "id": "running-entry",
+                    "timeInterval": {
+                        "start": "2026-07-21T08:00:00Z",
+                        "end": None,
+                    },
+                },
+            ]
+
+        with mock.patch.object(collector, "clockify_get", side_effect=fake_get):
+            result = collector.fetch_clockify(
+                {"CLOCKIFY_WORKSPACE_ID": "workspace", "CLOCKIFY_API_KEY": "not-logged"},
+                {"clockify_user_id": "user"},
+                SINCE,
+                UNTIL,
+            )
+
+        self.assertEqual("partial", result["status"])
+        self.assertFalse(result["complete"])
+        self.assertEqual(1, result["running_entry_count"])
+        running = next(entry for entry in result["entries"] if entry["id_suffix"] == "ng-entry")
+        self.assertIsNone(running["end"])
+        self.assertTrue(running["running"])
+
+    def test_repository_evidence_uses_only_commits_from_observed_session_cwds(self) -> None:
+        session_result = {
+            "machine": "macbook",
+            "claude_bursts": [],
+            "hermes_sessions": [],
+            "hermes_db_sessions": [],
+            "codex_sessions": [{"cwd": "/work/project"}],
+        }
+        responses = [
+            mock.Mock(returncode=0, stdout="/work/project\n", stderr=""),
+            mock.Mock(
+                returncode=0,
+                stdout=(
+                    "\x1e"
+                    + "a" * 40
+                    + "\x1f2026-07-20T10:00:00+03:00"
+                    + "\x1f2026-07-20T09:55:00+03:00"
+                    + "\x1fFix stable review identity\n\n"
+                    + "scripts/review.py\ntests/test_review.py\n"
+                ),
+                stderr="",
+            ),
+        ]
+        with mock.patch.object(Path, "is_dir", return_value=True), mock.patch.object(
+            collector.subprocess, "run", side_effect=responses
+        ) as run:
+            records, roots, errors = collector.collect_repository_events(
+                session_result, SINCE, UNTIL
+            )
+        self.assertEqual([], errors)
+        self.assertEqual(["/work/project"], roots)
+        self.assertEqual(1, len(records))
+        self.assertEqual("Fix stable review identity", records[0]["subject"])
+        self.assertEqual(
+            ["scripts/review.py", "tests/test_review.py"], records[0]["artifacts"]
+        )
+        log_command = run.call_args_list[1].args[0]
+        self.assertNotIn("--max-count=500", log_command)
+        self.assertTrue(any(part.startswith("--since=") for part in log_command))
+        self.assertTrue(any(part.startswith("--until=") for part in log_command))
+        self.assertTrue(all("status" not in call.args for call in run.call_args_list))
 
     def test_description_is_single_line_capped_and_ignores_sentinels(self) -> None:
         burst = {
@@ -363,6 +555,8 @@ class CollectorBurstContextTests(unittest.TestCase):
         self.assertIn("git: abc123", text)
         self.assertIn("review-snapshot.json", text)
         self.assertIn("stable review item IDs", text)
+        self.assertIn("legacy candidates", text)
+        self.assertNotIn("Proposal table", text)
 
 
     def test_auto_fleet_entry_is_local_only_on_matching_host(self) -> None:

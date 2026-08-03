@@ -9,6 +9,8 @@ runs/
 
 # Mutable local review state
 state/review-items.json
+state/review-corrections.jsonl
+state/review-acceptance.jsonl
 
 # Python cache
 __pycache__/

@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "evidence-ledger-v1.json",
+  "title": "Clockify evidence ledger v1",
+  "type": "object",
+  "oneOf": [
+    {"$ref": "#/$defs/ledgerDocument"},
+    {"$ref": "#/$defs/event"},
+    {"$ref": "#/$defs/manifest"}
+  ],
+  "$defs": {
+    "jsonObject": {"type": "object", "additionalProperties": true},
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "evidence_id", "source_type", "source_ref", "raw_source_span", "attributes", "legacy_aliases"],
+      "properties": {
+        "schema_version": {"const": "evidence-ledger/v1"},
+        "evidence_id": {"type": "string", "pattern": "^ev-[a-f0-9]{64}$"},
+        "source_type": {"type": "string", "minLength": 1},
+        "source_ref": {"$ref": "#/$defs/jsonObject", "minProperties": 1},
+        "observed_at": {"type": ["string", "null"]},
+        "raw_source_span": {"$ref": "#/$defs/jsonObject"},
+        "attributes": {"$ref": "#/$defs/jsonObject"},
+        "legacy_aliases": {"type": "object", "additionalProperties": {"type": "string"}}
+      }
+    },
+    "ledgerDocument": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "manifest", "events"],
+      "properties": {
+        "schema_version": {"const": "evidence-ledger/v1"},
+        "manifest": {"$ref": "#/$defs/manifest"},
+        "events": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/event"}
+        }
+      }
+    },
+    "manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "manifest_id", "events_digest", "event_count", "source_inventory", "source_completeness"],
+      "properties": {
+        "schema_version": {"const": "evidence-ledger/v1"},
+        "manifest_id": {"type": "string", "pattern": "^elm-[a-f0-9]{64}$"},
+        "events_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "event_count": {"type": "integer", "minimum": 0},
+        "source_inventory": {"type": "object", "additionalProperties": {"$ref": "#/$defs/sourceStatus"}},
+        "source_completeness": {"type": "object"}
+      }
+    },
+    "sourceStatus": {
+      "type": "object",
+      "required": ["status"],
+      "properties": {
+        "status": {"enum": ["complete", "partial", "unavailable", "excluded"]},
+        "expected_count": {"type": "integer", "minimum": 0},
+        "observed_count": {"type": "integer", "minimum": 0},
+        "reason": {"type": "string"}
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -79,6 +79,21 @@ def _digest(prefix: str, value: Any) -> str:
     return prefix + hashlib.sha256(_canonical(value).encode("utf-8")).hexdigest()[:20]
 
 
+def _evidence_ids(record: dict[str, Any]) -> list[str]:
+    provenance = record.get("provenance") if isinstance(record.get("provenance"), dict) else {}
+    values = record.get("evidence_ids", provenance.get("evidence_ids", []))
+    if not isinstance(values, (list, tuple, set)):
+        return []
+    return sorted({str(value).strip() for value in values if str(value).strip()})
+
+
+def _evidence_fingerprint(record: dict[str, Any]) -> str:
+    values = _evidence_ids(record)
+    if not values:
+        return ""
+    return "evfp:sha256:" + hashlib.sha256(_canonical({"evidence_ids": values}).encode("utf-8")).hexdigest()
+
+
 def _clean_record(record: dict[str, Any]) -> dict[str, Any]:
     """Drop ephemeral display IDs, retaining all review-relevant collector data."""
     cleaned = copy.deepcopy(record)
@@ -108,6 +123,11 @@ def _identity(record: dict[str, Any]) -> dict[str, Any]:
     project = _normal_text(record.get("client_project") or record.get("project"))
     return {
         "provided_candidate_key": _normal_text(record.get("candidate_key")),
+        "provided_activity_key": _normal_text(record.get("review_activity_key")),
+        "activity_id": _normal_text(record.get("activity_id")),
+        "workstream_id": _normal_text(record.get("workstream_id")),
+        "evidence_ids": _evidence_ids(record),
+        "evidence_fingerprint": _evidence_fingerprint(record),
         "provenance": provenance,
         "anchor": anchor,
         "fallback": {**anchor, "project": project},
@@ -118,6 +138,18 @@ def _keys(record: dict[str, Any]) -> dict[str, str]:
     identity = _identity(record)
     return {
         "candidate_key": identity["provided_candidate_key"],
+        "activity_key": identity["provided_activity_key"] or (
+            _digest(
+                "act-",
+                {
+                    "activity_id": identity["activity_id"],
+                    "workstream_id": identity["workstream_id"],
+                    "evidence_fingerprint": identity["evidence_fingerprint"],
+                },
+            )
+            if identity["activity_id"] and identity["evidence_fingerprint"]
+            else ""
+        ),
         "provenance_key": _digest("pv-", identity["provenance"]) if identity["provenance"] else "",
         "anchor_key": _digest("sa-", identity["anchor"]),
         "fallback_key": _digest("sf-", identity["fallback"]),
@@ -140,13 +172,18 @@ def load_state(path: Path) -> dict[str, Any]:
     return state
 
 
-def _find_item(state: dict[str, Any], keys: dict[str, str]) -> dict[str, Any] | None:
+def _find_item(state: dict[str, Any], keys: dict[str, str], *, excluded_ids: set[str] | None = None) -> dict[str, Any] | None:
     items = state["items"]
-    for name in ("candidate_key", "provenance_key", "anchor_key", "fallback_key"):
+    excluded_ids = excluded_ids or set()
+    # Semantic allocation rows are collapsed into one activity-level review
+    # record before matching.  That makes activity_key safe to use: allocation
+    # movement or one-to-many segment changes cannot map one review decision to
+    # several independently reviewable rows.
+    for name in ("activity_key", "candidate_key", "provenance_key", "anchor_key", "fallback_key"):
         value = keys[name]
         if not value:
             continue
-        matches = [item for item in items.values() if item.get("match_keys", {}).get(name) == value]
+        matches = [item for item in items.values() if item["id"] not in excluded_ids and item.get("match_keys", {}).get(name) == value]
         if len(matches) == 1:
             return matches[0]
     return None
@@ -157,12 +194,17 @@ def _item_view(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": item["id"],
         "candidate_key": item["candidate_key"],
+        "activity_id": current.get("activity_id"),
+        "workstream_id": current.get("workstream_id"),
+        "evidence_ids": _evidence_ids(current),
+        "evidence_fingerprint": _evidence_fingerprint(current),
         "disposition": item["disposition"],
         "revision": item["revision"],
         "last_seen_run": item.get("last_seen_run"),
         "start": current.get("start"),
         "end": current.get("end"),
         "duration_minutes": current.get("duration_minutes"),
+        "allocation_segments": current.get("allocation_segments", []),
         "time": current.get("time"),
         "source": current.get("source"),
         "label": current.get("source_label") or current.get("label"),
@@ -171,6 +213,8 @@ def _item_view(item: dict[str, Any]) -> dict[str, Any]:
         "tag_names": current.get("tag_names"),
         "confidence": current.get("confidence"),
         "reason": current.get("reason"),
+        "parent_review_item_id": item.get("parent_review_item_id"),
+        "supersedes": item.get("supersedes", []),
     }
 
 
@@ -193,6 +237,109 @@ def _load_records(run_dir: Path, warnings: list[dict[str, str]]) -> list[tuple[s
                 raise ValueError(f"Expected object records in {path}")
             records.append((disposition, record))
     return records
+
+
+def _semantic_allocation(record: dict[str, Any]) -> bool:
+    provenance = record.get("provenance") if isinstance(record.get("provenance"), dict) else {}
+    return bool(
+        record.get("activity_id")
+        and _evidence_ids(record)
+        and record.get("start")
+        and record.get("end")
+        and (
+            record.get("allocation_mode")
+            or provenance.get("source_type") == "semantic_activity"
+        )
+    )
+
+
+def _aggregate_semantic_allocations(
+    records: list[tuple[str, dict[str, Any]]],
+) -> list[tuple[str, dict[str, Any]]]:
+    """Collapse placement segments into one durable activity review item.
+
+    Clockify may eventually receive several non-overlapping entries for one
+    atomic accomplishment, but the human decision is about that accomplishment.
+    Keeping the full segment collection on one item prevents allocation movement
+    from creating fresh rvi IDs or orphaning an approve/skip/modify decision.
+    """
+    passthrough: list[tuple[str, dict[str, Any]]] = []
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for disposition, raw in records:
+        record = _clean_record(raw)
+        keys = _keys(record)
+        if not _semantic_allocation(record) or not keys["activity_key"]:
+            passthrough.append((disposition, record))
+            continue
+        groups.setdefault((disposition, keys["activity_key"]), []).append(record)
+
+    for (disposition, activity_key), values in sorted(groups.items()):
+        ordered = sorted(
+            values,
+            key=lambda value: (
+                _normal_time(value.get("start")),
+                _normal_time(value.get("end")),
+                _normal_text(value.get("candidate_key")),
+            ),
+        )
+        common_fields = (
+            "activity_id", "workstream_id", "description", "client_project",
+            "clockify_project_suffix", "tag_suffixes", "tag_names", "billable",
+            "source", "source_label", "confidence", "timing_confidence",
+            "rationale", "allocation_mode", "effort",
+        )
+        signature = {
+            field: _canonical(value.get(field))
+            for field in common_fields
+            for value in ordered[:1]
+        }
+        if any(
+            any(_canonical(value.get(field)) != signature[field] for field in common_fields)
+            for value in ordered[1:]
+        ):
+            # Conflicting semantic rows must remain separately visible rather
+            # than being silently combined under one human decision.
+            passthrough.extend((disposition, value) for value in ordered)
+            continue
+        normalized_provenance = []
+        for value in ordered:
+            provenance = copy.deepcopy(value.get("provenance") or {})
+            if isinstance(provenance, dict):
+                provenance.pop("burst_start", None)
+                provenance.pop("burst_end", None)
+            normalized_provenance.append(provenance)
+        if any(
+            _canonical(value) != _canonical(normalized_provenance[0])
+            for value in normalized_provenance[1:]
+        ):
+            passthrough.extend((disposition, value) for value in ordered)
+            continue
+        aggregate = copy.deepcopy(ordered[0])
+        segments = [
+            {
+                "candidate_key": str(value.get("candidate_key") or ""),
+                "segment": int(value.get("allocation_segment") or index),
+                "start": value.get("start"),
+                "end": value.get("end"),
+                "duration_minutes": value.get("duration_minutes"),
+            }
+            for index, value in enumerate(ordered, 1)
+        ]
+        aggregate["candidate_key"] = activity_key
+        aggregate["review_activity_key"] = activity_key
+        aggregate["start"] = segments[0]["start"]
+        aggregate["end"] = segments[-1]["end"]
+        aggregate["duration_minutes"] = sum(
+            int(segment.get("duration_minutes") or 0) for segment in segments
+        )
+        aggregate["allocation_segments"] = segments
+        aggregate["proposal_candidate_keys"] = [segment["candidate_key"] for segment in segments]
+        if isinstance(aggregate.get("provenance"), dict):
+            aggregate["provenance"]["burst_start"] = segments[0]["start"]
+            aggregate["provenance"]["burst_end"] = segments[-1]["end"]
+        aggregate.pop("allocation_segment", None)
+        passthrough.append((disposition, aggregate))
+    return passthrough
 
 
 def _evidence_warnings(run_dir: Path, warnings: list[dict[str, str]]) -> None:
@@ -240,24 +387,107 @@ def set_disposition(state: dict[str, Any], item_id: str, disposition: str, run_i
         item.setdefault("history", []).append({"run_id": run_id, "action": "disposition_changed", "from": old, "to": disposition})
 
 
+def _parent_reference(record: dict[str, Any]) -> tuple[str, str]:
+    """Return an explicit parent type/value, never inferring a legacy split."""
+    provenance = record.get("provenance") if isinstance(record.get("provenance"), dict) else {}
+    parent = record.get("parent") if isinstance(record.get("parent"), dict) else {}
+    for key in ("parent_review_item_id", "supersedes"):
+        value = record.get(key, parent.get(key, provenance.get(key)))
+        if isinstance(value, list):
+            value = value[0] if len(value) == 1 else ""
+        if value:
+            return "review_item_id", str(value)
+    for key in ("parent_candidate_key", "legacy_candidate_key"):
+        value = record.get(key, parent.get(key, provenance.get(key)))
+        if value:
+            return "candidate_key", str(value)
+    return "", ""
+
+
+def _declared_parent_fingerprint(record: dict[str, Any]) -> str:
+    provenance = record.get("provenance") if isinstance(record.get("provenance"), dict) else {}
+    parent = record.get("parent") if isinstance(record.get("parent"), dict) else {}
+    return str(record.get("parent_evidence_fingerprint") or parent.get("evidence_fingerprint") or provenance.get("parent_evidence_fingerprint") or "")
+
+
+def _parent_item(state: dict[str, Any], kind: str, value: str) -> dict[str, Any] | None:
+    if kind == "review_item_id":
+        return state["items"].get(value)
+    matches = [item for item in state["items"].values() if item.get("candidate_key") == value]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _split_plans(
+    state: dict[str, Any],
+    prepared: list[tuple[str, dict[str, Any], dict[str, str]]],
+    warnings: list[dict[str, str]],
+) -> dict[str, dict[str, Any]]:
+    """Validate explicit legacy-to-segment migrations before touching history.
+
+    A source activity ID alone is intentionally insufficient.  The parent must
+    be named and fingerprinted, have two or more distinct children, and every
+    parent evidence ID must be covered by the child evidence union.
+    """
+    groups: dict[str, list[tuple[dict[str, Any], dict[str, str]]]] = {}
+    for _, record, keys in prepared:
+        kind, value = _parent_reference(record)
+        if kind and value:
+            groups.setdefault(f"{kind}:{value}", []).append((record, keys))
+    valid: dict[str, dict[str, Any]] = {}
+    for group_key, children in sorted(groups.items()):
+        kind, value = group_key.split(":", 1)
+        parent = _parent_item(state, kind, value)
+        reason = ""
+        if parent is None:
+            reason = "explicit parent review item was not found"
+        elif len(children) < 2:
+            reason = "split requires at least two child segments in the same replay"
+        else:
+            parent_fingerprint = _evidence_fingerprint(parent.get("current", {}))
+            declared = {_declared_parent_fingerprint(record) for record, _ in children}
+            child_ids = {str(record.get("activity_id") or "") for record, _ in children}
+            child_evidence = set().union(*[set(_evidence_ids(record)) for record, _ in children])
+            if not parent_fingerprint or declared != {parent_fingerprint}:
+                reason = "parent evidence fingerprint is missing or does not match durable state"
+            elif not all(_evidence_ids(record) for record, _ in children):
+                reason = "every split child must carry cited evidence IDs"
+            elif len(child_ids) != len(children) or "" in child_ids:
+                reason = "split children require distinct stable activity IDs"
+            elif child_evidence != set(_evidence_ids(parent.get("current", {}))):
+                reason = "child evidence does not deterministically cover the parent evidence"
+        if reason:
+            _add_warning(warnings, "migration_required", group_key, reason)
+            continue
+        for record, keys in children:
+            marker = _canonical({"record": record, "keys": keys})
+            valid[marker] = {"parent": parent, "parent_fingerprint": _evidence_fingerprint(parent.get("current", {}))}
+    return valid
+
+
 def ingest_run(run_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
     """Merge one run bundle into state and return its deterministic snapshot."""
     run_dir = run_dir.resolve()
     run_id = run_dir.name
     warnings: list[dict[str, str]] = []
-    records = _load_records(run_dir, warnings)
+    records = _aggregate_semantic_allocations(_load_records(run_dir, warnings))
     _evidence_warnings(run_dir, warnings)
     # Sorting removes collector ordering from both IDs and state history.
     prepared = sorted(
         ((disposition, _clean_record(record), _keys(record)) for disposition, record in records),
         key=lambda row: (_canonical(row[2]), _canonical(row[1])),
     )
+    split_plans = _split_plans(state, prepared, warnings)
     categories: dict[str, list[dict[str, Any]]] = {
         "new": [], "changed": [], "carried_pending": [], "resolved_disappeared": []
     }
     seen_ids: set[str] = set()
     for initial_disposition, record, keys in prepared:
-        item = _find_item(state, keys)
+        split_plan = split_plans.get(_canonical({"record": record, "keys": keys}))
+        item = _find_item(
+            state,
+            keys,
+            excluded_ids={split_plan["parent"]["id"]} if split_plan is not None else None,
+        )
         if item is None:
             stable_key = keys["candidate_key"] or keys["provenance_key"] or keys["anchor_key"] or keys["fallback_key"]
             item_id = _digest("rvi-", {"stable_key": stable_key})
@@ -275,6 +505,17 @@ def ingest_run(run_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
                 "current": record,
                 "history": [{"run_id": run_id, "action": "created", "disposition": initial_disposition}],
             }
+            if split_plan is not None:
+                parent = split_plan["parent"]
+                item["parent_review_item_id"] = parent["id"]
+                item["supersedes"] = [parent["id"]]
+                item["parent_evidence_fingerprint"] = split_plan["parent_fingerprint"]
+                item["history"].append({
+                    "run_id": run_id,
+                    "action": "split_child_linked",
+                    "parent_review_item_id": parent["id"],
+                    "parent_evidence_fingerprint": split_plan["parent_fingerprint"],
+                })
             state["items"][item_id] = item
             categories["new"].append(_item_view(item))
         else:
@@ -299,6 +540,30 @@ def ingest_run(run_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
             elif item["disposition"] in ACTIVE_DISPOSITIONS:
                 categories["carried_pending"].append(_item_view(item))
         seen_ids.add(item["id"])
+
+    # Only a fully validated batch may supersede the legacy parent.  This is
+    # deliberately after child creation so a malformed partial batch cannot
+    # hide the original review item.
+    superseded_parents: set[str] = set()
+    for plan in split_plans.values():
+        parent = plan["parent"]
+        if parent["id"] in superseded_parents or parent["id"] not in state["items"]:
+            continue
+        old = parent["disposition"]
+        if old != "superseded":
+            parent["disposition"] = "superseded"
+            parent["superseded_by"] = sorted(
+                item["id"] for item in state["items"].values()
+                if item.get("parent_review_item_id") == parent["id"]
+            )
+            parent.setdefault("history", []).append({
+                "run_id": run_id,
+                "action": "superseded_by_verified_split",
+                "from": old,
+                "children": parent["superseded_by"],
+                "evidence_fingerprint": plan["parent_fingerprint"],
+            })
+        superseded_parents.add(parent["id"])
 
     for item in sorted(state["items"].values(), key=lambda value: value["id"]):
         if item["id"] in seen_ids:

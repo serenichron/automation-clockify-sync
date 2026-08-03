@@ -1,0 +1,11 @@
+{
+  "records_digest": "43b010aa6bc9c18612e8a3a855244be7bd492364ce28fa40a65cbd341def8618",
+  "redaction_policy": "v3: preserve only source-line identity, deterministic non-identifying feature vectors, and separately human-reviewed safe semantics; never retain raw descriptions, names, account data, paths, URLs, secrets, or client facts",
+  "schema_version": "clockify-regression-corpus/v1",
+  "semantic_mapping_boundary": "Source feature vectors prove only source-shape provenance. Human review remains required to map source records to render, split, omit, or exception dispositions.",
+  "source": {
+    "logical_record_count": 86,
+    "sha256": "f796c5145131c15191f9fbfd2e02808ea553ee5888d4cb8e0a067740cb00018c"
+  },
+  "source_feature_digest": "261bab71221ebf0cc9cd48f447cbfcb21515e40614ab836986a898584b5de97a"
+}

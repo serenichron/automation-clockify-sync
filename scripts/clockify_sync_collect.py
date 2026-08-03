@@ -15,12 +15,14 @@ import json
 import os
 import pwd
 import re
+import shlex
 import socket
 import subprocess
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +30,9 @@ ROOT = Path(__file__).resolve().parents[1]
 RUNS = ROOT / "runs"
 CLOCKIFY_API = "https://api.clockify.me/api/v1"
 FATHOM_API = "https://api.fathom.ai/external/v1"
-BUCHAREST = dt.timezone(dt.timedelta(hours=3))  # display timezone; DST precision is non-critical for first dry-run
+FATHOM_HISTORY_FLOOR = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
+FATHOM_MAX_PAGES = 1000
+BUCHAREST = ZoneInfo("Europe/Bucharest")
 
 MULTICA_PROFILE = "desktop-api.multica.ai"
 
@@ -404,6 +408,62 @@ def _message_content(content: Any) -> str:
     )
 
 
+def _message_evidence(content: Any, role: str) -> list[dict[str, Any]]:
+    """Normalize text and tool activity while excluding hidden reasoning."""
+    if isinstance(content, str):
+        return [{"role": role, "kind": "message", "content": content}]
+    if not isinstance(content, list):
+        return [{"role": role, "kind": "message", "content": str(content or "")}]
+    events: list[dict[str, Any]] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "")
+        if item_type == "text":
+            events.append({"role": role, "kind": "message", "content": str(item.get("text") or "")})
+        elif item_type == "tool_use":
+            events.append(
+                {
+                    "role": role,
+                    "kind": "tool_call",
+                    "tool_name": str(item.get("name") or "unknown"),
+                    "content": json.dumps(item.get("input") or {}, ensure_ascii=False, sort_keys=True),
+                }
+            )
+        elif item_type == "tool_result":
+            value = item.get("content")
+            if not isinstance(value, str):
+                value = json.dumps(value, ensure_ascii=False, sort_keys=True)
+            events.append(
+                {
+                    "role": "tool",
+                    "kind": "tool_result",
+                    "tool_name": str(item.get("tool_use_id") or ""),
+                    "content": value,
+                }
+            )
+        # Thinking and tool-reference transport are deliberately not evidence.
+    return events
+
+
+def _serialized_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Preserve complete normalized message evidence without display truncation."""
+    return [
+        {
+            "timestamp": local_dt_string(event.get("timestamp")),
+            "role": str(event.get("role") or "unknown"),
+            "kind": str(event.get("kind") or "message"),
+            "content": str(event.get("content") or ""),
+            **(
+                {"tool_name": str(event.get("tool_name"))}
+                if event.get("tool_name")
+                else {}
+            ),
+        }
+        for event in events
+    ]
+
+
 def _partition_bursts(events: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     """Group on direct user activity, then attach assistant context without bridging gaps."""
     users = sorted(
@@ -421,7 +481,7 @@ def _partition_bursts(events: list[dict[str, Any]]) -> list[list[dict[str, Any]]
     # Each assistant result belongs to the current user burst only until the
     # following burst starts. It can enrich context but never merge user work.
     for event in events:
-        if event.get("role") != "assistant" or not event.get("timestamp"):
+        if event.get("role") == "user" or not event.get("timestamp"):
             continue
         for index, burst in enumerate(bursts):
             start = burst[0]["timestamp"]
@@ -801,8 +861,15 @@ def _extract_claude_events(path: Path, since: dt.datetime, until: dt.datetime) -
             msg_type = obj.get("type", "")
             if msg_type not in ("user", "assistant"):
                 continue
-            content = _message_content(obj.get("message", {}).get("content", ""))
-            events.append({"timestamp": t.astimezone(BUCHAREST), "role": msg_type, "content": content})
+            content = obj.get("message", {}).get("content", "")
+            for normalized in _message_evidence(content, msg_type):
+                events.append(
+                    {
+                        "timestamp": t.astimezone(BUCHAREST),
+                        "cwd": str(obj.get("cwd") or ""),
+                        **normalized,
+                    }
+                )
     except Exception:
         pass
     return events
@@ -847,6 +914,10 @@ def parse_claude_jsonl_file(path: Path | str, base: str, since: dt.datetime, unt
             "machine": machine,
             "session_id": p.stem,
             "path": str(p),
+            "cwd": next(
+                (str(event.get("cwd")) for event in burst_events if event.get("cwd")),
+                "",
+            ),
             "label": label,
             "start": local_dt_string(bs),
             "end": local_dt_string(be),
@@ -857,14 +928,108 @@ def parse_claude_jsonl_file(path: Path | str, base: str, since: dt.datetime, unt
             "evidence_level": method,
             "first_user_message": first_user,
             "last_assistant_message": last_assistant,
+            "events": _serialized_events(burst_events),
         })
     return out
+
+
+def collect_repository_events(
+    session_result: dict[str, Any],
+    since: dt.datetime,
+    until: dt.datetime,
+) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    """Collect commit-backed work products from observed session CWDs.
+
+    Dirty working-tree paths are deliberately excluded: their age and author are
+    not proven by current state.  Commit metadata and changed paths are bounded,
+    immutable evidence that may corroborate an accomplishment without becoming
+    a Clockify allocation by themselves.
+    """
+    candidate_cwds = {
+        str(record.get("cwd") or "").strip()
+        for key in ("claude_bursts", "hermes_sessions", "hermes_db_sessions", "codex_sessions")
+        for record in session_result.get(key, [])
+        if isinstance(record, dict) and str(record.get("cwd") or "").strip()
+    }
+    roots: set[str] = set()
+    errors: list[str] = []
+    for cwd in sorted(candidate_cwds):
+        path = Path(cwd)
+        if not path.is_absolute() or not path.is_dir():
+            continue
+        try:
+            resolved = subprocess.run(
+                ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except FileNotFoundError:
+            return [], [], ["git executable unavailable for repository evidence"]
+        except subprocess.TimeoutExpired:
+            errors.append(f"repository root lookup timed out: {path}")
+            continue
+        if resolved.returncode == 0 and resolved.stdout.strip():
+            roots.add(resolved.stdout.strip())
+
+    records: list[dict[str, Any]] = []
+    for root in sorted(roots):
+        try:
+            log = subprocess.run(
+                [
+                    # The requested date range is the completeness boundary.
+                    # A hard commit-count cap can silently turn a busy month
+                    # into partial evidence while reporting it as complete.
+                    "git", "-C", root, "log", "--all",
+                    f"--since={since.isoformat()}", f"--until={until.isoformat()}",
+                    "--format=%x1e%H%x1f%cI%x1f%aI%x1f%s",
+                    "--name-only",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except subprocess.TimeoutExpired:
+            errors.append(f"commit evidence timed out: {root}")
+            continue
+        if log.returncode != 0:
+            errors.append(f"commit evidence unavailable: {root}")
+            continue
+        for raw in log.stdout.split("\x1e"):
+            raw = raw.strip("\n")
+            if not raw:
+                continue
+            header, *path_lines = raw.splitlines()
+            parts = header.split("\x1f", 3)
+            if len(parts) != 4:
+                errors.append(f"malformed commit evidence: {root}")
+                continue
+            commit_sha, committed_at, authored_at, subject = parts
+            artifacts = sorted({line.strip() for line in path_lines if line.strip()})
+            records.append(
+                {
+                    "source": "git_commit",
+                    "machine": session_result.get("machine"),
+                    "id": f"{root}:{commit_sha}",
+                    "commit_sha": commit_sha,
+                    "repository_root": root,
+                    "cwd": root,
+                    "start": committed_at,
+                    "end": committed_at,
+                    "authored_at": authored_at,
+                    "subject": subject,
+                    "artifacts": artifacts,
+                    "evidence_level": "immutable git commit metadata",
+                }
+            )
+    records.sort(key=lambda value: (str(value.get("start")), str(value.get("commit_sha"))))
+    return records, sorted(roots), errors
 
 
 def collect_local_sessions(machine: dict[str, Any], since: dt.datetime, until: dt.datetime) -> dict[str, Any]:
     result = {"machine": machine["name"], "status": "ok",
               "claude_bursts": [], "hermes_sessions": [], "hermes_db_sessions": [],
-              "codex_sessions": [], "errors": []}
+              "codex_sessions": [], "repository_events": [], "errors": []}
     cbase = machine.get("claude_projects")
     if cbase and Path(cbase).exists():
         for p in Path(cbase).glob("*/*.jsonl"):
@@ -910,6 +1075,17 @@ def collect_local_sessions(machine: dict[str, Any], since: dt.datetime, until: d
                     "model": obj.get("model"),
                     "platform": obj.get("platform"),
                     "evidence_level": evidence,
+                    "events": [
+                        {
+                            "timestamp": local_dt_string(parse_dt(message.get("timestamp"))),
+                            "role": str(message.get("role") or "unknown"),
+                            "kind": "message",
+                            "content": str(message.get("content") or ""),
+                            "ordinal": index,
+                        }
+                        for index, message in enumerate(msgs)
+                        if isinstance(message, dict)
+                    ],
                 })
             except Exception as e:
                 result["errors"].append(f"hermes legacy parse failed {p.name}: {e}")
@@ -925,6 +1101,15 @@ def collect_local_sessions(machine: dict[str, Any], since: dt.datetime, until: d
         result["codex_sessions"] = collect_codex_sessions(codex_home, machine["name"], since, until)
     else:
         result["errors"].append(f"codex_home not found: {codex_home}")
+    repository_events, repository_roots, repository_errors = collect_repository_events(
+        result, since, until
+    )
+    result["repository_events"] = repository_events
+    result["repository_roots"] = repository_roots
+    result["repository_evidence_status"] = "partial" if repository_errors else "complete"
+    result["errors"].extend(repository_errors)
+    if result["errors"]:
+        result["status"] = "partial"
     return result
 
 
@@ -1077,8 +1262,48 @@ def collect_remote_sessions(machine: dict[str, Any], since: dt.datetime, until: 
     host = machine["host"]
     result = {"machine": machine["name"], "status": "unavailable",
               "claude_bursts": [], "hermes_sessions": [], "hermes_db_sessions": [],
-              "codex_sessions": [], "errors": []}
+              "codex_sessions": [], "repository_events": [], "errors": []}
+    collector_root = str(machine.get("collector_root") or "").strip()
+    if collector_root:
+        script = str(Path(collector_root) / "scripts" / "clockify_sync_collect.py")
+        remote_parts = [
+            "python3",
+            script,
+            "export-local",
+            "--machine-json",
+            json.dumps(machine, ensure_ascii=False, separators=(",", ":")),
+            "--since",
+            since.isoformat(),
+            "--until",
+            until.isoformat(),
+        ]
+        canonical_command = " ".join(shlex.quote(part) for part in remote_parts)
+        try:
+            canonical = subprocess.run(
+                ["ssh", *ssh_options, host, canonical_command],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if canonical.returncode == 0:
+                exported = json.loads(canonical.stdout.strip().splitlines()[-1])
+                if isinstance(exported, dict) and exported.get("machine") == machine["name"]:
+                    exported["collector_contract"] = "canonical_export_v1"
+                    return exported
+            result["errors"].append(
+                "canonical remote evidence export unavailable; legacy metadata fallback used"
+            )
+        except Exception as exc:
+            result["errors"].append(
+                f"canonical remote evidence export unavailable ({type(exc).__name__}); "
+                "legacy metadata fallback used"
+            )
     remote_code = "\nimport datetime as dt, json\nfrom pathlib import Path\nBUCHAREST=dt.timezone(dt.timedelta(hours=3))\nMACHINE=__MACHINE__\nCBASE=__CBASE__\nHBASE=__HBASE__\nHDB=__HDB__\nCXBASE=__CXBASE__\nSINCE=dt.datetime.fromisoformat(__SINCE__)\nUNTIL=dt.datetime.fromisoformat(__UNTIL__)\ndef parse_dt(s):\n    if not s: return None\n    try:\n        x=dt.datetime.fromisoformat(str(s).replace('Z','+00:00'))\n        return x if x.tzinfo else x.replace(tzinfo=BUCHAREST)\n    except Exception: return None\ndef local_str(x):\n    return x.astimezone(BUCHAREST).strftime('%Y-%m-%d %H:%M') if x else None\ndef label(path, base):\n    rel=str(path).replace(base,'').lstrip('/')\n    top=rel.split('/')[0]\n    for pref in ['-Users-blackthorne-Work-','-Users-blackthorne-','-home-blackthorne-Work-','-home-blackthorne-']:\n        if top.startswith(pref): return top[len(pref):]\n    return top\ndef skip_path(p):\n    return any(f in str(p) for f in ['/subagents/','multica-runtime','claude-mem-observer','multica-command'])\ndef parse_claude(p):\n    if skip_path(p): return []\n    first_user=''; last_assistant=''; ts=[]\n    try:\n        for line in Path(p).read_text(errors='ignore').splitlines():\n            try: o=json.loads(line)\n            except Exception: continue\n            t=parse_dt(o.get('timestamp'))\n            if not t or not (SINCE <= t.astimezone(BUCHAREST) < UNTIL): continue\n            msg_type=o.get('type')\n            c=o.get('message',{}).get('content','')\n            if isinstance(c,list):\n                text_parts=[]\n                for item in c:\n                    if isinstance(item,dict):\n                        if item.get('type')=='text': text_parts.append(item.get('text',''))\n                        elif item.get('type')=='tool_use': text_parts.append('[tool_use: '+item.get('name','?')+']')\n                        elif item.get('type')=='tool_result': text_parts.append('[tool_result]')\n                        elif item.get('type')=='thinking': text_parts.append('[thinking]')\n                        elif item.get('type')=='tool_reference': text_parts.append('[tool_ref: '+item.get('tool_name','?')+']')\n                c='\\n'.join(text_parts)\n            c=str(c)\n            ts.append(t.astimezone(BUCHAREST))\n            if msg_type=='user' and not first_user: first_user=c[:300]\n            if msg_type=='assistant': last_assistant=c[:300]\n    except Exception: return []\n    if not ts: return []\n    ts.sort()\n    bursts=[]\n    start=end=ts[0]\n    count=1\n    for t in ts[1:]:\n        if (t-end).total_seconds()>1800:\n            bursts.append((start,end,count))\n            start=t; count=1\n        else: count+=1\n        end=t\n    bursts.append((start,end,count))\n    out=[]\n    for bs,be,cnt in bursts:\n        gap=(be-bs).total_seconds()\n        raw_wallclock=max(1,int(gap/60))\n        if gap>600:\n            active=int(cnt*2.5)\n            method='content heuristic'\n        else:\n            active=max(1,int(gap/60))\n            method='wall clock'\n        out.append({'start':local_str(bs),'end':local_str(be),'duration_minutes':min(active,raw_wallclock),'raw_wallclock_minutes':raw_wallclock,'user_messages':cnt,'label':label(p,CBASE),'first_user_message':first_user[:200],'last_assistant_message':last_assistant[:200],'evidence_level':method,'heartbeat_like':False,'source':'claude','machine':MACHINE})\n    return out\nres={'machine':MACHINE,'status':'ok','claude_bursts':[],'hermes_sessions':[],'hermes_db_sessions':[],'codex_sessions':[],'errors':[]}\ntry:\n    if CBASE and Path(CBASE).exists():\n        for p in Path(CBASE).glob('*/*.jsonl'):\n            res['claude_bursts'].extend(parse_claude(p))\n    else:\n        res['errors'].append('claude_projects not found: '+CBASE)\nexcept Exception as e: res['errors'].append('claude scan: '+str(e)[:200])\ntry:\n    if HBASE and Path(HBASE).exists():\n        for p in Path(HBASE).glob('request_dump_*.json'):\n            try:\n                obj=json.loads(p.read_text(errors='ignore'))\n                start=parse_dt(obj.get('session_start'))\n                last=parse_dt(obj.get('last_updated'))\n                touch=last or start\n                if not (touch and SINCE <= touch.astimezone(BUCHAREST) < UNTIL): continue\n                msgs=obj.get('messages',[])\n                user_count=sum(1 for m in msgs if m.get('role')=='user')\n                total_count=obj.get('message_count') or len(msgs)\n                if start and last:\n                    real_span_td=(last-start).total_seconds()/3600\n                else: real_span_td=0\n                if real_span_td>=4:\n                    est_minutes=int(user_count*7+(total_count-user_count)*0.5)\n                    est_start=start or touch\n                    est_end=est_start+dt.timedelta(minutes=est_minutes)\n                    evidence='session spans '+str(round(real_span_td,1))+'h but has only '+str(user_count)+' user msgs; estimated '+str(est_minutes)+'m via content heuristic'\n                else:\n                    est_start=start; est_end=last\n                    evidence='session_start/last_updated used (span='+str(round(real_span_td,1))+'h, '+str(user_count)+' user msgs)'\n                res['hermes_sessions'].append({'source':'hermes_legacy','machine':MACHINE,'session_id':obj.get('session_id') or p.stem,'path':str(p),'start':local_str(est_start),'end':local_str(est_end),'real_span_hours':round(real_span_td,2),'user_messages':user_count,'total_messages':total_count,'model':obj.get('model'),'platform':obj.get('platform'),'evidence_level':evidence})\n            except Exception as e: res['errors'].append('hermes legacy parse failed '+p.name+': '+str(e)[:200])\n    else:\n        res['errors'].append('hermes_sessions not found: '+HBASE)\nexcept Exception as e: res['errors'].append('hermes scan: '+str(e)[:200])\ntry:\n    if HDB and Path(HDB).exists():\n        import sqlite3\n        conn=sqlite3.connect(HDB)\n        since_ts=SINCE.timestamp()\n        until_ts=UNTIL.timestamp()\n        rows=conn.execute('SELECT id, started_at, ended_at, message_count, model, cwd, estimated_cost_usd, title, input_tokens, output_tokens FROM sessions WHERE started_at >= ? AND started_at < ? ORDER BY started_at', (since_ts, until_ts)).fetchall()\n        for row in rows:\n            sid, started_at, ended_at, msg_count, model, cwd, cost, title, in_tok, out_tok = row\n            if not started_at: continue\n            start_dt=dt.datetime.fromtimestamp(started_at, tz=BUCHAREST)\n            end_dt=dt.datetime.fromtimestamp(ended_at, tz=BUCHAREST) if ended_at else None\n            duration_m=int((end_dt-start_dt).total_seconds()/60) if end_dt else None\n            first_msg=conn.execute('SELECT content FROM messages WHERE session_id = ? AND role = \"user\" ORDER BY timestamp LIMIT 1', (sid,)).fetchone()\n            first_content=(first_msg[0][:300] if first_msg and first_msg[0] else '') if first_msg else ''\n            res['hermes_db_sessions'].append({'source':'hermes_db','machine':MACHINE,'session_id':sid,'start':local_str(start_dt),'end':local_str(end_dt) if end_dt else None,'duration_minutes':duration_m,'message_count':msg_count,'model':model,'cwd':cwd or '','estimated_cost_usd':cost or 0.0,'input_tokens':in_tok or 0,'output_tokens':out_tok or 0,'title':title or '','first_user_message':first_content})\n        conn.close()\n    else:\n        res['errors'].append('hermes_db not found: '+HDB)\nexcept Exception as e: res['errors'].append('hermes_db scan: '+str(e)[:200])\ntry:\n    if CXBASE and Path(CXBASE).exists():\n        db=Path(CXBASE)/'state_5.sqlite'\n        if db.exists():\n            import sqlite3\n            conn=sqlite3.connect('file:'+str(db)+'?mode=ro', uri=True)\n            lo=int((SINCE-dt.timedelta(days=1)).timestamp())\n            rows=conn.execute('SELECT id, rollout_path, cwd, title, first_user_message, thread_source, archived FROM threads WHERE updated_at >= ? ORDER BY updated_at', (lo,)).fetchall()\n            conn.close()\n            for sid, rollout_path, cwd, title, first_msg, thread_source, archived in rows:\n                if thread_source=='subagent': continue\n                if not rollout_path or not Path(rollout_path).exists(): continue\n                try:\n                    lines=Path(rollout_path).read_text(errors='ignore').splitlines()\n                    if not lines: continue\n                    meta=json.loads(lines[0])\n                    if meta.get('type')!='session_meta': continue\n                    ts_list=[]\n                    for line in lines[1:]:\n                        try: o=json.loads(line)\n                        except: continue\n                        if o.get('type')!='event_msg': continue\n                        p=o.get('payload',{})\n                        if p.get('type')!='user_message': continue\n                        t=parse_dt(o.get('timestamp'))\n                        if t and SINCE <= t.astimezone(BUCHAREST) < UNTIL: ts_list.append(t.astimezone(BUCHAREST))\n                    if not ts_list: continue\n                    ts_list.sort()\n                    bursts=[]\n                    start=end=ts_list[0]\n                    count=1\n                    for t in ts_list[1:]:\n                        if (t-end).total_seconds()>1800:\n                            bursts.append((start,end,count))\n                            start=t; count=1\n                        else: count+=1\n                        end=t\n                    bursts.append((start,end,count))\n                    for bs,be,cnt in bursts:\n                        gap=(be-bs).total_seconds()\n                        active=max(1,int(gap/60)) if gap<=600 else int(cnt*2.5)\n                        res['codex_sessions'].append({'source':'codex','machine':MACHINE,'session_id':sid,'cwd':cwd or '','title':title or first_msg or '','start':local_str(bs),'end':local_str(be),'duration_minutes':active,'user_messages':cnt,'archived':bool(archived)})\n                except Exception: pass\n        else:\n            res['errors'].append('codex state_5.sqlite not found')\n    else:\n        res['errors'].append('codex_home not found: '+CXBASE)\nexcept Exception as e: res['errors'].append('codex scan: '+str(e)[:200])\nprint(json.dumps(res))\n"
+    remote_code = remote_code.replace(
+        "from pathlib import Path\nBUCHAREST=dt.timezone(dt.timedelta(hours=3))",
+        "from pathlib import Path\nfrom zoneinfo import ZoneInfo\n"
+        "BUCHAREST=ZoneInfo('Europe/Bucharest')",
+    )
     remote_code = re.sub(
         r"def skip_path\(p\):.*?(?=res=\{)",
         lambda _match: _remote_claude_contract(),
@@ -1105,7 +1330,13 @@ def collect_remote_sessions(machine: dict[str, Any], since: dt.datetime, until: 
         if proc.returncode != 0:
             result["errors"].append(proc.stderr.strip()[:500] or proc.stdout.strip()[:500])
             return result
-        return json.loads(proc.stdout.strip().splitlines()[-1])
+        legacy = json.loads(proc.stdout.strip().splitlines()[-1])
+        legacy["status"] = "partial"
+        legacy.setdefault("errors", []).extend(result["errors"])
+        legacy["collector_contract"] = "legacy_metadata_fallback"
+        legacy.setdefault("repository_events", [])
+        legacy["repository_evidence_status"] = "unavailable"
+        return legacy
     except Exception as e:
         result["errors"].append(str(e))
     return result
@@ -1163,6 +1394,28 @@ def collect_hermes_db_sessions(db_path: str, machine: str, since: dt.datetime, u
                 (sid,)
             ).fetchone()
             first_content = (first_msg[0][:300] if first_msg and first_msg[0] else "") if first_msg else ""
+            message_rows = conn.execute(
+                "SELECT role, timestamp, content, tool_name FROM messages "
+                "WHERE session_id = ? ORDER BY timestamp",
+                (sid,),
+            ).fetchall()
+            events = []
+            for index, (role, timestamp, content, tool_name) in enumerate(message_rows):
+                event_dt = (
+                    dt.datetime.fromtimestamp(timestamp, tz=BUCHAREST)
+                    if timestamp
+                    else None
+                )
+                events.append(
+                    {
+                        "timestamp": local_dt_string(event_dt),
+                        "role": str(role or "unknown"),
+                        "kind": "tool" if tool_name else "message",
+                        "content": str(content or ""),
+                        "tool_name": str(tool_name or ""),
+                        "ordinal": index,
+                    }
+                )
             out.append({
                 "source": "hermes_db",
                 "machine": machine,
@@ -1178,6 +1431,7 @@ def collect_hermes_db_sessions(db_path: str, machine: str, since: dt.datetime, u
                 "output_tokens": out_tok or 0,
                 "title": title or "",
                 "first_user_message": first_content,
+                "events": events,
             })
         conn.close()
     except Exception as e:
@@ -1222,19 +1476,43 @@ def parse_codex_rollout_file(path: Path, machine: str, since: dt.datetime, until
             obj = json.loads(line)
         except Exception:
             continue
-        if obj.get("type") != "event_msg":
+        t = parse_dt(obj.get("timestamp"))
+        if not t:
             continue
         p = obj.get("payload", {})
-        event_type = p.get("type")
-        if event_type not in ("user_message", "agent_message"):
-            continue
-        t = parse_dt(obj.get("timestamp"))
-        if t:
+        if obj.get("type") == "event_msg":
+            event_type = p.get("type")
+            if event_type not in ("user_message", "agent_message"):
+                continue
             events.append({
                 "timestamp": t.astimezone(BUCHAREST),
                 "role": "user" if event_type == "user_message" else "assistant",
+                "kind": "message",
                 "content": p.get("message", ""),
             })
+        elif obj.get("type") == "response_item":
+            item = p.get("item") if isinstance(p.get("item"), dict) else p
+            item_type = str(item.get("type") or "")
+            if item_type in {"function_call", "custom_tool_call", "tool_call"}:
+                events.append(
+                    {
+                        "timestamp": t.astimezone(BUCHAREST),
+                        "role": "assistant",
+                        "kind": "tool_call",
+                        "tool_name": str(item.get("name") or item.get("tool_name") or "unknown"),
+                        "content": str(item.get("arguments") or item.get("input") or ""),
+                    }
+                )
+            elif item_type in {"function_call_output", "custom_tool_call_output", "tool_result"}:
+                events.append(
+                    {
+                        "timestamp": t.astimezone(BUCHAREST),
+                        "role": "tool",
+                        "kind": "tool_result",
+                        "tool_name": str(item.get("name") or item.get("call_id") or ""),
+                        "content": str(item.get("output") or item.get("content") or ""),
+                    }
+                )
     if not events:
         return out
     for burst_events in _partition_bursts(events):
@@ -1268,6 +1546,7 @@ def parse_codex_rollout_file(path: Path, machine: str, since: dt.datetime, until
             "evidence_level": method,
             "first_user_message": first_user,
             "last_assistant_message": last_assistant,
+            "events": _serialized_events(burst_events),
         })
     return out
 
@@ -1565,14 +1844,45 @@ def extract_hermes_db_context(db_path: str, since: dt.datetime, until: dt.dateti
 
 def fetch_clockify(cenv: dict[str, str], routing: dict[str, Any], since: dt.datetime, until: dt.datetime) -> dict[str, Any]:
     if cenv.get("_missing"):
-        return {"status": "missing_credentials", "missing": cenv["_missing"], "entries": []}
+        return {
+            "status": "missing_credentials",
+            "missing": cenv["_missing"],
+            "entries": [],
+            "running_entry_count": 0,
+            "complete": False,
+        }
     ws = cenv["CLOCKIFY_WORKSPACE_ID"]
     user = routing["clockify_user_id"]
     try:
-        entries = clockify_get(f"/workspaces/{ws}/user/{user}/time-entries?start={iso_utc(since)}&end={iso_utc(until)}&page-size=200", cenv)
+        entries: list[dict[str, Any]] = []
+        seen_pages: set[tuple[str, ...]] = set()
+        page = 1
+        while True:
+            page_entries = clockify_get(
+                f"/workspaces/{ws}/user/{user}/time-entries?"
+                f"start={iso_utc(since)}&end={iso_utc(until)}&page={page}&page-size=200",
+                cenv,
+            )
+            if not isinstance(page_entries, list):
+                raise ValueError("Clockify time-entry response did not contain a list")
+            rows = [entry for entry in page_entries if isinstance(entry, dict)]
+            signature = tuple(str(entry.get("id") or "") for entry in rows)
+            if rows and signature in seen_pages:
+                raise ValueError("Clockify pagination repeated a page")
+            seen_pages.add(signature)
+            entries.extend(rows)
+            if len(rows) < 200:
+                break
+            page += 1
+            if page > 100:
+                raise ValueError("Clockify pagination exceeded safety limit")
         sanitized = []
+        running_entry_count = 0
         for e in entries:
             ti = e.get("timeInterval", {})
+            running = not ti.get("end")
+            if running:
+                running_entry_count += 1
             sanitized.append({
                 "id_suffix": e.get("id", "")[-8:],
                 "description": e.get("description", ""),
@@ -1580,38 +1890,155 @@ def fetch_clockify(cenv: dict[str, str], routing: dict[str, Any], since: dt.date
                 "tag_id_suffixes": [(t or "")[-8:] for t in e.get("tagIds", [])],
                 "start": local_dt_string(parse_dt(ti.get("start"))),
                 "end": local_dt_string(parse_dt(ti.get("end"))) if ti.get("end") else None,
+                "running": running,
                 "duration": ti.get("duration"),
                 "billable": e.get("billable"),
             })
-        return {"status": "ok", "entries": sanitized}
+        return {
+            # A running Clockify entry has no immutable end boundary. Preserve
+            # it as evidence, but fail closed so later accounting cannot place
+            # suggested work around an invented end time.
+            "status": "partial" if running_entry_count else "ok",
+            "entries": sanitized,
+            "pages_fetched": page,
+            "running_entry_count": running_entry_count,
+            "complete": running_entry_count == 0,
+        }
     except Exception as e:
-        return {"status": "error", "error": str(e), "entries": []}
+        return {
+            "status": "error",
+            "error": str(e),
+            "entries": [],
+            "running_entry_count": 0,
+            "complete": False,
+        }
 
 
 def fetch_fathom(fenv: dict[str, str], since: dt.datetime, until: dt.datetime) -> dict[str, Any]:
     if fenv.get("_missing"):
-        return {"status": "missing_credentials", "missing": fenv["_missing"], "meetings": []}
-    params = urllib.parse.urlencode({"created_after": iso_utc(since), "created_before": iso_utc(until), "limit": 50})
+        return {
+            "status": "missing_credentials",
+            "missing": fenv["_missing"],
+            "meetings": [],
+            "complete": False,
+        }
     try:
-        data = http_json(f"{FATHOM_API}/meetings?{params}", {"X-Api-Key": fenv["FATHOM_API_KEY"]})
-        items = data.get("items", data if isinstance(data, list) else [])
+        headers = {"X-Api-Key": fenv["FATHOM_API_KEY"]}
+        items: list[dict[str, Any]] = []
+        cursor: str | None = None
+        pages = 0
+        seen_cursors: set[str] = set()
+        while True:
+            query = {
+                # Fathom filters this endpoint by record creation, not meeting
+                # occurrence. Fetch the complete creation history through the
+                # requested end and filter locally on recording/scheduled time.
+                "created_after": iso_utc(FATHOM_HISTORY_FLOOR),
+                "created_before": iso_utc(until),
+                "limit": 50,
+                # Fathom exposes semantic meeting content through opt-in fields
+                # on the list endpoint. There is no documented
+                # GET /meetings/{recording_id} hydration endpoint.
+                "include_summary": "true",
+                "include_action_items": "true",
+                "include_transcript": "true",
+            }
+            if cursor:
+                query["cursor"] = cursor
+            params = urllib.parse.urlencode(query)
+            data = http_json(f"{FATHOM_API}/meetings?{params}", headers)
+            if isinstance(data, list):
+                page_items = data
+            elif isinstance(data, dict) and isinstance(data.get("items"), list):
+                page_items = data["items"]
+            else:
+                raise ValueError("Fathom meetings response did not contain a list")
+            items.extend(item for item in page_items if isinstance(item, dict))
+            pages += 1
+            if isinstance(data, list):
+                break
+            next_cursor = (
+                data.get("next_cursor")
+                or data.get("nextCursor")
+                or data.get("next_page_token")
+                or (data.get("pagination") or {}).get("next_cursor")
+            )
+            cursor = str(next_cursor or "").strip() or None
+            if not cursor:
+                break
+            if pages >= FATHOM_MAX_PAGES:
+                raise ValueError("Fathom pagination exceeded safety limit")
+            if cursor in seen_cursors:
+                raise ValueError("Fathom pagination cursor repeated")
+            seen_cursors.add(cursor)
+
         meetings = []
         for m in items:
-            start = parse_dt(m.get("recording_start_time")) or parse_dt(m.get("scheduled_start_time"))
-            end = parse_dt(m.get("recording_end_time")) or parse_dt(m.get("scheduled_end_time"))
+            recording_id = m.get("recording_id") or m.get("id")
+            recording_start = parse_dt(m.get("recording_start_time"))
+            recording_end = parse_dt(m.get("recording_end_time"))
+            scheduled_start = parse_dt(m.get("scheduled_start_time"))
+            scheduled_end = parse_dt(m.get("scheduled_end_time"))
+            if recording_start and recording_end and recording_end > recording_start:
+                start, end, timing_basis = recording_start, recording_end, "recording"
+            elif scheduled_start and scheduled_end and scheduled_end > scheduled_start:
+                start, end, timing_basis = scheduled_start, scheduled_end, "scheduled"
+            else:
+                start, end, timing_basis = None, None, "unavailable"
+            if start and end:
+                if not (start < until and end > since):
+                    continue
+            else:
+                created_at = parse_dt(m.get("created_at"))
+                if not created_at or not (since <= created_at < until):
+                    continue
+            summary = m.get("default_summary") or m.get("summary")
+            action_items = m.get("action_items") or []
+            transcript = m.get("transcript")
+            semantic_available = bool(summary or action_items or transcript)
             meetings.append({
-                "recording_id": m.get("recording_id") or m.get("id"),
+                "recording_id": recording_id,
                 "title": m.get("title") or m.get("meeting_title"),
                 "start": local_dt_string(start),
                 "end": local_dt_string(end),
+                "timing_basis": timing_basis,
                 "share_url": m.get("share_url") or m.get("url"),
                 "calendar_invitees": [{"email": i.get("email"), "name": i.get("name"), "is_external": i.get("is_external")} for i in m.get("calendar_invitees", [])[:20]],
                 "domains_type": m.get("calendar_invitees_domains_type"),
+                "calendar_invitees_domains_type": m.get("calendar_invitees_domains_type"),
                 "recorded_by_email": (m.get("recorded_by") or {}).get("email"),
+                "summary": summary,
+                "action_items": action_items,
+                "transcript": transcript,
+                "transcript_language": m.get("transcript_language"),
+                "semantic_evidence_status": (
+                    "available" if semantic_available else "title_only"
+                ),
             })
-        return {"status": "ok", "meetings": meetings}
+        return {
+            "status": "ok",
+            "meetings": meetings,
+            "pages_fetched": pages,
+            "complete": True,
+            "creation_history_floor": iso_utc(FATHOM_HISTORY_FLOOR),
+            "occurrence_filter": {
+                "start": iso_utc(since),
+                "end": iso_utc(until),
+                "basis": "recording_or_scheduled_overlap",
+            },
+            "semantic_content_requested": [
+                "summary",
+                "action_items",
+                "transcript",
+            ],
+        }
     except Exception as e:
-        return {"status": "error", "error": str(e), "meetings": []}
+        return {
+            "status": "error",
+            "error": str(e),
+            "meetings": [],
+            "complete": False,
+        }
 
 
 def multica_profile_config() -> dict[str, Any] | None:
@@ -1633,7 +2060,10 @@ def multica_profile_config() -> dict[str, Any] | None:
     return None
 
 
-def fetch_multica_issues() -> dict[str, Any]:
+def fetch_multica_issues(
+    since: dt.datetime | None = None,
+    until: dt.datetime | None = None,
+) -> dict[str, Any]:
     cfg = multica_profile_config()
     if not cfg:
         return {"status": "missing_profile", "issues": []}
@@ -1642,20 +2072,87 @@ def fetch_multica_issues() -> dict[str, Any]:
     workspace_id = cfg.get("workspace_id") or cfg.get("workspaceId") or os.environ.get("MULTICA_WORKSPACE_ID")
     if not (token and server and workspace_id):
         return {"status": "profile_incomplete", "issues": []}
-    # Try common API shapes, keeping output sanitized.
-    paths = ["/api/issues?limit=100", "/issues?limit=100"]
+    # Try common API shapes, keeping output sanitized. Exact page-size results
+    # are not proof of completeness, so continue with offset pagination until
+    # the server returns a short page. A server that ignores offset is rejected
+    # via the repeated-page guard instead of silently reporting 100 as complete.
+    paths = ["/api/issues", "/issues"]
     headers = {"Authorization": f"Bearer {token}", "X-Workspace-ID": workspace_id}
     for path in paths:
         try:
-            data = http_json(server.rstrip("/") + path, headers)
-            items = data.get("issues") or data.get("items") or (data if isinstance(data, list) else [])
-            issues = []
-            for it in items[:100]:
-                issues.append({"id": it.get("id"), "key": it.get("key") or it.get("identifier"), "title": it.get("title"), "status": it.get("status"), "project_id": it.get("project_id") or it.get("projectId")})
-            return {"status": "ok", "issues": issues}
+            issues: list[dict[str, Any]] = []
+            seen_pages: set[tuple[str, ...]] = set()
+            offset = 0
+            pages = 0
+            while True:
+                data = http_json(
+                    server.rstrip("/") + f"{path}?limit=100&offset={offset}",
+                    headers,
+                )
+                items = data.get("issues") or data.get("items") or (data if isinstance(data, list) else [])
+                if not isinstance(items, list):
+                    raise ValueError("Multica issues response did not contain a list")
+                page = [item for item in items if isinstance(item, dict)]
+                signature = tuple(
+                    str(item.get("id") or item.get("key") or item.get("identifier") or "")
+                    for item in page
+                )
+                if page and signature in seen_pages:
+                    raise ValueError("Multica issues pagination repeated a page")
+                seen_pages.add(signature)
+                pages += 1
+                for it in page:
+                    issue = {
+                        "id": it.get("id"),
+                        "key": it.get("key") or it.get("identifier"),
+                        "title": it.get("title"),
+                        "description": it.get("description"),
+                        "status": it.get("status"),
+                        "project_id": it.get("project_id") or it.get("projectId"),
+                        "created_at": it.get("created_at") or it.get("createdAt"),
+                        "updated_at": it.get("updated_at") or it.get("updatedAt"),
+                        "completed_at": it.get("completed_at") or it.get("completedAt"),
+                        "labels": it.get("labels") or [],
+                    }
+                    if since is not None and until is not None:
+                        activity_times = [
+                            parse_dt(issue.get(field))
+                            for field in ("created_at", "updated_at", "completed_at")
+                        ]
+                        if not any(
+                            value is not None
+                            and since <= value.astimezone(since.tzinfo or BUCHAREST) < until
+                            for value in activity_times
+                        ):
+                            continue
+                    issues.append(issue)
+                if len(page) < 100:
+                    break
+                offset += len(page)
+                if pages >= 100:
+                    raise ValueError("Multica issues pagination exceeded safety limit")
+            return {
+                "status": "ok",
+                "issues": issues,
+                "pages_fetched": pages,
+                "complete": True,
+                "activity_window": (
+                    {
+                        "since": since.isoformat(),
+                        "until": until.isoformat(),
+                    }
+                    if since is not None and until is not None
+                    else None
+                ),
+            }
         except Exception:
             continue
-    return {"status": "error", "issues": [], "note": "Unable to fetch issues with known API paths; autopilot can use CLI/API fallback."}
+    return {
+        "status": "error",
+        "issues": [],
+        "complete": False,
+        "note": "Unable to fetch issues with known API paths; autopilot can use CLI/API fallback.",
+    }
 
 
 def route_session(burst: dict[str, Any], routing: dict[str, Any]) -> dict[str, Any]:
@@ -1854,6 +2351,22 @@ def build_proposals(evidence: dict[str, Any], routing: dict[str, Any]) -> tuple[
                 "time": f"{start}–{end}",
                 "label": title,
                 "reason": "solo impromptu recording treated as recorder misfire",
+            })
+            continue
+        if meeting.get("semantic_evidence_status") == "title_only":
+            ambiguous.append({
+                "id": f"A{len(ambiguous)+1:03d}",
+                "candidate_key": _candidate_key(meeting_record),
+                "provenance": _record_provenance(meeting_record),
+                "source": "fathom",
+                "time": f"{start}–{end}",
+                "label": title,
+                "reason": (
+                    "Fathom supplied only a meeting title; no transcript, summary, "
+                    "or action items support a truthful outcome"
+                ),
+                "machine": "fathom",
+                "exception_kind": "insufficient_meeting_evidence",
             })
             continue
         route = route_meeting(meeting, routing)
@@ -2086,21 +2599,13 @@ def write_markdown(run_dir: Path, report: dict[str, Any]) -> None:
         for err in s.get('errors', [])[:5]:
             lines.append(f"  - warning: {err}")
     lines.append("")
-    lines.append("## Proposal table")
-    lines.append("| ID | Time | Dur | Project | Tags | Source | Confidence | Description |")
-    lines.append("|---|---:|---:|---|---|---|---|---|")
-    for p in report['proposals']:
-        tags = ", ".join(p.get('tag_names') or p.get('tag_suffixes') or [])
-        src = ", ".join(p.get('source', []))
-        lines.append(f"| {p['id']} | {p.get('start')}–{str(p.get('end',''))[-5:]} | {p.get('duration_minutes')}m | {p.get('client_project')} | {tags} | {src} | {p.get('confidence')} | {p.get('description')} |")
-    if not report['proposals']:
-        lines.append("| — | — | — | — | — | — | — | No high-confidence proposals generated. |")
-    lines.append("")
-    lines.append("## Ambiguous rows")
-    for a in report['ambiguous'][:50]:
-        lines.append(f"- {a['id']}: {a.get('time')} {a.get('source')} on {a.get('machine')} — {a.get('reason')} — {a.get('label')}")
-    if not report['ambiguous']:
-        lines.append("- None")
+    lines.append("## Collection-stage diagnostics")
+    lines.append(
+        f"- {len(report['proposals'])} legacy candidates, "
+        f"{len(report['ambiguous'])} legacy ambiguities, "
+        f"{len(report['skipped'])} legacy exclusions"
+    )
+    lines.append("- These are local diagnostic counts only; their extracted text is not reviewable Clockify output.")
     lines.append("")
     lines.append("## Skipped summary")
     reasons: dict[str, int] = {}
@@ -2113,7 +2618,7 @@ def write_markdown(run_dir: Path, report: dict[str, Any]) -> None:
         lines.append("- None")
     lines.append("")
     lines.append("## Approval instruction")
-    lines.append("Run-local proposal IDs (for example: P001) are not approval IDs. First ingest this run into review-snapshot.json; approve only the stable review item IDs created there. This run did not post entries.")
+    lines.append("Semantic accounting must replace the empty proposal placeholders before durable review. Approve only stable review item IDs from review-snapshot.json. This run did not post entries.")
     (run_dir / "run-report.md").write_text("\n".join(lines) + "\n")
 
 
@@ -2130,7 +2635,7 @@ def run(args: argparse.Namespace) -> int:
     evidence = {
         "clockify": fetch_clockify(cenv, routing, since, until),
         "fathom": fetch_fathom(fenv, since, until),
-        "multica_issues": fetch_multica_issues(),
+        "multica_issues": fetch_multica_issues(since, until),
         "sessions": [],
     }
     for m in fleet.get("machines", []):
@@ -2172,7 +2677,13 @@ def run(args: argparse.Namespace) -> int:
         "runtime_identity": collector_runtime_identity(),
         "date_range": {"since": local_dt_string(since), "until": local_dt_string(until), "reason": reason},
         "safety": {"dry_run": True, "clockify_posted": False},
-        "paths": {"run_dir": str(run_dir), "report_json": str(run_dir / "run-report.json"), "report_md": str(run_dir / "run-report.md"), "proposals_json": str(run_dir / "proposals.json")},
+        "paths": {
+            "run_dir": str(run_dir),
+            "report_json": str(run_dir / "run-report.json"),
+            "report_md": str(run_dir / "run-report.md"),
+            "proposals_json": str(run_dir / "proposals.json"),
+            "legacy_proposals_json": str(run_dir / "legacy-proposals.json"),
+        },
         "evidence": evidence,
         "proposals": proposals,
         "ambiguous": ambiguous,
@@ -2185,9 +2696,47 @@ def run(args: argparse.Namespace) -> int:
     write_json(run_dir / "evidence" / "sessions.json", evidence["sessions"])
     if "enriched_context" in evidence:
         write_json(run_dir / "evidence" / "enriched-context.json", evidence["enriched_context"])
-    write_json(run_dir / "proposals.json", proposals)
-    write_json(run_dir / "ambiguous.json", ambiguous)
-    write_json(run_dir / "skipped.json", skipped)
+    try:
+        from scripts.evidence_ledger import (
+            EvidenceLedger,
+            normalize_collector_snapshot,
+            source_inventory_from_collector,
+        )
+    except ModuleNotFoundError:
+        from evidence_ledger import (  # type: ignore[no-redef]
+            EvidenceLedger,
+            normalize_collector_snapshot,
+            source_inventory_from_collector,
+        )
+    ledger = EvidenceLedger(
+        tuple(normalize_collector_snapshot(evidence)),
+        source_inventory_from_collector(evidence),
+    )
+    ledger_path = run_dir / "evidence" / "evidence-ledger.json"
+    write_json(
+        ledger_path,
+        {
+            "schema_version": ledger.manifest.schema_version,
+            "manifest": ledger.manifest.document(),
+            "events": [event.document() for event in ledger.events],
+        },
+    )
+    report["paths"]["evidence_ledger"] = str(ledger_path)
+    report["evidence_ledger"] = {
+        "manifest_id": ledger.manifest.manifest_id,
+        "event_count": ledger.manifest.event_count,
+        "events_digest": ledger.manifest.events_digest,
+        "source_completeness": ledger.manifest.document()["source_completeness"],
+    }
+    write_json(run_dir / "legacy-proposals.json", proposals)
+    write_json(run_dir / "legacy-ambiguous.json", ambiguous)
+    write_json(run_dir / "legacy-skipped.json", skipped)
+    # Only work_accounting_pipeline may populate reviewable artifacts.  Empty
+    # placeholders keep a blocked collector run from exposing extraction-based
+    # descriptions as if they were semantic recommendations.
+    write_json(run_dir / "proposals.json", [])
+    write_json(run_dir / "ambiguous.json", [])
+    write_json(run_dir / "skipped.json", [])
     # Write a COMPACT run-report.json: the full evidence (enriched_context + per-message
     # session data) is megabytes and already lives in evidence/ files. Embedding it here
     # bloated the report to ~2.4MB and was a likely trigger for the agent's provider
@@ -2202,9 +2751,19 @@ def run(args: argparse.Namespace) -> int:
             "hermes_sessions": len(s.get("hermes_sessions", [])),
             "hermes_db_sessions": len(s.get("hermes_db_sessions", [])),
             "codex_sessions": len(s.get("codex_sessions", [])),
+            "repository_events": len(s.get("repository_events", [])),
+            "repository_evidence_status": s.get("repository_evidence_status"),
             "errors": s.get("errors", []),
         })
     compact = dict(report)
+    compact["legacy_candidate_summary"] = {
+        "candidates": len(proposals),
+        "ambiguous": len(ambiguous),
+        "skipped": len(skipped),
+    }
+    compact.pop("proposals", None)
+    compact.pop("ambiguous", None)
+    compact.pop("skipped", None)
     compact["evidence"] = {
         "clockify": {"status": evidence.get("clockify", {}).get("status"),
                      "entry_count": len(evidence.get("clockify", {}).get("entries", []))},
@@ -2219,6 +2778,7 @@ def run(args: argparse.Namespace) -> int:
             "multica_issues": str(run_dir / "evidence" / "multica-issues.json"),
             "sessions": str(run_dir / "evidence" / "sessions.json"),
             "enriched_context": str(run_dir / "evidence" / "enriched-context.json") if "enriched_context" in evidence else None,
+            "evidence_ledger": str(ledger_path),
         },
     }
     write_json(run_dir / "run-report.json", compact)
@@ -2237,9 +2797,23 @@ def main() -> int:
                     help="Extract user message context (prev/next assistant) for enriched descriptions (default: on)")
     r.add_argument("--no-enrich", action="store_false", dest="enrich",
                     help="Disable enriched context extraction")
+    export = sub.add_parser("export-local")
+    export.add_argument("--machine-json", required=True)
+    export.add_argument("--since", required=True)
+    export.add_argument("--until", required=True)
     args = ap.parse_args()
     if args.cmd == "run":
         return run(args)
+    if args.cmd == "export-local":
+        machine = json.loads(args.machine_json)
+        if not isinstance(machine, dict) or not machine.get("name"):
+            raise ValueError("export-local requires a named machine object")
+        since = parse_dt(args.since)
+        until = parse_dt(args.until)
+        if not since or not until or until <= since:
+            raise ValueError("export-local requires a valid since/until range")
+        print(json.dumps(collect_local_sessions(machine, since, until), ensure_ascii=False))
+        return 0
     return 2
 
 

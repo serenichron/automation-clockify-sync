@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 import csv
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "clockify_review_run.py"
@@ -23,6 +26,202 @@ def item(item_id: str, description: str) -> dict:
 
 
 class ReviewRunResultTests(unittest.TestCase):
+    def test_exceptions_only_cannot_start_before_acceptance_gate(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(review_run, "_run") as run:
+            code = review_run.main(
+                [
+                    "--review-mode", "exceptions_only",
+                    "--acceptance-ledger", str(Path(tmp) / "missing.jsonl"),
+                ]
+            )
+
+        self.assertEqual(2, code)
+        run.assert_not_called()
+
+    def test_exceptions_only_compacts_clean_rows_and_keeps_active_exceptions(self):
+        snapshot = {
+            "summary": {
+                "new": 2,
+                "changed": 0,
+                "carried_pending": 2,
+                "resolved_disappeared": 0,
+            },
+            "categories": {
+                "new": [
+                    {**item("rvi-clean-new", "SC — Repaired stable review wording using cited work outcomes"), "disposition": "pending"},
+                    {**item("rvi-ex-new", ""), "disposition": "ambiguous", "reason": "Route is unsupported."},
+                ],
+                "changed": [],
+                "carried_pending": [
+                    {**item("rvi-clean-old", "SC — Verified replay behavior across unchanged review inputs"), "disposition": "pending"},
+                    {**item("rvi-ex-old", ""), "disposition": "ambiguous", "reason": "Meeting context is insufficient."},
+                ],
+            },
+            "coverage_warnings": [],
+        }
+        gate = {"status": "evaluated", "exceptions_only_eligible": True}
+
+        result = review_run.build_result(
+            Path("/tmp/run-exceptions"),
+            {"status": "pass", "summary": {}},
+            snapshot,
+            review_mode="exceptions_only",
+            acceptance_gate=gate,
+        )
+
+        self.assertEqual("review_exceptions", result["action"])
+        self.assertEqual(2, result["clean_batch"]["count"])
+        self.assertEqual(
+            ["rvi-clean-new", "rvi-clean-old"],
+            result["clean_batch"]["review_item_ids"],
+        )
+        self.assertRegex(result["clean_batch"]["batch_id"], r"^rbatch-[0-9a-f]{24}$")
+        self.assertEqual(
+            ["rvi-ex-new"],
+            [row["id"] for row in result["exceptions"]],
+        )
+        self.assertEqual(2, result["active_exception_count"])
+        self.assertNotIn("rvi-clean-new", json.dumps(result["new"]))
+        self.assertNotIn("rvi-clean-old", json.dumps(result["exceptions"]))
+
+    def test_exceptions_only_clean_delta_requests_one_batch_without_reprinting_carried_rows(self):
+        snapshot = {
+            "summary": {"new": 1, "changed": 0, "carried_pending": 1, "resolved_disappeared": 0},
+            "categories": {
+                "new": [{**item("rvi-new", "SC — Improved clean batch review using stable identities"), "disposition": "pending"}],
+                "changed": [],
+                "carried_pending": [{**item("rvi-old", "SC — Preserved prior clean row without repeated details"), "disposition": "pending"}],
+            },
+            "coverage_warnings": [],
+        }
+
+        result = review_run.build_result(
+            Path("/tmp/run-batch"),
+            {"status": "pass", "summary": {}},
+            snapshot,
+            review_mode="exceptions_only",
+            acceptance_gate={"exceptions_only_eligible": True},
+        )
+
+        self.assertEqual("review_batch", result["action"])
+        self.assertEqual([], result["exceptions"])
+        self.assertEqual(2, result["clean_batch"]["count"])
+
+    def test_exceptions_only_unchanged_carried_items_do_not_repeat_comment(self):
+        snapshot = {
+            "summary": {"new": 0, "changed": 0, "carried_pending": 2, "resolved_disappeared": 0},
+            "categories": {
+                "new": [],
+                "changed": [],
+                "carried_pending": [
+                    {**item("rvi-clean", "SC — Preserved clean carried work without repeated review detail"), "disposition": "pending"},
+                    {**item("rvi-ex", ""), "disposition": "ambiguous", "reason": "Existing exception."},
+                ],
+            },
+            "coverage_warnings": [],
+        }
+
+        result = review_run.build_result(
+            Path("/tmp/run-carried"),
+            {"status": "pass", "summary": {}},
+            snapshot,
+            review_mode="exceptions_only",
+            acceptance_gate={"exceptions_only_eligible": True},
+        )
+
+        self.assertEqual("no_comment", result["action"])
+        self.assertFalse(result["should_comment"])
+        self.assertEqual([], result["exceptions"])
+        self.assertEqual(1, result["active_exception_count"])
+
+    def test_clean_batch_id_changes_when_a_member_revision_changes(self):
+        def snapshot(revision: int) -> dict:
+            return {
+                "summary": {"new": 1, "changed": 0, "carried_pending": 0, "resolved_disappeared": 0},
+                "categories": {
+                    "new": [{
+                        **item("rvi-clean", "SC — Preserved exact clean batch membership across review runs"),
+                        "disposition": "pending",
+                        "revision": revision,
+                        "evidence_fingerprint": "evfp:sha256:" + "a" * 64,
+                    }],
+                    "changed": [],
+                    "carried_pending": [],
+                },
+                "coverage_warnings": [],
+            }
+
+        first = review_run.build_result(
+            Path("/tmp/run-rev-one"), {"status": "pass"}, snapshot(1),
+            review_mode="exceptions_only", acceptance_gate={"exceptions_only_eligible": True},
+        )
+        second = review_run.build_result(
+            Path("/tmp/run-rev-two"), {"status": "pass"}, snapshot(2),
+            review_mode="exceptions_only", acceptance_gate={"exceptions_only_eligible": True},
+        )
+
+        self.assertNotEqual(first["clean_batch"]["batch_id"], second["clean_batch"]["batch_id"])
+
+    def test_exceptions_only_summary_contains_batch_id_not_clean_descriptions(self):
+        snapshot = {
+            "summary": {"new": 2, "changed": 0, "carried_pending": 0, "resolved_disappeared": 0},
+            "categories": {
+                "new": [
+                    {**item("rvi-clean", "SC — Private clean description should stay compact"), "disposition": "pending"},
+                    {**item("rvi-ex", ""), "disposition": "ambiguous", "reason": "Insufficient evidence."},
+                ],
+                "changed": [],
+                "carried_pending": [],
+            },
+            "coverage_warnings": [],
+        }
+        result = review_run.build_result(
+            Path("/tmp/run-summary"),
+            {"status": "pass", "summary": {}},
+            snapshot,
+            review_mode="exceptions_only",
+            acceptance_gate={"exceptions_only_eligible": True},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "summary.md"
+            review_run.write_summary(path, result)
+            text = path.read_text(encoding="utf-8")
+
+        self.assertIn("Clean batch: 1 rows", text)
+        self.assertIn("rvi-ex", text)
+        self.assertNotIn("Private clean description", text)
+
+    def test_missing_analyzer_configuration_emits_blocked_local_action_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            run_dir = runs / "run-blocked"
+            run_dir.mkdir(parents=True)
+            (run_dir / "run-report.json").write_text("{}\n", encoding="utf-8")
+            (run_dir / "run-report.md").write_text("# fixture\n", encoding="utf-8")
+            collected = subprocess.CompletedProcess(
+                args=["collector"], returncode=0,
+                stdout=str(run_dir / "run-report.md") + "\n", stderr="",
+            )
+            blocked = subprocess.CompletedProcess(
+                args=["accounting"], returncode=2, stdout="",
+                stderr=(
+                    "work accounting blocked: semantic analyzer is not configured; "
+                    "CLOCKIFY_ANALYZER_PRIMARY_URL is required"
+                ),
+            )
+            with mock.patch.object(review_run, "RUNS", runs), mock.patch.object(
+                review_run, "_run", side_effect=[collected, blocked]
+            ):
+                result_code = review_run.main(
+                    ["--state", str(Path(tmp) / "state.json"), "--corrections", str(Path(tmp) / "corrections.jsonl")]
+                )
+            self.assertEqual(2, result_code)
+            contract = json.loads((run_dir / "autopilot-result.json").read_text(encoding="utf-8"))
+            self.assertEqual("blocked", contract["action"])
+            self.assertFalse(contract["external_writes"])
+            self.assertIn("not configured", contract["quality_summary"]["reason"])
+            self.assertTrue((run_dir / "autopilot-summary.md").is_file())
+
     def test_healthy_carried_queue_requires_no_comment(self):
         snapshot = {
             "summary": {
