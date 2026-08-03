@@ -68,7 +68,7 @@ explicit exclusions or exceptions.
    hashes without merging or changing any scheduled automation.
 3. Run `scripts/analyzer_live_evaluation.py` for the intended primary analyzer
    and any configured fallback. Require every raw replay to pass schema,
-   citation, partition, atomicity, and rendering gates and to agree on the
+   citation, partition, atomicity, concrete-concept, and rendering gates and to agree on the
    review-relevant semantic decision. All cases are built-in and no ledger
    evidence is sent.
 4. Obtain a separate explicit decision before setting

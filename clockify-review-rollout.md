@@ -126,7 +126,7 @@ allocation, or correction-regression contracts recorded there.
 3. Run the complete verification suite on every collector host.
 4. Run the selected analyzer route through
    `scripts/analyzer_live_evaluation.py`. Stop on any probe, schema, partition,
-   rendering, or review-decision-stability failure; retain its synthetic capture
+   concrete-concept, rendering, or review-decision-stability failure; retain its synthetic capture
    and sealed scorecard. Harmless rationale wording may vary, but evidence
    disposition, partitions, lifecycle, effort, and confidence may not.
 5. Enable `CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED=approved` only when the exact

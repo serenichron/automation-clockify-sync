@@ -94,6 +94,12 @@ class CavemanRendererTests(unittest.TestCase):
         with self.assertRaises(renderer.CavemanValidationError):
             renderer.render_caveman_description(parts)
 
+    def test_adjacent_repeated_words_are_rejected(self):
+        with self.assertRaisesRegex(renderer.CavemanValidationError, "repeated words"):
+            renderer.validate_description(
+                "SC — Wrote guarded rollout plan plan for safe deployment"
+            )
+
     def test_no_field_is_silently_rewritten(self):
         parts = {"prefix": "SC", "action": "Reviewed", "object": "service page", "outcome": "for client conversion planning"}
         result = renderer.render_caveman_description(parts)

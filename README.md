@@ -279,7 +279,8 @@ python3 scripts/analyzer_evaluation.py \
 
 The evaluator validates every raw replay independently for complete corpus
 coverage, fixed expected evidence partitions, production schema/citation and
-atomicity rules, and renderer/forbidden-description compliance. Replay stability
+atomicity rules, concrete accomplishment concepts, and renderer/forbidden-description
+compliance. Adjacent repeated words are rejected. Replay stability
 compares the review-relevant decision—disposition, partitions, lifecycle,
 effort, and confidence—rather than arbitrary rationale prose. The append-only
 validated decision cache owns exact output replay and is separately integrity

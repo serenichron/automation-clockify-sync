@@ -27,7 +27,7 @@ import urllib.request
 
 
 SCHEMA_VERSION = 1
-PROMPT_VERSION = "clockify-semantic-v5"
+PROMPT_VERSION = "clockify-semantic-v6"
 ANALYZER_CACHE_SCHEMA_VERSION = "clockify-analyzer-cache/v1"
 DEFAULT_PRIMARY_MODEL = "deepseek-v4-flash:cloud"
 DEFAULT_MAX_BODY_BYTES = 1_450_000
@@ -508,6 +508,9 @@ Every activities[] item MUST have a non-empty split_rationale, including an alre
 atomic item or an item created by merging duplicate evidence. Never leave it blank.
 The action must start with a capitalized past-tense verb phrase of one to three words. Put the specific
 object and bounded result in object and outcome, not in a long action.
+Preserve the evidence's concrete nouns and quantities in object and outcome. Never
+replace a specific result such as removing duplicate buffers with a generic claim such
+as reducing usage. Do not repeat the object's final word as the outcome's first word.
 Give related atomic accomplishments the same short parent workstream name even when
 their specific objects differ; unrelated work must not share a workstream.
 Classify planned work, waiting, polling, agent chatter, heartbeats, and autonomous
@@ -1311,7 +1314,7 @@ def probe_endpoint(endpoint: AnalyzerEndpoint, transport: Transport = http_trans
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": "Return JSON only."},
-            {"role": "user", "content": '{"probe":"clockify-semantic-v5"}'},
+            {"role": "user", "content": '{"probe":"clockify-semantic-v6"}'},
         ],
     }
     raw = transport(endpoint, body)

@@ -40,12 +40,16 @@ def document() -> dict:
         "schema_version": evaluation.INPUT_SCHEMA_VERSION,
         "corpus": {"records": records, "digest": evaluation.sha256_hex(records)},
         "route": {"route_id": "ollama-cloud-primary", "model": "deepseek-v4-flash:cloud", "tier": "primary"},
-        "prompt_version": "clockify-semantic-v5",
+        "prompt_version": "clockify-semantic-v6",
         "semantic_schema_version": 1,
         "cases": [{
             "case_id": "one-atomic-outcome",
             "evidence_ids": [evidence],
             "expected_activity_partitions": [[evidence]],
+            "expected_activity_concepts": [{
+                "evidence_ids": [evidence],
+                "required_terms": ["clockify"],
+            }],
             "replays": [response(evidence), response(evidence)],
         }],
     }
@@ -55,7 +59,7 @@ class AnalyzerEvaluationTests(unittest.TestCase):
     def test_produces_digest_bound_passing_scorecard(self) -> None:
         scorecard = evaluation.evaluate(document())
         self.assertTrue(scorecard["passed"])
-        self.assertEqual("clockify-analyzer-evaluator/v2", scorecard["evaluator_version"])
+        self.assertEqual("clockify-analyzer-evaluator/v3", scorecard["evaluator_version"])
         self.assertEqual("deepseek-v4-flash:cloud", scorecard["route"]["model"])
         self.assertEqual(64, len(scorecard["input_corpus_digest"]))
         self.assertEqual(scorecard, evaluation.verify_scorecard(scorecard))
@@ -71,6 +75,7 @@ class AnalyzerEvaluationTests(unittest.TestCase):
     def test_atomicity_mismatch_is_rejected(self) -> None:
         source = document()
         source["cases"][0]["expected_activity_partitions"] = []
+        source["cases"][0]["expected_activity_concepts"] = []
         scorecard = evaluation.evaluate(source)
         self.assertFalse(scorecard["passed"])
         self.assertFalse(scorecard["results"][0]["checks"]["atomicity_valid"])
@@ -99,6 +104,15 @@ class AnalyzerEvaluationTests(unittest.TestCase):
         scorecard = evaluation.evaluate(source)
         self.assertTrue(scorecard["passed"])
         self.assertTrue(scorecard["results"][0]["checks"]["stable_replay"])
+
+    def test_vague_description_missing_concrete_concepts_is_rejected(self) -> None:
+        source = document()
+        for replay in source["cases"][0]["replays"]:
+            replay["activities"][0]["object"] = "generic process"
+            replay["activities"][0]["outcome"] = "completed expected work safely"
+        scorecard = evaluation.evaluate(source)
+        self.assertFalse(scorecard["passed"])
+        self.assertFalse(scorecard["results"][0]["checks"]["semantic_content_valid"])
 
     def test_incomplete_or_tampered_input_fails_closed(self) -> None:
         source = document()

@@ -107,6 +107,9 @@ def validate_description(description: str) -> str:
     for label, pattern in _FORBIDDEN_PATTERNS:
         if pattern.search(description):
             raise CavemanValidationError(f"description contains forbidden {label}")
+    body_words = re.findall(r"\b[\w'-]+\b", body)
+    if any(left.casefold() == right.casefold() for left, right in zip(body_words, body_words[1:])):
+        raise CavemanValidationError("description contains adjacent repeated words")
     word_count = len(re.findall(r"\b[\w'-]+\b", description))
     if not 8 <= word_count <= 14:
         raise CavemanValidationError(f"description has {word_count} words; expected 8–14")

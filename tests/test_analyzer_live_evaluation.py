@@ -15,12 +15,12 @@ from scripts import analyzer_live_evaluation as live  # noqa: E402
 from scripts import semantic_analyzer  # noqa: E402
 
 
-def _activity(evidence_ids: list[str], spans: dict[str, dict[str, str]], index: int) -> dict:
+def _activity(evidence_ids: list[str], spans: dict[str, dict[str, str]], index: int, concepts: list[str]) -> dict:
     return {
         "lifecycle": "completed",
         "workstream": "synthetic route evaluation",
         "action": "Verified",
-        "object": f"synthetic analyzer behavior {index}",
+        "object": f"{' '.join(concepts)} behavior {index}",
         "outcome": "against fixed evidence partitions",
         "evidence_ids": evidence_ids,
         "evidence_spans": [spans[evidence_id] for evidence_id in evidence_ids],
@@ -64,7 +64,12 @@ class AnalyzerLiveEvaluationTests(unittest.TestCase):
             aliases = dict(zip(original_ids, evidence_ids, strict=True))
             spans = {str(event["evidence_id"]): event["time_span"] for event in events}
             activities = [
-                _activity([aliases[value] for value in partition], spans, index)
+                _activity(
+                    [aliases[value] for value in partition],
+                    spans,
+                    index,
+                    case["expected_activity_concepts"][index - 1]["required_terms"],
+                )
                 for index, partition in enumerate(case["expected_activity_partitions"], 1)
             ]
             exceptions = []

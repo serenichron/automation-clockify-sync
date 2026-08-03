@@ -73,6 +73,10 @@ def synthetic_cases() -> list[dict[str, Any]]:
                 )
             ],
             "expected_activity_partitions": [[_evidence_id(atomic, 1)]],
+            "expected_activity_concepts": [{
+                "evidence_ids": [_evidence_id(atomic, 1)],
+                "required_terms": ["export", "gate", "blocked"],
+            }],
         },
         {
             "case_id": split,
@@ -96,6 +100,16 @@ def synthetic_cases() -> list[dict[str, Any]]:
                 [_evidence_id(split, 1)],
                 [_evidence_id(split, 2)],
             ],
+            "expected_activity_concepts": [
+                {
+                    "evidence_ids": [_evidence_id(split, 1)],
+                    "required_terms": ["memory", "duplicate", "buffer"],
+                },
+                {
+                    "evidence_ids": [_evidence_id(split, 2)],
+                    "required_terms": ["rollout", "plan"],
+                },
+            ],
         },
         {
             "case_id": merge,
@@ -118,6 +132,10 @@ def synthetic_cases() -> list[dict[str, Any]]:
             "expected_activity_partitions": [
                 [_evidence_id(merge, 1), _evidence_id(merge, 2)]
             ],
+            "expected_activity_concepts": [{
+                "evidence_ids": [_evidence_id(merge, 1), _evidence_id(merge, 2)],
+                "required_terms": ["review", "identity", "allocation"],
+            }],
         },
         {
             "case_id": meeting,
@@ -134,6 +152,7 @@ def synthetic_cases() -> list[dict[str, Any]]:
                 )
             ],
             "expected_activity_partitions": [],
+            "expected_activity_concepts": [],
         },
         {
             "case_id": noise,
@@ -147,6 +166,7 @@ def synthetic_cases() -> list[dict[str, Any]]:
                 )
             ],
             "expected_activity_partitions": [],
+            "expected_activity_concepts": [],
         },
     ]
 
@@ -200,6 +220,7 @@ def capture_evaluation(
                 "case_id": case["case_id"],
                 "evidence_ids": evidence_ids,
                 "expected_activity_partitions": case["expected_activity_partitions"],
+                "expected_activity_concepts": case["expected_activity_concepts"],
                 "replays": replays,
             }
         )
