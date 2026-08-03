@@ -106,11 +106,14 @@ are excluded. Substantive accomplishments that merely mention words such as
 "heartbeat", "approval", or "polling" remain eligible.
 
 The primary analyzer must pass a minimal live probe and its structured response
-contract. A configured stronger fallback handles primary probe/call/schema
-failures, conflicting evidence, and low semantic or timing confidence. Without a
-usable fallback, primary probe/call/schema failures block the run. Conflicting or
-low-confidence claims that remain unresolved become explicit exceptions, never
-proposals.
+contract. A sealed contract rejection receives exactly one content-addressed
+repair request containing only its allowlisted failure category and narrow
+corrective guidance; raw rejected output is never copied into that request or
+cache record. Transport and probe failures are not retried. If repair still
+fails, a configured stronger fallback receives the safe category and handles
+the bounded chunk. Without a usable fallback, primary probe/call/schema failures
+block the run. Conflicting or low-confidence claims that remain unresolved become
+explicit exceptions, never proposals.
 
 Analyzer requests retain the fail-closed 1,450,000-byte hard ceiling. Normal
 extraction uses a 250,000-byte and 250-event operational target with four
@@ -121,6 +124,8 @@ evaluated routes reject one bounded chunk, the complete chunk becomes one local
 `analyzer_failure` exception with a failure digest and processing continues.
 If both routes reject repeated-workstream synthesis, those otherwise valid but
 potentially duplicative claims become one `analyzer_synthesis_failure` exception.
+Synthesis candidates require the same normalized project, workstream, and
+concrete object; generic model labels alone cannot combine unrelated activities.
 No rejected activity can become a proposal.
 
 Validated analyzer decisions are stored in an append-only local cache beside

@@ -131,6 +131,9 @@
             "failed_exception"
           ]
         },
+        "repair_status": {
+          "enum": ["not_attempted", "used", "rejected", "transport_failed"]
+        },
         "failure_digest": {"type": "string", "pattern": "^aer-[a-f0-9]{24}$"},
         "fallback_endpoint": {"type": "string", "minLength": 1},
         "fallback_model": {"type": "string", "minLength": 1}

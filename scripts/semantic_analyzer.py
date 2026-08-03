@@ -132,6 +132,8 @@ class AnalyzerCancelledError(AnalyzerError):
 _CONTRACT_FAILURE_PATTERNS: tuple[tuple[str, str], ...] = (
     ("invalid_json", "invalid json"),
     ("missing_json_content", "lacks json message content"),
+    ("omitted_evidence", "semantic result omitted known evidence ids"),
+    ("duplicate_evidence", "semantic result reassigned evidence ids"),
     ("missing_atomicity_rationale", "explicit atomicity rationale"),
     ("compound_action", "one atomic verb phrase"),
     ("compound_field", "multiple accomplishment clauses"),
@@ -140,15 +142,21 @@ _CONTRACT_FAILURE_PATTERNS: tuple[tuple[str, str], ...] = (
     ("unsupported_evidence_span", "not supported by cited evidence"),
     ("invalid_output_lists", "activities, exceptions, and omissions must be lists"),
     ("invalid_evidence_ids", "evidence_ids"),
+    ("invalid_evidence_ids", "evidence ids"),
+    ("invalid_evidence_ids", "unknown evidence reference"),
+    ("invalid_evidence_ids", "requires known evidence ids"),
     ("missing_activity_fields", "requires action, object, and outcome"),
     ("missing_workstream", "requires a workstream"),
     ("invalid_effort", "effort"),
+    ("invalid_effort", "must be positive"),
     ("invalid_project", "project_recommendation"),
     ("omitted_evidence", "omitted known evidence ids"),
     ("duplicate_evidence", "reassigned evidence ids"),
     ("identity_collision", "activity identity collision"),
     ("invalid_lifecycle", "invalid lifecycle"),
     ("invalid_confidence", "confidence"),
+    ("synthesis_nonactivity", "synthesis must preserve cited activities"),
+    ("synthesis_split", "synthesis must not split provisional activities"),
 )
 CONTRACT_FAILURE_CODES = {
     "contract_rejected",
@@ -160,10 +168,39 @@ CONTRACT_FAILURE_CODES = {
 def _contract_failure_code(error: BaseException) -> str:
     """Return a privacy-safe operational reason for a rejected model response."""
     message = str(error).casefold()
+    cached_code = re.search(r"\b(contract_rejected(?:_[a-z_]+)?)\b", message)
+    if cached_code and cached_code.group(1) in CONTRACT_FAILURE_CODES:
+        return cached_code.group(1)
     for code, needle in _CONTRACT_FAILURE_PATTERNS:
         if needle in message:
             return f"contract_rejected_{code}"
     return "contract_rejected_other"
+
+
+def _repair_instruction(failure_code: str) -> str:
+    """Return narrow, privacy-safe corrective guidance for one sealed rejection."""
+    if failure_code not in CONTRACT_FAILURE_CODES:
+        raise AnalyzerError("repair feedback code is invalid")
+    category = failure_code.removeprefix("contract_rejected_")
+    instructions = {
+        "compound_action": "Return one atomic past-tense action per activity; split unrelated actions.",
+        "compound_field": "Keep each action, object, and outcome to one accomplishment clause.",
+        "omitted_evidence": "Account for every supplied evidence ref exactly once.",
+        "duplicate_evidence": "Cite each supplied evidence ref exactly once across the full result.",
+        "missing_evidence_span": "Give every reviewable activity a supported nonempty evidence span.",
+        "invalid_evidence_span": "Use only valid evidence spans supported by cited refs.",
+        "unsupported_evidence_span": "Keep each claimed span within its cited evidence interval.",
+        "missing_atomicity_rationale": "Give every reviewable activity a nonempty atomicity rationale.",
+        "invalid_evidence_ids": "Copy only supplied evidence refs and do not repeat them.",
+        "missing_activity_fields": "Include lifecycle, action, object, outcome, evidence, spans, and effort.",
+        "missing_workstream": "Give each reviewable activity a short stable workstream name.",
+        "invalid_effort": "Use positive ordered effort minutes for every activity.",
+        "invalid_project": "Use an object for project recommendation, with blank fields when unsupported.",
+        "invalid_output_lists": "Return activities, exceptions, and omissions as JSON lists.",
+        "synthesis_nonactivity": "Synthesis must return only activities and preserve all cited refs.",
+        "synthesis_split": "Synthesis may merge provisional activities but must not split them.",
+    }
+    return instructions.get(category, "Return only contract-valid JSON that preserves all supplied evidence exactly once.")
 
 
 def _raise_if_cancelled(cancelled: Callable[[], bool] | None) -> None:
@@ -583,6 +620,7 @@ def _request_messages(
     mode: str,
     corrections: list[dict[str, Any]] | None = None,
     private_text_approved: bool | None = None,
+    repair_failure_code: str | None = None,
 ) -> list[dict[str, str]]:
     _require_private_text_approval(events, private_text_approved)
     system = """You reconstruct human work for a Clockify ledger from cited evidence.
@@ -654,6 +692,11 @@ Output object:
         "events": model_events,
         "review_corrections": _project_corrections(corrections),
     }
+    if repair_failure_code is not None:
+        payload["repair_feedback"] = {
+            "failure_code": repair_failure_code,
+            "instruction": _repair_instruction(repair_failure_code),
+        }
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": canonical_json(payload)},
@@ -667,6 +710,7 @@ def _body_for(
     mode: str,
     corrections: list[dict[str, Any]] | None = None,
     private_text_approved: bool | None = None,
+    repair_failure_code: str | None = None,
 ) -> dict[str, Any]:
     return {
         "model": model,
@@ -678,6 +722,7 @@ def _body_for(
             mode=mode,
             corrections=corrections,
             private_text_approved=private_text_approved,
+            repair_failure_code=repair_failure_code,
         ),
     }
 
@@ -762,7 +807,9 @@ def _safe_provisional_activity(activity: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _synthesis_messages(activities: list[dict[str, Any]], *, workstream_id: str) -> list[dict[str, str]]:
+def _synthesis_messages(
+    activities: list[dict[str, Any]], *, workstream_id: str, repair_failure_code: str | None = None,
+) -> list[dict[str, str]]:
     """Build a privacy-safe request to reconcile one repeated workstream."""
     if not SAFE_EVIDENCE_ID_RE.fullmatch(workstream_id):
         raise AnalyzerError("synthesis workstream ID is unsafe")
@@ -800,6 +847,11 @@ or status prose in descriptive fields."""
         "workstream_id": workstream_id,
         "provisional_activities": model_provisional,
     }
+    if repair_failure_code is not None:
+        payload["repair_feedback"] = {
+            "failure_code": repair_failure_code,
+            "instruction": _repair_instruction(repair_failure_code),
+        }
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": canonical_json(payload)},
@@ -807,14 +859,17 @@ or status prose in descriptive fields."""
 
 
 def _synthesis_body(
-    activities: list[dict[str, Any]], *, model: str, workstream_id: str
+    activities: list[dict[str, Any]], *, model: str, workstream_id: str,
+    repair_failure_code: str | None = None,
 ) -> dict[str, Any]:
     return {
         "model": model,
         "temperature": 0,
         "seed": 0,
         "response_format": {"type": "json_object"},
-        "messages": _synthesis_messages(activities, workstream_id=workstream_id),
+        "messages": _synthesis_messages(
+            activities, workstream_id=workstream_id, repair_failure_code=repair_failure_code
+        ),
     }
 
 
@@ -1591,6 +1646,7 @@ def _call_validated(
     cache: AnalyzerResponseCache | None = None,
     before_transport: Callable[[AnalyzerEndpoint], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
+    repair_failure_code: str | None = None,
 ) -> dict[str, Any]:
     body = _body_for(
         events,
@@ -1598,6 +1654,7 @@ def _call_validated(
         mode="extract",
         corrections=corrections,
         private_text_approved=private_text_approved,
+        repair_failure_code=repair_failure_code,
     )
     if len(canonical_json(body).encode("utf-8")) > DEFAULT_MAX_BODY_BYTES:
         raise AnalyzerError("analyzer body exceeds configured request ceiling")
@@ -1665,9 +1722,15 @@ def _call_synthesis_validated(
     evidence_time_spans: dict[str, dict[str, str]],
     cache: AnalyzerResponseCache | None = None,
     before_transport: Callable[[AnalyzerEndpoint], None] | None = None,
+    repair_failure_code: str | None = None,
 ) -> dict[str, Any]:
     """Synthesize one repeated workstream and reject any lost evidence."""
-    body = _synthesis_body(activities, model=endpoint.model, workstream_id=workstream_id)
+    body = _synthesis_body(
+        activities,
+        model=endpoint.model,
+        workstream_id=workstream_id,
+        repair_failure_code=repair_failure_code,
+    )
     if len(canonical_json(body).encode("utf-8")) > DEFAULT_MAX_BODY_BYTES:
         raise AnalyzerError("synthesis body exceeds configured request ceiling")
     response = cache.lookup(endpoint, body) if cache is not None else None
@@ -1710,8 +1773,8 @@ def _call_synthesis_validated(
         ):
             raise AnalyzerError("synthesis lost or reassigned cited evidence IDs")
         if len(result["activities"]) > 1:
-            workstreams = [activity["workstream_id"] for activity in result["activities"]]
-            if len(workstreams) != len(set(workstreams)):
+            candidate_keys = [_synthesis_candidate_key(activity) for activity in result["activities"]]
+            if len(candidate_keys) != len(set(candidate_keys)):
                 raise AnalyzerError(
                     "synthesis split activities require distinct specific objects"
                 )
@@ -1776,6 +1839,20 @@ def _defer_unresolved_low_confidence(result: dict[str, Any]) -> dict[str, Any]:
         "activities": retained,
         "exceptions": sorted(exceptions, key=canonical_json),
     }
+
+
+def _synthesis_candidate_key(activity: Mapping[str, Any]) -> str:
+    """Keep broad allocation workstreams out of cross-chunk merge candidates."""
+    project = activity.get("project_recommendation")
+    project_name = project.get("name") if isinstance(project, Mapping) else ""
+    return stable_digest(
+        "sc-",
+        {
+            "project": _normalized_identity(project_name),
+            "workstream": _normalized_identity(activity.get("workstream")),
+            "object": _normalized_identity(activity.get("object")),
+        },
+    )
 
 
 def analyze_tiered(
@@ -1866,6 +1943,9 @@ def analyze_tiered(
             if (span := _safe_time_span(original_by_id[evidence_id])) is not None
         }
         fallback_status = "not_needed"
+        repair_status = "not_attempted"
+        primary_error: AnalyzerError | None = None
+        fallback_feedback: str | None = None
         try:
             result = _call_validated(
                 primary,
@@ -1880,7 +1960,41 @@ def analyze_tiered(
                 before_transport=before_extraction_transport,
                 cancelled=cancellation.is_set,
             )
-        except AnalyzerError as primary_error:
+        except AnalyzerContractError as initial_error:
+            # A sealed contract rejection may receive exactly one corrective
+            # request.  The feedback is category-only, so neither rejected
+            # prose nor raw model output can enter a request or the cache.
+            initial_failure_code = _contract_failure_code(initial_error)
+            try:
+                result = _call_validated(
+                    primary,
+                    chunk,
+                    tier="primary",
+                    transport=transport,
+                    corrections=corrections,
+                    known_evidence_ids=chunk_ids,
+                    evidence_time_spans=chunk_spans,
+                    private_text_approved=private_text_approved,
+                    cache=cache,
+                    before_transport=before_extraction_transport,
+                    cancelled=cancellation.is_set,
+                    repair_failure_code=initial_failure_code,
+                )
+            except AnalyzerContractError as repair_error:
+                primary_error = repair_error
+                fallback_feedback = _contract_failure_code(repair_error)
+                repair_status = "rejected"
+            except AnalyzerError:
+                # The original sealed rejection remains the contract evidence;
+                # a repair transport fault is never retried.
+                primary_error = initial_error
+                fallback_feedback = initial_failure_code
+                repair_status = "transport_failed"
+            else:
+                repair_status = "used"
+        except AnalyzerError as error:
+            primary_error = error
+        if primary_error is not None:
             _raise_if_cancelled(cancellation.is_set)
             if fallback is None:
                 raise AnalyzerError(
@@ -1899,6 +2013,7 @@ def analyze_tiered(
                     cache=cache,
                     before_transport=before_extraction_transport,
                     cancelled=cancellation.is_set,
+                    repair_failure_code=fallback_feedback,
                 )
             except AnalyzerError as fallback_error:
                 _raise_if_cancelled(cancellation.is_set)
@@ -1993,6 +2108,7 @@ def analyze_tiered(
             "model": used.model,
             "tier": tier,
             "fallback_status": fallback_status,
+            "repair_status": repair_status,
         }
         if fallback_status == "failed_exception":
             chunk_metadata["failure_digest"] = fallback_failure_digest
@@ -2070,13 +2186,14 @@ def analyze_tiered(
     }
     grouped: dict[str, list[dict[str, Any]]] = {}
     for activity in activities_by_id.values():
-        grouped.setdefault(activity["workstream_id"], []).append(activity)
+        grouped.setdefault(_synthesis_candidate_key(activity), []).append(activity)
 
     synthesis_exceptions: list[dict[str, Any]] = []
-    for workstream_id in sorted(grouped):
-        provisional = sorted(grouped[workstream_id], key=lambda value: value["activity_id"])
+    for candidate_key in sorted(grouped):
+        provisional = sorted(grouped[candidate_key], key=lambda value: value["activity_id"])
         if len(provisional) < 2:
             continue
+        workstream_id = provisional[0]["workstream_id"]
         synthesis_ids = {
             evidence_id
             for activity in provisional
@@ -2087,6 +2204,8 @@ def analyze_tiered(
             for evidence_id in synthesis_ids
             if (span := _safe_time_span(original_by_id[evidence_id])) is not None
         }
+        primary_error: AnalyzerError | None = None
+        fallback_feedback: str | None = None
         try:
             synthesized = _call_synthesis_validated(
                 primary,
@@ -2101,7 +2220,32 @@ def analyze_tiered(
             )
             used = primary
             tier = "primary"
-        except AnalyzerError as primary_error:
+        except AnalyzerContractError as initial_error:
+            initial_failure_code = _contract_failure_code(initial_error)
+            try:
+                synthesized = _call_synthesis_validated(
+                    primary,
+                    provisional,
+                    workstream_id=workstream_id,
+                    tier="primary",
+                    transport=transport,
+                    known_evidence_ids=synthesis_ids,
+                    evidence_time_spans=synthesis_spans,
+                    cache=cache,
+                    before_transport=probe_once,
+                    repair_failure_code=initial_failure_code,
+                )
+                used = primary
+                tier = "primary"
+            except AnalyzerContractError as repair_error:
+                primary_error = repair_error
+                fallback_feedback = _contract_failure_code(repair_error)
+            except AnalyzerError:
+                primary_error = initial_error
+                fallback_feedback = initial_failure_code
+        except AnalyzerError as error:
+            primary_error = error
+        if primary_error is not None:
             if fallback is None:
                 raise AnalyzerError(
                     f"primary analyzer failed for synthesis {workstream_id}: {primary_error}"
@@ -2117,6 +2261,7 @@ def analyze_tiered(
                     evidence_time_spans=synthesis_spans,
                     cache=cache,
                     before_transport=probe_once,
+                    repair_failure_code=fallback_feedback,
                 )
             except AnalyzerError as fallback_error:
                 if not all(isinstance(error, AnalyzerContractError) for error in (
