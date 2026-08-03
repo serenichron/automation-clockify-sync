@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
+import tempfile
 import unittest
 from unittest import mock
 
@@ -816,6 +818,139 @@ class SemanticAnalyzerTests(unittest.TestCase):
                     },
                 }
             ])
+
+    def test_validated_response_cache_replays_without_recalling_provider(self):
+        calls: list[str] = []
+
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                calls.append("probe")
+                return {"probe": "ok"}
+            calls.append("evidence")
+            evidence_id = payload["events"][0]["evidence_id"]
+            return valid_response(evidence_id)
+
+        endpoint = semantic.AnalyzerEndpoint("primary", "http://primary", "cheap")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "analyzer-cache.jsonl"
+            first_cache = semantic.AnalyzerResponseCache(path)
+            first = semantic.analyze_tiered(
+                [event("ev-1")],
+                primary=endpoint,
+                transport=transport,
+                private_text_approved=True,
+                cache=first_cache,
+            )
+            second_cache = semantic.AnalyzerResponseCache(path)
+            second = semantic.analyze_tiered(
+                [event("ev-1")],
+                primary=endpoint,
+                transport=transport,
+                private_text_approved=True,
+                cache=second_cache,
+            )
+
+        self.assertEqual(first["activities"], second["activities"])
+        self.assertEqual(["probe", "evidence"], calls)
+        self.assertEqual(1, first_cache.misses)
+        self.assertEqual(1, second_cache.hits)
+        self.assertEqual(
+            first["analyzer_cache"]["records"], second["analyzer_cache"]["records"]
+        )
+
+    def test_response_cache_tampering_fails_closed(self):
+        endpoint = semantic.AnalyzerEndpoint("primary", "http://primary", "cheap")
+        body = semantic._body_for(
+            [event("ev-1")], model="cheap", mode="extract", private_text_approved=True
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "analyzer-cache.jsonl"
+            cache = semantic.AnalyzerResponseCache(path)
+            cache.store_accepted(endpoint, body, valid_response("ev-1"))
+            record = json.loads(path.read_text(encoding="utf-8"))
+            record["response"]["activities"][0]["outcome"] = "tampered"
+            path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(semantic.AnalyzerError, "decision digest differs"):
+                semantic.AnalyzerResponseCache(path)
+
+    def test_response_cache_identity_tampering_fails_closed(self):
+        endpoint = semantic.AnalyzerEndpoint("primary", "http://primary", "cheap")
+        body = semantic._body_for(
+            [event("ev-1")], model="cheap", mode="extract", private_text_approved=True
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "analyzer-cache.jsonl"
+            cache = semantic.AnalyzerResponseCache(path)
+            cache.store_accepted(endpoint, body, valid_response("ev-1"))
+            record = json.loads(path.read_text(encoding="utf-8"))
+            record["body_digest"] = "0" * 64
+            path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(semantic.AnalyzerError, "identity digest differs"):
+                semantic.AnalyzerResponseCache(path)
+
+    def test_cache_preserves_primary_rejection_and_fallback_choice(self):
+        calls: list[tuple[str, str]] = []
+
+        def transport(endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                calls.append((endpoint.name, "probe"))
+                return {"probe": "ok"}
+            calls.append((endpoint.name, "evidence"))
+            evidence_id = payload["events"][0]["evidence_id"]
+            if endpoint.name == "primary":
+                return {"activities": [], "exceptions": [], "omissions": []}
+            return valid_response(evidence_id)
+
+        primary = semantic.AnalyzerEndpoint("primary", "http://primary", "cheap")
+        fallback = semantic.AnalyzerEndpoint("fallback", "http://fallback", "strong")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "analyzer-cache.jsonl"
+            first = semantic.analyze_tiered(
+                [event("ev-1")],
+                primary=primary,
+                fallback=fallback,
+                transport=transport,
+                private_text_approved=True,
+                cache=semantic.AnalyzerResponseCache(path),
+            )
+            second = semantic.analyze_tiered(
+                [event("ev-1")],
+                primary=primary,
+                fallback=fallback,
+                transport=transport,
+                private_text_approved=True,
+                cache=semantic.AnalyzerResponseCache(path),
+            )
+
+        self.assertEqual(first["activities"], second["activities"])
+        self.assertEqual(
+            [
+                ("primary", "probe"),
+                ("primary", "evidence"),
+                ("fallback", "probe"),
+                ("fallback", "evidence"),
+            ],
+            calls,
+        )
+
+    def test_stale_cache_writer_rejects_conflicting_decision(self):
+        endpoint = semantic.AnalyzerEndpoint("primary", "http://primary", "cheap")
+        body = semantic._body_for(
+            [event("ev-1")], model="cheap", mode="extract", private_text_approved=True
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "analyzer-cache.jsonl"
+            first = semantic.AnalyzerResponseCache(path)
+            stale = semantic.AnalyzerResponseCache(path)
+            first.store_accepted(endpoint, body, valid_response("ev-1"))
+            conflicting = valid_response("ev-1")
+            conflicting["activities"][0]["outcome"] = "different accepted wording"
+            with self.assertRaisesRegex(
+                semantic.AnalyzerError, "cannot replace an existing decision"
+            ):
+                stale.store_accepted(endpoint, body, conflicting)
 
 
 if __name__ == "__main__":

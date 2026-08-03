@@ -11,6 +11,7 @@ runs/
 state/review-items.json
 state/review-corrections.jsonl
 state/review-acceptance.jsonl
+state/analyzer-cache.jsonl
 state/validation/
 
 # Python cache

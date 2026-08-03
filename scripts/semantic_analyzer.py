@@ -11,8 +11,10 @@ available merely because its name appears in repository documentation.
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
 import datetime as dt
+import fcntl
 import hashlib
 import json
 import os
@@ -25,7 +27,8 @@ import urllib.request
 
 
 SCHEMA_VERSION = 1
-PROMPT_VERSION = "clockify-semantic-v1"
+PROMPT_VERSION = "clockify-semantic-v2"
+ANALYZER_CACHE_SCHEMA_VERSION = "clockify-analyzer-cache/v1"
 DEFAULT_PRIMARY_MODEL = "deepseek-v4-flash:cloud"
 DEFAULT_MAX_BODY_BYTES = 1_450_000
 PRIVATE_TEXT_APPROVAL_ENV = "CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED"
@@ -460,8 +463,15 @@ def _request_messages(
     system = """You reconstruct human work for a Clockify ledger from cited evidence.
 Return JSON only. Never quote a prompt or status message as a work description.
 Separate independent accomplishments. Merge duplicated evidence for the same work.
+Implementation plus verification of that same change is one accomplishment, not two.
+For example, implementing a stable identity and confirming that same identity survives
+allocation movement must be one activity citing both evidence items, with a specific
+merge_rationale. Verification becomes separate only when it produces an independently
+meaningful deliverable or diagnoses a distinct problem.
 Every reviewable activity needs a specific split_rationale explaining why it is one
 atomic accomplishment. Never join verbs with "and", "or", "then", or "also".
+The action must be a past-tense verb phrase of one to three words. Put the specific
+object and bounded result in object and outcome, not in a long action.
 Give related atomic accomplishments the same short parent workstream name even when
 their specific objects differ; unrelated work must not share a workstream.
 Classify planned work, waiting, polling, agent chatter, heartbeats, and autonomous
@@ -475,6 +485,8 @@ activities, exceptions, and omissions. Exceptions and omissions require cited
 evidence IDs. Do not allocate start/end Clockify blocks.
 Write action + object + outcome so the final prefixed description is 8-14 words,
 using terse past-tense Caveman wording and no Markdown, IDs, paths, URLs, or status prose.
+Project prefix and tags are recommendations only. Leave them blank when the evidence
+does not explicitly support them; deterministic routing owns the final project and tags.
 
 Output object:
 {
@@ -522,6 +534,7 @@ def _body_for(
     return {
         "model": model,
         "temperature": 0,
+        "seed": 0,
         "response_format": {"type": "json_object"},
         "messages": _request_messages(
             events,
@@ -613,6 +626,7 @@ def _synthesis_body(
     return {
         "model": model,
         "temperature": 0,
+        "seed": 0,
         "response_format": {"type": "json_object"},
         "messages": _synthesis_messages(activities, workstream_id=workstream_id),
     }
@@ -962,6 +976,229 @@ class AnalyzerEndpoint:
 Transport = Callable[[AnalyzerEndpoint, dict[str, Any]], dict[str, Any]]
 
 
+class AnalyzerResponseCache:
+    """Append-only cache for validated semantic responses.
+
+    The cache stores no request prose.  Keys bind the route and complete request body
+    by digest; records retain only the validated structured response needed to make an
+    immutable replay independent of provider wording drift.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._records: dict[str, dict[str, Any]] = {}
+        self.hits = 0
+        self.misses = 0
+        self.used: dict[str, str] = {}
+        self._load()
+
+    @staticmethod
+    def _request_identity(endpoint: AnalyzerEndpoint, body: Mapping[str, Any]) -> dict[str, str]:
+        body_digest = hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
+        route_digest = hashlib.sha256(
+            canonical_json(
+                {"name": endpoint.name, "url": endpoint.url, "model": endpoint.model}
+            ).encode("utf-8")
+        ).hexdigest()
+        cache_key = stable_digest(
+            "arc-",
+            {
+                "schema_version": ANALYZER_CACHE_SCHEMA_VERSION,
+                "prompt_version": PROMPT_VERSION,
+                "semantic_schema_version": SCHEMA_VERSION,
+                "route_digest": route_digest,
+                "body_digest": body_digest,
+            },
+            length=64,
+        )
+        return {
+            "cache_key": cache_key,
+            "body_digest": body_digest,
+            "route_digest": route_digest,
+        }
+
+    @staticmethod
+    def _decision_digest(value: Mapping[str, Any]) -> str:
+        return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+    def _validate_record(self, value: Any, *, line_number: int) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            raise AnalyzerError(f"analyzer cache line {line_number} is not an object")
+        required = {
+            "schema_version",
+            "cache_key",
+            "body_digest",
+            "route_digest",
+            "model",
+            "prompt_version",
+            "semantic_schema_version",
+            "status",
+            "decision_digest",
+        }
+        status = str(value.get("status") or "")
+        variant_field = "response" if status == "accepted" else "failure_code"
+        if status not in {"accepted", "rejected"} or set(value) != required | {variant_field}:
+            raise AnalyzerError(f"analyzer cache line {line_number} has unsupported fields")
+        if value.get("schema_version") != ANALYZER_CACHE_SCHEMA_VERSION:
+            raise AnalyzerError(f"analyzer cache line {line_number} has an unsupported schema")
+        if value.get("prompt_version") != PROMPT_VERSION or value.get("semantic_schema_version") != SCHEMA_VERSION:
+            raise AnalyzerError(f"analyzer cache line {line_number} targets another analyzer version")
+        for name in ("body_digest", "route_digest", "decision_digest"):
+            if not re.fullmatch(r"[a-f0-9]{64}", str(value.get(name) or "")):
+                raise AnalyzerError(f"analyzer cache line {line_number} has an invalid {name}")
+        if not re.fullmatch(r"arc-[a-f0-9]{64}", str(value.get("cache_key") or "")):
+            raise AnalyzerError(f"analyzer cache line {line_number} has an invalid cache key")
+        expected_key = stable_digest(
+            "arc-",
+            {
+                "schema_version": ANALYZER_CACHE_SCHEMA_VERSION,
+                "prompt_version": PROMPT_VERSION,
+                "semantic_schema_version": SCHEMA_VERSION,
+                "route_digest": value["route_digest"],
+                "body_digest": value["body_digest"],
+            },
+            length=64,
+        )
+        if value["cache_key"] != expected_key:
+            raise AnalyzerError(f"analyzer cache line {line_number} identity digest differs")
+        decision = {"status": status, variant_field: value[variant_field]}
+        if status == "accepted" and not isinstance(value.get("response"), dict):
+            raise AnalyzerError(f"analyzer cache line {line_number} response is invalid")
+        if status == "rejected" and value.get("failure_code") != "contract_rejected":
+            raise AnalyzerError(f"analyzer cache line {line_number} rejection is invalid")
+        if self._decision_digest(decision) != value.get("decision_digest"):
+            raise AnalyzerError(f"analyzer cache line {line_number} decision digest differs")
+        return copy.deepcopy(value)
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            return
+        try:
+            with self.path.open("r", encoding="utf-8") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+                try:
+                    lines = handle.read().splitlines()
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError as exc:
+            raise AnalyzerError("analyzer cache cannot be read") from exc
+        self._merge_lines(lines)
+
+    def _merge_lines(self, lines: Iterable[str]) -> None:
+        for line_number, line in enumerate(lines, 1):
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise AnalyzerError(f"analyzer cache line {line_number} is invalid JSON") from exc
+            record = self._validate_record(value, line_number=line_number)
+            key = str(record["cache_key"])
+            prior = self._records.get(key)
+            if prior is not None and prior != record:
+                raise AnalyzerError(f"analyzer cache key conflicts at line {line_number}")
+            self._records[key] = record
+
+    def lookup(self, endpoint: AnalyzerEndpoint, body: Mapping[str, Any]) -> dict[str, Any] | None:
+        identity = self._request_identity(endpoint, body)
+        record = self._records.get(identity["cache_key"])
+        if record is None and self.path.exists():
+            # Another guarded run may have appended after this instance loaded.
+            self._load()
+            record = self._records.get(identity["cache_key"])
+        if record is None:
+            self.misses += 1
+            return None
+        if record["body_digest"] != identity["body_digest"] or record["route_digest"] != identity["route_digest"]:
+            raise AnalyzerError("analyzer cache identity collision")
+        self.hits += 1
+        self.used[identity["cache_key"]] = str(record["decision_digest"])
+        if record["status"] == "rejected":
+            raise AnalyzerError("analyzer cache records a contract-rejected response")
+        return copy.deepcopy(record["response"])
+
+    def _store_record(self, record: dict[str, Any]) -> None:
+        key = str(record["cache_key"])
+        prior = self._records.get(key)
+        if prior is not None:
+            if prior != record:
+                raise AnalyzerError("analyzer cache cannot replace an existing decision")
+            self.used[key] = str(record["decision_digest"])
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a+", encoding="utf-8") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    handle.seek(0)
+                    self._merge_lines(handle.read().splitlines())
+                    prior = self._records.get(key)
+                    if prior is not None:
+                        if prior != record:
+                            raise AnalyzerError(
+                                "analyzer cache cannot replace an existing decision"
+                            )
+                    else:
+                        handle.seek(0, os.SEEK_END)
+                        handle.write(canonical_json(record) + "\n")
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError as exc:
+            raise AnalyzerError("analyzer cache cannot be written") from exc
+        self._records[key] = record
+        self.used[key] = str(record["decision_digest"])
+
+    def store_accepted(
+        self,
+        endpoint: AnalyzerEndpoint,
+        body: Mapping[str, Any],
+        response: Mapping[str, Any],
+    ) -> None:
+        identity = self._request_identity(endpoint, body)
+        response_value = copy.deepcopy(dict(response))
+        decision = {"status": "accepted", "response": response_value}
+        record = {
+            "schema_version": ANALYZER_CACHE_SCHEMA_VERSION,
+            **identity,
+            "model": endpoint.model,
+            "prompt_version": PROMPT_VERSION,
+            "semantic_schema_version": SCHEMA_VERSION,
+            "status": "accepted",
+            "decision_digest": self._decision_digest(decision),
+            "response": response_value,
+        }
+        self._store_record(record)
+
+    def store_rejected(self, endpoint: AnalyzerEndpoint, body: Mapping[str, Any]) -> None:
+        identity = self._request_identity(endpoint, body)
+        decision = {"status": "rejected", "failure_code": "contract_rejected"}
+        self._store_record(
+            {
+                "schema_version": ANALYZER_CACHE_SCHEMA_VERSION,
+                **identity,
+                "model": endpoint.model,
+                "prompt_version": PROMPT_VERSION,
+                "semantic_schema_version": SCHEMA_VERSION,
+                "status": "rejected",
+                "decision_digest": self._decision_digest(decision),
+                "failure_code": "contract_rejected",
+            }
+        )
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "schema_version": ANALYZER_CACHE_SCHEMA_VERSION,
+            "hits": self.hits,
+            "misses": self.misses,
+            "records": [
+                {"cache_key": key, "decision_digest": digest}
+                for key, digest in sorted(self.used.items())
+            ],
+        }
+
+
 def http_transport(endpoint: AnalyzerEndpoint, body: dict[str, Any]) -> dict[str, Any]:
     encoded = canonical_json(body).encode("utf-8")
     request = urllib.request.Request(
@@ -992,7 +1229,7 @@ def probe_endpoint(endpoint: AnalyzerEndpoint, transport: Transport = http_trans
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": "Return JSON only."},
-            {"role": "user", "content": '{"probe":"clockify-semantic-v1"}'},
+            {"role": "user", "content": '{"probe":"clockify-semantic-v2"}'},
         ],
     }
     raw = transport(endpoint, body)
@@ -1010,6 +1247,8 @@ def _call_validated(
     known_evidence_ids: set[str] | None = None,
     evidence_time_spans: dict[str, dict[str, str]] | None = None,
     private_text_approved: bool | None = None,
+    cache: AnalyzerResponseCache | None = None,
+    before_transport: Callable[[AnalyzerEndpoint], None] | None = None,
 ) -> dict[str, Any]:
     body = _body_for(
         events,
@@ -1020,14 +1259,27 @@ def _call_validated(
     )
     if len(canonical_json(body).encode("utf-8")) > DEFAULT_MAX_BODY_BYTES:
         raise AnalyzerError("analyzer body exceeds configured request ceiling")
-    response = _json_object_from_response(transport(endpoint, body))
-    return validate_result(
-        response,
-        known_evidence_ids=known_evidence_ids or {str(event.get("evidence_id")) for event in events},
-        provider_model=endpoint.model,
-        analyzer_tier=tier,
-        evidence_time_spans=evidence_time_spans,
-    )
+    response = cache.lookup(endpoint, body) if cache is not None else None
+    cache_miss = response is None
+    if response is None:
+        if before_transport is not None:
+            before_transport(endpoint)
+        response = _json_object_from_response(transport(endpoint, body))
+    try:
+        result = validate_result(
+            response,
+            known_evidence_ids=known_evidence_ids or {str(event.get("evidence_id")) for event in events},
+            provider_model=endpoint.model,
+            analyzer_tier=tier,
+            evidence_time_spans=evidence_time_spans,
+        )
+    except AnalyzerError:
+        if cache is not None and cache_miss:
+            cache.store_rejected(endpoint, body)
+        raise
+    if cache is not None and cache_miss:
+        cache.store_accepted(endpoint, body, response)
+    return result
 
 
 def _call_synthesis_validated(
@@ -1039,36 +1291,51 @@ def _call_synthesis_validated(
     transport: Transport,
     known_evidence_ids: set[str],
     evidence_time_spans: dict[str, dict[str, str]],
+    cache: AnalyzerResponseCache | None = None,
+    before_transport: Callable[[AnalyzerEndpoint], None] | None = None,
 ) -> dict[str, Any]:
     """Synthesize one repeated workstream and reject any lost evidence."""
     body = _synthesis_body(activities, model=endpoint.model, workstream_id=workstream_id)
     if len(canonical_json(body).encode("utf-8")) > DEFAULT_MAX_BODY_BYTES:
         raise AnalyzerError("synthesis body exceeds configured request ceiling")
-    result = validate_result(
-        _json_object_from_response(transport(endpoint, body)),
-        known_evidence_ids=known_evidence_ids,
-        provider_model=endpoint.model,
-        analyzer_tier=tier,
-        evidence_time_spans=evidence_time_spans,
-    )
-    if result["exceptions"] or result["omissions"]:
-        raise AnalyzerError("synthesis must preserve cited activities, not emit nonactivities")
-    if len(result["activities"]) > len(activities):
-        raise AnalyzerError("synthesis must not split provisional activities")
-    citation_counts: dict[str, int] = {}
-    for activity in result["activities"]:
-        for evidence_id in activity["evidence_ids"]:
-            citation_counts[evidence_id] = citation_counts.get(evidence_id, 0) + 1
-    if set(citation_counts) != known_evidence_ids or any(
-        count != 1 for count in citation_counts.values()
-    ):
-        raise AnalyzerError("synthesis lost or reassigned cited evidence IDs")
-    if len(result["activities"]) > 1:
-        workstreams = [activity["workstream_id"] for activity in result["activities"]]
-        if len(workstreams) != len(set(workstreams)):
-            raise AnalyzerError(
-                "synthesis split activities require distinct specific objects"
-            )
+    response = cache.lookup(endpoint, body) if cache is not None else None
+    cache_miss = response is None
+    if response is None:
+        if before_transport is not None:
+            before_transport(endpoint)
+        response = _json_object_from_response(transport(endpoint, body))
+    try:
+        result = validate_result(
+            response,
+            known_evidence_ids=known_evidence_ids,
+            provider_model=endpoint.model,
+            analyzer_tier=tier,
+            evidence_time_spans=evidence_time_spans,
+        )
+        if result["exceptions"] or result["omissions"]:
+            raise AnalyzerError("synthesis must preserve cited activities, not emit nonactivities")
+        if len(result["activities"]) > len(activities):
+            raise AnalyzerError("synthesis must not split provisional activities")
+        citation_counts: dict[str, int] = {}
+        for activity in result["activities"]:
+            for evidence_id in activity["evidence_ids"]:
+                citation_counts[evidence_id] = citation_counts.get(evidence_id, 0) + 1
+        if set(citation_counts) != known_evidence_ids or any(
+            count != 1 for count in citation_counts.values()
+        ):
+            raise AnalyzerError("synthesis lost or reassigned cited evidence IDs")
+        if len(result["activities"]) > 1:
+            workstreams = [activity["workstream_id"] for activity in result["activities"]]
+            if len(workstreams) != len(set(workstreams)):
+                raise AnalyzerError(
+                    "synthesis split activities require distinct specific objects"
+                )
+    except AnalyzerError:
+        if cache is not None and cache_miss:
+            cache.store_rejected(endpoint, body)
+        raise
+    if cache is not None and cache_miss:
+        cache.store_accepted(endpoint, body, response)
     return result
 
 
@@ -1120,6 +1387,7 @@ def analyze_tiered(
     transport: Transport = http_transport,
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
     private_text_approved: bool | None = None,
+    cache: AnalyzerResponseCache | None = None,
 ) -> dict[str, Any]:
     original_events = sorted((dict(event) for event in events), key=_event_sort_key)
     if not original_events:
@@ -1131,6 +1399,11 @@ def analyze_tiered(
             "exceptions": [],
             "omissions": [],
             "analysis_chunks": [],
+            "analyzer_cache": (
+                cache.summary()
+                if cache is not None
+                else {"schema_version": ANALYZER_CACHE_SCHEMA_VERSION, "status": "disabled"}
+            ),
         }
     original_by_id = {str(event.get("evidence_id")): event for event in original_events}
     if len(original_by_id) != len(original_events):
@@ -1161,7 +1434,6 @@ def analyze_tiered(
             if (span := _safe_time_span(original_by_id[evidence_id])) is not None
         }
         try:
-            probe_once(primary)
             result = _call_validated(
                 primary,
                 chunk,
@@ -1171,11 +1443,12 @@ def analyze_tiered(
                 known_evidence_ids=chunk_ids,
                 evidence_time_spans=chunk_spans,
                 private_text_approved=private_text_approved,
+                cache=cache,
+                before_transport=probe_once,
             )
             used = primary
             tier = "primary"
             if _requires_stronger_fallback(result) and fallback is not None:
-                probe_once(fallback)
                 result = _call_validated(
                     fallback,
                     chunk,
@@ -1185,6 +1458,8 @@ def analyze_tiered(
                     known_evidence_ids=chunk_ids,
                     evidence_time_spans=chunk_spans,
                     private_text_approved=private_text_approved,
+                    cache=cache,
+                    before_transport=probe_once,
                 )
                 used = fallback
                 tier = "fallback"
@@ -1193,7 +1468,6 @@ def analyze_tiered(
                 raise AnalyzerError(
                     f"primary analyzer failed for chunk {index + 1}: {primary_error}"
                 ) from primary_error
-            probe_once(fallback)
             result = _call_validated(
                 fallback,
                 chunk,
@@ -1203,6 +1477,8 @@ def analyze_tiered(
                 known_evidence_ids=chunk_ids,
                 evidence_time_spans=chunk_spans,
                 private_text_approved=private_text_approved,
+                cache=cache,
+                before_transport=probe_once,
             )
             used = fallback
             tier = "fallback"
@@ -1249,7 +1525,6 @@ def analyze_tiered(
             if (span := _safe_time_span(original_by_id[evidence_id])) is not None
         }
         try:
-            probe_once(primary)
             synthesized = _call_synthesis_validated(
                 primary,
                 provisional,
@@ -1258,6 +1533,8 @@ def analyze_tiered(
                 transport=transport,
                 known_evidence_ids=synthesis_ids,
                 evidence_time_spans=synthesis_spans,
+                cache=cache,
+                before_transport=probe_once,
             )
             used = primary
             tier = "primary"
@@ -1266,7 +1543,6 @@ def analyze_tiered(
                 raise AnalyzerError(
                     f"primary analyzer failed for synthesis {workstream_id}: {primary_error}"
                 ) from primary_error
-            probe_once(fallback)
             synthesized = _call_synthesis_validated(
                 fallback,
                 provisional,
@@ -1275,6 +1551,8 @@ def analyze_tiered(
                 transport=transport,
                 known_evidence_ids=synthesis_ids,
                 evidence_time_spans=synthesis_spans,
+                cache=cache,
+                before_transport=probe_once,
             )
             used = fallback
             tier = "fallback"
@@ -1297,6 +1575,11 @@ def analyze_tiered(
         "exceptions": sorted(exceptions, key=canonical_json),
         "omissions": sorted(omissions, key=canonical_json),
         "analysis_chunks": metadata,
+        "analyzer_cache": (
+            cache.summary()
+            if cache is not None
+            else {"schema_version": ANALYZER_CACHE_SCHEMA_VERSION, "status": "disabled"}
+        ),
     }
 
 

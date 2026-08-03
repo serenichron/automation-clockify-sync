@@ -26,7 +26,7 @@
         "schema_version": {"const": "clockify-analyzer-evaluation-input/v1"},
         "corpus": {"type": "object"},
         "route": {"$ref": "#/$defs/route"},
-        "prompt_version": {"const": "clockify-semantic-v1"},
+        "prompt_version": {"const": "clockify-semantic-v2"},
         "semantic_schema_version": {"const": 1},
         "cases": {"type": "array", "minItems": 1, "items": {"type": "object"}}
       }
@@ -41,11 +41,11 @@
       ],
       "properties": {
         "schema_version": {"const": "clockify-analyzer-evaluation-scorecard/v1"},
-        "evaluator_version": {"const": "clockify-analyzer-evaluator/v1"},
+        "evaluator_version": {"const": "clockify-analyzer-evaluator/v2"},
         "input_corpus_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
         "input_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
         "route": {"$ref": "#/$defs/route"},
-        "prompt_version": {"const": "clockify-semantic-v1"},
+        "prompt_version": {"const": "clockify-semantic-v2"},
         "semantic_schema_version": {"const": 1},
         "case_count": {"type": "integer", "minimum": 1},
         "results": {"type": "array", "minItems": 1, "items": {"type": "object"}},

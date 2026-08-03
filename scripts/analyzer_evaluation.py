@@ -24,7 +24,7 @@ except ModuleNotFoundError:
 
 INPUT_SCHEMA_VERSION = "clockify-analyzer-evaluation-input/v1"
 SCORECARD_SCHEMA_VERSION = "clockify-analyzer-evaluation-scorecard/v1"
-EVALUATOR_VERSION = "clockify-analyzer-evaluator/v1"
+EVALUATOR_VERSION = "clockify-analyzer-evaluator/v2"
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 _CASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _ROUTE_FIELDS = frozenset({"route_id", "model", "tier"})
@@ -215,6 +215,56 @@ def _rendering_is_valid(result: Mapping[str, Any]) -> bool:
     return True
 
 
+def _activity_partitions(result: Mapping[str, Any]) -> list[tuple[str, ...]]:
+    return sorted(
+        tuple(sorted(str(value) for value in activity["evidence_ids"]))
+        for activity in result["activities"]
+    )
+
+
+def _review_decision_signature(result: Mapping[str, Any]) -> str:
+    """Return the provider-wording-independent decision that affects review.
+
+    Exact replay is guaranteed by the validated response cache.  Live route
+    replays still have to agree on evidence disposition, activity partitions,
+    lifecycle, effort, and confidence.  Explanatory prose and omission reasons
+    are intentionally excluded because they do not create or revise review rows.
+    """
+    activities = sorted(
+        (
+            {
+                "evidence_ids": sorted(str(value) for value in activity["evidence_ids"]),
+                "lifecycle": activity["lifecycle"],
+                "effort": activity["effort"],
+                "semantic_confidence": activity["semantic_confidence"],
+                "timing_confidence": activity["timing_confidence"],
+            }
+            for activity in result["activities"]
+        ),
+        key=canonical_json,
+    )
+    exceptions = sorted(
+        (
+            {
+                "kind": value["kind"],
+                "evidence_ids": sorted(str(item) for item in value["evidence_ids"]),
+            }
+            for value in result["exceptions"]
+        ),
+        key=canonical_json,
+    )
+    omissions = sorted(
+        (
+            {"evidence_ids": sorted(str(item) for item in value["evidence_ids"])}
+            for value in result["omissions"]
+        ),
+        key=canonical_json,
+    )
+    return canonical_json(
+        {"activities": activities, "exceptions": exceptions, "omissions": omissions}
+    )
+
+
 def _case_score(
     case: Mapping[str, Any], *, evidence_ids: list[str], expected_partitions: list[tuple[str, ...]], corpus_spans: Mapping[str, dict[str, str]], route: Mapping[str, str]
 ) -> dict[str, Any]:
@@ -226,11 +276,12 @@ def _case_score(
             schema_ok = False
             continue
         normalized.append(result)
-    replay_ok = schema_ok and len(normalized) == len(case["replays"]) and len({canonical_json(item) for item in normalized}) == 1
-    result = normalized[0] if replay_ok else None
-    partitions = sorted(tuple(activity["evidence_ids"]) for activity in result["activities"]) if result else []
-    atomic_ok = bool(result) and partitions == expected_partitions
-    descriptions_ok = bool(result) and _rendering_is_valid(result)
+    complete = schema_ok and len(normalized) == len(case["replays"])
+    replay_ok = complete and len({_review_decision_signature(item) for item in normalized}) == 1
+    atomic_ok = complete and all(
+        _activity_partitions(item) == expected_partitions for item in normalized
+    )
+    descriptions_ok = complete and all(_rendering_is_valid(item) for item in normalized)
     checks = {
         "schema_valid": schema_ok,
         "evidence_citations_valid": schema_ok,

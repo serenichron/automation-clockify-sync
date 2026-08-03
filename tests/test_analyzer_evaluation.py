@@ -40,7 +40,7 @@ def document() -> dict:
         "schema_version": evaluation.INPUT_SCHEMA_VERSION,
         "corpus": {"records": records, "digest": evaluation.sha256_hex(records)},
         "route": {"route_id": "ollama-cloud-primary", "model": "deepseek-v4-flash:cloud", "tier": "primary"},
-        "prompt_version": "clockify-semantic-v1",
+        "prompt_version": "clockify-semantic-v2",
         "semantic_schema_version": 1,
         "cases": [{
             "case_id": "one-atomic-outcome",
@@ -55,7 +55,7 @@ class AnalyzerEvaluationTests(unittest.TestCase):
     def test_produces_digest_bound_passing_scorecard(self) -> None:
         scorecard = evaluation.evaluate(document())
         self.assertTrue(scorecard["passed"])
-        self.assertEqual("clockify-analyzer-evaluator/v1", scorecard["evaluator_version"])
+        self.assertEqual("clockify-analyzer-evaluator/v2", scorecard["evaluator_version"])
         self.assertEqual("deepseek-v4-flash:cloud", scorecard["route"]["model"])
         self.assertEqual(64, len(scorecard["input_corpus_digest"]))
         self.assertEqual(scorecard, evaluation.verify_scorecard(scorecard))
@@ -85,10 +85,20 @@ class AnalyzerEvaluationTests(unittest.TestCase):
 
     def test_different_replay_is_rejected(self) -> None:
         source = document()
-        source["cases"][0]["replays"][1]["activities"][0]["outcome"] = "removed unsafe report fragments"
+        source["cases"][0]["replays"][1]["activities"][0]["effort"]["recommended_minutes"] = 21
         scorecard = evaluation.evaluate(source)
         self.assertFalse(scorecard["passed"])
         self.assertFalse(scorecard["results"][0]["checks"]["stable_replay"])
+
+    def test_harmless_wording_drift_preserves_review_stability(self) -> None:
+        source = document()
+        second = source["cases"][0]["replays"][1]["activities"][0]
+        second["action"] = "Corrected"
+        second["outcome"] = "removed unsafe report fragments"
+        second["split_rationale"] = "one separately supported result"
+        scorecard = evaluation.evaluate(source)
+        self.assertTrue(scorecard["passed"])
+        self.assertTrue(scorecard["results"][0]["checks"]["stable_replay"])
 
     def test_incomplete_or_tampered_input_fails_closed(self) -> None:
         source = document()

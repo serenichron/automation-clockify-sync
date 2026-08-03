@@ -12,17 +12,19 @@
     "activities",
     "exceptions",
     "omissions",
-    "analysis_chunks"
+    "analysis_chunks",
+    "analyzer_cache"
   ],
   "properties": {
     "schema_version": {"const": 1},
-    "prompt_version": {"const": "clockify-semantic-v1"},
+    "prompt_version": {"const": "clockify-semantic-v2"},
     "ledger_event_count": {"type": "integer", "minimum": 0},
     "ledger_evidence_digest": {"type": "string", "pattern": "^led-[a-f0-9]{24}$"},
     "activities": {"type": "array", "items": {"$ref": "#/$defs/activity"}},
     "exceptions": {"type": "array", "items": {"$ref": "#/$defs/nonactivity"}},
     "omissions": {"type": "array", "items": {"$ref": "#/$defs/nonactivity"}},
     "analysis_chunks": {"type": "array", "items": {"$ref": "#/$defs/chunk"}},
+    "analyzer_cache": {"$ref": "#/$defs/analyzerCache"},
     "noise_classifications": {"type": "array", "items": {"type": "object"}}
   },
   "$defs": {
@@ -83,7 +85,7 @@
         "rendered_description": {"type": ["string", "null"]},
         "analyzer_model": {"type": "string"},
         "analyzer_tier": {"enum": ["primary", "fallback", "fixture"]},
-        "prompt_version": {"const": "clockify-semantic-v1"},
+        "prompt_version": {"const": "clockify-semantic-v2"},
         "schema_version": {"const": 1}
       }
     },
@@ -107,6 +109,40 @@
         "model": {"type": "string"},
         "tier": {"enum": ["primary", "fallback"]}
       }
+    },
+    "analyzerCache": {
+      "type": "object",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "required": ["schema_version", "status"],
+          "properties": {
+            "schema_version": {"const": "clockify-analyzer-cache/v1"},
+            "status": {"const": "disabled"}
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": ["schema_version", "hits", "misses", "records"],
+          "properties": {
+            "schema_version": {"const": "clockify-analyzer-cache/v1"},
+            "hits": {"type": "integer", "minimum": 0},
+            "misses": {"type": "integer", "minimum": 0},
+            "records": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["cache_key", "decision_digest"],
+                "properties": {
+                  "cache_key": {"type": "string", "pattern": "^arc-[a-f0-9]{64}$"},
+                  "decision_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+                }
+              }
+            }
+          }
+        }
+      ]
     }
   }
 }

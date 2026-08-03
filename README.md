@@ -100,6 +100,15 @@ usable fallback, primary probe/call/schema failures block the run. Conflicting o
 low-confidence claims that remain unresolved become explicit exceptions, never
 proposals.
 
+Validated analyzer decisions are stored in an append-only local cache beside
+the durable review state. Cache keys bind the endpoint, model, prompt/schema
+versions, and complete request-body digest without storing request prose. Both
+accepted responses and contract-rejected primary decisions are sealed, so an
+immutable replay cannot randomly switch provider wording or fallback routing.
+Every cache hit is revalidated; replayed decisions do not require another live
+provider probe. Concurrent or stale writers are locked and conflicting decisions
+fail closed instead of replacing or interleaving cache records.
+
 The `rendered_description` field is required on semantic activities and starts
 as `null`; deterministic routing and rendering populate it only for activities
 that can become proposals. Analyzer wording is never trusted as final text. The
@@ -220,9 +229,10 @@ python3 scripts/clockify_review_run.py \
 ```
 
 The replay command creates a distinct run, copies the evidence ledger
-byte-for-byte, reruns semantic analysis, and fails before durable-state ingestion
-if the ledger identity, semantic evidence digest, or analyzer route/version
-differs. Its `replay-integrity.json` is required alongside replay
+byte-for-byte, reruns deterministic accounting through the same validated
+analyzer-decision cache, and fails before durable-state ingestion if the ledger
+identity, semantic evidence digest, analyzer route/version, or sealed cache
+decision differs. Its `replay-integrity.json` is required alongside replay
 `0 new / 0 changed`; running the ordinary collector twice is not replay proof.
 
 In `exceptions_only`, clean pending rows are represented by one
@@ -264,9 +274,13 @@ python3 scripts/analyzer_evaluation.py \
   --output /absolute/path/to/analyzer-scorecard.json
 ```
 
-The evaluator checks complete corpus coverage and fixed expected evidence
-partitions, production schema/citation and atomicity validators,
-renderer/forbidden-description rules, and stable replay. A passing synthetic
+The evaluator validates every raw replay independently for complete corpus
+coverage, fixed expected evidence partitions, production schema/citation and
+atomicity rules, and renderer/forbidden-description compliance. Replay stability
+compares the review-relevant decision—disposition, partitions, lifecycle,
+effort, and confidence—rather than arbitrary rationale prose. The append-only
+validated decision cache owns exact output replay and is separately integrity
+checked. A passing synthetic
 route scorecard proves contract fitness, not July semantic accuracy; the latter
 still requires full-denominator human dispositions and the measured acceptance
 thresholds. Neither a probe nor a passing synthetic scorecard authorizes

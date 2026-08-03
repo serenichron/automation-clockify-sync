@@ -467,6 +467,25 @@ def _analysis_versions(document: dict[str, Any]) -> list[str]:
     return sorted(versions)
 
 
+def _analysis_cache_records(document: dict[str, Any]) -> list[dict[str, str]]:
+    cache = document.get("analyzer_cache")
+    if not isinstance(cache, dict):
+        return []
+    records = cache.get("records", [])
+    if not isinstance(records, list):
+        raise ValueError("semantic analysis cache records must be a list")
+    normalized: list[dict[str, str]] = []
+    for raw in records:
+        if not isinstance(raw, dict) or set(raw) != {"cache_key", "decision_digest"}:
+            raise ValueError("semantic analysis cache record is invalid")
+        cache_key = str(raw.get("cache_key") or "")
+        decision_digest = str(raw.get("decision_digest") or "")
+        if not cache_key.startswith("arc-") or len(decision_digest) != 64:
+            raise ValueError("semantic analysis cache identity is invalid")
+        normalized.append({"cache_key": cache_key, "decision_digest": decision_digest})
+    return sorted(normalized, key=lambda value: value["cache_key"])
+
+
 def _verify_replay_integrity(source: Path, replay: Path) -> dict[str, Any]:
     source = _run_child(source, label="replay source")
     replay = _run_child(replay, label="replay run")
@@ -478,6 +497,8 @@ def _verify_replay_integrity(source: Path, replay: Path) -> dict[str, Any]:
         raise ValueError("semantic analysis artifacts must be objects")
     source_versions = _analysis_versions(source_analysis)
     replay_versions = _analysis_versions(replay_analysis)
+    source_cache_records = _analysis_cache_records(source_analysis)
+    replay_cache_records = _analysis_cache_records(replay_analysis)
     source_evidence_digest = str(source_analysis.get("ledger_evidence_digest") or "")
     replay_evidence_digest = str(replay_analysis.get("ledger_evidence_digest") or "")
     failures: list[str] = []
@@ -487,6 +508,8 @@ def _verify_replay_integrity(source: Path, replay: Path) -> dict[str, Any]:
         failures.append("semantic ledger evidence digest differs")
     if source_versions != replay_versions:
         failures.append("analyzer route or version differs")
+    if source_cache_records != replay_cache_records:
+        failures.append("validated analyzer cache decisions differ")
     report: dict[str, Any] = {
         "schema_version": 1,
         "status": "pass" if not failures else "blocked",
@@ -495,6 +518,7 @@ def _verify_replay_integrity(source: Path, replay: Path) -> dict[str, Any]:
         "ledger_identity": replay_identity,
         "ledger_evidence_digest": replay_evidence_digest,
         "analyzer_versions": [json.loads(value) for value in replay_versions],
+        "analyzer_cache_records": replay_cache_records,
         "failures": failures,
     }
     report["integrity_digest"] = "sha256:" + hashlib.sha256(
@@ -533,6 +557,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--analysis-fixture",
         type=Path,
         help="Offline validated semantic response fixture; never used by scheduled production runs.",
+    )
+    parser.add_argument(
+        "--analyzer-cache",
+        type=Path,
+        help="Validated append-only semantic response cache; defaults beside --state.",
     )
     return parser.parse_args(argv)
 
@@ -609,6 +638,8 @@ def main(argv: list[str] | None = None) -> int:
         str(ROOT),
         "--corrections",
         str(args.corrections),
+        "--analyzer-cache",
+        str(args.analyzer_cache or (args.state.parent / "analyzer-cache.jsonl")),
     ]
     if args.analysis_fixture:
         accounting_command.extend(["--analysis-fixture", str(args.analysis_fixture)])

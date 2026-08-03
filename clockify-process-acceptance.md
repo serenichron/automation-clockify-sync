@@ -49,7 +49,7 @@ explicit exclusions or exceptions.
 | 100% non-overlap | Proven locally | Complete guarded allocation report checked against live Clockify blocks |
 | Zero gap filling | Proven locally | Guarded allocation report and audit |
 | Every eligible Fathom meeting reconciled/excluded | Implemented locally; live denominator missing | Complete paginated Fathom inventory and reconciliation artifact |
-| Replay produces `0 new / 0 changed` | Immutable replay path and fail-closed gate proven locally; live proof missing | First shadow run plus a distinct `--replay-from` run with passing digest-bound `replay-integrity.json` and `0 new / 0 changed` |
+| Replay produces `0 new / 0 changed` | Immutable replay path and validated append-only analyzer-decision cache proven locally; live proof missing | First shadow run plus a distinct `--replay-from` run with matching cache-decision digests, passing `replay-integrity.json`, and `0 new / 0 changed` |
 | Every analyzer route passes digest-bound evaluation | Missing live proof | One verified scorecard per model/tier used in each acceptance period |
 | Versioned 86-record corpus | Proven locally | `tests/fixtures/clockify-regression/v1/manifest.json`; 86 content-addressed records |
 | At least 90% approve unchanged baseline | Missing | One complete integrity-linked `shadow_baseline` report with decisions for every active row, including ambiguous rows |
@@ -67,8 +67,10 @@ explicit exclusions or exceptions.
    deploy that exact SHA to Mac, Precision, and Desktop, and verify Git/readback
    hashes without merging or changing any scheduled automation.
 3. Run `scripts/analyzer_live_evaluation.py` for the intended primary analyzer
-   and any configured fallback. Require a passing digest-bound scorecard for
-   each route; all cases are built-in and no ledger evidence is sent.
+   and any configured fallback. Require every raw replay to pass schema,
+   citation, partition, atomicity, and rendering gates and to agree on the
+   review-relevant semantic decision. All cases are built-in and no ledger
+   evidence is sent.
 4. Obtain a separate explicit decision before setting
    `CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED=approved`; a successful probe alone
    does not authorize private session, meeting, or issue prose to leave the
@@ -76,8 +78,9 @@ explicit exclusions or exceptions.
 5. Run one complete July 1 through August 3 read-only shadow reconciliation and
    require complete source manifests, including every eligible Fathom meeting.
 6. Replay the same immutable input and model versions through the same durable
-   state and require `0 new / 0 changed`; this is the second run, not an
-   additional independently collected period.
+   state and validated analyzer cache. Require identical cache-decision digests
+   and `0 new / 0 changed`; this is the second run, not an additional
+   independently collected period.
 7. Collect full-denominator approve/skip/modify dispositions and calculate the
    unchanged-approval rate; ambiguous rows are part of that denominator and
    every skip/modify needs a criticality assessment.

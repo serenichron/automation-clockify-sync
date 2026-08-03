@@ -126,8 +126,9 @@ allocation, or correction-regression contracts recorded there.
 3. Run the complete verification suite on every collector host.
 4. Run the selected analyzer route through
    `scripts/analyzer_live_evaluation.py`. Stop on any probe, schema, partition,
-   rendering, or stable-replay failure; retain its synthetic capture and sealed
-   scorecard.
+   rendering, or review-decision-stability failure; retain its synthetic capture
+   and sealed scorecard. Harmless rationale wording may vary, but evidence
+   disposition, partitions, lifecycle, effort, and confidence may not.
 5. Enable `CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED=approved` only when the exact
    validation approval includes redacted private semantic-text egress, and only
    for the approved run scope.
@@ -136,9 +137,11 @@ allocation, or correction-regression contracts recorded there.
    `state/validation/july-baseline/`. Do not copy Mac state and do not mutate the
    existing production review state.
 7. Replay the exact immutable evidence and model versions through that same
-   validation state with `scripts/clockify_review_run.py --replay-from
+   validation state and its append-only `analyzer-cache.jsonl` with
+   `scripts/clockify_review_run.py --replay-from
    /absolute/path/to/runs/<first-run-id>`. Require a passing
-   `replay-integrity.json`, `new=0`, `changed=0`, all unresolved active rows as
+   `replay-integrity.json`, identical sealed cache-decision digests, `new=0`,
+   `changed=0`, all unresolved active rows as
    `carried_pending`, complete source manifests, passing quality, and explicit
    Fathom reconciliation. A second live collection is not replay evidence.
 8. Attach every passing route scorecard to the complete evidence-bound review

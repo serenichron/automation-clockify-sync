@@ -234,6 +234,7 @@ def analyze_ledger(
     *,
     analysis_fixture: Path | None = None,
     corrections: list[dict[str, Any]] | None = None,
+    analyzer_cache_path: Path | None = None,
 ) -> dict[str, Any]:
     known = {str(event.get("evidence_id")) for event in events}
     if analysis_fixture:
@@ -253,11 +254,17 @@ def analyze_ledger(
             "semantic analyzer is not configured; CLOCKIFY_ANALYZER_PRIMARY_URL is required"
         )
     fallback = semantic_analyzer.AnalyzerEndpoint.from_env("CLOCKIFY_ANALYZER_FALLBACK")
+    cache = (
+        semantic_analyzer.AnalyzerResponseCache(analyzer_cache_path)
+        if analyzer_cache_path is not None
+        else None
+    )
     return semantic_analyzer.analyze_tiered(
         events,
         primary=primary,
         fallback=fallback,
         corrections=corrections,
+        cache=cache,
     )
 
 
@@ -564,6 +571,7 @@ def run_accounting(
     root: Path,
     analysis_fixture: Path | None = None,
     corrections_path: Path | None = None,
+    analyzer_cache_path: Path | None = None,
 ) -> dict[str, Any]:
     ledger_path = run_dir / "evidence" / "evidence-ledger.json"
     ledger, all_events = load_ledger(ledger_path)
@@ -582,12 +590,20 @@ def run_accounting(
         analysis_events,
         analysis_fixture=analysis_fixture,
         corrections=corrections,
+        analyzer_cache_path=analyzer_cache_path,
     )
     analysis.setdefault("ledger_event_count", len(analysis_events))
     analysis.setdefault("ledger_evidence_digest", semantic_analyzer.stable_digest(
         "led-", sorted(event["evidence_id"] for event in analysis_events)
     ))
     analysis.setdefault("analysis_chunks", [])
+    analysis.setdefault(
+        "analyzer_cache",
+        {
+            "schema_version": semantic_analyzer.ANALYZER_CACHE_SCHEMA_VERSION,
+            "status": "disabled",
+        },
+    )
     analysis["noise_classifications"] = noise
     _write_json(run_dir / "semantic-analysis.json", analysis)
 
@@ -944,6 +960,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--analysis-fixture", type=Path)
     parser.add_argument("--corrections", type=Path)
+    parser.add_argument("--analyzer-cache", type=Path)
     return parser.parse_args(argv)
 
 
@@ -955,6 +972,7 @@ def main(argv: list[str] | None = None) -> int:
             root=args.root.resolve(),
             analysis_fixture=args.analysis_fixture,
             corrections_path=args.corrections,
+            analyzer_cache_path=args.analyzer_cache,
         )
     except (WorkAccountingError, semantic_analyzer.AnalyzerError, work_allocator.AllocationError, ValueError) as exc:
         print(f"work accounting blocked: {exc}", file=sys.stderr)
