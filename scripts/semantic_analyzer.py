@@ -29,7 +29,7 @@ import urllib.request
 
 
 SCHEMA_VERSION = 1
-PROMPT_VERSION = "clockify-semantic-v7"
+PROMPT_VERSION = "clockify-semantic-v8"
 ANALYZER_CACHE_SCHEMA_VERSION = "clockify-analyzer-cache/v1"
 DEFAULT_PRIMARY_MODEL = "deepseek-v4-flash:cloud"
 DEFAULT_MAX_BODY_BYTES = 1_450_000
@@ -201,6 +201,18 @@ def _repair_instruction(failure_code: str) -> str:
         "synthesis_split": "Synthesis may merge provisional activities but must not split them.",
     }
     return instructions.get(category, "Return only contract-valid JSON that preserves all supplied evidence exactly once.")
+
+
+def _repair_system_addendum(failure_code: str) -> str:
+    """Make category-only repair guidance prominent without leaking rejected prose."""
+    if failure_code not in CONTRACT_FAILURE_CODES:
+        raise AnalyzerError("repair feedback code is invalid")
+    return (
+        "\n\nCORRECTIVE RETRY: The previous response was rejected under the "
+        f"allowlisted category {failure_code}. {_repair_instruction(failure_code)} "
+        "Return a complete replacement result. Do not quote, summarize, or refer to "
+        "the rejected response."
+    )
 
 
 def _raise_if_cancelled(cancelled: Callable[[], bool] | None) -> None:
@@ -679,6 +691,8 @@ Output object:
   "omissions": [{"lifecycle":"planned|noise", "evidence_ids":[], "reason":""}]
 }
 """
+    if repair_failure_code is not None:
+        system += _repair_system_addendum(repair_failure_code)
     projected = project_events(events)
     aliases, _ = _evidence_reference_maps(event["evidence_id"] for event in projected)
     model_events = [
@@ -840,6 +854,8 @@ Every returned activity must have a non-empty split_rationale; merged evidence m
 non-empty merge_rationale.
 Do not invent projects, outcomes, effort, or timing. Never include paths, URLs, emails, secrets, IDs,
 or status prose in descriptive fields."""
+    if repair_failure_code is not None:
+        system += _repair_system_addendum(repair_failure_code)
     payload = {
         "mode": "synthesize",
         "schema_version": SCHEMA_VERSION,
@@ -1625,7 +1641,7 @@ def probe_endpoint(endpoint: AnalyzerEndpoint, transport: Transport = http_trans
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": "Return JSON only."},
-            {"role": "user", "content": '{"probe":"clockify-semantic-v7"}'},
+            {"role": "user", "content": canonical_json({"probe": PROMPT_VERSION})},
         ],
     }
     raw = transport(endpoint, body)

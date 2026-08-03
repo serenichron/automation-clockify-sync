@@ -157,7 +157,7 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         )
         expected = {
             "schema_version": 1,
-            "prompt_version": "clockify-semantic-v7",
+            "prompt_version": "clockify-semantic-v8",
             "activities": [],
             "exceptions": [],
             "omissions": [],

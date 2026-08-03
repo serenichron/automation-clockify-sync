@@ -536,7 +536,11 @@ class SemanticAnalyzerTests(unittest.TestCase):
 
         def transport(endpoint, body):
             payload = json.loads(body["messages"][-1]["content"])
-            calls.append({"endpoint": endpoint.name, "payload": payload})
+            calls.append({
+                "endpoint": endpoint.name,
+                "payload": payload,
+                "system": body["messages"][0]["content"],
+            })
             if payload.get("probe"):
                 return {"probe": "ok"}
             response = valid_response(payload["events"][0]["evidence_id"])
@@ -557,6 +561,10 @@ class SemanticAnalyzerTests(unittest.TestCase):
             "contract_rejected_compound_action",
             requests[1]["repair_feedback"]["failure_code"],
         )
+        repair_call = [call for call in calls if "repair_feedback" in call["payload"]][0]
+        self.assertIn("CORRECTIVE RETRY", repair_call["system"])
+        self.assertIn("Return one atomic past-tense action", repair_call["system"])
+        self.assertNotIn("Fixed and published", repair_call["system"])
         self.assertEqual("used", result["analysis_chunks"][0]["repair_status"])
         self.assertEqual("primary", result["analysis_chunks"][0]["tier"])
 
