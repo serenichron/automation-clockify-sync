@@ -168,6 +168,14 @@ def build_period_report(
     replay_analysis = _require_mapping(_read_json(replay_run_dir / "semantic-analysis.json"), "replay semantic analysis")
     quality = _require_mapping(_read_json(run_dir / "quality_report.json"), "quality report")
     replay_quality = _require_mapping(_read_json(replay_run_dir / "quality_report.json"), "replay quality report")
+    replay_integrity_path = replay_run_dir / "replay-integrity.json"
+    if not replay_integrity_path.is_file():
+        raise AcceptanceError(
+            "acceptance replay lacks replay-integrity.json; a second live collection is not replay evidence"
+        )
+    replay_integrity = _require_mapping(
+        _read_json(replay_integrity_path), "replay integrity"
+    )
 
     denominator = _denominator(snapshot)
     replay_denominator = _denominator(replay_snapshot)
@@ -214,6 +222,27 @@ def build_period_report(
     replay_manifest = _require_mapping(replay_accounting.get("ledger_manifest"), "replay ledger manifest")
     manifest_id = str(ledger_manifest.get("manifest_id") or "")
     replay_manifest_id = str(replay_manifest.get("manifest_id") or "")
+    integrity_identity = _require_mapping(
+        replay_integrity.get("ledger_identity"), "replay integrity ledger identity"
+    )
+    integrity_payload = {
+        str(key): value
+        for key, value in replay_integrity.items()
+        if key != "integrity_digest"
+    }
+    immutable_replay_pass = bool(
+        replay_integrity.get("integrity_digest") == digest(integrity_payload)
+        and replay_integrity.get("schema_version") == SCHEMA_VERSION
+        and replay_integrity.get("status") == "pass"
+        and str(replay_integrity.get("source_run_id") or "")
+        == str(snapshot.get("run_id") or run_dir.name)
+        and str(replay_integrity.get("replay_run_id") or "")
+        == str(replay_snapshot.get("run_id") or replay_run_dir.name)
+        and str(integrity_identity.get("manifest_id") or "") == manifest_id
+        and str(replay_integrity.get("ledger_evidence_digest") or "")
+        == str(analysis.get("ledger_evidence_digest") or "")
+        and not replay_integrity.get("failures")
+    )
     source_complete = (
         _require_mapping(ledger_manifest.get("source_completeness"), "source completeness").get("status") == "complete"
         and _require_mapping(replay_manifest.get("source_completeness"), "replay source completeness").get("status") == "complete"
@@ -253,6 +282,7 @@ def build_period_report(
         and denominator == replay_denominator
         and versions_complete
         and versions == replay_versions
+        and immutable_replay_pass
         and int(replay_summary.get("new", -1)) == 0
         and int(replay_summary.get("changed", -1)) == 0
     )
@@ -284,6 +314,7 @@ def build_period_report(
         "source_complete": source_complete,
         "quality_pass": quality_pass,
         "coverage_clean": coverage_clean,
+        "immutable_replay_pass": immutable_replay_pass,
         "replay_stable": replay_stable,
         "full_denominator_complete": full_denominator_complete,
     }

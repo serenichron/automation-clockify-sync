@@ -106,6 +106,27 @@ def _make_run(
         },
     )
     _write(run / "quality_report.json", {"status": quality_status})
+    if replay:
+        source_name = name.removesuffix("-replay")
+        replay_integrity = {
+            "schema_version": 1,
+            "status": "pass",
+            "source_run_id": source_name,
+            "replay_run_id": name,
+            "ledger_identity": {"manifest_id": "manifest-one"},
+            "ledger_evidence_digest": evidence_digest,
+            "analyzer_versions": [
+                {
+                    "model": "fixture-model",
+                    "tier": "primary",
+                    "prompt_version": "prompt-one",
+                    "schema_version": 1,
+                }
+            ],
+            "failures": [],
+        }
+        replay_integrity["integrity_digest"] = acceptance.digest(replay_integrity)
+        _write(run / "replay-integrity.json", replay_integrity)
     return run
 
 
@@ -241,6 +262,19 @@ class ReviewAcceptanceTests(unittest.TestCase):
                     run, replay, [_decision(rows[0])], stage="shadow_baseline"
                 )
                 self.assertFalse(acceptance.period_passes(period, 0.90))
+
+    def test_second_live_collection_cannot_masquerade_as_immutable_replay(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rows = [_review_item(1)]
+            run = _make_run(root, "run-one", rows)
+            replay = _make_run(root, "run-one-replay", rows, replay=True)
+            (replay / "replay-integrity.json").unlink()
+
+            with self.assertRaisesRegex(acceptance.AcceptanceError, "second live collection"):
+                acceptance.build_period_report(
+                    run, replay, [_decision(rows[0])], stage="shadow_baseline"
+                )
 
     def test_baseline_and_two_later_distinct_guarded_periods_enable_gate(self):
         records = [

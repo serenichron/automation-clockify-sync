@@ -14,6 +14,7 @@ import datetime as dt
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from typing import Any
@@ -368,11 +369,153 @@ def _collector_run_dir(stdout: str) -> Path:
     return run_dir
 
 
+def _run_child(path: Path, *, label: str) -> Path:
+    resolved = path.resolve()
+    if resolved.parent != RUNS.resolve() or not resolved.is_dir():
+        raise ValueError(f"{label} must be a direct child of {RUNS.resolve()}: {resolved}")
+    return resolved
+
+
+def _ledger_identity(run_dir: Path) -> dict[str, str]:
+    path = run_dir / "evidence" / "evidence-ledger.json"
+    document = _read_json(path)
+    if not isinstance(document, dict) or document.get("schema_version") != "evidence-ledger/v1":
+        raise ValueError(f"invalid evidence ledger document: {path}")
+    manifest = document.get("manifest")
+    if not isinstance(manifest, dict):
+        raise ValueError(f"evidence ledger manifest is missing: {path}")
+    manifest_id = str(manifest.get("manifest_id") or "")
+    events_digest = str(manifest.get("events_digest") or "")
+    if not manifest_id.startswith("elm-") or len(events_digest) != 64:
+        raise ValueError(f"evidence ledger identity is incomplete: {path}")
+    return {
+        "manifest_id": manifest_id,
+        "events_digest": events_digest,
+        "file_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+
+
+def _prepare_replay_run(source: Path) -> Path:
+    """Create a distinct run that reuses only one immutable collected ledger."""
+    source = _run_child(source, label="replay source")
+    for required in ("run-report.json", "run-report.md", "semantic-analysis.json"):
+        if not (source / required).is_file():
+            raise ValueError(f"replay source is incomplete; missing {source / required}")
+    source_identity = _ledger_identity(source)
+    stem = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ") + f"-replay-{source.name}"
+    target = RUNS.resolve() / stem
+    suffix = 1
+    while target.exists():
+        target = RUNS.resolve() / f"{stem}-{suffix}"
+        suffix += 1
+    try:
+        (target / "evidence").mkdir(parents=True)
+        shutil.copyfile(
+            source / "evidence" / "evidence-ledger.json",
+            target / "evidence" / "evidence-ledger.json",
+        )
+        report = _read_json(source / "run-report.json")
+        if not isinstance(report, dict):
+            raise ValueError("replay source run report must be an object")
+        report = dict(report)
+        report["run_id"] = target.name
+        report["replay_of_run_id"] = source.name
+        _write_json(target / "run-report.json", report)
+        shutil.copyfile(source / "run-report.md", target / "run-report.md")
+        _write_json(
+            target / "replay-source.json",
+            {
+                "schema_version": 1,
+                "source_run_id": source.name,
+                "source_run_dir": str(source),
+                "source_manifest_id": source_identity["manifest_id"],
+                "source_events_digest": source_identity["events_digest"],
+                "ledger_file_sha256": source_identity["file_sha256"],
+            },
+        )
+        if _ledger_identity(target) != source_identity:
+            raise ValueError("replay ledger copy does not match its immutable source")
+        return target
+    except Exception:
+        shutil.rmtree(target, ignore_errors=True)
+        raise
+
+
+def _analysis_versions(document: dict[str, Any]) -> list[str]:
+    versions: set[str] = set()
+    prompt_version = str(document.get("prompt_version") or "")
+    schema_version = document.get("schema_version")
+    for key in ("activities", "analysis_chunks"):
+        values = document.get(key, [])
+        if not isinstance(values, list):
+            raise ValueError(f"semantic analysis {key} must be a list")
+        for raw in values:
+            if not isinstance(raw, dict):
+                raise ValueError(f"semantic analysis {key} item must be an object")
+            model = str(raw.get("analyzer_model") or raw.get("model") or "")
+            tier = str(raw.get("analyzer_tier") or raw.get("tier") or "")
+            if model and tier:
+                version = {
+                    "model": model,
+                    "tier": tier,
+                    "prompt_version": str(raw.get("prompt_version") or prompt_version),
+                    "schema_version": raw.get("schema_version", schema_version),
+                }
+                versions.add(json.dumps(version, sort_keys=True, separators=(",", ":")))
+    if not versions:
+        raise ValueError("semantic analysis does not identify an analyzer route/version")
+    return sorted(versions)
+
+
+def _verify_replay_integrity(source: Path, replay: Path) -> dict[str, Any]:
+    source = _run_child(source, label="replay source")
+    replay = _run_child(replay, label="replay run")
+    source_identity = _ledger_identity(source)
+    replay_identity = _ledger_identity(replay)
+    source_analysis = _read_json(source / "semantic-analysis.json")
+    replay_analysis = _read_json(replay / "semantic-analysis.json")
+    if not isinstance(source_analysis, dict) or not isinstance(replay_analysis, dict):
+        raise ValueError("semantic analysis artifacts must be objects")
+    source_versions = _analysis_versions(source_analysis)
+    replay_versions = _analysis_versions(replay_analysis)
+    source_evidence_digest = str(source_analysis.get("ledger_evidence_digest") or "")
+    replay_evidence_digest = str(replay_analysis.get("ledger_evidence_digest") or "")
+    failures: list[str] = []
+    if source_identity != replay_identity:
+        failures.append("immutable ledger identity differs")
+    if not source_evidence_digest or source_evidence_digest != replay_evidence_digest:
+        failures.append("semantic ledger evidence digest differs")
+    if source_versions != replay_versions:
+        failures.append("analyzer route or version differs")
+    report: dict[str, Any] = {
+        "schema_version": 1,
+        "status": "pass" if not failures else "blocked",
+        "source_run_id": source.name,
+        "replay_run_id": replay.name,
+        "ledger_identity": replay_identity,
+        "ledger_evidence_digest": replay_evidence_digest,
+        "analyzer_versions": [json.loads(value) for value in replay_versions],
+        "failures": failures,
+    }
+    report["integrity_digest"] = "sha256:" + hashlib.sha256(
+        json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    _write_json(replay / "replay-integrity.json", report)
+    if failures:
+        raise ValueError("; ".join(failures))
+    return report
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--since", help="YYYY-MM-DD")
     parser.add_argument("--until", help="YYYY-MM-DD inclusive")
     parser.add_argument("--no-enrich", action="store_true")
+    parser.add_argument(
+        "--replay-from",
+        type=Path,
+        help="Reuse a completed run's immutable evidence ledger in a distinct replay run.",
+    )
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--corrections", type=Path, default=DEFAULT_CORRECTIONS)
     parser.add_argument(
@@ -396,6 +539,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.replay_from and (args.since or args.until or args.no_enrich):
+        print(
+            "clockify review run: --replay-from cannot be combined with collection range/enrichment options",
+            file=sys.stderr,
+        )
+        return 2
     acceptance_gate: dict[str, Any] = {
         "exceptions_only_eligible": False,
         "status": "not_recorded",
@@ -422,26 +571,35 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    collector = [
-        sys.executable,
-        str(SCRIPTS / "clockify_sync_collect.py"),
-        "run",
-    ]
-    if args.since:
-        collector.extend(["--since", args.since])
-    if args.until:
-        collector.extend(["--until", args.until])
-    collector.append("--no-enrich" if args.no_enrich else "--enrich")
+    replay_source: Path | None = None
+    if args.replay_from:
+        try:
+            replay_source = _run_child(args.replay_from, label="replay source")
+            run_dir = _prepare_replay_run(replay_source)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"clockify review run: cannot prepare immutable replay: {exc}", file=sys.stderr)
+            return 2
+    else:
+        collector = [
+            sys.executable,
+            str(SCRIPTS / "clockify_sync_collect.py"),
+            "run",
+        ]
+        if args.since:
+            collector.extend(["--since", args.since])
+        if args.until:
+            collector.extend(["--until", args.until])
+        collector.append("--no-enrich" if args.no_enrich else "--enrich")
 
-    collected = _run(collector)
-    if collected.returncode != 0:
-        print(collected.stderr or collected.stdout, file=sys.stderr)
-        return collected.returncode or 2
-    try:
-        run_dir = _collector_run_dir(collected.stdout)
-    except ValueError as exc:
-        print(f"clockify review run: {exc}", file=sys.stderr)
-        return 2
+        collected = _run(collector)
+        if collected.returncode != 0:
+            print(collected.stderr or collected.stdout, file=sys.stderr)
+            return collected.returncode or 2
+        try:
+            run_dir = _collector_run_dir(collected.stdout)
+        except ValueError as exc:
+            print(f"clockify review run: {exc}", file=sys.stderr)
+            return 2
 
     accounting_command = [
         sys.executable,
@@ -478,6 +636,28 @@ def main(argv: list[str] | None = None) -> int:
         write_summary(summary_path, result)
         print(result_path)
         return accounted.returncode or 2
+
+    if replay_source is not None:
+        try:
+            _verify_replay_integrity(replay_source, run_dir)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            quality = {
+                "status": "blocked",
+                "summary": {"immutable_replay": "failed", "reason": str(exc)},
+            }
+            _write_json(run_dir / "quality_report.json", quality)
+            result = build_result(
+                run_dir,
+                quality,
+                None,
+                review_mode=args.review_mode,
+                acceptance_gate=acceptance_gate,
+            )
+            result_path = run_dir / "autopilot-result.json"
+            _write_json(result_path, result)
+            write_summary(run_dir / "autopilot-summary.md", result)
+            print(result_path)
+            return 2
 
     checked = _run(
         [
@@ -520,6 +700,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     result["paths"]["work_accounting_result"] = str(
         (run_dir / "work-accounting-result.json").resolve()
+    )
+    result["paths"]["replay_integrity"] = (
+        str((run_dir / "replay-integrity.json").resolve())
+        if replay_source is not None
+        else None
     )
     result_path = run_dir / "autopilot-result.json"
     summary_path = run_dir / "autopilot-summary.md"

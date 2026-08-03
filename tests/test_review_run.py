@@ -26,6 +26,101 @@ def item(item_id: str, description: str) -> dict:
 
 
 class ReviewRunResultTests(unittest.TestCase):
+    def test_immutable_replay_copies_only_ledger_and_binds_source_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            source = runs / "source-run"
+            (source / "evidence").mkdir(parents=True)
+            ledger = {
+                "schema_version": "evidence-ledger/v1",
+                "manifest": {
+                    "manifest_id": "elm-" + "a" * 64,
+                    "events_digest": "b" * 64,
+                },
+                "events": [],
+            }
+            (source / "evidence" / "evidence-ledger.json").write_text(
+                json.dumps(ledger, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            (source / "run-report.json").write_text(
+                json.dumps({"run_id": "source-run"}) + "\n", encoding="utf-8"
+            )
+            (source / "run-report.md").write_text("# source\n", encoding="utf-8")
+            (source / "semantic-analysis.json").write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "prompt_version": "prompt-v1",
+                    "ledger_evidence_digest": "sha256:" + "c" * 64,
+                    "activities": [{
+                        "analyzer_model": "model-a",
+                        "analyzer_tier": "primary",
+                    }],
+                    "analysis_chunks": [],
+                }) + "\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(review_run, "RUNS", runs):
+                replay = review_run._prepare_replay_run(source)
+
+            self.assertNotEqual(source, replay)
+            self.assertEqual(
+                (source / "evidence" / "evidence-ledger.json").read_bytes(),
+                (replay / "evidence" / "evidence-ledger.json").read_bytes(),
+            )
+            provenance = json.loads((replay / "replay-source.json").read_text(encoding="utf-8"))
+            self.assertEqual("source-run", provenance["source_run_id"])
+            self.assertEqual("elm-" + "a" * 64, provenance["source_manifest_id"])
+            self.assertFalse((replay / "semantic-analysis.json").exists())
+
+    def test_replay_integrity_rejects_analyzer_version_drift(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            source = runs / "source-run"
+            replay = runs / "replay-run"
+            ledger = {
+                "schema_version": "evidence-ledger/v1",
+                "manifest": {
+                    "manifest_id": "elm-" + "a" * 64,
+                    "events_digest": "b" * 64,
+                },
+                "events": [],
+            }
+            for run_dir, model in ((source, "model-a"), (replay, "model-b")):
+                (run_dir / "evidence").mkdir(parents=True)
+                (run_dir / "evidence" / "evidence-ledger.json").write_text(
+                    json.dumps(ledger, sort_keys=True) + "\n", encoding="utf-8"
+                )
+                (run_dir / "semantic-analysis.json").write_text(
+                    json.dumps({
+                        "schema_version": 1,
+                        "prompt_version": "prompt-v1",
+                        "ledger_evidence_digest": "sha256:" + "c" * 64,
+                        "activities": [{
+                            "analyzer_model": model,
+                            "analyzer_tier": "primary",
+                        }],
+                        "analysis_chunks": [],
+                    }) + "\n",
+                    encoding="utf-8",
+                )
+
+            with mock.patch.object(review_run, "RUNS", runs):
+                with self.assertRaisesRegex(ValueError, "analyzer route or version differs"):
+                    review_run._verify_replay_integrity(source, replay)
+
+            report = json.loads((replay / "replay-integrity.json").read_text(encoding="utf-8"))
+            self.assertEqual("blocked", report["status"])
+
+    def test_replay_range_options_are_rejected_before_any_process_runs(self):
+        with mock.patch.object(review_run, "_run") as run:
+            code = review_run.main(
+                ["--replay-from", "/tmp/source", "--since", "2026-07-01"]
+            )
+
+        self.assertEqual(2, code)
+        run.assert_not_called()
+
     def test_exceptions_only_cannot_start_before_acceptance_gate(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(review_run, "_run") as run:
             code = review_run.main(

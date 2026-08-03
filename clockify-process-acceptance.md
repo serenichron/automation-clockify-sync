@@ -49,7 +49,7 @@ explicit exclusions or exceptions.
 | 100% non-overlap | Proven locally | Complete guarded allocation report checked against live Clockify blocks |
 | Zero gap filling | Proven locally | Guarded allocation report and audit |
 | Every eligible Fathom meeting reconciled/excluded | Implemented locally; live denominator missing | Complete paginated Fathom inventory and reconciliation artifact |
-| Replay produces `0 new / 0 changed` | Missing live proof | Two runs of the same immutable inputs/model versions against fresh durable state |
+| Replay produces `0 new / 0 changed` | Immutable replay path and fail-closed gate proven locally; live proof missing | First shadow run plus a distinct `--replay-from` run with passing digest-bound `replay-integrity.json` and `0 new / 0 changed` |
 | Every analyzer route passes digest-bound evaluation | Missing live proof | One verified scorecard per model/tier used in each acceptance period |
 | Versioned 86-record corpus | Proven locally | `tests/fixtures/clockify-regression/v1/manifest.json`; 86 content-addressed records |
 | At least 90% approve unchanged baseline | Missing | One complete integrity-linked `shadow_baseline` report with decisions for every active row, including ambiguous rows |
@@ -60,18 +60,23 @@ explicit exclusions or exceptions.
 
 ## Guarded evidence sequence
 
-1. Freeze the candidate as an immutable Git SHA after explicit approval.
-2. Probe the intended primary analyzer route and configured fallback without
-   sending ledger evidence until the minimal probe succeeds.
-3. Obtain a separate explicit decision before setting
+1. Resolve the clean local candidate with `git rev-parse HEAD` and bind every
+   approval, deployment, run manifest, and readback to that immutable SHA. A
+   later local edit creates a new candidate and invalidates the prior binding.
+2. After explicit publication/deployment approval, push only the feature branch,
+   deploy that exact SHA to Mac, Precision, and Desktop, and verify Git/readback
+   hashes without merging or changing any scheduled automation.
+3. Probe the intended primary analyzer route and any configured fallback without
+   sending ledger evidence until the minimal probes succeed.
+4. Obtain a separate explicit decision before setting
    `CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED=approved`; a successful probe alone
    does not authorize private session, meeting, or issue prose to leave the
    machine.
-4. Deploy and read back the exact SHA on Mac, Precision, and Desktop without
-   changing Clockify, Sheets, or Multica review content.
-5. Run a complete July 1 through August 3 read-only shadow reconciliation and
+5. Run one complete July 1 through August 3 read-only shadow reconciliation and
    require complete source manifests, including every eligible Fathom meeting.
-6. Replay the same immutable input/model versions and require `0 new / 0 changed`.
+6. Replay the same immutable input and model versions through the same durable
+   state and require `0 new / 0 changed`; this is the second run, not an
+   additional independently collected period.
 7. Collect full-denominator approve/skip/modify dispositions and calculate the
    unchanged-approval rate; ambiguous rows are part of that denominator and
    every skip/modify needs a criticality assessment.
@@ -86,12 +91,15 @@ explicit exclusions or exceptions.
 
 ## Current rollout status
 
-No candidate commit, route probe, private-text approval, deployment, Sheet
-refresh, or Clockify write has been completed for this candidate. The live
-route probe, explicit `CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED=approved`
-decision, exact-SHA fleet deployment/readback, two complete July 1–August 3
-shadow runs plus replay, the acceptance periods, and any Sheet refresh remain
-separate guarded gates.
+A clean candidate is committed locally on
+`codex/clockify-evidence-work-accounting`; resolve and record its exact SHA at
+the approval boundary because any later edit creates a new candidate. It has
+not been pushed, merged, probed against a live analyzer, deployed, or authorized
+for private-text egress. No Sheet, Clockify, Multica, or schedule mutation has
+been performed for this candidate. Exact-SHA fleet deployment/readback, one
+complete July 1–August 3 shadow run plus immutable replay, full-denominator
+acceptance periods, and any review-surface refresh remain separate guarded
+gates.
 
 ## Local verification
 

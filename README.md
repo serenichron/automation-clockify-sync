@@ -56,6 +56,8 @@ Outputs:
   bound to reviewed evidence; these are never sent to a model;
 - `runs/<run-id>/review-regression-results.json`: pass/fail evidence showing
   whether previously corrected behavior was actually learned;
+- `runs/<replay-run-id>/replay-integrity.json`: digest-bound proof that a
+  distinct replay reused the byte-identical ledger and analyzer versions;
 - `runs/<run-id>/proposals.json`: final semantic allocation candidates;
 - `runs/<run-id>/legacy-*.json`: collector-only diagnostic candidates, never
   reviewable output and never carried into durable state;
@@ -201,6 +203,27 @@ python3 scripts/review_acceptance.py record \
 python3 scripts/review_acceptance.py status \
   --ledger state/review-acceptance.jsonl
 ```
+
+An acceptance replay must not recollect live sources. Run the first shadow pass
+with isolated validation state, then point `--replay-from` at its absolute run
+directory while reusing the same state and corrections files:
+
+```bash
+python3 scripts/clockify_review_run.py \
+  --since 2026-07-01 --until 2026-08-03 \
+  --state state/validation/july-baseline/review-items.json \
+  --corrections state/validation/july-baseline/review-corrections.jsonl
+python3 scripts/clockify_review_run.py \
+  --replay-from /absolute/path/to/runs/<first-run-id> \
+  --state state/validation/july-baseline/review-items.json \
+  --corrections state/validation/july-baseline/review-corrections.jsonl
+```
+
+The replay command creates a distinct run, copies the evidence ledger
+byte-for-byte, reruns semantic analysis, and fails before durable-state ingestion
+if the ledger identity, semantic evidence digest, or analyzer route/version
+differs. Its `replay-integrity.json` is required alongside replay
+`0 new / 0 changed`; running the ordinary collector twice is not replay proof.
 
 In `exceptions_only`, clean pending rows are represented by one
 content-addressed `clean_batch` count and ID; active ambiguous rows remain

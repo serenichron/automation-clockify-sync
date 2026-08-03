@@ -6,11 +6,15 @@ historical evidence and must be re-read before any rollout.
 
 ## Candidate status — 2026-08-03
 
-The local candidate has not been committed, deployed, or routed live. There
-has been no analyzer route probe, private-text egress authorization, Sheet
-refresh, Clockify write, Multica mutation, or fleet mutation for this candidate.
-Calendly remains excluded. Clockify remains the system of record; the process
-only creates local review artifacts until separate guarded approval is granted.
+The candidate is committed locally on
+`codex/clockify-evidence-work-accounting`. Resolve its exact SHA with
+`git rev-parse HEAD` immediately before approval and bind every deployment and
+run manifest to that SHA; any later edit creates a new candidate. It has not
+been pushed, merged, deployed, or routed live. There has been no analyzer route
+probe, private-text egress authorization, Sheet refresh, Clockify write,
+Multica mutation, or fleet mutation for this candidate. Calendly remains
+excluded. Clockify remains the system of record; the process only creates local
+review artifacts until the applicable guarded approval is granted.
 
 The standard local command is `python3 scripts/clockify_review_run.py`, which
 defaults to `--review-mode shadow_all`. In that mode the full active review
@@ -58,8 +62,11 @@ the versioned files under `schemas/`. This rollout document does not replace the
 noise, Fathom eligibility, analyzer fallback, deterministic description,
 allocation, or correction-regression contracts recorded there.
 
-1. Obtain direct board approval for publication, merge, deployment, Multica
-   configuration changes, the one-time SER-651 migration, and manual canary.
+1. Obtain direct board approval for each applicable guarded phase. Validation
+   approval may cover feature-branch publication, exact-SHA fleet deployment,
+   no-evidence route probes, and the read-only shadow run. It does not imply
+   merge, Multica configuration, Sheet refresh, Clockify posting, or scheduling
+   approval.
 2. Re-read all IDs and statuses above. Abort on drift.
 3. Run:
 
@@ -82,9 +89,10 @@ allocation, or correction-regression contracts recorded there.
 
 4. Confirm `state/review-items.json` and `runs/` are ignored and absent from the
    commit.
-5. Record the candidate SHA after commit. Every deployment and readback must use
-   that exact SHA.
-6. Probe the intended analyzer route on Precision. Require an actual successful
+5. Resolve and record the clean candidate SHA. Every deployment, manifest, run,
+   and readback must use that exact SHA.
+6. After validation deployment, probe the intended analyzer route on Precision.
+   Require an actual successful
    JSON probe for the selected primary route and its fallback; configuration is
    not proof. The probe carries no evidence and is separate from offline
    `scripts/analyzer_evaluation.py`, which validates redacted captured replays,
@@ -94,9 +102,11 @@ allocation, or correction-regression contracts recorded there.
    `CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED=approved`. The minimal probe contains
    no evidence and does not authorize private agent/session, meeting, or issue
    prose to leave the machine.
-8. Run two complete July 1–August 3 read-only shadow runs plus stable replays.
-   Require complete canonical fleet evidence, Fathom reconciliation, strict
-   non-overlap, and `0 new / 0 changed` before any issue or Sheet refresh.
+8. Run one complete July 1–August 3 read-only shadow reconciliation, then replay
+   the same immutable inputs and analyzer versions through the same durable
+   state. Require complete canonical fleet evidence, Fathom reconciliation,
+   strict non-overlap, and replay `0 new / 0 changed` before any issue or Sheet
+   refresh.
 9. Do not claim acceptance until all active rows, including ambiguous ones,
    have approve/skip/modify dispositions and every skip/modify has a
    criticality assessment. `exceptions_only` requires one complete >=90%
@@ -104,10 +114,41 @@ allocation, or correction-regression contracts recorded there.
    with complete sources, passing quality and analyzer scorecards, stable replay, and no critical
    routing, description-truth, meeting, or allocation error.
 
-## Guarded rollout order
+## Guarded validation order
 
-1. Publish the feature branch, create a reviewed PR, and merge the exact
-   candidate to `master`. Fetch the remote and verify the remote master SHA.
+1. Publish only the feature branch. Do not merge it. Fetch the remote and verify
+   that the remote feature-branch SHA equals the approved candidate SHA.
+2. Deploy that exact feature-branch SHA to Mac, Precision, and Desktop using the
+   paths below. Preserve `runs/`, durable state, environment files, credentials,
+   and unrelated changes. Read back Git HEAD on Git worktrees and compare a
+   tracked-file hash manifest for the Desktop non-Git copy.
+3. Run the complete verification suite on every collector host.
+4. Probe the selected analyzer route with the evidence-free JSON probe. Stop on
+   any transport or contract failure.
+5. Enable `CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED=approved` only when the exact
+   validation approval includes redacted private semantic-text egress, and only
+   for the approved run scope.
+6. On Precision, create fresh validation state from the complete July 1–August
+   3 read-only shadow backfill using explicit paths under
+   `state/validation/july-baseline/`. Do not copy Mac state and do not mutate the
+   existing production review state.
+7. Replay the exact immutable evidence and model versions through that same
+   validation state with `scripts/clockify_review_run.py --replay-from
+   /absolute/path/to/runs/<first-run-id>`. Require a passing
+   `replay-integrity.json`, `new=0`, `changed=0`, all unresolved active rows as
+   `carried_pending`, complete source manifests, passing quality, and explicit
+   Fathom reconciliation. A second live collection is not replay evidence.
+8. Generate the digest-bound analyzer scorecard and prepare the complete
+   evidence-bound review denominator. Do not refresh Google Sheets or record a
+   passing acceptance period until every active row has a human disposition.
+
+## Separately approved production rollout order
+
+Only after guarded validation evidence is accepted and a separate production
+approval is granted:
+
+1. Create/review the PR, merge the exact accepted candidate to `master`, fetch
+   the remote, and verify the remote master SHA.
 2. Pause redundant autopilot
    `f10f0de3-7288-4f41-ab28-495baae5371b`. Do not delete it. Verify its status
    is `paused`; retain its trigger for rollback evidence.
@@ -132,10 +173,10 @@ allocation, or correction-regression contracts recorded there.
    Preserve `runs/`, `state/review-items.json`, environment files, and all
    credentials. The Desktop non-Git copy must be populated from an archive of
    the exact SHA and verified by a tracked-file hash manifest.
-6. On Precision only, create a fresh authoritative
-   `state/review-items.json` from a complete July 1–current read-only shadow
-   backfill. Do not copy the Mac state.
-7. Run the same bundle through the durable state a second time and require:
+6. Promote the accepted validation state on Precision only through an explicit,
+   verified state-migration step; never copy Mac state or silently overwrite the
+   authoritative review ledger.
+7. Run the accepted bundle through the authoritative durable state and require:
    - `new=0`;
    - `changed=0`;
    - active items appear only as `carried_pending`;
