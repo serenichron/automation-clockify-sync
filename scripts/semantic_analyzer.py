@@ -1598,6 +1598,7 @@ def analyze_tiered(
             for evidence_id in chunk_ids
             if (span := _safe_time_span(original_by_id[evidence_id])) is not None
         }
+        fallback_status = "not_needed"
         try:
             result = _call_validated(
                 primary,
@@ -1611,9 +1612,12 @@ def analyze_tiered(
                 cache=cache,
                 before_transport=probe_once,
             )
-            used = primary
-            tier = "primary"
-            if _requires_stronger_fallback(result) and fallback is not None:
+        except AnalyzerError as primary_error:
+            if fallback is None:
+                raise AnalyzerError(
+                    f"primary analyzer failed for chunk {index + 1}: {primary_error}"
+                ) from primary_error
+            try:
                 result = _call_validated(
                     fallback,
                     chunk,
@@ -1626,27 +1630,43 @@ def analyze_tiered(
                     cache=cache,
                     before_transport=probe_once,
                 )
-                used = fallback
-                tier = "fallback"
-        except AnalyzerError as primary_error:
-            if fallback is None:
+            except AnalyzerError as fallback_error:
                 raise AnalyzerError(
-                    f"primary analyzer failed for chunk {index + 1}: {primary_error}"
-                ) from primary_error
-            result = _call_validated(
-                fallback,
-                chunk,
-                tier="fallback",
-                transport=transport,
-                corrections=corrections,
-                known_evidence_ids=chunk_ids,
-                evidence_time_spans=chunk_spans,
-                private_text_approved=private_text_approved,
-                cache=cache,
-                before_transport=probe_once,
-            )
+                    f"primary and fallback analyzers failed for chunk {index + 1}: "
+                    f"primary={primary_error}; fallback={fallback_error}"
+                ) from fallback_error
             used = fallback
             tier = "fallback"
+            fallback_status = "used_after_primary_failure"
+        else:
+            used = primary
+            tier = "primary"
+            if _requires_stronger_fallback(result) and fallback is not None:
+                primary_result = result
+                try:
+                    result = _call_validated(
+                        fallback,
+                        chunk,
+                        tier="fallback",
+                        transport=transport,
+                        corrections=corrections,
+                        known_evidence_ids=chunk_ids,
+                        evidence_time_spans=chunk_spans,
+                        private_text_approved=private_text_approved,
+                        cache=cache,
+                        before_transport=probe_once,
+                    )
+                except AnalyzerError:
+                    # A validated low-confidence primary decision is still useful
+                    # evidence.  If the stronger route fails, retain only its
+                    # review-safe portions and turn unresolved claims into
+                    # explicit exceptions instead of retrying a sealed rejection.
+                    result = _defer_unresolved_low_confidence(primary_result)
+                    fallback_status = "failed_deferred"
+                else:
+                    used = fallback
+                    tier = "fallback"
+                    fallback_status = "used_for_low_confidence"
         if _requires_stronger_fallback(result):
             result = _defer_unresolved_low_confidence(result)
         results.append(result)
@@ -1660,6 +1680,7 @@ def analyze_tiered(
                 "endpoint": used.name,
                 "model": used.model,
                 "tier": tier,
+                "fallback_status": fallback_status,
             }
         )
 
