@@ -111,8 +111,11 @@ def validate_description(description: str) -> str:
     if any(left.casefold() == right.casefold() for left, right in zip(body_words, body_words[1:])):
         raise CavemanValidationError("description contains adjacent repeated words")
     word_count = len(re.findall(r"\b[\w'-]+\b", description))
-    if not 8 <= word_count <= 14:
-        raise CavemanValidationError(f"description has {word_count} words; expected 8–14")
+    if not 5 <= word_count <= 14:
+        raise CavemanValidationError(
+            f"description has {word_count} words; expected hard bounds 5–14 "
+            "with an 8–14 word target"
+        )
     return description
 
 

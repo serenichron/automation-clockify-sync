@@ -34,6 +34,19 @@ class CavemanRendererTests(unittest.TestCase):
             with self.subTest(expected=expected):
                 self.assertEqual(expected, renderer.render_caveman_description(parts))
 
+    def test_short_user_examples_are_valid_caveman_descriptions(self):
+        for description in (
+            "SC — Reduced Honcho memory use",
+            "SC — Wrote Honcho rollout plan",
+            "SC — Rewrote 33 internal links",
+        ):
+            with self.subTest(description=description):
+                self.assertEqual(description, renderer.validate_description(description))
+
+    def test_fewer_than_five_words_is_rejected(self):
+        with self.assertRaisesRegex(renderer.CavemanValidationError, "hard bounds 5–14"):
+            renderer.validate_description("SC — Fixed clock sync")
+
     def test_adversarial_forbidden_content_fails_closed(self):
         base = {"prefix": "SC", "action": "Reviewed", "object": "service page", "outcome": "for client conversion planning"}
         forbidden = {

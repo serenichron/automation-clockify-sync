@@ -27,7 +27,8 @@ complete process:
 2. write and validate an immutable, content-addressed evidence ledger;
 3. classify noise and reconstruct atomic semantic accomplishments with a
    tiered analyzer;
-4. route projects deterministically and render 8–14 word Caveman descriptions;
+4. route projects deterministically and render Caveman descriptions targeting
+   8–14 words, with a five-word hard floor for complete atomic examples;
 5. allocate active effort around fixed Clockify and Fathom blocks without
    overlap, gap filling, overnight bridging, or silent trimming;
 6. validate quality and ingest stable review identities; shadow evaluation
