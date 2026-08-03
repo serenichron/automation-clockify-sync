@@ -170,6 +170,90 @@ class SemanticAnalyzerTests(unittest.TestCase):
         )
         self.assertEqual(result["activities"][0]["effort"], second["activities"][0]["effort"])
 
+    def test_bounded_source_spans_canonicalize_effort_and_timing_replays(self):
+        first = valid_response("ev-1")
+        first["activities"][0].update({
+            "action": "Fixed",
+            "outcome": "removed copied transcript fragments",
+            "evidence_spans": [{
+                "start": "2026-07-10T10:00:00+03:00",
+                "end": "2026-07-10T10:28:00+03:00",
+            }],
+            "effort": {
+                "minimum_minutes": 28,
+                "recommended_minutes": 28,
+                "maximum_minutes": 28,
+            },
+            "timing_confidence": "high",
+        })
+        second = valid_response("ev-1")
+        second["activities"][0].update({
+            "action": "Corrected",
+            "outcome": "cleared copied transcript fragments",
+            "evidence_spans": [{
+                "start": "2026-07-10T10:00:00+03:00",
+                "end": "2026-07-10T10:28:00+03:00",
+            }],
+            "effort": {
+                "minimum_minutes": 10,
+                "recommended_minutes": 20,
+                "maximum_minutes": 28,
+            },
+            "timing_confidence": "low",
+        })
+        source_spans = {
+            "ev-1": {
+                "start": "2026-07-10T10:00:00+03:00",
+                "end": "2026-07-10T10:28:00+03:00",
+            }
+        }
+
+        left = semantic.validate_result(
+            first,
+            known_evidence_ids={"ev-1"},
+            provider_model="model-a",
+            analyzer_tier="primary",
+            evidence_time_spans=source_spans,
+        )["activities"][0]
+        right = semantic.validate_result(
+            second,
+            known_evidence_ids={"ev-1"},
+            provider_model="model-a",
+            analyzer_tier="primary",
+            evidence_time_spans=source_spans,
+        )["activities"][0]
+
+        review_fields = (
+            "evidence_ids",
+            "lifecycle",
+            "effort",
+            "semantic_confidence",
+            "timing_confidence",
+        )
+        self.assertEqual(
+            {field: left[field] for field in review_fields},
+            {field: right[field] for field in review_fields},
+        )
+        self.assertEqual(
+            {"minimum_minutes": 10, "recommended_minutes": 20, "maximum_minutes": 30},
+            left["effort"],
+        )
+        self.assertEqual("medium", left["timing_confidence"])
+        self.assertEqual(
+            (10, 15, 20),
+            semantic._effort_from_bounded_capacity(
+                semantic._bounded_evidence_capacity_minutes(
+                    ["ev-2"],
+                    {
+                        "ev-2": {
+                            "start": "2026-07-10T10:30:00+03:00",
+                            "end": "2026-07-10T10:48:00+03:00",
+                        }
+                    },
+                )
+            ),
+        )
+
     def test_redundant_verification_action_is_canonicalized_but_other_compounds_fail(self):
         response = valid_response("ev-1")
         response["activities"][0]["action"] = "implemented and verified"

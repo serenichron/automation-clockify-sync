@@ -113,6 +113,14 @@ class AnalyzerError(RuntimeError):
     """Fail-closed analyzer or contract error."""
 
 
+class _ValidatedAnalysis(dict[str, Any]):
+    """Schema-shaped analysis plus ephemeral fallback-only timing evidence."""
+
+    def __init__(self, value: Mapping[str, Any], *, low_timing_evidence_ids: set[str]):
+        super().__init__(value)
+        self.low_timing_evidence_ids = frozenset(low_timing_evidence_ids)
+
+
 class AnalyzerContractError(AnalyzerError):
     """A sealed provider response rejected by the semantic output contract."""
 
@@ -945,6 +953,71 @@ def _effort_band(recommended: int) -> tuple[int, int]:
     return minimum, maximum
 
 
+def _bounded_evidence_capacity_minutes(
+    evidence_ids: Iterable[str],
+    evidence_time_spans: Mapping[str, Mapping[str, str]] | None,
+) -> int | None:
+    """Return the union of fully observed cited intervals, rounded up to five minutes.
+
+    A source interval is an upper bound on attention, not a claim that every
+    observed minute was active work.  Point observations and partial source
+    timing deliberately return ``None`` so they cannot manufacture an effort
+    estimate.
+    """
+    if not evidence_time_spans:
+        return None
+    intervals: list[tuple[dt.datetime, dt.datetime]] = []
+    for evidence_id in evidence_ids:
+        span = evidence_time_spans.get(evidence_id)
+        if not isinstance(span, Mapping):
+            return None
+        start = _timestamp_instant(span.get("start"))
+        end = _timestamp_instant(span.get("end"))
+        if (
+            start is None
+            or end is None
+            or start >= end
+            or (start.tzinfo is None) != (end.tzinfo is None)
+        ):
+            return None
+        intervals.append((start, end))
+    if not intervals:
+        return None
+    if len({value.tzinfo is not None for interval in intervals for value in interval}) != 1:
+        return None
+    intervals.sort()
+    merged: list[tuple[dt.datetime, dt.datetime]] = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        else:
+            merged.append((start, end))
+    seconds = sum((end - start).total_seconds() for start, end in merged)
+    return max(5, ((int(seconds) + 299) // 300) * 5)
+
+
+def _effort_from_bounded_capacity(capacity_minutes: int | None) -> tuple[int, int, int] | None:
+    """Use a bounded source interval as a ceiling, never as full attention.
+
+    The returned recommended effort is the largest five-minute estimate whose
+    conservative band fits inside the observed capacity.  This reuses the
+    existing 2/3--4/3 effort-band contract and keeps allocation demand below
+    the observed interval instead of filling it wholesale.
+    """
+    if capacity_minutes is None:
+        return None
+    candidates = [
+        recommended
+        for recommended in range(5, capacity_minutes + 1, 5)
+        if _effort_band(recommended)[1] <= capacity_minutes
+    ]
+    if not candidates:
+        return None
+    recommended = candidates[-1]
+    minimum, maximum = _effort_band(recommended)
+    return minimum, recommended, maximum
+
+
 def _normalized_identity(value: Any) -> str:
     """Normalize harmless wording/punctuation variation for stable semantic IDs."""
     text = _one_line(value).casefold()
@@ -1062,6 +1135,10 @@ def validate_result(
             raise AnalyzerError("effort must satisfy minimum <= recommended <= maximum")
         recommended = _five_minute_effort(raw_recommended)
         minimum, maximum = _effort_band(recommended)
+        model_timing_confidence = _confidence(
+            raw.get("timing_confidence"), "timing_confidence"
+        )
+        timing_confidence = model_timing_confidence
         project = raw.get("project_recommendation") or {}
         if not isinstance(project, dict):
             raise AnalyzerError("project_recommendation must be an object")
@@ -1077,6 +1154,18 @@ def validate_result(
             if lifecycle not in {"planned", "noise"}
             else []
         )
+        # Fully observed source intervals give a stable ceiling for attention.
+        # They are intentionally not treated as all-active wall time: only the
+        # largest conservative effort band that fits within the ceiling is used.
+        if lifecycle not in {"planned", "noise"}:
+            bounded_effort = _effort_from_bounded_capacity(
+                _bounded_evidence_capacity_minutes(evidence_ids, evidence_time_spans)
+            )
+            if bounded_effort is not None:
+                minimum, recommended, maximum = bounded_effort
+                # Exact source start/end make timing reviewable, but not certain
+                # enough to claim uninterrupted human attention.
+                timing_confidence = "medium"
         identity = {
             "evidence_ids": evidence_ids,
             "lifecycle": lifecycle,
@@ -1111,9 +1200,7 @@ def validate_result(
                 "semantic_confidence": _confidence(
                     raw.get("semantic_confidence"), "semantic_confidence"
                 ),
-                "timing_confidence": _confidence(
-                    raw.get("timing_confidence"), "timing_confidence"
-                ),
+                "timing_confidence": timing_confidence,
                 "split_rationale": split_rationale,
                 "merge_rationale": _one_line(raw.get("merge_rationale")),
                 "omit_rationale": _one_line(raw.get("omit_rationale")),
@@ -1172,6 +1259,17 @@ def validate_result(
         "activities": normalized_activities,
         "exceptions": normalized_exceptions,
         "omissions": normalized_omissions,
+    }
+
+
+def _low_model_timing_evidence_ids(response: Mapping[str, Any]) -> set[str]:
+    """Keep low model timing as an internal fallback signal, not review JSON."""
+    return {
+        str(evidence_id)
+        for activity in response.get("activities", [])
+        if isinstance(activity, Mapping)
+        and _confidence(activity.get("timing_confidence"), "timing_confidence") == "low"
+        for evidence_id in activity.get("evidence_ids", [])
     }
 
 
@@ -1550,7 +1648,10 @@ def _call_validated(
     _raise_if_cancelled(cancelled)
     if cache is not None and cache_miss:
         cache.store_accepted(endpoint, body, response)
-    return result
+    return _ValidatedAnalysis(
+        result,
+        low_timing_evidence_ids=_low_model_timing_evidence_ids(restored_response),
+    )
 
 
 def _call_synthesis_validated(
@@ -1624,15 +1725,17 @@ def _call_synthesis_validated(
         raise AnalyzerContractError(str(exc)) from exc
     if cache is not None and cache_miss:
         cache.store_accepted(endpoint, body, response)
-    return result
+    return _ValidatedAnalysis(
+        result,
+        low_timing_evidence_ids=_low_model_timing_evidence_ids(restored_response),
+    )
 
 
 def _requires_stronger_fallback(result: dict[str, Any]) -> bool:
     return any(
         activity.get("semantic_confidence") == "low"
-        or activity.get("timing_confidence") == "low"
         for activity in result.get("activities", [])
-    ) or any(
+    ) or bool(getattr(result, "low_timing_evidence_ids", ())) or any(
         str(exception.get("kind") or "").casefold() == "conflicting_evidence"
         for exception in result.get("exceptions", [])
         if isinstance(exception, dict)
@@ -1643,11 +1746,20 @@ def _defer_unresolved_low_confidence(result: dict[str, Any]) -> dict[str, Any]:
     """Turn unresolved low-confidence claims into explicit exceptions."""
     retained: list[dict[str, Any]] = []
     exceptions = list(result.get("exceptions", []))
+    low_timing_evidence_ids = set(getattr(result, "low_timing_evidence_ids", ()))
     for activity in result.get("activities", []):
         confidence_fields = [
             field
-            for field in ("semantic_confidence", "timing_confidence")
-            if activity.get(field) == "low"
+            for field, value in (
+                ("semantic_confidence", activity.get("semantic_confidence")),
+                (
+                    "timing_confidence",
+                    "low"
+                    if low_timing_evidence_ids.intersection(activity.get("evidence_ids", []))
+                    else activity.get("timing_confidence"),
+                ),
+            )
+            if value == "low"
         ]
         if not confidence_fields:
             retained.append(activity)

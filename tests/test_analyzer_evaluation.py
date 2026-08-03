@@ -88,12 +88,29 @@ class AnalyzerEvaluationTests(unittest.TestCase):
         self.assertFalse(scorecard["passed"])
         self.assertFalse(scorecard["results"][0]["checks"]["forbidden_descriptions_rejected"])
 
-    def test_different_replay_is_rejected(self) -> None:
+    def test_different_review_decision_is_rejected(self) -> None:
         source = document()
-        source["cases"][0]["replays"][1]["activities"][0]["effort"]["recommended_minutes"] = 26
+        source["cases"][0]["replays"][1]["activities"][0]["semantic_confidence"] = "medium"
         scorecard = evaluation.evaluate(source)
         self.assertFalse(scorecard["passed"])
         self.assertFalse(scorecard["results"][0]["checks"]["stable_replay"])
+
+    def test_bounded_effort_and_timing_drift_preserves_review_stability(self) -> None:
+        source = document()
+        second = source["cases"][0]["replays"][1]["activities"][0]
+        second["action"] = "Corrected"
+        second["outcome"] = "cleared copied transcript fragments"
+        second["effort"] = {
+            "minimum_minutes": 5,
+            "recommended_minutes": 5,
+            "maximum_minutes": 10,
+        }
+        second["timing_confidence"] = "low"
+
+        scorecard = evaluation.evaluate(source)
+
+        self.assertTrue(scorecard["passed"])
+        self.assertTrue(scorecard["results"][0]["checks"]["stable_replay"])
 
     def test_harmless_wording_drift_preserves_review_stability(self) -> None:
         source = document()
