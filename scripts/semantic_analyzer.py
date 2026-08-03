@@ -27,7 +27,7 @@ import urllib.request
 
 
 SCHEMA_VERSION = 1
-PROMPT_VERSION = "clockify-semantic-v2"
+PROMPT_VERSION = "clockify-semantic-v3"
 ANALYZER_CACHE_SCHEMA_VERSION = "clockify-analyzer-cache/v1"
 DEFAULT_PRIMARY_MODEL = "deepseek-v4-flash:cloud"
 DEFAULT_MAX_BODY_BYTES = 1_450_000
@@ -389,6 +389,40 @@ def project_events(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted((project_event(dict(event)) for event in events), key=_event_sort_key)
 
 
+def _evidence_reference_maps(evidence_ids: Iterable[str]) -> tuple[dict[str, str], dict[str, str]]:
+    """Create compact deterministic model references and their local inverse."""
+    originals = sorted(str(value) for value in evidence_ids)
+    if len(originals) != len(set(originals)):
+        raise AnalyzerError("cannot alias duplicate evidence IDs")
+    if any(not SAFE_EVIDENCE_ID_RE.fullmatch(value) for value in originals):
+        raise AnalyzerError("cannot alias an unsafe evidence ID")
+    forward = {value: f"ref-{index:04d}" for index, value in enumerate(originals, 1)}
+    return forward, {alias: original for original, alias in forward.items()}
+
+
+def _restore_evidence_references(
+    response: Mapping[str, Any], *, evidence_ids: Iterable[str]
+) -> dict[str, Any]:
+    """Resolve model-facing evidence refs without trusting copied long hashes."""
+    _, inverse = _evidence_reference_maps(evidence_ids)
+    restored = copy.deepcopy(dict(response))
+    for classification in ("activities", "exceptions", "omissions"):
+        records = restored.get(classification)
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if not isinstance(record, dict) or not isinstance(record.get("evidence_ids"), list):
+                continue
+            values: list[str] = []
+            for raw in record["evidence_ids"]:
+                alias = str(raw)
+                if alias not in inverse:
+                    raise AnalyzerError("analyzer returned an unknown evidence reference")
+                values.append(inverse[alias])
+            record["evidence_ids"] = values
+    return restored
+
+
 def _project_corrections(corrections: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     """Keep only generalized learning rules; correction history itself stays local."""
     output: list[dict[str, Any]] = []
@@ -470,6 +504,8 @@ merge_rationale. Verification becomes separate only when it produces an independ
 meaningful deliverable or diagnoses a distinct problem.
 Every reviewable activity needs a specific split_rationale explaining why it is one
 atomic accomplishment. Never join verbs with "and", "or", "then", or "also".
+Every activities[] item MUST have a non-empty split_rationale, including an already
+atomic item or an item created by merging duplicate evidence. Never leave it blank.
 The action must be a past-tense verb phrase of one to three words. Put the specific
 object and bounded result in object and outcome, not in a long action.
 Give related atomic accomplishments the same short parent workstream name even when
@@ -479,10 +515,11 @@ background execution as planned or noise, not completed human work. A blocker is
 loggable only when the evidence proves substantive diagnosis or remediation.
 Do not invent projects, outcomes, evidence, effort, or meeting purpose. For a
 title-only meeting with no supported outcome, emit an exception. Effort is human
-attention, not process runtime or empty wall-clock time. Evidence IDs must be copied
-exactly from the input. Account for every input evidence ID exactly once across
+attention, not process runtime or empty wall-clock time. Evidence IDs are short refs
+such as ref-0001 and must be copied exactly from the input. Account for every input
+evidence ref exactly once across
 activities, exceptions, and omissions. Exceptions and omissions require cited
-evidence IDs. Do not allocate start/end Clockify blocks.
+evidence refs. Do not allocate start/end Clockify blocks.
 Write action + object + outcome so the final prefixed description is 8-14 words,
 using terse past-tense Caveman wording and no Markdown, IDs, paths, URLs, or status prose.
 Project prefix and tags are recommendations only. Leave them blank when the evidence
@@ -496,13 +533,13 @@ Output object:
     "action": "short verb phrase",
     "object": "specific work object",
     "outcome": "bounded evidenced outcome",
-    "evidence_ids": ["ev-..."],
+    "evidence_ids": ["ref-0001"],
     "evidence_spans": [{"start":"ISO-like", "end":"ISO-like"}],
     "project_recommendation": {"name":"", "prefix":"", "tag_names":[]},
     "effort": {"minimum_minutes":1, "recommended_minutes":1, "maximum_minutes":1},
     "semantic_confidence": "low|medium|high",
     "timing_confidence": "low|medium|high",
-    "split_rationale": "",
+    "split_rationale": "why this is exactly one atomic accomplishment",
     "merge_rationale": "",
     "omit_rationale": ""
   }],
@@ -510,11 +547,17 @@ Output object:
   "omissions": [{"lifecycle":"planned|noise", "evidence_ids":[], "reason":""}]
 }
 """
+    projected = project_events(events)
+    aliases, _ = _evidence_reference_maps(event["evidence_id"] for event in projected)
+    model_events = [
+        {**event, "evidence_id": aliases[event["evidence_id"]]}
+        for event in projected
+    ]
     payload = {
         "mode": mode,
         "schema_version": SCHEMA_VERSION,
         "prompt_version": PROMPT_VERSION,
-        "events": project_events(events),
+        "events": model_events,
         "review_corrections": _project_corrections(corrections),
     }
     return [
@@ -598,13 +641,27 @@ def _synthesis_messages(activities: list[dict[str, Any]], *, workstream_id: str)
         (_safe_provisional_activity(activity) for activity in activities),
         key=lambda value: (value["activity_id"], canonical_json(value)),
     )
+    aliases, _ = _evidence_reference_maps(
+        evidence_id
+        for activity in provisional
+        for evidence_id in activity["evidence_ids"]
+    )
+    model_provisional = [
+        {
+            **activity,
+            "evidence_ids": [aliases[value] for value in activity["evidence_ids"]],
+        }
+        for activity in provisional
+    ]
     system = """You reconcile provisional Clockify semantic activities from repeated workstream evidence.
 Return JSON only, using the same activities/exceptions/omissions schema supplied for extraction.
 Merge provisional activities only when their cited evidence proves the same single atomic accomplishment.
 When accomplishments differ, preserve separate activities and give each a distinct, specific object.
 Preserve the supplied parent workstream name for related atomic accomplishments.
-Every input evidence ID must appear in exactly one returned activity; do not add, omit, or move evidence
-to exceptions or omissions. Copy evidence IDs and evidence spans exactly from supported input evidence.
+Every input evidence ref must appear in exactly one returned activity; do not add, omit, or move evidence
+to exceptions or omissions. Copy the short evidence refs and evidence spans exactly from supported input.
+Every returned activity must have a non-empty split_rationale; merged evidence must also have a specific
+non-empty merge_rationale.
 Do not invent projects, outcomes, effort, or timing. Never include paths, URLs, emails, secrets, IDs,
 or status prose in descriptive fields."""
     payload = {
@@ -612,7 +669,7 @@ or status prose in descriptive fields."""
         "schema_version": SCHEMA_VERSION,
         "prompt_version": PROMPT_VERSION,
         "workstream_id": workstream_id,
-        "provisional_activities": provisional,
+        "provisional_activities": model_provisional,
     }
     return [
         {"role": "system", "content": system},
@@ -1041,8 +1098,12 @@ class AnalyzerResponseCache:
             raise AnalyzerError(f"analyzer cache line {line_number} has unsupported fields")
         if value.get("schema_version") != ANALYZER_CACHE_SCHEMA_VERSION:
             raise AnalyzerError(f"analyzer cache line {line_number} has an unsupported schema")
-        if value.get("prompt_version") != PROMPT_VERSION or value.get("semantic_schema_version") != SCHEMA_VERSION:
-            raise AnalyzerError(f"analyzer cache line {line_number} targets another analyzer version")
+        prompt_version = str(value.get("prompt_version") or "")
+        semantic_schema_version = value.get("semantic_schema_version")
+        if not re.fullmatch(r"clockify-semantic-v[1-9][0-9]*", prompt_version):
+            raise AnalyzerError(f"analyzer cache line {line_number} has an invalid prompt version")
+        if not isinstance(semantic_schema_version, int) or semantic_schema_version < 1:
+            raise AnalyzerError(f"analyzer cache line {line_number} has an invalid semantic schema version")
         for name in ("body_digest", "route_digest", "decision_digest"):
             if not re.fullmatch(r"[a-f0-9]{64}", str(value.get(name) or "")):
                 raise AnalyzerError(f"analyzer cache line {line_number} has an invalid {name}")
@@ -1052,8 +1113,8 @@ class AnalyzerResponseCache:
             "arc-",
             {
                 "schema_version": ANALYZER_CACHE_SCHEMA_VERSION,
-                "prompt_version": PROMPT_VERSION,
-                "semantic_schema_version": SCHEMA_VERSION,
+                "prompt_version": prompt_version,
+                "semantic_schema_version": semantic_schema_version,
                 "route_digest": value["route_digest"],
                 "body_digest": value["body_digest"],
             },
@@ -1229,7 +1290,7 @@ def probe_endpoint(endpoint: AnalyzerEndpoint, transport: Transport = http_trans
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": "Return JSON only."},
-            {"role": "user", "content": '{"probe":"clockify-semantic-v2"}'},
+            {"role": "user", "content": '{"probe":"clockify-semantic-v3"}'},
         ],
     }
     raw = transport(endpoint, body)
@@ -1266,8 +1327,13 @@ def _call_validated(
             before_transport(endpoint)
         response = _json_object_from_response(transport(endpoint, body))
     try:
-        result = validate_result(
+        restored_response = _restore_evidence_references(
             response,
+            evidence_ids=known_evidence_ids
+            or {str(event.get("evidence_id")) for event in events},
+        )
+        result = validate_result(
+            restored_response,
             known_evidence_ids=known_evidence_ids or {str(event.get("evidence_id")) for event in events},
             provider_model=endpoint.model,
             analyzer_tier=tier,
@@ -1305,8 +1371,11 @@ def _call_synthesis_validated(
             before_transport(endpoint)
         response = _json_object_from_response(transport(endpoint, body))
     try:
+        restored_response = _restore_evidence_references(
+            response, evidence_ids=known_evidence_ids
+        )
         result = validate_result(
-            response,
+            restored_response,
             known_evidence_ids=known_evidence_ids,
             provider_model=endpoint.model,
             analyzer_tier=tier,

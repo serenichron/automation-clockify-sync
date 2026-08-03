@@ -370,7 +370,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
                 self.assertNotIn("ev-", json.dumps(body))
                 return {"probe": "ok"}
             response = valid_response(payload["events"][0]["evidence_id"])
-            if payload["events"][0]["evidence_id"] == "ev-b":
+            if payload["events"][0]["time_span"]["start"].startswith("2026-07-11"):
                 response["activities"][0]["object"] = "Clockify review state"
             response["activities"][0]["evidence_spans"] = [payload["events"][0]["time_span"]]
             return response
@@ -472,12 +472,16 @@ class SemanticAnalyzerTests(unittest.TestCase):
                 response["activities"][0]["evidence_spans"] = [evidence["time_span"]]
                 return response
             provisional = payload["provisional_activities"]
-            response = valid_response("ev-a")
+            response = valid_response(provisional[0]["evidence_ids"][0])
             if endpoint.name == "primary":
                 response["activities"][0]["evidence_spans"] = provisional[0]["evidence_spans"]
                 return response
             response["activities"][0].update({
-                "evidence_ids": ["ev-a", "ev-b"],
+                "evidence_ids": sorted(
+                    evidence_id
+                    for activity in provisional
+                    for evidence_id in activity["evidence_ids"]
+                ),
                 "evidence_spans": [
                     span for activity in provisional for span in activity["evidence_spans"]
                 ],
@@ -518,7 +522,11 @@ class SemanticAnalyzerTests(unittest.TestCase):
             provisional = payload["provisional_activities"]
             response = valid_response(provisional[0]["evidence_ids"][0])
             response["activities"][0].update({
-                "evidence_ids": ["ev-a", "ev-b"],
+                "evidence_ids": sorted(
+                    evidence_id
+                    for activity in provisional
+                    for evidence_id in activity["evidence_ids"]
+                ),
                 "evidence_spans": [
                     span for activity in provisional for span in activity["evidence_spans"]
                 ],
@@ -571,10 +579,10 @@ class SemanticAnalyzerTests(unittest.TestCase):
                 transport=transport,
             )
 
-        with self.assertRaisesRegex(semantic.AnalyzerError, "missing or unknown evidence IDs"):
-            run_synthesis(["ev-a", "ev-unknown"])
+        with self.assertRaisesRegex(semantic.AnalyzerError, "unknown evidence reference"):
+            run_synthesis(["ref-0001", "ref-unknown"])
         with self.assertRaisesRegex(semantic.AnalyzerError, "omitted known evidence IDs"):
-            run_synthesis(["ev-a"])
+            run_synthesis(["ref-0001"])
 
     def test_synthesis_is_deterministic_under_input_permutation(self):
         def transport(endpoint, body):
@@ -589,7 +597,11 @@ class SemanticAnalyzerTests(unittest.TestCase):
             provisional = payload["provisional_activities"]
             response = valid_response(provisional[0]["evidence_ids"][0])
             response["activities"][0].update({
-                "evidence_ids": ["ev-a", "ev-b"],
+                "evidence_ids": sorted(
+                    evidence_id
+                    for activity in provisional
+                    for evidence_id in activity["evidence_ids"]
+                ),
                 "evidence_spans": [
                     span for activity in provisional for span in activity["evidence_spans"]
                 ],
@@ -648,8 +660,9 @@ class SemanticAnalyzerTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, request_json)
         payload = json.loads(body["messages"][1]["content"])
-        safe = next(item for item in payload["events"] if item["evidence_id"] == "ev-safe")
-        tool_projection = next(item for item in payload["events"] if item["evidence_id"] == "ev-tool")
+        safe = next(item for item in payload["events"] if item["role"] == "assistant")
+        tool_projection = next(item for item in payload["events"] if item["role"] == "tool")
+        self.assertEqual({"ref-0001", "ref-0002"}, {item["evidence_id"] for item in payload["events"]})
         self.assertIn("Completed safe reconciliation", safe["content"])
         self.assertIn("Validated safe semantic outcome", safe["content"])
         self.assertEqual("agent_session", safe["source_category"])
@@ -888,6 +901,33 @@ class SemanticAnalyzerTests(unittest.TestCase):
             path.write_text(json.dumps(record) + "\n", encoding="utf-8")
             with self.assertRaisesRegex(semantic.AnalyzerError, "identity digest differs"):
                 semantic.AnalyzerResponseCache(path)
+
+    def test_response_cache_retains_prior_prompt_records_without_reusing_them(self):
+        endpoint = semantic.AnalyzerEndpoint("primary", "http://primary", "cheap")
+        body = semantic._body_for(
+            [event("ev-1")], model="cheap", mode="extract", private_text_approved=True
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "analyzer-cache.jsonl"
+            cache = semantic.AnalyzerResponseCache(path)
+            cache.store_accepted(endpoint, body, valid_response("ref-0001"))
+            record = json.loads(path.read_text(encoding="utf-8"))
+            record["prompt_version"] = "clockify-semantic-v2"
+            record["cache_key"] = semantic.stable_digest(
+                "arc-",
+                {
+                    "schema_version": semantic.ANALYZER_CACHE_SCHEMA_VERSION,
+                    "prompt_version": record["prompt_version"],
+                    "semantic_schema_version": record["semantic_schema_version"],
+                    "route_digest": record["route_digest"],
+                    "body_digest": record["body_digest"],
+                },
+                length=64,
+            )
+            path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+            reloaded = semantic.AnalyzerResponseCache(path)
+            self.assertIsNone(reloaded.lookup(endpoint, body))
 
     def test_cache_preserves_primary_rejection_and_fallback_choice(self):
         calls: list[tuple[str, str]] = []

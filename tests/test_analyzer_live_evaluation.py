@@ -45,14 +45,12 @@ def _activity(evidence_ids: list[str], spans: dict[str, dict[str, str]], index: 
 class AnalyzerLiveEvaluationTests(unittest.TestCase):
     def test_synthetic_capture_produces_a_passing_digest_bound_scorecard(self) -> None:
         cases = {case["case_id"]: case for case in live.synthetic_cases()}
-        evidence_to_case = {
-            str(event["evidence_id"]): case
-            for case in cases.values()
-            for event in case["events"]
-        }
+        ordered_cases = live.synthetic_cases()
         calls: list[dict] = []
+        evidence_calls = 0
 
         def transport(_endpoint: semantic_analyzer.AnalyzerEndpoint, body: dict) -> dict:
+            nonlocal evidence_calls
             calls.append(body)
             user_content = str(body["messages"][-1]["content"])
             if '"probe"' in user_content:
@@ -60,10 +58,13 @@ class AnalyzerLiveEvaluationTests(unittest.TestCase):
             payload = json.loads(user_content)
             events = payload["events"]
             evidence_ids = sorted(str(event["evidence_id"]) for event in events)
-            case = evidence_to_case[evidence_ids[0]]
+            case = ordered_cases[evidence_calls // 2]
+            evidence_calls += 1
+            original_ids = sorted(str(event["evidence_id"]) for event in case["events"])
+            aliases = dict(zip(original_ids, evidence_ids, strict=True))
             spans = {str(event["evidence_id"]): event["time_span"] for event in events}
             activities = [
-                _activity(list(partition), spans, index)
+                _activity([aliases[value] for value in partition], spans, index)
                 for index, partition in enumerate(case["expected_activity_partitions"], 1)
             ]
             exceptions = []

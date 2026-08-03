@@ -40,7 +40,7 @@ def document() -> dict:
         "schema_version": evaluation.INPUT_SCHEMA_VERSION,
         "corpus": {"records": records, "digest": evaluation.sha256_hex(records)},
         "route": {"route_id": "ollama-cloud-primary", "model": "deepseek-v4-flash:cloud", "tier": "primary"},
-        "prompt_version": "clockify-semantic-v2",
+        "prompt_version": "clockify-semantic-v3",
         "semantic_schema_version": 1,
         "cases": [{
             "case_id": "one-atomic-outcome",

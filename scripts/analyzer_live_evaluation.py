@@ -189,7 +189,12 @@ def capture_evaluation(
                 mode="extract",
                 private_text_approved=True,
             )
-            replays.append(_response_object(transport(endpoint, body)))
+            raw = _response_object(transport(endpoint, body))
+            replays.append(
+                semantic_analyzer._restore_evidence_references(
+                    raw, evidence_ids=evidence_ids
+                )
+            )
         captured_cases.append(
             {
                 "case_id": case["case_id"],

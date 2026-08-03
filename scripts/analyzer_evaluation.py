@@ -199,12 +199,11 @@ def _rendering_is_valid(result: Mapping[str, Any]) -> bool:
         for activity in result["activities"]:
             if activity.get("lifecycle") in {"planned", "noise"}:
                 continue
-            project = activity.get("project_recommendation")
-            if not isinstance(project, Mapping):
-                return False
             caveman_renderer.render_caveman_description(
                 {
-                    "prefix": project.get("prefix"),
+                    # Deterministic routing owns the prefix; the analyzer route
+                    # is evaluated only on action, object, and bounded outcome.
+                    "prefix": "SC",
                     "action": activity.get("action"),
                     "object": activity.get("object"),
                     "outcome": activity.get("outcome"),

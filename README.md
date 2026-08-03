@@ -142,7 +142,7 @@ export CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED=approved
 Do not persist or enable that value merely because a route probe succeeded;
 setting it authorizes redacted private prose to leave the local machine for the
 configured analyzer endpoint. When explicitly enabled, cloud requests receive
-only a strict semantic projection: evidence IDs and spans, redacted
+only a strict semantic projection: short deterministic evidence references and spans, redacted
 user/assistant text, structured Fathom summary/action-item/transcript text,
 safe commit subjects, and artifact basenames. Tool-call inputs, tool-result
 bodies, credentials, emails, URLs, absolute paths, and hashes never cross that
@@ -280,7 +280,10 @@ atomicity rules, and renderer/forbidden-description compliance. Replay stability
 compares the review-relevant decision—disposition, partitions, lifecycle,
 effort, and confidence—rather than arbitrary rationale prose. The append-only
 validated decision cache owns exact output replay and is separately integrity
-checked. A passing synthetic
+checked. Long immutable ledger IDs never rely on model copying: local code maps
+short references back before schema and citation validation. Prefix validation
+uses a neutral placeholder because deterministic routing owns the final prefix.
+A passing synthetic
 route scorecard proves contract fitness, not July semantic accuracy; the latter
 still requires full-denominator human dispositions and the measured acceptance
 thresholds. Neither a probe nor a passing synthetic scorecard authorizes
