@@ -6,13 +6,12 @@ historical evidence and must be re-read before any rollout.
 
 ## Candidate status — 2026-08-03
 
-The candidate is committed locally on
-`codex/clockify-evidence-work-accounting`. Resolve its exact SHA with
-`git rev-parse HEAD` immediately before approval and bind every deployment and
-run manifest to that SHA; any later edit creates a new candidate. It has not
-been pushed, merged, deployed, or routed live. There has been no analyzer route
-probe, private-text egress authorization, Sheet refresh, Clockify write,
-Multica mutation, or fleet mutation for this candidate. Calendly remains
+The current guarded candidate is developed on
+`codex/clockify-analyzer-determinism`. Resolve its exact SHA with `git rev-parse
+HEAD` immediately before every publication, deployment, and run, and bind each
+manifest and readback to that SHA; any later edit creates a new candidate. Do
+not infer merge, private-text egress, Sheet refresh, Clockify write, Multica
+mutation, or schedule approval from a validation deployment. Calendly remains
 excluded. Clockify remains the system of record; the process only creates local
 review artifacts until the applicable guarded approval is granted.
 

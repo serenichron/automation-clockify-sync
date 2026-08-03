@@ -158,13 +158,27 @@ class ProcessIntegrationTests(unittest.TestCase):
             "repository_events": [],
             "repository_evidence_status": "complete",
             "errors": [],
+            "canonical_export_attestation": {
+                "collector_script_sha256": "fixture-digest",
+                "runtime_identity": {"git_sha": "fixture-sha", "git_dirty": False},
+            },
         }
         completed = subprocess.CompletedProcess(
             args=["ssh"], returncode=0, stdout=json.dumps(exported) + "\n", stderr=""
         )
-        with mock.patch.object(collector.subprocess, "run", return_value=completed) as run:
-            result = collector.collect_remote_sessions(machine, SINCE, UNTIL, [])
+        with (
+            mock.patch.object(collector, "collector_script_sha256", return_value="fixture-digest"),
+            mock.patch.object(collector.subprocess, "run", return_value=completed) as run,
+        ):
+            result = collector.collect_remote_sessions(
+                machine,
+                SINCE,
+                UNTIL,
+                [],
+                coordinator_identity={"git_sha": "fixture-sha", "git_dirty": False},
+            )
         self.assertEqual("canonical_export_v1", result["collector_contract"])
+        self.assertEqual("git_worktree", result["canonical_export"]["bundle_provenance"])
         self.assertEqual(1, run.call_count)
         self.assertNotIn("<<'PY'", " ".join(str(value) for value in run.call_args.args[0]))
 
@@ -190,7 +204,13 @@ class ProcessIntegrationTests(unittest.TestCase):
             args=["ssh"], returncode=0, stdout=json.dumps(legacy_payload) + "\n", stderr=""
         )
         with mock.patch.object(collector.subprocess, "run", side_effect=[failed, legacy]):
-            result = collector.collect_remote_sessions(machine, SINCE, UNTIL, [])
+            result = collector.collect_remote_sessions(
+                machine,
+                SINCE,
+                UNTIL,
+                [],
+                coordinator_identity={"git_sha": "fixture-sha", "git_dirty": False},
+            )
         self.assertEqual("partial", result["status"])
         self.assertEqual("legacy_metadata_fallback", result["collector_contract"])
         inventory = evidence_ledger.source_inventory_from_collector(

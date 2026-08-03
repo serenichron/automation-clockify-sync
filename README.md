@@ -158,8 +158,22 @@ Fathom collection fetches the complete creation history through the requested
 end timestamp, then filters locally by recording or scheduled occurrence
 overlap. This prevents a meeting created earlier from disappearing from the
 accounting window. The inventory records its history floor, occurrence filter,
-pagination count, and completeness. Multica issue evidence is fully paginated
+pagination count, and completeness. HTTP 429 responses use one bounded
+collection-wide retry budget; exhaustion records sanitized page/cursor and
+retry provenance and fails closed. Multica issue evidence is fully paginated
 and then bounded to issue activity in the requested accounting window.
+
+Canonical remote session exports attest the exact collector-script SHA-256
+before their evidence can be called complete. Git worktrees must also match the
+coordinator Git SHA with no tracked changes; the Desktop non-Git archive is
+identified explicitly and accepted only when its collector-script digest
+matches. Month-scale canonical exports use a bounded, configurable timeout and
+never turn a timeout or attestation mismatch into legacy metadata evidence.
+
+A currently running Clockify entry is represented as an existing fixed block
+only through the earlier of the collection snapshot and the requested end. Its
+temporary boundary remains explicit provenance. If any running entry cannot be
+bounded safely, Clockify coverage stays partial and accounting fails closed.
 
 `review-snapshot.json` categorizes items as `new`, `changed`,
 `carried_pending`, or `resolved_disappeared`. A zero-candidate run never closes

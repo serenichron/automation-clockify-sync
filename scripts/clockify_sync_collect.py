@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import email.utils
 import fnmatch
 import hashlib
 import json
@@ -19,6 +20,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -32,6 +34,14 @@ CLOCKIFY_API = "https://api.clockify.me/api/v1"
 FATHOM_API = "https://api.fathom.ai/external/v1"
 FATHOM_HISTORY_FLOOR = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
 FATHOM_MAX_PAGES = 1000
+FATHOM_MAX_RETRY_ATTEMPTS = 3
+FATHOM_MAX_RETRY_DELAY_SECONDS = 60
+FATHOM_MAX_COLLECTION_RETRIES = 12
+FATHOM_MAX_COLLECTION_RETRY_DELAY_SECONDS = 120
+FATHOM_COLLECTION_RETRY_DEADLINE_SECONDS = 180
+CANONICAL_EXPORT_TIMEOUT_SECONDS = 900
+CANONICAL_EXPORT_TIMEOUT_MIN_SECONDS = 60
+CANONICAL_EXPORT_TIMEOUT_MAX_SECONDS = 1800
 BUCHAREST = ZoneInfo("Europe/Bucharest")
 
 MULTICA_PROFILE = "desktop-api.multica.ai"
@@ -77,6 +87,11 @@ def write_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False, default=str) + "\n")
 
 
+def collector_script_sha256() -> str:
+    """Digest the exact collector code that is executing this command."""
+    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
 def collector_runtime_identity() -> dict[str, Any]:
     """Record the exact local checkout that assembled a dry-run bundle."""
     sha = None
@@ -90,8 +105,18 @@ def collector_runtime_identity() -> dict[str, Any]:
         )
         if proc.returncode == 0:
             sha = proc.stdout.strip() or None
+        # Durable state and Syncthing scratch files are intentionally untracked
+        # and cannot change the committed collector implementation. Record only
+        # tracked-file drift against the exact candidate SHA.
         status = subprocess.run(
-            ["git", "-C", str(ROOT), "status", "--porcelain"],
+            [
+                "git",
+                "-C",
+                str(ROOT),
+                "status",
+                "--porcelain",
+                "--untracked-files=no",
+            ],
             capture_output=True,
             text=True,
             timeout=5,
@@ -153,6 +178,92 @@ def http_json(url: str, headers: dict[str, str]) -> Any:
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(r.read())
+
+
+def _fathom_retry_delay(error: urllib.error.HTTPError, attempt: int) -> int:
+    """Return a capped rate-limit delay, preferring Fathom's Retry-After."""
+    fallback = min(FATHOM_MAX_RETRY_DELAY_SECONDS, 2 ** attempt)
+    retry_after = (error.headers or {}).get("Retry-After")
+    if not retry_after:
+        return fallback
+    try:
+        return min(FATHOM_MAX_RETRY_DELAY_SECONDS, max(0, int(retry_after)))
+    except (TypeError, ValueError):
+        pass
+    try:
+        retry_at = email.utils.parsedate_to_datetime(retry_after)
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=dt.timezone.utc)
+        seconds = int((retry_at - dt.datetime.now(dt.timezone.utc)).total_seconds())
+        return min(FATHOM_MAX_RETRY_DELAY_SECONDS, max(0, seconds))
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return fallback
+
+
+class FathomRetryBudgetExhausted(RuntimeError):
+    """A collection-wide Fathom retry budget was exhausted."""
+
+
+class FathomRetryBudget:
+    """Keep rate-limit retries bounded across every page of one collection."""
+
+    def __init__(self) -> None:
+        self.started_at = time.monotonic()
+        self.retry_delays: list[int] = []
+
+    def policy(self) -> dict[str, Any]:
+        return {
+            "max_attempts_per_page": FATHOM_MAX_RETRY_ATTEMPTS,
+            "max_retries_per_collection": FATHOM_MAX_COLLECTION_RETRIES,
+            "max_delay_per_retry_seconds": FATHOM_MAX_RETRY_DELAY_SECONDS,
+            "max_total_retry_delay_seconds": FATHOM_MAX_COLLECTION_RETRY_DELAY_SECONDS,
+            "retry_deadline_seconds": FATHOM_COLLECTION_RETRY_DEADLINE_SECONDS,
+            "retryable_http_statuses": [429],
+        }
+
+    def reserve_retry(self, delay: int) -> None:
+        elapsed = max(0, int(time.monotonic() - self.started_at))
+        if len(self.retry_delays) >= FATHOM_MAX_COLLECTION_RETRIES:
+            raise FathomRetryBudgetExhausted("collection_retry_count_exhausted")
+        if sum(self.retry_delays) + delay > FATHOM_MAX_COLLECTION_RETRY_DELAY_SECONDS:
+            raise FathomRetryBudgetExhausted("collection_retry_delay_exhausted")
+        if elapsed + delay > FATHOM_COLLECTION_RETRY_DEADLINE_SECONDS:
+            raise FathomRetryBudgetExhausted("collection_retry_deadline_exhausted")
+        self.retry_delays.append(delay)
+
+    def require_time_remaining(self) -> None:
+        elapsed = max(0, int(time.monotonic() - self.started_at))
+        if elapsed > FATHOM_COLLECTION_RETRY_DEADLINE_SECONDS:
+            raise FathomRetryBudgetExhausted("collection_retry_deadline_exhausted")
+
+
+def fathom_http_json_with_retry(
+    url: str, headers: dict[str, str], retry_budget: FathomRetryBudget
+) -> Any:
+    """Fetch one Fathom page, retrying only bounded HTTP 429 responses."""
+    for attempt in range(FATHOM_MAX_RETRY_ATTEMPTS):
+        try:
+            return http_json(url, headers)
+        except urllib.error.HTTPError as error:
+            if error.code != 429 or attempt + 1 >= FATHOM_MAX_RETRY_ATTEMPTS:
+                raise
+            delay = _fathom_retry_delay(error, attempt)
+            retry_budget.reserve_retry(delay)
+            time.sleep(delay)
+    raise AssertionError("Fathom retry loop exhausted without returning or raising")
+
+
+def canonical_export_timeout_seconds() -> int:
+    """Return the bounded timeout for canonical month-scale remote exports."""
+    raw = os.environ.get("CLOCKIFY_CANONICAL_EXPORT_TIMEOUT_SECONDS", "")
+    try:
+        configured = int(raw) if raw else CANONICAL_EXPORT_TIMEOUT_SECONDS
+    except ValueError:
+        configured = CANONICAL_EXPORT_TIMEOUT_SECONDS
+    return min(
+        CANONICAL_EXPORT_TIMEOUT_MAX_SECONDS,
+        max(CANONICAL_EXPORT_TIMEOUT_MIN_SECONDS, configured),
+    )
 
 
 def clockify_get(path: str, cenv: dict[str, str]) -> Any:
@@ -1258,13 +1369,24 @@ except Exception as e: res['errors'].append('codex scan: '+str(e)[:200])
 '''
 
 
-def collect_remote_sessions(machine: dict[str, Any], since: dt.datetime, until: dt.datetime, ssh_options: list[str]) -> dict[str, Any]:
+def collect_remote_sessions(
+    machine: dict[str, Any],
+    since: dt.datetime,
+    until: dt.datetime,
+    ssh_options: list[str],
+    *,
+    coordinator_identity: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     host = machine["host"]
     result = {"machine": machine["name"], "status": "unavailable",
               "claude_bursts": [], "hermes_sessions": [], "hermes_db_sessions": [],
               "codex_sessions": [], "repository_events": [], "errors": []}
     collector_root = str(machine.get("collector_root") or "").strip()
     if collector_root:
+        canonical_timeout = canonical_export_timeout_seconds()
+        expected_script_digest = collector_script_sha256()
+        coordinator = coordinator_identity or collector_runtime_identity()
+        coordinator_git_sha = str(coordinator.get("git_sha") or "").strip()
         script = str(Path(collector_root) / "scripts" / "clockify_sync_collect.py")
         remote_parts = [
             "python3",
@@ -1276,23 +1398,89 @@ def collect_remote_sessions(machine: dict[str, Any], since: dt.datetime, until: 
             since.isoformat(),
             "--until",
             until.isoformat(),
+            "--expected-collector-sha256",
+            expected_script_digest,
         ]
+        if coordinator_git_sha:
+            remote_parts.extend(["--coordinator-git-sha", coordinator_git_sha])
         canonical_command = " ".join(shlex.quote(part) for part in remote_parts)
         try:
             canonical = subprocess.run(
                 ["ssh", *ssh_options, host, canonical_command],
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=canonical_timeout,
             )
             if canonical.returncode == 0:
-                exported = json.loads(canonical.stdout.strip().splitlines()[-1])
+                try:
+                    exported = json.loads(canonical.stdout.strip().splitlines()[-1])
+                except (IndexError, json.JSONDecodeError):
+                    result["errors"].append(
+                        "canonical remote evidence export returned an invalid attestation payload; no legacy metadata fallback used"
+                    )
+                    return result
                 if isinstance(exported, dict) and exported.get("machine") == machine["name"]:
+                    attestation = exported.get("canonical_export_attestation")
+                    if not isinstance(attestation, dict):
+                        result["errors"].append(
+                            "canonical remote evidence export missing code attestation; no legacy metadata fallback used"
+                        )
+                        return result
+                    remote_digest = str(attestation.get("collector_script_sha256") or "")
+                    runtime = attestation.get("runtime_identity")
+                    if remote_digest != expected_script_digest:
+                        result["errors"].append(
+                            "canonical remote evidence export script digest mismatch; no legacy metadata fallback used"
+                        )
+                        return result
+                    if not isinstance(runtime, dict):
+                        result["errors"].append(
+                            "canonical remote evidence export missing runtime identity; no legacy metadata fallback used"
+                        )
+                        return result
+                    remote_git_sha = str(runtime.get("git_sha") or "").strip()
+                    remote_git_dirty = runtime.get("git_dirty")
+                    if remote_git_sha:
+                        if not coordinator_git_sha or remote_git_sha != coordinator_git_sha:
+                            result["errors"].append(
+                                "canonical remote evidence export Git SHA mismatch; no legacy metadata fallback used"
+                            )
+                            return result
+                        if remote_git_dirty is not False:
+                            result["errors"].append(
+                                "canonical remote evidence export tracked Git worktree is dirty; no legacy metadata fallback used"
+                            )
+                            return result
+                        bundle_provenance = "git_worktree"
+                    else:
+                        bundle_provenance = "non_git_bundle"
                     exported["collector_contract"] = "canonical_export_v1"
+                    exported["canonical_export"] = {
+                        "timeout_seconds": canonical_timeout,
+                        "provenance": "full_context_remote_export",
+                        "bundle_provenance": bundle_provenance,
+                        "collector_script_sha256": remote_digest,
+                        "coordinator_git_sha": coordinator_git_sha or None,
+                        "remote_git_sha": remote_git_sha or None,
+                    }
                     return exported
+                result["errors"].append(
+                    "canonical remote evidence export identity mismatch; no legacy metadata fallback used"
+                )
+                return result
             result["errors"].append(
                 "canonical remote evidence export unavailable; legacy metadata fallback used"
             )
+        except subprocess.TimeoutExpired:
+            result["errors"].append(
+                "canonical remote evidence export timed out; no legacy metadata fallback used"
+            )
+            result["canonical_export"] = {
+                "timeout_seconds": canonical_timeout,
+                "provenance": "full_context_remote_export",
+                "status": "timed_out",
+            }
+            return result
         except Exception as exc:
             result["errors"].append(
                 f"canonical remote evidence export unavailable ({type(exc).__name__}); "
@@ -1842,7 +2030,14 @@ def extract_hermes_db_context(db_path: str, since: dt.datetime, until: dt.dateti
 
 
 
-def fetch_clockify(cenv: dict[str, str], routing: dict[str, Any], since: dt.datetime, until: dt.datetime) -> dict[str, Any]:
+def fetch_clockify(
+    cenv: dict[str, str],
+    routing: dict[str, Any],
+    since: dt.datetime,
+    until: dt.datetime,
+    *,
+    snapshot_at: dt.datetime | None = None,
+) -> dict[str, Any]:
     if cenv.get("_missing"):
         return {
             "status": "missing_credentials",
@@ -1853,6 +2048,10 @@ def fetch_clockify(cenv: dict[str, str], routing: dict[str, Any], since: dt.date
         }
     ws = cenv["CLOCKIFY_WORKSPACE_ID"]
     user = routing["clockify_user_id"]
+    observed_at = snapshot_at or dt.datetime.now(dt.timezone.utc)
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=dt.timezone.utc)
+    snapshot_boundary = min(until, observed_at)
     try:
         entries: list[dict[str, Any]] = []
         seen_pages: set[tuple[str, ...]] = set()
@@ -1878,31 +2077,57 @@ def fetch_clockify(cenv: dict[str, str], routing: dict[str, Any], since: dt.date
                 raise ValueError("Clockify pagination exceeded safety limit")
         sanitized = []
         running_entry_count = 0
+        running_snapshot_count = 0
         for e in entries:
             ti = e.get("timeInterval", {})
             running = not ti.get("end")
             if running:
                 running_entry_count += 1
+            start_dt = parse_dt(ti.get("start"))
+            fixed_end = parse_dt(ti.get("end"))
+            running_snapshot = None
+            if running and start_dt and start_dt < snapshot_boundary:
+                # Clockify has not supplied an immutable end. For this
+                # collection only, the observed snapshot makes it an existing
+                # fixed block through the earlier of collection time and the
+                # requested range boundary.
+                fixed_end = snapshot_boundary
+                running_snapshot_count += 1
+                running_snapshot = {
+                    "observed_at": iso_utc(observed_at),
+                    "boundary": iso_utc(snapshot_boundary),
+                    "basis": "collection_snapshot_boundary",
+                }
             sanitized.append({
                 "id_suffix": e.get("id", "")[-8:],
                 "description": e.get("description", ""),
                 "project_id_suffix": (e.get("projectId") or "")[-6:],
                 "tag_id_suffixes": [(t or "")[-8:] for t in e.get("tagIds", [])],
-                "start": local_dt_string(parse_dt(ti.get("start"))),
-                "end": local_dt_string(parse_dt(ti.get("end"))) if ti.get("end") else None,
+                "start": local_dt_string(start_dt),
+                "end": local_dt_string(fixed_end),
                 "running": running,
+                "running_snapshot": running_snapshot,
                 "duration": ti.get("duration"),
                 "billable": e.get("billable"),
             })
         return {
-            # A running Clockify entry has no immutable end boundary. Preserve
-            # it as evidence, but fail closed so later accounting cannot place
-            # suggested work around an invented end time.
-            "status": "partial" if running_entry_count else "ok",
+            # Pagination is complete even when Clockify has a currently
+            # running entry only if each one has a temporary end explicitly
+            # bounded by this collection snapshot, never by a guessed future
+            # end. An unparseable or future start remains fail-closed.
+            "status": (
+                "ok" if running_snapshot_count == running_entry_count else "partial"
+            ),
             "entries": sanitized,
             "pages_fetched": page,
             "running_entry_count": running_entry_count,
-            "complete": running_entry_count == 0,
+            "running_entry_snapshot_count": running_snapshot_count,
+            "collection_snapshot": {
+                "observed_at": iso_utc(observed_at),
+                "boundary": iso_utc(snapshot_boundary),
+                "requested_until": iso_utc(until),
+            },
+            "complete": running_snapshot_count == running_entry_count,
         }
     except Exception as e:
         return {
@@ -1914,6 +2139,34 @@ def fetch_clockify(cenv: dict[str, str], routing: dict[str, Any], since: dt.date
         }
 
 
+def _fathom_cursor_reference(cursor: str | None) -> str:
+    if not cursor:
+        return "initial"
+    return "sha256:" + hashlib.sha256(cursor.encode("utf-8")).hexdigest()[:12]
+
+
+def _fathom_failure(
+    reason: str,
+    *,
+    page: int,
+    cursor: str | None,
+    retry_budget: FathomRetryBudget,
+) -> dict[str, Any]:
+    return {
+        "status": "error",
+        "error": reason,
+        "meetings": [],
+        "complete": False,
+        "failure": {
+            "page": page,
+            "cursor": _fathom_cursor_reference(cursor),
+            "retry_count": len(retry_budget.retry_delays),
+            "retry_delays_seconds": list(retry_budget.retry_delays),
+            "retry_policy": retry_budget.policy(),
+        },
+    }
+
+
 def fetch_fathom(fenv: dict[str, str], since: dt.datetime, until: dt.datetime) -> dict[str, Any]:
     if fenv.get("_missing"):
         return {
@@ -1922,13 +2175,15 @@ def fetch_fathom(fenv: dict[str, str], since: dt.datetime, until: dt.datetime) -
             "meetings": [],
             "complete": False,
         }
+    headers = {"X-Api-Key": fenv["FATHOM_API_KEY"]}
+    items: list[dict[str, Any]] = []
+    cursor: str | None = None
+    pages = 0
+    retry_budget = FathomRetryBudget()
     try:
-        headers = {"X-Api-Key": fenv["FATHOM_API_KEY"]}
-        items: list[dict[str, Any]] = []
-        cursor: str | None = None
-        pages = 0
         seen_cursors: set[str] = set()
         while True:
+            retry_budget.require_time_remaining()
             query = {
                 # Fathom filters this endpoint by record creation, not meeting
                 # occurrence. Fetch the complete creation history through the
@@ -1946,7 +2201,9 @@ def fetch_fathom(fenv: dict[str, str], since: dt.datetime, until: dt.datetime) -
             if cursor:
                 query["cursor"] = cursor
             params = urllib.parse.urlencode(query)
-            data = http_json(f"{FATHOM_API}/meetings?{params}", headers)
+            data = fathom_http_json_with_retry(
+                f"{FATHOM_API}/meetings?{params}", headers, retry_budget
+            )
             if isinstance(data, list):
                 page_items = data
             elif isinstance(data, dict) and isinstance(data.get("items"), list):
@@ -2031,14 +2288,25 @@ def fetch_fathom(fenv: dict[str, str], since: dt.datetime, until: dt.datetime) -
                 "action_items",
                 "transcript",
             ],
+            "retry_count": len(retry_budget.retry_delays),
+            "retry_delays_seconds": list(retry_budget.retry_delays),
+            "retry_policy": retry_budget.policy(),
         }
+    except FathomRetryBudgetExhausted as error:
+        return _fathom_failure(
+            str(error), page=pages + 1, cursor=cursor, retry_budget=retry_budget
+        )
+    except urllib.error.HTTPError as error:
+        return _fathom_failure(
+            f"Fathom HTTP {error.code}",
+            page=pages + 1,
+            cursor=cursor,
+            retry_budget=retry_budget,
+        )
     except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e),
-            "meetings": [],
-            "complete": False,
-        }
+        return _fathom_failure(
+            str(e), page=pages + 1, cursor=cursor, retry_budget=retry_budget
+        )
 
 
 def multica_profile_config() -> dict[str, Any] | None:
@@ -2628,6 +2896,7 @@ def run(args: argparse.Namespace) -> int:
     cenv = load_env_file(clockify_env_candidates(), ["CLOCKIFY_API_KEY", "CLOCKIFY_WORKSPACE_ID"])
     fenv = load_env_file(fathom_env_candidates(), ["FATHOM_API_KEY"])
     since, until, reason = compute_range(args, routing, cenv)
+    runtime_identity = collector_runtime_identity()
     run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_dir = RUNS / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -2644,7 +2913,15 @@ def run(args: argparse.Namespace) -> int:
         if machine_is_local(m):
             evidence["sessions"].append(collect_local_sessions(m, since, until))
         elif m.get("kind") in ("ssh", "auto"):
-            evidence["sessions"].append(collect_remote_sessions(m, since, until, fleet.get("ssh_options", [])))
+            evidence["sessions"].append(
+                collect_remote_sessions(
+                    m,
+                    since,
+                    until,
+                    fleet.get("ssh_options", []),
+                    coordinator_identity=runtime_identity,
+                )
+            )
 
     # Enriched session context (user messages with prev/next assistant)
     if getattr(args, 'enrich', False):
@@ -2674,7 +2951,7 @@ def run(args: argparse.Namespace) -> int:
     proposals, ambiguous, skipped = build_proposals(evidence, routing)
     report = {
         "run_id": run_id,
-        "runtime_identity": collector_runtime_identity(),
+        "runtime_identity": runtime_identity,
         "date_range": {"since": local_dt_string(since), "until": local_dt_string(until), "reason": reason},
         "safety": {"dry_run": True, "clockify_posted": False},
         "paths": {
@@ -2801,6 +3078,8 @@ def main() -> int:
     export.add_argument("--machine-json", required=True)
     export.add_argument("--since", required=True)
     export.add_argument("--until", required=True)
+    export.add_argument("--expected-collector-sha256", required=True)
+    export.add_argument("--coordinator-git-sha")
     args = ap.parse_args()
     if args.cmd == "run":
         return run(args)
@@ -2812,7 +3091,25 @@ def main() -> int:
         until = parse_dt(args.until)
         if not since or not until or until <= since:
             raise ValueError("export-local requires a valid since/until range")
-        print(json.dumps(collect_local_sessions(machine, since, until), ensure_ascii=False))
+        expected_digest = str(args.expected_collector_sha256).strip()
+        actual_digest = collector_script_sha256()
+        runtime_identity = collector_runtime_identity()
+        if expected_digest != actual_digest:
+            print(json.dumps({
+                "machine": machine["name"],
+                "status": "unavailable",
+                "canonical_export_attestation": {
+                    "collector_script_sha256": actual_digest,
+                    "runtime_identity": runtime_identity,
+                },
+            }, ensure_ascii=False))
+            return 0
+        exported = collect_local_sessions(machine, since, until)
+        exported["canonical_export_attestation"] = {
+            "collector_script_sha256": actual_digest,
+            "runtime_identity": runtime_identity,
+        }
+        print(json.dumps(exported, ensure_ascii=False))
         return 0
     return 2
 
