@@ -216,10 +216,18 @@ def _safe_text(value: Any) -> str:
         line = PERSON_NAME_RE.sub(_redact_contextual_person, line)
         lines.append(line)
     safe = _one_line(" ".join(lines))
-    # Redaction can expose a second adjacent path only after whitespace and
-    # punctuation are normalized. Converge instead of treating that newly
-    # visible fragment as an irrecoverable projection failure.
-    safe = _sub_until_stable(PATH_RE, "[path removed]", safe)
+    # Redaction can expose a second adjacent identifier only after whitespace
+    # and punctuation are normalized. Converge every direct-identifier class
+    # instead of weakening the final fail-closed assertion.
+    for pattern, replacement in (
+        (URL_RE, "[url removed]"),
+        (EMAIL_RE, "[email removed]"),
+        (PATH_RE, "[path removed]"),
+        (BEARER_RE, "[credential removed]"),
+        (SECRET_RE, "[credential removed]"),
+        (HASH_RE, "[hash removed]"),
+    ):
+        safe = _sub_until_stable(pattern, replacement, safe)
     if any(pattern.search(safe) for pattern in (URL_RE, EMAIL_RE, PATH_RE, BEARER_RE, SECRET_RE, HASH_RE, COMMAND_RE, TRANSPORT_RE)):
         raise AnalyzerError("semantic projection contains unsafe text")
     return safe
