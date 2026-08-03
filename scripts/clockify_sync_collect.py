@@ -8,9 +8,11 @@ No Clockify writes are performed by this script.
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import email.utils
 import fnmatch
+import gzip
 import hashlib
 import json
 import os
@@ -37,11 +39,12 @@ FATHOM_MAX_PAGES = 1000
 FATHOM_MAX_RETRY_ATTEMPTS = 3
 FATHOM_MAX_RETRY_DELAY_SECONDS = 60
 FATHOM_MAX_COLLECTION_RETRIES = 12
-FATHOM_MAX_COLLECTION_RETRY_DELAY_SECONDS = 120
-FATHOM_COLLECTION_RETRY_DEADLINE_SECONDS = 900
+FATHOM_MAX_COLLECTION_RETRY_DELAY_SECONDS = 600
+FATHOM_COLLECTION_RETRY_DEADLINE_SECONDS = 1800
 CANONICAL_EXPORT_TIMEOUT_SECONDS = 900
 CANONICAL_EXPORT_TIMEOUT_MIN_SECONDS = 60
 CANONICAL_EXPORT_TIMEOUT_MAX_SECONDS = 1800
+CANONICAL_EXPORT_ENVELOPE_PREFIX = "clockify-canonical-v1:"
 BUCHAREST = ZoneInfo("Europe/Bucharest")
 
 MULTICA_PROFILE = "desktop-api.multica.ai"
@@ -279,12 +282,28 @@ def canonical_export_timeout_seconds() -> int:
     )
 
 
+def canonical_export_envelope(payload: dict[str, Any]) -> str:
+    """Compress a canonical export into one noise-tolerant transport line."""
+    raw = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    compressed = gzip.compress(raw, compresslevel=1, mtime=0)
+    return CANONICAL_EXPORT_ENVELOPE_PREFIX + base64.b64encode(compressed).decode("ascii")
+
+
 def canonical_export_payload(stdout: str, machine_name: str) -> dict[str, Any] | None:
-    """Find the last machine-specific JSON payload without exposing stdout."""
+    """Find and decode the last machine-specific payload without exposing stdout."""
     for line in reversed(stdout.splitlines()):
         try:
-            candidate = json.loads(line)
-        except json.JSONDecodeError:
+            if line.startswith(CANONICAL_EXPORT_ENVELOPE_PREFIX):
+                encoded = line[len(CANONICAL_EXPORT_ENVELOPE_PREFIX):]
+                compressed = base64.b64decode(encoded, validate=True)
+                candidate = json.loads(gzip.decompress(compressed))
+            else:
+                candidate = json.loads(line)
+        except (ValueError, gzip.BadGzipFile, json.JSONDecodeError):
             continue
         if isinstance(candidate, dict) and candidate.get("machine") == machine_name:
             return candidate
@@ -1425,6 +1444,7 @@ def collect_remote_sessions(
             until.isoformat(),
             "--expected-collector-sha256",
             expected_script_digest,
+            "--encoded-output",
         ]
         if coordinator_git_sha:
             remote_parts.extend(["--coordinator-git-sha", coordinator_git_sha])
@@ -3105,6 +3125,7 @@ def main() -> int:
     export.add_argument("--until", required=True)
     export.add_argument("--expected-collector-sha256", required=True)
     export.add_argument("--coordinator-git-sha")
+    export.add_argument("--encoded-output", action="store_true")
     args = ap.parse_args()
     if args.cmd == "run":
         return run(args)
@@ -3120,21 +3141,30 @@ def main() -> int:
         actual_digest = collector_script_sha256()
         runtime_identity = collector_runtime_identity()
         if expected_digest != actual_digest:
-            print(json.dumps({
+            mismatch = {
                 "machine": machine["name"],
                 "status": "unavailable",
                 "canonical_export_attestation": {
                     "collector_script_sha256": actual_digest,
                     "runtime_identity": runtime_identity,
                 },
-            }, ensure_ascii=False))
+            }
+            print(
+                canonical_export_envelope(mismatch)
+                if args.encoded_output
+                else json.dumps(mismatch, ensure_ascii=False)
+            )
             return 0
         exported = collect_local_sessions(machine, since, until)
         exported["canonical_export_attestation"] = {
             "collector_script_sha256": actual_digest,
             "runtime_identity": runtime_identity,
         }
-        print(json.dumps(exported, ensure_ascii=False))
+        print(
+            canonical_export_envelope(exported)
+            if args.encoded_output
+            else json.dumps(exported, ensure_ascii=False)
+        )
         return 0
     return 2
 

@@ -674,12 +674,13 @@ class CollectorBurstContextTests(unittest.TestCase):
         self.assertTrue(result["complete"])
         self.assertEqual(32, result["pages_fetched"])
         self.assertEqual(0, result["retry_count"])
-        self.assertEqual(900, result["retry_policy"]["retry_deadline_seconds"])
+        self.assertEqual(1800, result["retry_policy"]["retry_deadline_seconds"])
+        self.assertEqual(600, result["retry_policy"]["max_total_retry_delay_seconds"])
 
     def test_fathom_month_scale_deadline_still_bounds_collection(self) -> None:
         with (
             mock.patch.object(collector, "http_json") as http,
-            mock.patch.object(collector.time, "monotonic", side_effect=[0, 901]),
+            mock.patch.object(collector.time, "monotonic", side_effect=[0, 1801]),
         ):
             result = collector.fetch_fathom(
                 {"FATHOM_API_KEY": "not-logged"}, SINCE, UNTIL
@@ -689,6 +690,16 @@ class CollectorBurstContextTests(unittest.TestCase):
         self.assertEqual("collection_retry_deadline_exhausted", result["error"])
         self.assertEqual(1, result["failure"]["page"])
         http.assert_not_called()
+
+    def test_fathom_month_scale_retry_delay_budget_allows_live_backoff_pattern(self) -> None:
+        budget = collector.FathomRetryBudget()
+        with mock.patch.object(collector.time, "monotonic", return_value=0):
+            budget.started_at = 0
+            for delay in (38, 39, 40, 41):
+                budget.reserve_retry(delay)
+
+        self.assertEqual([38, 39, 40, 41], budget.retry_delays)
+        self.assertEqual(600, budget.policy()["max_total_retry_delay_seconds"])
 
     def test_fathom_final_http_error_has_sanitized_failure_provenance(self) -> None:
         unavailable = urllib.error.HTTPError(
@@ -733,6 +744,7 @@ class CollectorBurstContextTests(unittest.TestCase):
         command = run.call_args.args[0][-1]
         self.assertIn("--expected-collector-sha256 expected-digest", command)
         self.assertIn("--coordinator-git-sha coordinator-sha", command)
+        self.assertIn("--encoded-output", command)
 
     def test_canonical_export_attestation_ignores_trailing_stdout_noise(self) -> None:
         machine = {"name": "precision", "host": "precision.example.test", "collector_root": "/work/clockify"}
@@ -747,6 +759,33 @@ class CollectorBurstContextTests(unittest.TestCase):
         }
         stdout = "profile notice\n" + json.dumps(exported) + "\ntrailing status\n"
         completed = collector.subprocess.CompletedProcess(["ssh"], 0, stdout, "")
+        with (
+            mock.patch.object(collector, "collector_script_sha256", return_value="expected-digest"),
+            mock.patch.object(collector.subprocess, "run", return_value=completed),
+        ):
+            result = collector.collect_remote_sessions(
+                machine, SINCE, UNTIL, [],
+                coordinator_identity={"git_sha": "coordinator-sha", "git_dirty": False},
+            )
+
+        self.assertEqual("canonical_export_v1", result["collector_contract"])
+
+    def test_canonical_export_attestation_decodes_compressed_envelope_with_noise(self) -> None:
+        machine = {"name": "precision", "host": "precision.example.test", "collector_root": "/work/clockify"}
+        exported = {
+            "machine": "precision", "status": "ok", "claude_bursts": [],
+            "hermes_sessions": [], "hermes_db_sessions": [], "codex_sessions": [],
+            "repository_events": [], "repository_evidence_status": "complete", "errors": [],
+            "canonical_export_attestation": {
+                "collector_script_sha256": "expected-digest",
+                "runtime_identity": {"git_sha": "coordinator-sha", "git_dirty": False},
+            },
+        }
+        envelope = collector.canonical_export_envelope(exported)
+        self.assertLess(len(envelope), len(json.dumps(exported)))
+        completed = collector.subprocess.CompletedProcess(
+            ["ssh"], 0, "profile notice\n" + envelope + "\ntrailing status\n", ""
+        )
         with (
             mock.patch.object(collector, "collector_script_sha256", return_value="expected-digest"),
             mock.patch.object(collector.subprocess, "run", return_value=completed),
