@@ -105,6 +105,16 @@ usable fallback, primary probe/call/schema failures block the run. Conflicting o
 low-confidence claims that remain unresolved become explicit exceptions, never
 proposals.
 
+Analyzer requests retain the fail-closed 1,450,000-byte hard ceiling. Normal
+extraction uses a 500,000-byte and 250-event operational target so a large-context
+route does not receive an unnecessarily broad semantic partition. A single event
+may exceed the target but never the hard ceiling; it is never clipped. When both
+evaluated routes reject one bounded chunk, the complete chunk becomes one local
+`analyzer_failure` exception with a failure digest and processing continues.
+If both routes reject repeated-workstream synthesis, those otherwise valid but
+potentially duplicative claims become one `analyzer_synthesis_failure` exception.
+No rejected activity can become a proposal.
+
 Validated analyzer decisions are stored in an append-only local cache beside
 the durable review state. Cache keys bind the endpoint, model, prompt/schema
 versions, and complete request-body digest without storing request prose. Both

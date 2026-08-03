@@ -31,6 +31,8 @@ PROMPT_VERSION = "clockify-semantic-v7"
 ANALYZER_CACHE_SCHEMA_VERSION = "clockify-analyzer-cache/v1"
 DEFAULT_PRIMARY_MODEL = "deepseek-v4-flash:cloud"
 DEFAULT_MAX_BODY_BYTES = 1_450_000
+DEFAULT_CHUNK_BODY_BYTES = 500_000
+DEFAULT_MAX_EVENTS_PER_CHUNK = 250
 PRIVATE_TEXT_APPROVAL_ENV = "CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED"
 LIFECYCLES = {
     "completed",
@@ -103,6 +105,10 @@ PROJECTED_EVENT_FIELDS = {
 
 class AnalyzerError(RuntimeError):
     """Fail-closed analyzer or contract error."""
+
+
+class AnalyzerContractError(AnalyzerError):
+    """A sealed provider response rejected by the semantic output contract."""
 
 
 def canonical_json(value: Any) -> str:
@@ -757,6 +763,8 @@ def chunk_events(
     *,
     model: str = DEFAULT_PRIMARY_MODEL,
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
+    target_body_bytes: int | None = None,
+    max_events_per_chunk: int = DEFAULT_MAX_EVENTS_PER_CHUNK,
     corrections: list[dict[str, Any]] | None = None,
     private_text_approved: bool | None = None,
 ) -> list[list[dict[str, Any]]]:
@@ -765,6 +773,13 @@ def chunk_events(
     Oversized individual evidence is rejected: silently clipping it would violate
     the complete-context and cited-evidence contract.
     """
+    if max_events_per_chunk <= 0:
+        raise AnalyzerError("max_events_per_chunk must be positive")
+    if target_body_bytes is None:
+        target_body_bytes = max_body_bytes
+    target_body_bytes = min(target_body_bytes, max_body_bytes)
+    if target_body_bytes <= 0:
+        raise AnalyzerError("target_body_bytes must be positive")
     # Size exactly what may leave the machine, never the raw immutable ledger.
     ordered = project_events(events)
     _require_private_text_approval(ordered, private_text_approved)
@@ -806,7 +821,10 @@ def chunk_events(
                 + len(current)
                 + _alias_extra_bytes(trial_count)
             )
-            if current and trial_size > max_body_bytes:
+            if current and (
+                trial_size > target_body_bytes
+                or len(current) >= max_events_per_chunk
+            ):
                 chunks.append(current)
                 current = [event]
                 current_event_bytes = event_bytes
@@ -1272,7 +1290,9 @@ class AnalyzerResponseCache:
         self.hits += 1
         self.used[identity["cache_key"]] = str(record["decision_digest"])
         if record["status"] == "rejected":
-            raise AnalyzerError("analyzer cache records a contract-rejected response")
+            raise AnalyzerContractError(
+                "analyzer cache records a contract-rejected response"
+            )
         return copy.deepcopy(record["response"])
 
     def _store_record(self, record: dict[str, Any]) -> None:
@@ -1422,7 +1442,13 @@ def _call_validated(
     if response is None:
         if before_transport is not None:
             before_transport(endpoint)
-        response = _json_object_from_response(transport(endpoint, body))
+        raw_response = transport(endpoint, body)
+        try:
+            response = _json_object_from_response(raw_response)
+        except AnalyzerError as exc:
+            if cache is not None and cache_miss:
+                cache.store_rejected(endpoint, body)
+            raise AnalyzerContractError(str(exc)) from exc
     try:
         restored_response = _restore_evidence_references(
             response,
@@ -1436,10 +1462,10 @@ def _call_validated(
             analyzer_tier=tier,
             evidence_time_spans=evidence_time_spans,
         )
-    except AnalyzerError:
+    except AnalyzerError as exc:
         if cache is not None and cache_miss:
             cache.store_rejected(endpoint, body)
-        raise
+        raise AnalyzerContractError(str(exc)) from exc
     if cache is not None and cache_miss:
         cache.store_accepted(endpoint, body, response)
     return result
@@ -1466,7 +1492,13 @@ def _call_synthesis_validated(
     if response is None:
         if before_transport is not None:
             before_transport(endpoint)
-        response = _json_object_from_response(transport(endpoint, body))
+        raw_response = transport(endpoint, body)
+        try:
+            response = _json_object_from_response(raw_response)
+        except AnalyzerError as exc:
+            if cache is not None and cache_miss:
+                cache.store_rejected(endpoint, body)
+            raise AnalyzerContractError(str(exc)) from exc
     try:
         restored_response = _restore_evidence_references(
             response, evidence_ids=known_evidence_ids
@@ -1496,10 +1528,10 @@ def _call_synthesis_validated(
                 raise AnalyzerError(
                     "synthesis split activities require distinct specific objects"
                 )
-    except AnalyzerError:
+    except AnalyzerError as exc:
         if cache is not None and cache_miss:
             cache.store_rejected(endpoint, body)
-        raise
+        raise AnalyzerContractError(str(exc)) from exc
     if cache is not None and cache_miss:
         cache.store_accepted(endpoint, body, response)
     return result
@@ -1552,6 +1584,8 @@ def analyze_tiered(
     corrections: list[dict[str, Any]] | None = None,
     transport: Transport = http_transport,
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
+    target_body_bytes: int = DEFAULT_CHUNK_BODY_BYTES,
+    max_events_per_chunk: int = DEFAULT_MAX_EVENTS_PER_CHUNK,
     private_text_approved: bool | None = None,
     cache: AnalyzerResponseCache | None = None,
 ) -> dict[str, Any]:
@@ -1579,6 +1613,8 @@ def analyze_tiered(
         original_events,
         model=primary.model,
         max_body_bytes=max_body_bytes,
+        target_body_bytes=target_body_bytes,
+        max_events_per_chunk=max_events_per_chunk,
         corrections=corrections,
         private_text_approved=private_text_approved,
     )
@@ -1631,13 +1667,47 @@ def analyze_tiered(
                     before_transport=probe_once,
                 )
             except AnalyzerError as fallback_error:
-                raise AnalyzerError(
-                    f"primary and fallback analyzers failed for chunk {index + 1}: "
-                    f"primary={primary_error}; fallback={fallback_error}"
-                ) from fallback_error
-            used = fallback
-            tier = "fallback"
-            fallback_status = "used_after_primary_failure"
+                if not all(isinstance(error, AnalyzerContractError) for error in (
+                    primary_error, fallback_error
+                )):
+                    raise AnalyzerError(
+                        f"primary and fallback analyzers failed without dual contract "
+                        f"rejection for chunk {index + 1}: primary={primary_error}; "
+                        f"fallback={fallback_error}"
+                    ) from fallback_error
+                # Both configured routes were usable at startup but rejected this
+                # bounded semantic partition.  Preserve complete evidence as one
+                # explicit local exception so a single model failure cannot halt
+                # reconciliation of every other chunk.
+                result = {
+                    "schema_version": SCHEMA_VERSION,
+                    "prompt_version": PROMPT_VERSION,
+                    "activities": [],
+                    "exceptions": [{
+                        "kind": "analyzer_failure",
+                        "evidence_ids": sorted(chunk_ids),
+                        "reason": "primary and fallback rejected this semantic chunk",
+                    }],
+                    "omissions": [],
+                }
+                used = primary
+                tier = "exception"
+                fallback_status = "failed_exception"
+                fallback_failure_digest = stable_digest(
+                    "aer-",
+                    {
+                        "mode": "extract",
+                        "evidence_ids": sorted(chunk_ids),
+                        "primary": {"name": primary.name, "model": primary.model},
+                        "fallback": {"name": fallback.name, "model": fallback.model},
+                        "prompt_version": PROMPT_VERSION,
+                        "schema_version": SCHEMA_VERSION,
+                    },
+                )
+            else:
+                used = fallback
+                tier = "fallback"
+                fallback_status = "used_after_primary_failure"
         else:
             used = primary
             tier = "primary"
@@ -1670,8 +1740,7 @@ def analyze_tiered(
         if _requires_stronger_fallback(result):
             result = _defer_unresolved_low_confidence(result)
         results.append(result)
-        metadata.append(
-            {
+        chunk_metadata = {
                 "chunk": index + 1,
                 "event_count": len(chunk),
                 "evidence_digest": stable_digest(
@@ -1682,7 +1751,11 @@ def analyze_tiered(
                 "tier": tier,
                 "fallback_status": fallback_status,
             }
-        )
+        if fallback_status == "failed_exception":
+            chunk_metadata["failure_digest"] = fallback_failure_digest
+            chunk_metadata["fallback_endpoint"] = fallback.name
+            chunk_metadata["fallback_model"] = fallback.model
+        metadata.append(chunk_metadata)
 
     # Exact stable identities are deterministic duplicates.  Broader workstream
     # grouping is only a candidate set: any semantic merge must pass through a
@@ -1696,6 +1769,7 @@ def analyze_tiered(
     for activity in activities_by_id.values():
         grouped.setdefault(activity["workstream_id"], []).append(activity)
 
+    synthesis_exceptions: list[dict[str, Any]] = []
     for workstream_id in sorted(grouped):
         provisional = sorted(grouped[workstream_id], key=lambda value: value["activity_id"])
         if len(provisional) < 2:
@@ -1729,17 +1803,53 @@ def analyze_tiered(
                 raise AnalyzerError(
                     f"primary analyzer failed for synthesis {workstream_id}: {primary_error}"
                 ) from primary_error
-            synthesized = _call_synthesis_validated(
-                fallback,
-                provisional,
-                workstream_id=workstream_id,
-                tier="fallback",
-                transport=transport,
-                known_evidence_ids=synthesis_ids,
-                evidence_time_spans=synthesis_spans,
-                cache=cache,
-                before_transport=probe_once,
-            )
+            try:
+                synthesized = _call_synthesis_validated(
+                    fallback,
+                    provisional,
+                    workstream_id=workstream_id,
+                    tier="fallback",
+                    transport=transport,
+                    known_evidence_ids=synthesis_ids,
+                    evidence_time_spans=synthesis_spans,
+                    cache=cache,
+                    before_transport=probe_once,
+                )
+            except AnalyzerError as fallback_error:
+                if not all(isinstance(error, AnalyzerContractError) for error in (
+                    primary_error, fallback_error
+                )):
+                    raise AnalyzerError(
+                        f"primary and fallback analyzers failed without dual contract "
+                        f"rejection for synthesis {workstream_id}: "
+                        f"primary={primary_error}; fallback={fallback_error}"
+                    ) from fallback_error
+                # Extraction was individually valid, but neither configured
+                # route could decide whether these repeated workstream claims
+                # should merge.  Do not emit potentially duplicate proposals
+                # and do not let one unresolved workstream halt other work.
+                for activity in provisional:
+                    del activities_by_id[activity["activity_id"]]
+                synthesis_exceptions.append({
+                    "kind": "analyzer_synthesis_failure",
+                    "evidence_ids": sorted(synthesis_ids),
+                    "reason": "primary and fallback rejected workstream synthesis",
+                    "failure_digest": stable_digest(
+                        "aer-",
+                        {
+                            "mode": "synthesize",
+                            "workstream_id": workstream_id,
+                            "evidence_ids": sorted(synthesis_ids),
+                            "primary": {"name": primary.name, "model": primary.model},
+                            "fallback": {"name": fallback.name, "model": fallback.model},
+                            "prompt_version": PROMPT_VERSION,
+                            "schema_version": SCHEMA_VERSION,
+                        },
+                    ),
+                    "primary_model": primary.model,
+                    "fallback_model": fallback.model,
+                })
+                continue
             used = fallback
             tier = "fallback"
         for activity in provisional:
@@ -1749,6 +1859,7 @@ def analyze_tiered(
                 raise AnalyzerError("synthesis activity identity collides with another workstream")
             activities_by_id[activity["activity_id"]] = activity
     exceptions = [value for result in results for value in result["exceptions"]]
+    exceptions.extend(synthesis_exceptions)
     omissions = [value for result in results for value in result["omissions"]]
     return {
         "schema_version": SCHEMA_VERSION,

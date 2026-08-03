@@ -230,6 +230,42 @@ class SemanticAnalyzerTests(unittest.TestCase):
             for chunk in chunks
         ))
 
+    def test_chunking_caps_event_count_without_losing_evidence(self):
+        events = [event(f"ev-{index:03d}") for index in range(11)]
+        chunks = semantic.chunk_events(
+            events,
+            max_body_bytes=50_000,
+            max_events_per_chunk=3,
+        )
+        self.assertEqual([3, 3, 3, 2], [len(chunk) for chunk in chunks])
+        self.assertEqual(
+            sorted(item["evidence_id"] for item in events),
+            sorted(item["evidence_id"] for chunk in chunks for item in chunk),
+        )
+
+    def test_operational_target_does_not_reject_event_below_hard_ceiling(self):
+        item = event("ev-large", content="x" * 8_000)
+        chunks = semantic.chunk_events(
+            [item],
+            max_body_bytes=20_000,
+            target_body_bytes=2_000,
+        )
+        self.assertEqual([["ev-large"]], [
+            [value["evidence_id"] for value in chunk]
+            for chunk in chunks
+        ])
+
+    def test_operational_target_must_be_positive(self):
+        with self.assertRaisesRegex(
+            semantic.AnalyzerError,
+            "target_body_bytes must be positive",
+        ):
+            semantic.chunk_events(
+                [event("ev-1")],
+                max_body_bytes=20_000,
+                target_body_bytes=0,
+            )
+
     def test_projection_preserves_structured_fathom_semantics_without_identity_fields(self):
         meeting = {
             "evidence_id": "ev-meeting",
@@ -455,7 +491,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
         self.assertEqual("primary", result["analysis_chunks"][0]["tier"])
         self.assertEqual("failed_deferred", result["analysis_chunks"][0]["fallback_status"])
 
-    def test_primary_and_fallback_contract_failures_block_without_retry(self):
+    def test_primary_and_fallback_contract_failures_become_bounded_exception(self):
         calls = []
 
         def transport(endpoint, body):
@@ -465,16 +501,12 @@ class SemanticAnalyzerTests(unittest.TestCase):
                 return {"probe": "ok"}
             return {"activities": [], "exceptions": [], "omissions": []}
 
-        with self.assertRaisesRegex(
-            semantic.AnalyzerError,
-            "primary and fallback analyzers failed for chunk 1",
-        ):
-            semantic.analyze_tiered(
-                [event("ev-1")],
-                primary=semantic.AnalyzerEndpoint("primary", "http://primary", "cheap"),
-                fallback=semantic.AnalyzerEndpoint("fallback", "http://fallback", "strong"),
-                transport=transport,
-            )
+        result = semantic.analyze_tiered(
+            [event("ev-1")],
+            primary=semantic.AnalyzerEndpoint("primary", "http://primary", "cheap"),
+            fallback=semantic.AnalyzerEndpoint("fallback", "http://fallback", "strong"),
+            transport=transport,
+        )
 
         self.assertEqual(
             [
@@ -485,6 +517,34 @@ class SemanticAnalyzerTests(unittest.TestCase):
             ],
             calls,
         )
+        self.assertEqual([], result["activities"])
+        self.assertEqual("analyzer_failure", result["exceptions"][0]["kind"])
+        self.assertEqual(["ev-1"], result["exceptions"][0]["evidence_ids"])
+        self.assertEqual("exception", result["analysis_chunks"][0]["tier"])
+        self.assertEqual("failed_exception", result["analysis_chunks"][0]["fallback_status"])
+        self.assertRegex(result["analysis_chunks"][0]["failure_digest"], r"^aer-[0-9a-f]{24}$")
+        self.assertEqual("fallback", result["analysis_chunks"][0]["fallback_endpoint"])
+        self.assertEqual("strong", result["analysis_chunks"][0]["fallback_model"])
+
+    def test_fallback_outage_blocks_instead_of_becoming_contract_exception(self):
+        def transport(endpoint, body):
+            payload = json.loads(body["messages"][1]["content"])
+            if endpoint.name == "fallback" and payload.get("probe"):
+                raise semantic.AnalyzerError("fallback route unavailable")
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            return {"activities": [], "exceptions": [], "omissions": []}
+
+        with self.assertRaisesRegex(
+            semantic.AnalyzerError,
+            "failed without dual contract rejection",
+        ):
+            semantic.analyze_tiered(
+                [event("ev-1")],
+                primary=semantic.AnalyzerEndpoint("primary", "http://primary", "cheap"),
+                fallback=semantic.AnalyzerEndpoint("fallback", "http://fallback", "strong"),
+                transport=transport,
+            )
 
     def test_tiered_analysis_is_deterministic_under_event_permutation(self):
         def transport(endpoint, body):
@@ -652,6 +712,63 @@ class SemanticAnalyzerTests(unittest.TestCase):
         )
         self.assertEqual("fallback", result["activities"][0]["analyzer_tier"])
         self.assertEqual("strong", result["activities"][0]["analyzer_model"])
+
+    def test_double_synthesis_failure_becomes_bounded_exception(self):
+        def transport(endpoint, body):
+            payload = json.loads(body["messages"][1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            if payload["mode"] == "extract":
+                evidence = payload["events"][0]
+                response = valid_response(evidence["evidence_id"])
+                response["activities"][0]["evidence_spans"] = [evidence["time_span"]]
+                return response
+            return {"activities": [], "exceptions": [], "omissions": []}
+
+        result = semantic.analyze_tiered(
+            [event("ev-a", "2026-07-10"), event("ev-b", "2026-07-11")],
+            primary=semantic.AnalyzerEndpoint("primary", "http://primary", "cheap"),
+            fallback=semantic.AnalyzerEndpoint("fallback", "http://fallback", "strong"),
+            transport=transport,
+        )
+
+        self.assertEqual([], result["activities"])
+        self.assertEqual(1, len(result["exceptions"]))
+        exception = result["exceptions"][0]
+        self.assertEqual("analyzer_synthesis_failure", exception["kind"])
+        self.assertEqual(["ev-a", "ev-b"], exception["evidence_ids"])
+        self.assertRegex(exception["failure_digest"], r"^aer-[0-9a-f]{24}$")
+
+    def test_double_contract_failure_digest_is_stable_on_cache_replay(self):
+        def transport(endpoint, body):
+            payload = json.loads(body["messages"][1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            return {"activities": [], "exceptions": [], "omissions": []}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "analyzer-cache.jsonl"
+            endpoint = semantic.AnalyzerEndpoint("primary", "http://primary", "cheap")
+            fallback = semantic.AnalyzerEndpoint("fallback", "http://fallback", "strong")
+            first = semantic.analyze_tiered(
+                [event("ev-1")],
+                primary=endpoint,
+                fallback=fallback,
+                transport=transport,
+                cache=semantic.AnalyzerResponseCache(path),
+            )
+            second = semantic.analyze_tiered(
+                [event("ev-1")],
+                primary=endpoint,
+                fallback=fallback,
+                transport=lambda *_: self.fail("sealed rejection must not retry transport"),
+                cache=semantic.AnalyzerResponseCache(path),
+            )
+
+        self.assertEqual(
+            first["analysis_chunks"][0]["failure_digest"],
+            second["analysis_chunks"][0]["failure_digest"],
+        )
 
     def test_synthesis_request_contains_only_safe_provisional_fields(self):
         captured = {}

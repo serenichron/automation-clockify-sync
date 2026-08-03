@@ -100,14 +100,40 @@
     "chunk": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["chunk", "event_count", "evidence_digest", "endpoint", "model", "tier"],
+      "required": ["chunk", "event_count", "evidence_digest", "endpoint", "model", "tier", "fallback_status"],
+      "allOf": [
+        {
+          "if": {"properties": {"tier": {"const": "exception"}}, "required": ["tier"]},
+          "then": {
+            "required": ["failure_digest", "fallback_endpoint", "fallback_model"],
+            "properties": {"fallback_status": {"const": "failed_exception"}}
+          },
+          "else": {"not": {"required": ["failure_digest"]}}
+        },
+        {
+          "if": {"properties": {"fallback_status": {"const": "failed_exception"}}, "required": ["fallback_status"]},
+          "then": {"properties": {"tier": {"const": "exception"}}}
+        }
+      ],
       "properties": {
         "chunk": {"type": "integer", "minimum": 1},
         "event_count": {"type": "integer", "minimum": 1},
         "evidence_digest": {"type": "string", "pattern": "^ech-[a-f0-9]{24}$"},
         "endpoint": {"type": "string"},
         "model": {"type": "string"},
-        "tier": {"enum": ["primary", "fallback"]}
+        "tier": {"enum": ["primary", "fallback", "exception"]},
+        "fallback_status": {
+          "enum": [
+            "not_needed",
+            "used_after_primary_failure",
+            "used_for_low_confidence",
+            "failed_deferred",
+            "failed_exception"
+          ]
+        },
+        "failure_digest": {"type": "string", "pattern": "^aer-[a-f0-9]{24}$"},
+        "fallback_endpoint": {"type": "string", "minLength": 1},
+        "fallback_model": {"type": "string", "minLength": 1}
       }
     },
     "analyzerCache": {
