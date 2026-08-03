@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 import unittest
 from unittest import mock
@@ -754,6 +755,12 @@ class SemanticAnalyzerTests(unittest.TestCase):
         self.assertIn("2026-07-10 10:00", safe)
         self.assertIn("123456 records", safe)
         self.assertIn("release 2026-07-10", safe)
+
+    def test_redaction_converges_when_one_match_exposes_an_adjacent_match(self):
+        self.assertEqual(
+            "a",
+            semantic._sub_until_stable(re.compile("ab"), "a", "abb"),
+        )
 
     def test_stable_identity_ignores_harmless_action_and_outcome_paraphrase(self):
         first = valid_response("ev-1")

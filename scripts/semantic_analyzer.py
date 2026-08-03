@@ -216,9 +216,26 @@ def _safe_text(value: Any) -> str:
         line = PERSON_NAME_RE.sub(_redact_contextual_person, line)
         lines.append(line)
     safe = _one_line(" ".join(lines))
+    # Redaction can expose a second adjacent path only after whitespace and
+    # punctuation are normalized. Converge instead of treating that newly
+    # visible fragment as an irrecoverable projection failure.
+    safe = _sub_until_stable(PATH_RE, "[path removed]", safe)
     if any(pattern.search(safe) for pattern in (URL_RE, EMAIL_RE, PATH_RE, BEARER_RE, SECRET_RE, HASH_RE, COMMAND_RE, TRANSPORT_RE)):
         raise AnalyzerError("semantic projection contains unsafe text")
     return safe
+
+
+def _sub_until_stable(
+    pattern: re.Pattern[str], replacement: str, value: str, *, max_passes: int = 8
+) -> str:
+    for _ in range(max_passes):
+        updated = pattern.sub(replacement, value)
+        if updated == value:
+            return value
+        value = updated
+    if pattern.search(value):
+        raise AnalyzerError("semantic projection redaction did not converge")
+    return value
 
 
 def _redact_phone_numbers(value: str) -> str:
