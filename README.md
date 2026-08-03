@@ -236,21 +236,40 @@ mode writes to Clockify.
 
 ## Analyzer evaluation
 
-A route probe only proves that the selected transport can return the minimal
-JSON contract. It contains no evidence. It is distinct from the offline,
-content-addressed evaluator:
+A route probe only proves that the selected transport can return minimal JSON.
+Before private-text approval, run the live synthetic evaluator. It probes the
+route, submits five fixed non-private cases twice, and writes both a capture and
+a digest-bound scorecard:
+
+```bash
+python3 scripts/analyzer_live_evaluation.py \
+  --tier primary \
+  --capture-output state/validation/analyzer/primary-capture.json \
+  --scorecard-output state/validation/analyzer/primary-scorecard.json
+```
+
+The built-in cases cover one atomic accomplishment, a required split, duplicate
+evidence merging, a title-only meeting, and waiting noise. The command accepts
+no evidence or prose input, so `CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED` remains
+closed. Run it separately with `--tier fallback` if a fallback is configured.
+The capture uses the versioned analyzer-evaluation input contract; the scorecard
+contains no captured prose.
+
+The transport-free evaluator remains available for inspecting or re-evaluating
+an existing capture:
 
 ```bash
 python3 scripts/analyzer_evaluation.py \
-  --input /absolute/path/to/redacted-captured-replays.json \
+  --input /absolute/path/to/synthetic-capture.json \
   --output /absolute/path/to/analyzer-scorecard.json
 ```
 
-The evaluator has no provider transport. It checks redacted captured replays
-against the exact corpus coverage and expected evidence partitions, production
-schema/citation and atomicity validators, renderer/forbidden-description
-rules, and stable replay. Its digest-bound scorecard does not reproduce the
-captured prose. A successful probe is not an evaluation and does not authorize
+The evaluator checks complete corpus coverage and fixed expected evidence
+partitions, production schema/citation and atomicity validators,
+renderer/forbidden-description rules, and stable replay. A passing synthetic
+route scorecard proves contract fitness, not July semantic accuracy; the latter
+still requires full-denominator human dispositions and the measured acceptance
+thresholds. Neither a probe nor a passing synthetic scorecard authorizes
 private-text egress.
 
 ## Safety contract
@@ -286,6 +305,7 @@ python3 -m py_compile \
   scripts/review_corrections.py \
   scripts/review_acceptance.py \
   scripts/analyzer_evaluation.py \
+  scripts/analyzer_live_evaluation.py \
   scripts/clockify_sync_collect.py \
   scripts/clockify_sync_quality.py \
   scripts/clockify_review_state.py \

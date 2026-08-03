@@ -22,7 +22,7 @@ may not overlap fixed blocks or one another.
 | Separate evidence and allocation timelines | Proven locally | `scripts/evidence_ledger.py`; `scripts/work_allocator.py`; `tests/test_work_allocator.py` |
 | Honest non-overlapping effort allocation | Proven locally | `scripts/work_allocator.py`; allocator and pipeline tests for fixed blocks, no gap filling, minimum rollback, and `contested_time` |
 | Deterministic Caveman descriptions | Proven locally for emitted fixtures and the 86-record corpus | `scripts/caveman_renderer.py`; `tests/test_caveman_renderer.py`; `tests/test_regression_corpus.py` |
-| Tiered privacy-gated model analysis | Deny-by-default private-text gate and mocked transports proven; live route and authorized evaluation unproven | `scripts/semantic_analyzer.py`; `scripts/analyzer_evaluation.py`; requires a live probe, separate private-text approval, and digest-bound offline evaluation |
+| Tiered privacy-gated model analysis | Deny-by-default private-text gate and executable non-private live evaluation proven locally; live route result and authorized July evaluation unproven | `scripts/semantic_analyzer.py`; `scripts/analyzer_live_evaluation.py`; `scripts/analyzer_evaluation.py`; requires a passing live synthetic scorecard and separate private-text approval |
 | Evidence-bound correction learning | Proven locally for approve, skip, modify, structural split partitions, omission, wording, routing, and allocation behavior; live decision ingestion unproven | `scripts/review_corrections.py`; `tests/test_review_corrections.py`; correction integration tests in `tests/test_work_accounting_pipeline.py` |
 | Exceptions-only durable review | Not activated; `shadow_all` is the default and the executable acceptance gate remains unproven live | `scripts/clockify_review_run.py`; `scripts/review_acceptance.py`; related tests and integrity-linked period ledger |
 
@@ -66,8 +66,9 @@ explicit exclusions or exceptions.
 2. After explicit publication/deployment approval, push only the feature branch,
    deploy that exact SHA to Mac, Precision, and Desktop, and verify Git/readback
    hashes without merging or changing any scheduled automation.
-3. Probe the intended primary analyzer route and any configured fallback without
-   sending ledger evidence until the minimal probes succeed.
+3. Run `scripts/analyzer_live_evaluation.py` for the intended primary analyzer
+   and any configured fallback. Require a passing digest-bound scorecard for
+   each route; all cases are built-in and no ledger evidence is sent.
 4. Obtain a separate explicit decision before setting
    `CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED=approved`; a successful probe alone
    does not authorize private session, meeting, or issue prose to leave the

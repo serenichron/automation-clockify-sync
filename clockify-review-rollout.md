@@ -64,9 +64,9 @@ allocation, or correction-regression contracts recorded there.
 
 1. Obtain direct board approval for each applicable guarded phase. Validation
    approval may cover feature-branch publication, exact-SHA fleet deployment,
-   no-evidence route probes, and the read-only shadow run. It does not imply
-   merge, Multica configuration, Sheet refresh, Clockify posting, or scheduling
-   approval.
+   non-private synthetic analyzer evaluation, and the read-only shadow run. It
+   does not imply merge, Multica configuration, Sheet refresh, Clockify posting,
+   or scheduling approval.
 2. Re-read all IDs and statuses above. Abort on drift.
 3. Run:
 
@@ -81,6 +81,9 @@ allocation, or correction-regression contracts recorded there.
      scripts/caveman_renderer.py \
      scripts/work_accounting_pipeline.py \
      scripts/review_corrections.py \
+     scripts/review_acceptance.py \
+     scripts/analyzer_evaluation.py \
+     scripts/analyzer_live_evaluation.py \
      scripts/clockify_sync_quality.py \
      scripts/clockify_review_state.py \
      scripts/clockify_review_run.py
@@ -91,13 +94,11 @@ allocation, or correction-regression contracts recorded there.
    commit.
 5. Resolve and record the clean candidate SHA. Every deployment, manifest, run,
    and readback must use that exact SHA.
-6. After validation deployment, probe the intended analyzer route on Precision.
-   Require an actual successful
-   JSON probe for the selected primary route and its fallback; configuration is
-   not proof. The probe carries no evidence and is separate from offline
-   `scripts/analyzer_evaluation.py`, which validates redacted captured replays,
-   exact corpus coverage/partitions, production validators, stable replay, and
-   a digest-bound scorecard.
+6. After validation deployment, run
+   `scripts/analyzer_live_evaluation.py` on Precision for the intended primary
+   route and any configured fallback. Require the evidence-free probe plus a
+   passing digest-bound scorecard across the fixed synthetic atomic, split,
+   merge, title-only-meeting, and noise cases. Configuration alone is not proof.
 7. Obtain a separate explicit privacy decision before setting
    `CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED=approved`. The minimal probe contains
    no evidence and does not authorize private agent/session, meeting, or issue
@@ -123,8 +124,10 @@ allocation, or correction-regression contracts recorded there.
    and unrelated changes. Read back Git HEAD on Git worktrees and compare a
    tracked-file hash manifest for the Desktop non-Git copy.
 3. Run the complete verification suite on every collector host.
-4. Probe the selected analyzer route with the evidence-free JSON probe. Stop on
-   any transport or contract failure.
+4. Run the selected analyzer route through
+   `scripts/analyzer_live_evaluation.py`. Stop on any probe, schema, partition,
+   rendering, or stable-replay failure; retain its synthetic capture and sealed
+   scorecard.
 5. Enable `CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED=approved` only when the exact
    validation approval includes redacted private semantic-text egress, and only
    for the approved run scope.
@@ -138,9 +141,9 @@ allocation, or correction-regression contracts recorded there.
    `replay-integrity.json`, `new=0`, `changed=0`, all unresolved active rows as
    `carried_pending`, complete source manifests, passing quality, and explicit
    Fathom reconciliation. A second live collection is not replay evidence.
-8. Generate the digest-bound analyzer scorecard and prepare the complete
-   evidence-bound review denominator. Do not refresh Google Sheets or record a
-   passing acceptance period until every active row has a human disposition.
+8. Attach every passing route scorecard to the complete evidence-bound review
+   denominator. Do not refresh Google Sheets or record a passing acceptance
+   period until every active row has a human disposition.
 
 ## Separately approved production rollout order
 
