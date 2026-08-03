@@ -136,6 +136,24 @@ class SemanticAnalyzerTests(unittest.TestCase):
                 analyzer_tier="primary",
             )
 
+    def test_effort_is_normalized_to_five_minute_granularity(self):
+        response = valid_response("ev-1")
+        response["activities"][0]["effort"] = {
+            "minimum_minutes": 8,
+            "recommended_minutes": 33,
+            "maximum_minutes": 37,
+        }
+        result = semantic.validate_result(
+            response,
+            known_evidence_ids={"ev-1"},
+            provider_model="model-a",
+            analyzer_tier="primary",
+        )
+        self.assertEqual(
+            {"minimum_minutes": 10, "recommended_minutes": 35, "maximum_minutes": 35},
+            result["activities"][0]["effort"],
+        )
+
     def test_chunking_never_truncates_events_and_prefers_days(self):
         events = [event("ev-a", "2026-07-10"), event("ev-b", "2026-07-11")]
         chunks = semantic.chunk_events(events, max_body_bytes=50_000)

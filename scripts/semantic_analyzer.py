@@ -27,7 +27,7 @@ import urllib.request
 
 
 SCHEMA_VERSION = 1
-PROMPT_VERSION = "clockify-semantic-v3"
+PROMPT_VERSION = "clockify-semantic-v4"
 ANALYZER_CACHE_SCHEMA_VERSION = "clockify-analyzer-cache/v1"
 DEFAULT_PRIMARY_MODEL = "deepseek-v4-flash:cloud"
 DEFAULT_MAX_BODY_BYTES = 1_450_000
@@ -793,6 +793,11 @@ def _positive_int(value: Any, field: str) -> int:
     return parsed
 
 
+def _five_minute_effort(value: int) -> int:
+    """Normalize model estimates to ordinary timesheet granularity."""
+    return max(5, ((value + 2) // 5) * 5)
+
+
 def _normalized_identity(value: Any) -> str:
     """Normalize harmless wording/punctuation variation for stable semantic IDs."""
     text = _one_line(value).casefold()
@@ -890,11 +895,14 @@ def validate_result(
         effort = raw.get("effort")
         if not isinstance(effort, dict):
             raise AnalyzerError("activity effort must be an object")
-        minimum = _positive_int(effort.get("minimum_minutes"), "minimum_minutes")
-        recommended = _positive_int(effort.get("recommended_minutes"), "recommended_minutes")
-        maximum = _positive_int(effort.get("maximum_minutes"), "maximum_minutes")
-        if not minimum <= recommended <= maximum:
+        raw_minimum = _positive_int(effort.get("minimum_minutes"), "minimum_minutes")
+        raw_recommended = _positive_int(effort.get("recommended_minutes"), "recommended_minutes")
+        raw_maximum = _positive_int(effort.get("maximum_minutes"), "maximum_minutes")
+        if not raw_minimum <= raw_recommended <= raw_maximum:
             raise AnalyzerError("effort must satisfy minimum <= recommended <= maximum")
+        minimum = _five_minute_effort(raw_minimum)
+        recommended = _five_minute_effort(raw_recommended)
+        maximum = _five_minute_effort(raw_maximum)
         project = raw.get("project_recommendation") or {}
         if not isinstance(project, dict):
             raise AnalyzerError("project_recommendation must be an object")
@@ -1290,7 +1298,7 @@ def probe_endpoint(endpoint: AnalyzerEndpoint, transport: Transport = http_trans
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": "Return JSON only."},
-            {"role": "user", "content": '{"probe":"clockify-semantic-v3"}'},
+            {"role": "user", "content": '{"probe":"clockify-semantic-v4"}'},
         ],
     }
     raw = transport(endpoint, body)

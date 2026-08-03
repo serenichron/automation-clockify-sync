@@ -40,7 +40,7 @@ def document() -> dict:
         "schema_version": evaluation.INPUT_SCHEMA_VERSION,
         "corpus": {"records": records, "digest": evaluation.sha256_hex(records)},
         "route": {"route_id": "ollama-cloud-primary", "model": "deepseek-v4-flash:cloud", "tier": "primary"},
-        "prompt_version": "clockify-semantic-v3",
+        "prompt_version": "clockify-semantic-v4",
         "semantic_schema_version": 1,
         "cases": [{
             "case_id": "one-atomic-outcome",
@@ -85,7 +85,7 @@ class AnalyzerEvaluationTests(unittest.TestCase):
 
     def test_different_replay_is_rejected(self) -> None:
         source = document()
-        source["cases"][0]["replays"][1]["activities"][0]["effort"]["recommended_minutes"] = 21
+        source["cases"][0]["replays"][1]["activities"][0]["effort"]["recommended_minutes"] = 26
         scorecard = evaluation.evaluate(source)
         self.assertFalse(scorecard["passed"])
         self.assertFalse(scorecard["results"][0]["checks"]["stable_replay"])
