@@ -66,7 +66,8 @@ class FathomSemanticEvidenceTests(unittest.TestCase):
         self.assertTrue(all("include_summary=true" in call for call in calls))
         self.assertTrue(all("include_action_items=true" in call for call in calls))
         self.assertTrue(all("include_transcript=true" in call for call in calls))
-        self.assertTrue(all("created_after=1970-01-01" in call for call in calls))
+        self.assertTrue(all("created_after=2026-06-30" in call for call in calls))
+        self.assertEqual(1, result["creation_search"]["lookback_days"])
         self.assertFalse(any("/meetings/r1" in call for call in calls))
 
     def test_fetch_filters_by_occurrence_not_record_creation(self):

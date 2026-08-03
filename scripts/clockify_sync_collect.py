@@ -34,7 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 RUNS = ROOT / "runs"
 CLOCKIFY_API = "https://api.clockify.me/api/v1"
 FATHOM_API = "https://api.fathom.ai/external/v1"
-FATHOM_HISTORY_FLOOR = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
+FATHOM_CREATION_LOOKBACK = dt.timedelta(days=1)
 FATHOM_MAX_PAGES = 1000
 FATHOM_MAX_RETRY_ATTEMPTS = 3
 FATHOM_MAX_RETRY_DELAY_SECONDS = 60
@@ -2225,15 +2225,17 @@ def fetch_fathom(fenv: dict[str, str], since: dt.datetime, until: dt.datetime) -
     cursor: str | None = None
     pages = 0
     retry_budget = FathomRetryBudget()
+    creation_search_start = since - FATHOM_CREATION_LOOKBACK
     try:
         seen_cursors: set[str] = set()
         while True:
             retry_budget.require_time_remaining()
             query = {
-                # Fathom filters this endpoint by record creation, not meeting
-                # occurrence. Fetch the complete creation history through the
-                # requested end and filter locally on recording/scheduled time.
-                "created_after": iso_utc(FATHOM_HISTORY_FLOOR),
+                # Fathom recording records are created at or shortly after the
+                # meeting occurs. Query the accounting window with one day of
+                # lead, then enforce occurrence overlap locally. A 1970 history
+                # crawl needlessly rate-limited on thousands of unrelated rows.
+                "created_after": iso_utc(creation_search_start),
                 "created_before": iso_utc(until),
                 "limit": 50,
                 # Fathom exposes semantic meeting content through opt-in fields
@@ -2322,7 +2324,12 @@ def fetch_fathom(fenv: dict[str, str], since: dt.datetime, until: dt.datetime) -
             "meetings": meetings,
             "pages_fetched": pages,
             "complete": True,
-            "creation_history_floor": iso_utc(FATHOM_HISTORY_FLOOR),
+            "creation_search": {
+                "start": iso_utc(creation_search_start),
+                "end": iso_utc(until),
+                "lookback_days": FATHOM_CREATION_LOOKBACK.days,
+                "basis": "record_created_at_or_after_meeting_observed_live",
+            },
             "occurrence_filter": {
                 "start": iso_utc(since),
                 "end": iso_utc(until),

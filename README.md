@@ -154,11 +154,13 @@ bodies, credentials, emails, URLs, absolute paths, and hashes never cross that
 boundary. Safe text is not clipped; an individually oversized projected event
 blocks analysis.
 
-Fathom collection fetches the complete creation history through the requested
-end timestamp, then filters locally by recording or scheduled occurrence
-overlap. This prevents a meeting created earlier from disappearing from the
-accounting window. The inventory records its history floor, occurrence filter,
-pagination count, and completeness. HTTP 429 responses use one bounded
+Fathom collection queries records created from one day before the requested
+window through its end, then filters locally by recording or scheduled
+occurrence overlap. Live July validation showed Fathom records were created
+between 9 minutes and 5.7 hours after their meetings; the lead covers the
+boundary without crawling thousands of unrelated historical records. The
+inventory records the creation-search window, occurrence filter, pagination
+count, and completeness. HTTP 429 responses use one bounded
 collection-wide retry budget; exhaustion records sanitized page/cursor and
 retry provenance and fails closed. Multica issue evidence is fully paginated
 and then bounded to issue activity in the requested accounting window.
