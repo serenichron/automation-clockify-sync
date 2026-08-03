@@ -1477,6 +1477,10 @@ class SemanticAnalyzerTests(unittest.TestCase):
                 private_text_approved=True,
                 cache=semantic.AnalyzerResponseCache(path),
             )
+            records = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+            ]
             second = semantic.analyze_tiered(
                 [event("ev-1")],
                 primary=primary,
@@ -1496,6 +1500,23 @@ class SemanticAnalyzerTests(unittest.TestCase):
             ],
             calls,
         )
+
+        rejection = next(record for record in records if record["status"] == "rejected")
+        self.assertEqual("contract_rejected_omitted_evidence", rejection["failure_code"])
+
+    def test_cache_rejects_unsafe_failure_code(self):
+        endpoint = semantic.AnalyzerEndpoint("primary", "http://primary", "cheap")
+        body = semantic._body_for(
+            [event("ev-1")], model="cheap", mode="extract", private_text_approved=True
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            cache = semantic.AnalyzerResponseCache(Path(directory) / "cache.jsonl")
+            with self.assertRaisesRegex(semantic.AnalyzerError, "rejection code is invalid"):
+                cache.store_rejected(
+                    endpoint,
+                    body,
+                    failure_code="private model text",
+                )
 
     def test_stale_cache_writer_rejects_conflicting_decision(self):
         endpoint = semantic.AnalyzerEndpoint("primary", "http://primary", "cheap")

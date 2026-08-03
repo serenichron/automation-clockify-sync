@@ -38,7 +38,7 @@ before an activity can become a proposal.
 Planned and noise activities do not become proposals. Title-only meetings,
 missing sources, routing conflicts, low confidence, double-route chunk or
 workstream-synthesis rejection, and contested capacity become explicit
-exclusions or exceptions. The analyzer uses a 250,000-byte and 50-event
+exclusions or exceptions. The analyzer uses a 250,000-byte and 250-event
 operational target with four deterministically ordered workers beneath its
 1,450,000-byte hard body ceiling; complete individual evidence is never clipped.
 

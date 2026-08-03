@@ -106,7 +106,7 @@ low-confidence claims that remain unresolved become explicit exceptions, never
 proposals.
 
 Analyzer requests retain the fail-closed 1,450,000-byte hard ceiling. Normal
-extraction uses a 250,000-byte and 50-event operational target with four
+extraction uses a 250,000-byte and 250-event operational target with four
 deterministically ordered workers so a large-context route does not receive an
 unnecessarily broad semantic partition. A single event may exceed the target but
 never the hard ceiling; it is never clipped. When both

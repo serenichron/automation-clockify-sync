@@ -144,11 +144,11 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         args = pipeline.parse_args([
             "/tmp/run",
             "--analyzer-target-body-bytes", "250000",
-            "--analyzer-max-events-per-chunk", "50",
+            "--analyzer-max-events-per-chunk", "250",
             "--analyzer-workers", "4",
         ])
         self.assertEqual(250_000, args.analyzer_target_body_bytes)
-        self.assertEqual(50, args.analyzer_max_events_per_chunk)
+        self.assertEqual(250, args.analyzer_max_events_per_chunk)
         self.assertEqual(4, args.analyzer_workers)
 
     def test_analyzer_tuning_reaches_semantic_analyzer(self):
@@ -191,6 +191,8 @@ class WorkAccountingPipelineTests(unittest.TestCase):
     def test_noise_classifier_excludes_transport_and_status_only_events(self):
         cases = (
             ({"attributes": {"role": "tool", "kind": "tool_result", "content": "private output"}}, "tool_transport"),
+            ({"attributes": {"role": "tool", "kind": "message", "content": "private output"}}, "tool_transport"),
+            ({"attributes": {"role": "assistant", "kind": "tool", "content": "private output"}}, "tool_transport"),
             ({"attributes": {"role": "assistant", "kind": "message", "content": "Heartbeat: ok"}}, "heartbeat"),
             ({"attributes": {"role": "assistant", "kind": "message", "content": "Standing by."}}, "standing_by"),
             ({"attributes": {"role": "assistant", "kind": "message", "content": "Awaiting board approval: deploy"}}, "approval_wait"),
@@ -199,6 +201,91 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         for event, expected in cases:
             with self.subTest(content=event["attributes"]["content"]):
                 self.assertEqual(expected, pipeline.classify_noise(event))
+
+    def test_analysis_events_drop_only_summaries_backed_by_canonical_events(self):
+        duplicate_summary = {
+            "evidence_id": "ev-summary-1",
+            "source_type": "hermes_db_sessions",
+            "source_ref": {
+                "source_type": "hermes_db_sessions",
+                "machine": "precision",
+                "session_id": "session-1",
+            },
+            "attributes": {"first_user_message": "duplicate"},
+        }
+        canonical_event = {
+            "evidence_id": "ev-event-1",
+            "source_type": "hermes_db_sessions_event",
+            "source_ref": {
+                "source_type": "hermes_db_sessions",
+                "machine": "precision",
+                "session_id": "session-1",
+            },
+            "attributes": {"role": "user", "kind": "message", "content": "real work"},
+        }
+        unmatched_summary = {
+            "evidence_id": "ev-summary-2",
+            "source_type": "hermes_db_sessions",
+            "source_ref": {
+                "source_type": "hermes_db_sessions",
+                "machine": "precision",
+                "session_id": "session-2",
+            },
+            "attributes": {"first_user_message": "only available context"},
+        }
+
+        retained, noise = pipeline._analysis_events(
+            [duplicate_summary, canonical_event, unmatched_summary]
+        )
+
+        self.assertEqual(
+            ["ev-event-1", "ev-summary-2"],
+            [event["evidence_id"] for event in retained],
+        )
+        self.assertIn(
+            {"evidence_id": "ev-summary-1", "reason": "duplicate_session_summary"},
+            noise,
+        )
+
+    def test_analysis_events_do_not_deduplicate_without_exact_machine_source_pair(self):
+        summary = {
+            "evidence_id": "ev-summary",
+            "source_type": "hermes_db_sessions",
+            "source_ref": {
+                "source_type": "hermes_db_sessions",
+                "session_id": "session-1",
+            },
+            "attributes": {"first_user_message": "only proven summary"},
+        }
+        missing_machine = {
+            "evidence_id": "ev-missing-machine",
+            "source_type": "hermes_db_sessions_event",
+            "source_ref": {
+                "source_type": "hermes_db_sessions",
+                "session_id": "session-1",
+            },
+            "attributes": {"role": "user", "kind": "message", "content": "work"},
+        }
+        spoofed_source = {
+            "evidence_id": "ev-spoofed-source",
+            "source_type": "unrelated_event",
+            "source_ref": {
+                "source_type": "hermes_db_sessions",
+                "machine": "precision",
+                "session_id": "session-1",
+            },
+            "attributes": {"role": "user", "kind": "message", "content": "work"},
+        }
+
+        retained, noise = pipeline._analysis_events(
+            [summary, missing_machine, spoofed_source]
+        )
+
+        self.assertEqual(
+            ["ev-summary", "ev-missing-machine", "ev-spoofed-source"],
+            [event["evidence_id"] for event in retained],
+        )
+        self.assertFalse(any(item["evidence_id"] == "ev-summary" for item in noise))
 
     def test_noise_words_inside_substantive_accomplishments_are_preserved(self):
         for content in (

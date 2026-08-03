@@ -354,7 +354,7 @@ class ReviewRunResultTests(unittest.TestCase):
                         "--state", str(Path(tmp) / "state.json"),
                         "--corrections", str(Path(tmp) / "corrections.jsonl"),
                         "--analyzer-target-body-bytes", "250000",
-                        "--analyzer-max-events-per-chunk", "50",
+                        "--analyzer-max-events-per-chunk", "250",
                         "--analyzer-workers", "4",
                     ]
                 )
@@ -371,7 +371,7 @@ class ReviewRunResultTests(unittest.TestCase):
             )
             for option, expected in (
                 ("--analyzer-target-body-bytes", "250000"),
-                ("--analyzer-max-events-per-chunk", "50"),
+                ("--analyzer-max-events-per-chunk", "250"),
                 ("--analyzer-workers", "4"),
             ):
                 self.assertEqual(expected, accounting_command[accounting_command.index(option) + 1])

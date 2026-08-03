@@ -156,7 +156,12 @@ def classify_noise(event: Mapping[str, Any]) -> str | None:
     kind = str(attrs.get("kind") or "").lower()
     if role == "system":
         return "system_message"
-    if kind == "tool_transport" or kind in semantic_analyzer.TOOL_KINDS:
+    if (
+        role == "tool"
+        or kind == "tool"
+        or kind == "tool_transport"
+        or kind in semantic_analyzer.TOOL_KINDS
+    ):
         return "tool_transport"
     for reason, pattern in NOISE_PATTERNS:
         if content and pattern.search(content):
@@ -180,10 +185,34 @@ def load_ledger(path: Path) -> tuple[evidence_ledger.EvidenceLedger, list[dict[s
 
 
 def _analysis_events(events: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    event_list = list(events)
     retained: list[dict[str, Any]] = []
     noise: list[dict[str, str]] = []
-    has_message_events = any(str(event.get("source_type", "")).endswith("_event") for event in events)
-    for event in events:
+    has_message_events = any(
+        str(event.get("source_type", "")).endswith("_event")
+        for event in event_list
+    )
+    canonical_session_keys = {
+        (
+            str(source.get("source_type") or ""),
+            str(source.get("machine") or ""),
+            str(source.get("session_id") or ""),
+        )
+        for event in event_list
+        for source in (
+            event.get("source_ref")
+            if isinstance(event.get("source_ref"), Mapping)
+            else {},
+        )
+        if (
+            source.get("source_type")
+            and source.get("machine")
+            and source.get("session_id")
+            and str(event.get("source_type") or "")
+            == f"{source.get('source_type')}_event"
+        )
+    }
+    for event in event_list:
         source_type = str(event.get("source_type") or "")
         if source_type == "clockify":
             continue
@@ -200,6 +229,23 @@ def _analysis_events(events: Iterable[dict[str, Any]]) -> tuple[list[dict[str, A
             # Canonical message events are richer; old enriched snippets would
             # duplicate and bias the semantic model.
             continue
+        if source_type in {"codex_sessions", "hermes_db_sessions", "claude_bursts"}:
+            source = (
+                event.get("source_ref")
+                if isinstance(event.get("source_ref"), Mapping)
+                else {}
+            )
+            session_key = (
+                str(source.get("source_type") or source_type),
+                str(source.get("machine") or ""),
+                str(source.get("session_id") or ""),
+            )
+            if session_key in canonical_session_keys:
+                noise.append({
+                    "evidence_id": str(event.get("evidence_id")),
+                    "reason": "duplicate_session_summary",
+                })
+                continue
         reason = classify_noise(event)
         if reason:
             noise.append({"evidence_id": str(event.get("evidence_id")), "reason": reason})

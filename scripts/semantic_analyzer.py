@@ -37,7 +37,7 @@ DEFAULT_MAX_BODY_BYTES = 1_450_000
 # cloud routes rejected or timed out on larger, mixed workstreams; small bounded
 # partitions make failures reviewable without dropping their evidence.
 DEFAULT_CHUNK_BODY_BYTES = 250_000
-DEFAULT_MAX_EVENTS_PER_CHUNK = 50
+DEFAULT_MAX_EVENTS_PER_CHUNK = 250
 DEFAULT_ANALYZER_WORKERS = 4
 PRIVATE_TEXT_APPROVAL_ENV = "CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED"
 LIFECYCLES = {
@@ -119,6 +119,43 @@ class AnalyzerContractError(AnalyzerError):
 
 class AnalyzerCancelledError(AnalyzerError):
     """A concurrent extraction result was superseded by a fatal peer failure."""
+
+
+_CONTRACT_FAILURE_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("invalid_json", "invalid json"),
+    ("missing_json_content", "lacks json message content"),
+    ("missing_atomicity_rationale", "explicit atomicity rationale"),
+    ("compound_action", "one atomic verb phrase"),
+    ("compound_field", "multiple accomplishment clauses"),
+    ("missing_evidence_span", "nonempty evidence_spans"),
+    ("invalid_evidence_span", "valid start and end timestamps"),
+    ("unsupported_evidence_span", "not supported by cited evidence"),
+    ("invalid_output_lists", "activities, exceptions, and omissions must be lists"),
+    ("invalid_evidence_ids", "evidence_ids"),
+    ("missing_activity_fields", "requires action, object, and outcome"),
+    ("missing_workstream", "requires a workstream"),
+    ("invalid_effort", "effort"),
+    ("invalid_project", "project_recommendation"),
+    ("omitted_evidence", "omitted known evidence ids"),
+    ("duplicate_evidence", "reassigned evidence ids"),
+    ("identity_collision", "activity identity collision"),
+    ("invalid_lifecycle", "invalid lifecycle"),
+    ("invalid_confidence", "confidence"),
+)
+CONTRACT_FAILURE_CODES = {
+    "contract_rejected",
+    "contract_rejected_other",
+    *(f"contract_rejected_{code}" for code, _needle in _CONTRACT_FAILURE_PATTERNS),
+}
+
+
+def _contract_failure_code(error: BaseException) -> str:
+    """Return a privacy-safe operational reason for a rejected model response."""
+    message = str(error).casefold()
+    for code, needle in _CONTRACT_FAILURE_PATTERNS:
+        if needle in message:
+            return f"contract_rejected_{code}"
+    return "contract_rejected_other"
 
 
 def _raise_if_cancelled(cancelled: Callable[[], bool] | None) -> None:
@@ -1256,7 +1293,7 @@ class AnalyzerResponseCache:
         decision = {"status": status, variant_field: value[variant_field]}
         if status == "accepted" and not isinstance(value.get("response"), dict):
             raise AnalyzerError(f"analyzer cache line {line_number} response is invalid")
-        if status == "rejected" and value.get("failure_code") != "contract_rejected":
+        if status == "rejected" and value.get("failure_code") not in CONTRACT_FAILURE_CODES:
             raise AnalyzerError(f"analyzer cache line {line_number} rejection is invalid")
         if self._decision_digest(decision) != value.get("decision_digest"):
             raise AnalyzerError(f"analyzer cache line {line_number} decision digest differs")
@@ -1309,7 +1346,7 @@ class AnalyzerResponseCache:
             self.used[identity["cache_key"]] = str(record["decision_digest"])
             if record["status"] == "rejected":
                 raise AnalyzerContractError(
-                    "analyzer cache records a contract-rejected response"
+                    f"analyzer cache records {record['failure_code']}"
                 )
             return copy.deepcopy(record["response"])
 
@@ -1368,9 +1405,17 @@ class AnalyzerResponseCache:
         }
         self._store_record(record)
 
-    def store_rejected(self, endpoint: AnalyzerEndpoint, body: Mapping[str, Any]) -> None:
+    def store_rejected(
+        self,
+        endpoint: AnalyzerEndpoint,
+        body: Mapping[str, Any],
+        *,
+        failure_code: str = "contract_rejected",
+    ) -> None:
+        if failure_code not in CONTRACT_FAILURE_CODES:
+            raise AnalyzerError("analyzer cache rejection code is invalid")
         identity = self._request_identity(endpoint, body)
-        decision = {"status": "rejected", "failure_code": "contract_rejected"}
+        decision = {"status": "rejected", "failure_code": failure_code}
         self._store_record(
             {
                 "schema_version": ANALYZER_CACHE_SCHEMA_VERSION,
@@ -1380,7 +1425,7 @@ class AnalyzerResponseCache:
                 "semantic_schema_version": SCHEMA_VERSION,
                 "status": "rejected",
                 "decision_digest": self._decision_digest(decision),
-                "failure_code": "contract_rejected",
+                "failure_code": failure_code,
             }
         )
 
@@ -1474,7 +1519,11 @@ def _call_validated(
         except AnalyzerError as exc:
             _raise_if_cancelled(cancelled)
             if cache is not None and cache_miss:
-                cache.store_rejected(endpoint, body)
+                cache.store_rejected(
+                    endpoint,
+                    body,
+                    failure_code=_contract_failure_code(exc),
+                )
             raise AnalyzerContractError(str(exc)) from exc
     try:
         restored_response = _restore_evidence_references(
@@ -1492,7 +1541,11 @@ def _call_validated(
     except AnalyzerError as exc:
         _raise_if_cancelled(cancelled)
         if cache is not None and cache_miss:
-            cache.store_rejected(endpoint, body)
+            cache.store_rejected(
+                endpoint,
+                body,
+                failure_code=_contract_failure_code(exc),
+            )
         raise AnalyzerContractError(str(exc)) from exc
     _raise_if_cancelled(cancelled)
     if cache is not None and cache_miss:
@@ -1526,7 +1579,11 @@ def _call_synthesis_validated(
             response = _json_object_from_response(raw_response)
         except AnalyzerError as exc:
             if cache is not None and cache_miss:
-                cache.store_rejected(endpoint, body)
+                cache.store_rejected(
+                    endpoint,
+                    body,
+                    failure_code=_contract_failure_code(exc),
+                )
             raise AnalyzerContractError(str(exc)) from exc
     try:
         restored_response = _restore_evidence_references(
@@ -1559,7 +1616,11 @@ def _call_synthesis_validated(
                 )
     except AnalyzerError as exc:
         if cache is not None and cache_miss:
-            cache.store_rejected(endpoint, body)
+            cache.store_rejected(
+                endpoint,
+                body,
+                failure_code=_contract_failure_code(exc),
+            )
         raise AnalyzerContractError(str(exc)) from exc
     if cache is not None and cache_miss:
         cache.store_accepted(endpoint, body, response)
