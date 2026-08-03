@@ -330,6 +330,39 @@ class SemanticAnalyzerTests(unittest.TestCase):
             sorted(item["evidence_id"] for chunk in chunks for item in chunk),
         )
 
+    def test_chunking_keeps_interleaved_sessions_contiguous_before_packing(self):
+        events = []
+        for minute, session_id, evidence_id in (
+            (0, "session-a", "ev-a1"),
+            (1, "session-b", "ev-b1"),
+            (2, "session-a", "ev-a2"),
+            (3, "session-b", "ev-b2"),
+        ):
+            item = event(evidence_id)
+            item["observed_start"] = f"2026-07-10 10:{minute:02d}"
+            item["observed_end"] = f"2026-07-10 10:{minute + 1:02d}"
+            item["source_ref"] = {
+                "source_type": "codex_sessions",
+                "machine": "test-machine",
+                "session_id": session_id,
+            }
+            events.append(item)
+
+        chunks = semantic.chunk_events(
+            reversed(events),
+            max_body_bytes=50_000,
+            max_events_per_chunk=3,
+        )
+
+        self.assertEqual(
+            [["ev-a1", "ev-a2"], ["ev-b1", "ev-b2"]],
+            [[item["evidence_id"] for item in chunk] for chunk in chunks],
+        )
+        self.assertEqual(
+            {item["evidence_id"] for item in events},
+            {item["evidence_id"] for chunk in chunks for item in chunk},
+        )
+
     def test_operational_target_does_not_reject_event_below_hard_ceiling(self):
         item = event("ev-large", content="x" * 8_000)
         chunks = semantic.chunk_events(

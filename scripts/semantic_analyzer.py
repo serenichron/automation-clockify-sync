@@ -626,6 +626,30 @@ def _event_day(event: dict[str, Any]) -> str:
     return value[:10] if re.match(r"^\d{4}-\d{2}-\d{2}", value) else "unknown"
 
 
+def _semantic_context_key(event: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return a local-only stable boundary for keeping related evidence contiguous."""
+    source_type = str(event.get("source_type") or "unknown")
+    source_ref = event.get("source_ref") if isinstance(event.get("source_ref"), Mapping) else {}
+    attributes = event.get("attributes") if isinstance(event.get("attributes"), Mapping) else {}
+    machine = str(source_ref.get("machine") or "")
+    if session_id := str(source_ref.get("session_id") or ""):
+        return ("session", source_type, machine, session_id)
+    if source_type == "repository_events":
+        return (
+            "repository",
+            str(attributes.get("repository_root") or source_ref.get("source_id") or "unknown"),
+        )
+    if source_type == "multica":
+        return (
+            "multica",
+            str(attributes.get("project_id") or "unknown"),
+            str(attributes.get("key") or source_ref.get("source_id") or "unknown"),
+        )
+    if source_type == "fathom":
+        return ("meeting", str(source_ref.get("source_id") or "unknown"))
+    return ("source", source_type, machine, str(source_ref.get("source_id") or "unknown"))
+
+
 def _request_messages(
     events: list[dict[str, Any]],
     *,
@@ -912,7 +936,16 @@ def chunk_events(
     if target_body_bytes <= 0:
         raise AnalyzerError("target_body_bytes must be positive")
     # Size exactly what may leave the machine, never the raw immutable ledger.
-    ordered = project_events(events)
+    # Retain local context keys only long enough to keep each session, repository,
+    # issue, or meeting contiguous.  The keys themselves never enter a request.
+    contextual = sorted(
+        (
+            (_event_day(raw), _semantic_context_key(raw), project_event(dict(raw)))
+            for raw in events
+        ),
+        key=lambda item: (_event_sort_key(item[2]), item[1]),
+    )
+    ordered = [projected for _day, _context, projected in contextual]
     _require_private_text_approval(ordered, private_text_approved)
     # This empty request gives the exact model/prompt/correction envelope once.
     # Candidate event text is then accounted for incrementally below; rebuilding
@@ -928,40 +961,72 @@ def chunk_events(
             )
         ).encode("utf-8")
     )
-    by_day: dict[str, list[dict[str, Any]]] = {}
-    for event in ordered:
-        by_day.setdefault(_event_day(event), []).append(event)
+    by_day: dict[str, dict[tuple[str, ...], list[dict[str, Any]]]] = {}
+    for day, context, projected in contextual:
+        by_day.setdefault(day, {}).setdefault(context, []).append(projected)
 
     chunks: list[list[dict[str, Any]]] = []
     for day in sorted(by_day):
         current: list[dict[str, Any]] = []
         current_event_bytes = 0
-        for event in by_day[day]:
-            event_bytes = _chunk_event_bytes(event)
-            one_size = empty_body_bytes + event_bytes + _alias_extra_bytes(1)
-            if one_size > max_body_bytes:
-                raise AnalyzerError(
-                    f"evidence event {event.get('evidence_id') or '<unknown>'} "
-                    f"exceeds analyzer request ceiling ({one_size} bytes)"
-                )
-            trial_count = len(current) + 1
-            trial_size = (
+        bundles = sorted(
+            by_day[day].items(),
+            key=lambda item: (_event_sort_key(item[1][0]), item[0]),
+        )
+        for _context, bundle in bundles:
+            bundle_bytes = [_chunk_event_bytes(event) for event in bundle]
+            bundle_count = len(bundle)
+            combined_count = len(current) + bundle_count
+            combined_size = (
                 empty_body_bytes
                 + current_event_bytes
-                + event_bytes
-                + len(current)
-                + _alias_extra_bytes(trial_count)
+                + sum(bundle_bytes)
+                + max(0, combined_count - 1)
+                + _alias_extra_bytes(combined_count)
             )
-            if current and (
-                trial_size > target_body_bytes
-                or len(current) >= max_events_per_chunk
+            bundle_size = (
+                empty_body_bytes
+                + sum(bundle_bytes)
+                + max(0, bundle_count - 1)
+                + _alias_extra_bytes(bundle_count)
+            )
+            if (
+                current
+                and bundle_count <= max_events_per_chunk
+                and bundle_size <= target_body_bytes
+                and (
+                    combined_count > max_events_per_chunk
+                    or combined_size > target_body_bytes
+                )
             ):
                 chunks.append(current)
-                current = [event]
-                current_event_bytes = event_bytes
-            else:
-                current.append(event)
-                current_event_bytes += event_bytes
+                current = []
+                current_event_bytes = 0
+            for event, event_bytes in zip(bundle, bundle_bytes, strict=True):
+                one_size = empty_body_bytes + event_bytes + _alias_extra_bytes(1)
+                if one_size > max_body_bytes:
+                    raise AnalyzerError(
+                        f"evidence event {event.get('evidence_id') or '<unknown>'} "
+                        f"exceeds analyzer request ceiling ({one_size} bytes)"
+                    )
+                trial_count = len(current) + 1
+                trial_size = (
+                    empty_body_bytes
+                    + current_event_bytes
+                    + event_bytes
+                    + len(current)
+                    + _alias_extra_bytes(trial_count)
+                )
+                if current and (
+                    trial_size > target_body_bytes
+                    or len(current) >= max_events_per_chunk
+                ):
+                    chunks.append(current)
+                    current = [event]
+                    current_event_bytes = event_bytes
+                else:
+                    current.append(event)
+                    current_event_bytes += event_bytes
         if current:
             chunks.append(current)
     return chunks
