@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 from pathlib import Path
 import re
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -410,6 +413,37 @@ class SemanticAnalyzerTests(unittest.TestCase):
         self.assertEqual("fallback", result["activities"][0]["analyzer_tier"])
         self.assertEqual("strong", result["activities"][0]["analyzer_model"])
 
+    def test_tiered_analysis_falls_back_on_primary_call_failure(self):
+        calls = []
+
+        def transport(endpoint, body):
+            payload = json.loads(body["messages"][1]["content"])
+            calls.append((endpoint.name, "probe" if payload.get("probe") else "extract"))
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            if endpoint.name == "primary":
+                raise semantic.AnalyzerError("primary call unavailable")
+            return valid_response(payload["events"][0]["evidence_id"])
+
+        result = semantic.analyze_tiered(
+            [event("ev-1")],
+            primary=semantic.AnalyzerEndpoint("primary", "http://primary", "cheap"),
+            fallback=semantic.AnalyzerEndpoint("fallback", "http://fallback", "strong"),
+            transport=transport,
+        )
+
+        self.assertEqual(
+            [
+                ("primary", "probe"),
+                ("primary", "extract"),
+                ("fallback", "probe"),
+                ("fallback", "extract"),
+            ],
+            calls,
+        )
+        self.assertEqual("fallback", result["activities"][0]["analyzer_tier"])
+        self.assertEqual("used_after_primary_failure", result["analysis_chunks"][0]["fallback_status"])
+
     def test_low_confidence_primary_uses_stronger_fallback(self):
         calls = []
 
@@ -591,6 +625,171 @@ class SemanticAnalyzerTests(unittest.TestCase):
         self.assertEqual(
             [("primary", "probe"), ("primary", "evidence"), ("primary", "evidence")],
             calls,
+        )
+
+    def test_concurrent_extraction_preserves_chunk_order_and_all_evidence(self):
+        active = 0
+        max_active = 0
+        lock = threading.Lock()
+
+        def transport(_endpoint, body):
+            nonlocal active, max_active
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            # Reverse completion order so the assertion cannot pass merely
+            # because requests happened to finish in source order.
+            evidence_id = payload["events"][0]["evidence_id"]
+            day = int(payload["events"][0]["time_span"]["start"][8:10])
+            time.sleep(0.01 * (20 - day))
+            with lock:
+                active -= 1
+            response = valid_response(evidence_id)
+            marker = payload["events"][0]["time_span"]["start"]
+            response["activities"][0].update({
+                "object": f"Clockify item {marker}",
+                "workstream": f"Clockify stream {marker}",
+                "evidence_spans": [payload["events"][0]["time_span"]],
+            })
+            return response
+
+        events = [event(f"ev-{number}", f"2026-07-{10 + number:02d}") for number in range(4)]
+        result = semantic.analyze_tiered(
+            events,
+            primary=semantic.AnalyzerEndpoint("primary", "http://primary", "cheap"),
+            transport=transport,
+            max_events_per_chunk=1,
+            max_workers=4,
+        )
+
+        self.assertGreaterEqual(max_active, 2)
+        self.assertEqual([1, 2, 3, 4], [item["chunk"] for item in result["analysis_chunks"]])
+        classified = {
+            evidence_id
+            for collection in ("activities", "exceptions", "omissions")
+            for item in result[collection]
+            for evidence_id in item["evidence_ids"]
+        }
+        self.assertEqual({item["evidence_id"] for item in events}, classified)
+
+    def test_concurrent_extraction_probes_each_route_once(self):
+        calls: list[tuple[str, str]] = []
+        lock = threading.Lock()
+
+        def transport(endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            with lock:
+                calls.append((endpoint.name, "probe" if payload.get("probe") else "extract"))
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            response = valid_response(payload["events"][0]["evidence_id"])
+            marker = payload["events"][0]["time_span"]["start"]
+            response["activities"][0].update({
+                "object": f"Clockify item {marker}",
+                "workstream": f"Clockify stream {marker}",
+                "evidence_spans": [payload["events"][0]["time_span"]],
+            })
+            return response
+
+        semantic.analyze_tiered(
+            [event(f"ev-{number}", f"2026-07-{10 + number:02d}") for number in range(5)],
+            primary=semantic.AnalyzerEndpoint("primary", "http://primary", "cheap"),
+            transport=transport,
+            max_events_per_chunk=1,
+            max_workers=4,
+        )
+        self.assertEqual(1, calls.count(("primary", "probe")))
+        self.assertEqual(5, calls.count(("primary", "extract")))
+
+    def test_concurrent_primary_probe_failure_uses_fallback_after_one_attempt(self):
+        calls: list[str] = []
+        lock = threading.Lock()
+
+        def transport(endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                with lock:
+                    calls.append(endpoint.name)
+                if endpoint.name == "primary":
+                    raise semantic.AnalyzerError("route unavailable")
+                return {"probe": "ok"}
+            response = valid_response(payload["events"][0]["evidence_id"])
+            marker = payload["events"][0]["time_span"]["start"]
+            response["activities"][0].update({
+                "object": f"Clockify item {marker}",
+                "workstream": f"Clockify stream {marker}",
+                "evidence_spans": [payload["events"][0]["time_span"]],
+            })
+            return response
+
+        result = semantic.analyze_tiered(
+            [event(f"ev-{number}", f"2026-07-{10 + number:02d}") for number in range(4)],
+            primary=semantic.AnalyzerEndpoint("primary", "http://primary", "cheap"),
+            fallback=semantic.AnalyzerEndpoint("fallback", "http://fallback", "strong"),
+            transport=transport,
+            max_events_per_chunk=1,
+            max_workers=4,
+        )
+        self.assertEqual(["primary", "fallback"], calls)
+        self.assertTrue(all(
+            chunk["tier"] == "fallback"
+            for chunk in result["analysis_chunks"]
+        ))
+
+    def test_fatal_concurrent_chunk_cancels_queued_chunks_before_transport_or_cache_write(self):
+        started_second = threading.Event()
+        extract_calls: list[tuple[str, int]] = []
+        lock = threading.Lock()
+
+        def transport(endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            event_payload = payload["events"][0]
+            day = int(event_payload["time_span"]["start"][8:10])
+            with lock:
+                extract_calls.append((endpoint.name, day))
+            if endpoint.name == "primary" and day == 10:
+                self.assertTrue(started_second.wait(timeout=1))
+                # A malformed primary answer is a contract rejection.  Its
+                # fallback's route outage is the fatal error that must cancel
+                # the chunks which are still queued behind these two workers.
+                return {"choices": [{"message": {"content": "not-json"}}]}
+            if endpoint.name == "fallback" and day == 10:
+                raise semantic.AnalyzerError("fallback route unavailable")
+            if endpoint.name == "primary" and day == 11:
+                started_second.set()
+                # Already in flight: it may complete, but cancellation must
+                # discard it before cache persistence, fallback, or synthesis.
+                time.sleep(0.1)
+                response = valid_response(event_payload["evidence_id"])
+                response["activities"][0]["evidence_spans"] = [event_payload["time_span"]]
+                return response
+            self.fail("a queued chunk must not reach the transport")
+
+        primary = semantic.AnalyzerEndpoint("primary", "http://primary", "cheap")
+        fallback = semantic.AnalyzerEndpoint("fallback", "http://fallback", "strong")
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "analyzer-cache.jsonl"
+            with self.assertRaisesRegex(semantic.AnalyzerError, "failed without dual contract rejection"):
+                semantic.analyze_tiered(
+                    [event(f"ev-{number}", f"2026-07-{10 + number:02d}") for number in range(5)],
+                    primary=primary,
+                    fallback=fallback,
+                    transport=transport,
+                    cache=semantic.AnalyzerResponseCache(cache_path),
+                    max_events_per_chunk=1,
+                    max_workers=2,
+                )
+            # Only the fatal primary contract rejection may be persisted.  The
+            # in-flight peer and all queued chunks cannot add cache records.
+            self.assertEqual(1, len(cache_path.read_text(encoding="utf-8").splitlines()))
+        self.assertEqual(
+            [("fallback", 10), ("primary", 10), ("primary", 11)],
+            sorted(extract_calls),
         )
 
     def test_cross_chunk_same_accomplishment_synthesizes_unioned_evidence(self):
@@ -1142,6 +1341,58 @@ class SemanticAnalyzerTests(unittest.TestCase):
         self.assertEqual(
             first["analyzer_cache"]["records"], second["analyzer_cache"]["records"]
         )
+
+    def test_response_cache_is_safe_for_concurrent_distinct_writers(self):
+        endpoint = semantic.AnalyzerEndpoint("primary", "http://primary", "cheap")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "analyzer-cache.jsonl"
+            cache = semantic.AnalyzerResponseCache(path)
+            bodies = [
+                semantic._body_for(
+                    [event(f"ev-{number}", content=f"work item {number}")],
+                    model="cheap",
+                    mode="extract",
+                    private_text_approved=True,
+                )
+                for number in range(8)
+            ]
+
+            def store(number_and_body):
+                number, body = number_and_body
+                cache.store_accepted(endpoint, body, valid_response(f"ev-{number}"))
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                list(executor.map(store, enumerate(bodies)))
+
+            self.assertEqual(8, len(path.read_text(encoding="utf-8").splitlines()))
+            self.assertEqual(8, len(cache.summary()["records"]))
+            reloaded = semantic.AnalyzerResponseCache(path)
+            self.assertEqual(8, len(reloaded._records))
+            self.assertTrue(all(reloaded.lookup(endpoint, body) is not None for body in bodies))
+
+    def test_cache_read_failure_fails_closed_without_fallback_transport(self):
+        endpoint = semantic.AnalyzerEndpoint("primary", "http://primary", "cheap")
+        fallback = semantic.AnalyzerEndpoint("fallback", "http://fallback", "strong")
+        calls: list[str] = []
+
+        def transport(route, _body):
+            calls.append(route.name)
+            return {"probe": "ok"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "analyzer-cache.jsonl"
+            cache = semantic.AnalyzerResponseCache(path)
+            path.write_text("not-json\n", encoding="utf-8")
+            with self.assertRaisesRegex(semantic.AnalyzerError, "invalid JSON"):
+                semantic.analyze_tiered(
+                    [event("ev-1")],
+                    primary=endpoint,
+                    fallback=fallback,
+                    transport=transport,
+                    private_text_approved=True,
+                    cache=cache,
+                )
+        self.assertEqual([], calls)
 
     def test_response_cache_tampering_fails_closed(self):
         endpoint = semantic.AnalyzerEndpoint("primary", "http://primary", "cheap")

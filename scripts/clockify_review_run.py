@@ -563,6 +563,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         help="Validated append-only semantic response cache; defaults beside --state.",
     )
+    parser.add_argument("--analyzer-target-body-bytes", type=int)
+    parser.add_argument("--analyzer-max-events-per-chunk", type=int)
+    parser.add_argument("--analyzer-workers", type=int)
     return parser.parse_args(argv)
 
 
@@ -643,6 +646,13 @@ def main(argv: list[str] | None = None) -> int:
     ]
     if args.analysis_fixture:
         accounting_command.extend(["--analysis-fixture", str(args.analysis_fixture)])
+    for option, value in (
+        ("--analyzer-target-body-bytes", args.analyzer_target_body_bytes),
+        ("--analyzer-max-events-per-chunk", args.analyzer_max_events_per_chunk),
+        ("--analyzer-workers", args.analyzer_workers),
+    ):
+        if value is not None:
+            accounting_command.extend([option, str(value)])
     accounted = _run(accounting_command)
     if accounted.returncode != 0:
         quality = {

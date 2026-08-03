@@ -140,6 +140,54 @@ def meeting_analysis(meeting):
 
 
 class WorkAccountingPipelineTests(unittest.TestCase):
+    def test_analyzer_tuning_cli_options_are_explicit(self):
+        args = pipeline.parse_args([
+            "/tmp/run",
+            "--analyzer-target-body-bytes", "250000",
+            "--analyzer-max-events-per-chunk", "50",
+            "--analyzer-workers", "4",
+        ])
+        self.assertEqual(250_000, args.analyzer_target_body_bytes)
+        self.assertEqual(50, args.analyzer_max_events_per_chunk)
+        self.assertEqual(4, args.analyzer_workers)
+
+    def test_analyzer_tuning_reaches_semantic_analyzer(self):
+        primary = pipeline.semantic_analyzer.AnalyzerEndpoint(
+            "primary", "http://primary", "flash"
+        )
+        expected = {
+            "schema_version": 1,
+            "prompt_version": "clockify-semantic-v7",
+            "activities": [],
+            "exceptions": [],
+            "omissions": [],
+            "analysis_chunks": [],
+        }
+        with (
+            mock.patch.object(
+                pipeline.semantic_analyzer.AnalyzerEndpoint,
+                "from_env",
+                side_effect=[primary, None],
+            ),
+            mock.patch.object(
+                pipeline.semantic_analyzer,
+                "analyze_tiered",
+                autospec=True,
+                return_value=expected,
+            ) as analyze,
+        ):
+            result = pipeline.analyze_ledger(
+                [{"evidence_id": "ev-1"}],
+                analyzer_target_body_bytes=250_000,
+                analyzer_max_events_per_chunk=50,
+                analyzer_workers=4,
+            )
+
+        self.assertIs(expected, result)
+        self.assertEqual(250_000, analyze.call_args.kwargs["target_body_bytes"])
+        self.assertEqual(50, analyze.call_args.kwargs["max_events_per_chunk"])
+        self.assertEqual(4, analyze.call_args.kwargs["max_workers"])
+
     def test_noise_classifier_excludes_transport_and_status_only_events(self):
         cases = (
             ({"attributes": {"role": "tool", "kind": "tool_result", "content": "private output"}}, "tool_transport"),

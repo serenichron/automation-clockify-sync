@@ -22,7 +22,7 @@ may not overlap fixed blocks or one another.
 | Separate evidence and allocation timelines | Proven locally | `scripts/evidence_ledger.py`; `scripts/work_allocator.py`; `tests/test_work_allocator.py` |
 | Honest non-overlapping effort allocation | Proven locally | `scripts/work_allocator.py`; allocator and pipeline tests for fixed blocks, no gap filling, minimum rollback, and `contested_time` |
 | Deterministic Caveman descriptions | Proven locally for emitted fixtures and the 86-record corpus | `scripts/caveman_renderer.py`; `tests/test_caveman_renderer.py`; `tests/test_regression_corpus.py` |
-| Tiered privacy-gated model analysis | Deny-by-default private-text gate, bounded operational chunks, executable non-private live evaluation, and fail-closed local analyzer exceptions proven locally; authorized July accuracy remains under validation | `scripts/semantic_analyzer.py`; `scripts/analyzer_live_evaluation.py`; `scripts/analyzer_evaluation.py`; passing Flash-primary and Pro-fallback scorecards plus separate private-text approval |
+| Tiered privacy-gated model analysis | Deny-by-default private-text gate, bounded concurrent operational chunks, executable non-private live evaluation, and fail-closed local analyzer exceptions proven locally; authorized July accuracy remains under validation | `scripts/semantic_analyzer.py`; `scripts/analyzer_live_evaluation.py`; `scripts/analyzer_evaluation.py`; passing Flash-primary and Pro-fallback scorecards plus separate private-text approval |
 | Evidence-bound correction learning | Proven locally for approve, skip, modify, structural split partitions, omission, wording, routing, and allocation behavior; live decision ingestion unproven | `scripts/review_corrections.py`; `tests/test_review_corrections.py`; correction integration tests in `tests/test_work_accounting_pipeline.py` |
 | Exceptions-only durable review | Not activated; `shadow_all` is the default and the executable acceptance gate remains unproven live | `scripts/clockify_review_run.py`; `scripts/review_acceptance.py`; related tests and integrity-linked period ledger |
 
@@ -38,9 +38,9 @@ before an activity can become a proposal.
 Planned and noise activities do not become proposals. Title-only meetings,
 missing sources, routing conflicts, low confidence, double-route chunk or
 workstream-synthesis rejection, and contested capacity become explicit
-exclusions or exceptions. The analyzer uses a 500,000-byte and 250-event
-operational target beneath its 1,450,000-byte hard body ceiling; complete
-individual evidence is never clipped.
+exclusions or exceptions. The analyzer uses a 250,000-byte and 50-event
+operational target with four deterministically ordered workers beneath its
+1,450,000-byte hard body ceiling; complete individual evidence is never clipped.
 
 ## Acceptance gates
 

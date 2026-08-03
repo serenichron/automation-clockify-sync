@@ -350,7 +350,13 @@ class ReviewRunResultTests(unittest.TestCase):
                 review_run, "_run", side_effect=[collected, blocked]
             ) as run:
                 result_code = review_run.main(
-                    ["--state", str(Path(tmp) / "state.json"), "--corrections", str(Path(tmp) / "corrections.jsonl")]
+                    [
+                        "--state", str(Path(tmp) / "state.json"),
+                        "--corrections", str(Path(tmp) / "corrections.jsonl"),
+                        "--analyzer-target-body-bytes", "250000",
+                        "--analyzer-max-events-per-chunk", "50",
+                        "--analyzer-workers", "4",
+                    ]
                 )
             self.assertEqual(2, result_code)
             contract = json.loads((run_dir / "autopilot-result.json").read_text(encoding="utf-8"))
@@ -363,6 +369,12 @@ class ReviewRunResultTests(unittest.TestCase):
             self.assertEqual(
                 str(Path(tmp) / "analyzer-cache.jsonl"), accounting_command[cache_index]
             )
+            for option, expected in (
+                ("--analyzer-target-body-bytes", "250000"),
+                ("--analyzer-max-events-per-chunk", "50"),
+                ("--analyzer-workers", "4"),
+            ):
+                self.assertEqual(expected, accounting_command[accounting_command.index(option) + 1])
 
     def test_healthy_carried_queue_requires_no_comment(self):
         snapshot = {

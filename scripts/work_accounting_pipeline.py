@@ -235,6 +235,9 @@ def analyze_ledger(
     analysis_fixture: Path | None = None,
     corrections: list[dict[str, Any]] | None = None,
     analyzer_cache_path: Path | None = None,
+    analyzer_target_body_bytes: int | None = None,
+    analyzer_max_events_per_chunk: int | None = None,
+    analyzer_workers: int | None = None,
 ) -> dict[str, Any]:
     known = {str(event.get("evidence_id")) for event in events}
     if analysis_fixture:
@@ -259,12 +262,22 @@ def analyze_ledger(
         if analyzer_cache_path is not None
         else None
     )
+    tuning = {
+        key: value
+        for key, value in {
+            "target_body_bytes": analyzer_target_body_bytes,
+            "max_events_per_chunk": analyzer_max_events_per_chunk,
+            "max_workers": analyzer_workers,
+        }.items()
+        if value is not None
+    }
     return semantic_analyzer.analyze_tiered(
         events,
         primary=primary,
         fallback=fallback,
         corrections=corrections,
         cache=cache,
+        **tuning,
     )
 
 
@@ -572,6 +585,9 @@ def run_accounting(
     analysis_fixture: Path | None = None,
     corrections_path: Path | None = None,
     analyzer_cache_path: Path | None = None,
+    analyzer_target_body_bytes: int | None = None,
+    analyzer_max_events_per_chunk: int | None = None,
+    analyzer_workers: int | None = None,
 ) -> dict[str, Any]:
     ledger_path = run_dir / "evidence" / "evidence-ledger.json"
     ledger, all_events = load_ledger(ledger_path)
@@ -591,6 +607,9 @@ def run_accounting(
         analysis_fixture=analysis_fixture,
         corrections=corrections,
         analyzer_cache_path=analyzer_cache_path,
+        analyzer_target_body_bytes=analyzer_target_body_bytes,
+        analyzer_max_events_per_chunk=analyzer_max_events_per_chunk,
+        analyzer_workers=analyzer_workers,
     )
     analysis.setdefault("ledger_event_count", len(analysis_events))
     analysis.setdefault("ledger_evidence_digest", semantic_analyzer.stable_digest(
@@ -961,6 +980,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--analysis-fixture", type=Path)
     parser.add_argument("--corrections", type=Path)
     parser.add_argument("--analyzer-cache", type=Path)
+    parser.add_argument("--analyzer-target-body-bytes", type=int)
+    parser.add_argument("--analyzer-max-events-per-chunk", type=int)
+    parser.add_argument("--analyzer-workers", type=int)
     return parser.parse_args(argv)
 
 
@@ -973,6 +995,9 @@ def main(argv: list[str] | None = None) -> int:
             analysis_fixture=args.analysis_fixture,
             corrections_path=args.corrections,
             analyzer_cache_path=args.analyzer_cache,
+            analyzer_target_body_bytes=args.analyzer_target_body_bytes,
+            analyzer_max_events_per_chunk=args.analyzer_max_events_per_chunk,
+            analyzer_workers=args.analyzer_workers,
         )
     except (WorkAccountingError, semantic_analyzer.AnalyzerError, work_allocator.AllocationError, ValueError) as exc:
         print(f"work accounting blocked: {exc}", file=sys.stderr)

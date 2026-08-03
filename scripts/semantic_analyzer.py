@@ -11,6 +11,7 @@ available merely because its name appears in repository documentation.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 import copy
 import dataclasses
 import datetime as dt
@@ -21,6 +22,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import threading
 from typing import Any, Callable, Iterable, Mapping
 import urllib.error
 import urllib.request
@@ -31,8 +33,12 @@ PROMPT_VERSION = "clockify-semantic-v7"
 ANALYZER_CACHE_SCHEMA_VERSION = "clockify-analyzer-cache/v1"
 DEFAULT_PRIMARY_MODEL = "deepseek-v4-flash:cloud"
 DEFAULT_MAX_BODY_BYTES = 1_450_000
-DEFAULT_CHUNK_BODY_BYTES = 500_000
-DEFAULT_MAX_EVENTS_PER_CHUNK = 250
+# Operational limits are deliberately well below the hard request ceiling.  The
+# cloud routes rejected or timed out on larger, mixed workstreams; small bounded
+# partitions make failures reviewable without dropping their evidence.
+DEFAULT_CHUNK_BODY_BYTES = 250_000
+DEFAULT_MAX_EVENTS_PER_CHUNK = 50
+DEFAULT_ANALYZER_WORKERS = 4
 PRIVATE_TEXT_APPROVAL_ENV = "CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED"
 LIFECYCLES = {
     "completed",
@@ -109,6 +115,15 @@ class AnalyzerError(RuntimeError):
 
 class AnalyzerContractError(AnalyzerError):
     """A sealed provider response rejected by the semantic output contract."""
+
+
+class AnalyzerCancelledError(AnalyzerError):
+    """A concurrent extraction result was superseded by a fatal peer failure."""
+
+
+def _raise_if_cancelled(cancelled: Callable[[], bool] | None) -> None:
+    if cancelled is not None and cancelled():
+        raise AnalyzerCancelledError("semantic extraction cancelled after fatal chunk failure")
 
 
 def canonical_json(value: Any) -> str:
@@ -1158,6 +1173,7 @@ class AnalyzerResponseCache:
 
     def __init__(self, path: Path):
         self.path = path
+        self._lock = threading.RLock()
         self._records: dict[str, dict[str, Any]] = {}
         self.hits = 0
         self.misses = 0
@@ -1247,18 +1263,19 @@ class AnalyzerResponseCache:
         return copy.deepcopy(value)
 
     def _load(self) -> None:
-        if not self.path.exists():
-            return
-        try:
-            with self.path.open("r", encoding="utf-8") as handle:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
-                try:
-                    lines = handle.read().splitlines()
-                finally:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except OSError as exc:
-            raise AnalyzerError("analyzer cache cannot be read") from exc
-        self._merge_lines(lines)
+        with self._lock:
+            if not self.path.exists():
+                return
+            try:
+                with self.path.open("r", encoding="utf-8") as handle:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+                    try:
+                        lines = handle.read().splitlines()
+                    finally:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError as exc:
+                raise AnalyzerError("analyzer cache cannot be read") from exc
+            self._merge_lines(lines)
 
     def _merge_lines(self, lines: Iterable[str]) -> None:
         for line_number, line in enumerate(lines, 1):
@@ -1276,57 +1293,59 @@ class AnalyzerResponseCache:
             self._records[key] = record
 
     def lookup(self, endpoint: AnalyzerEndpoint, body: Mapping[str, Any]) -> dict[str, Any] | None:
-        identity = self._request_identity(endpoint, body)
-        record = self._records.get(identity["cache_key"])
-        if record is None and self.path.exists():
-            # Another guarded run may have appended after this instance loaded.
-            self._load()
+        with self._lock:
+            identity = self._request_identity(endpoint, body)
             record = self._records.get(identity["cache_key"])
-        if record is None:
-            self.misses += 1
-            return None
-        if record["body_digest"] != identity["body_digest"] or record["route_digest"] != identity["route_digest"]:
-            raise AnalyzerError("analyzer cache identity collision")
-        self.hits += 1
-        self.used[identity["cache_key"]] = str(record["decision_digest"])
-        if record["status"] == "rejected":
-            raise AnalyzerContractError(
-                "analyzer cache records a contract-rejected response"
-            )
-        return copy.deepcopy(record["response"])
+            if record is None and self.path.exists():
+                # Another guarded run may have appended after this instance loaded.
+                self._load()
+                record = self._records.get(identity["cache_key"])
+            if record is None:
+                self.misses += 1
+                return None
+            if record["body_digest"] != identity["body_digest"] or record["route_digest"] != identity["route_digest"]:
+                raise AnalyzerError("analyzer cache identity collision")
+            self.hits += 1
+            self.used[identity["cache_key"]] = str(record["decision_digest"])
+            if record["status"] == "rejected":
+                raise AnalyzerContractError(
+                    "analyzer cache records a contract-rejected response"
+                )
+            return copy.deepcopy(record["response"])
 
     def _store_record(self, record: dict[str, Any]) -> None:
-        key = str(record["cache_key"])
-        prior = self._records.get(key)
-        if prior is not None:
-            if prior != record:
-                raise AnalyzerError("analyzer cache cannot replace an existing decision")
+        with self._lock:
+            key = str(record["cache_key"])
+            prior = self._records.get(key)
+            if prior is not None:
+                if prior != record:
+                    raise AnalyzerError("analyzer cache cannot replace an existing decision")
+                self.used[key] = str(record["decision_digest"])
+                return
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with self.path.open("a+", encoding="utf-8") as handle:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                    try:
+                        handle.seek(0)
+                        self._merge_lines(handle.read().splitlines())
+                        prior = self._records.get(key)
+                        if prior is not None:
+                            if prior != record:
+                                raise AnalyzerError(
+                                    "analyzer cache cannot replace an existing decision"
+                                )
+                        else:
+                            handle.seek(0, os.SEEK_END)
+                            handle.write(canonical_json(record) + "\n")
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                    finally:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError as exc:
+                raise AnalyzerError("analyzer cache cannot be written") from exc
+            self._records[key] = record
             self.used[key] = str(record["decision_digest"])
-            return
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a+", encoding="utf-8") as handle:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-                try:
-                    handle.seek(0)
-                    self._merge_lines(handle.read().splitlines())
-                    prior = self._records.get(key)
-                    if prior is not None:
-                        if prior != record:
-                            raise AnalyzerError(
-                                "analyzer cache cannot replace an existing decision"
-                            )
-                    else:
-                        handle.seek(0, os.SEEK_END)
-                        handle.write(canonical_json(record) + "\n")
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                finally:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except OSError as exc:
-            raise AnalyzerError("analyzer cache cannot be written") from exc
-        self._records[key] = record
-        self.used[key] = str(record["decision_digest"])
 
     def store_accepted(
         self,
@@ -1366,15 +1385,16 @@ class AnalyzerResponseCache:
         )
 
     def summary(self) -> dict[str, Any]:
-        return {
-            "schema_version": ANALYZER_CACHE_SCHEMA_VERSION,
-            "hits": self.hits,
-            "misses": self.misses,
-            "records": [
-                {"cache_key": key, "decision_digest": digest}
-                for key, digest in sorted(self.used.items())
-            ],
-        }
+        with self._lock:
+            return {
+                "schema_version": ANALYZER_CACHE_SCHEMA_VERSION,
+                "hits": self.hits,
+                "misses": self.misses,
+                "records": [
+                    {"cache_key": key, "decision_digest": digest}
+                    for key, digest in sorted(self.used.items())
+                ],
+            }
 
 
 def http_transport(endpoint: AnalyzerEndpoint, body: dict[str, Any]) -> dict[str, Any]:
@@ -1427,6 +1447,7 @@ def _call_validated(
     private_text_approved: bool | None = None,
     cache: AnalyzerResponseCache | None = None,
     before_transport: Callable[[AnalyzerEndpoint], None] | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     body = _body_for(
         events,
@@ -1437,15 +1458,21 @@ def _call_validated(
     )
     if len(canonical_json(body).encode("utf-8")) > DEFAULT_MAX_BODY_BYTES:
         raise AnalyzerError("analyzer body exceeds configured request ceiling")
+    _raise_if_cancelled(cancelled)
     response = cache.lookup(endpoint, body) if cache is not None else None
+    _raise_if_cancelled(cancelled)
     cache_miss = response is None
     if response is None:
+        _raise_if_cancelled(cancelled)
         if before_transport is not None:
             before_transport(endpoint)
+        _raise_if_cancelled(cancelled)
         raw_response = transport(endpoint, body)
+        _raise_if_cancelled(cancelled)
         try:
             response = _json_object_from_response(raw_response)
         except AnalyzerError as exc:
+            _raise_if_cancelled(cancelled)
             if cache is not None and cache_miss:
                 cache.store_rejected(endpoint, body)
             raise AnalyzerContractError(str(exc)) from exc
@@ -1463,9 +1490,11 @@ def _call_validated(
             evidence_time_spans=evidence_time_spans,
         )
     except AnalyzerError as exc:
+        _raise_if_cancelled(cancelled)
         if cache is not None and cache_miss:
             cache.store_rejected(endpoint, body)
         raise AnalyzerContractError(str(exc)) from exc
+    _raise_if_cancelled(cancelled)
     if cache is not None and cache_miss:
         cache.store_accepted(endpoint, body, response)
     return result
@@ -1586,9 +1615,12 @@ def analyze_tiered(
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
     target_body_bytes: int = DEFAULT_CHUNK_BODY_BYTES,
     max_events_per_chunk: int = DEFAULT_MAX_EVENTS_PER_CHUNK,
+    max_workers: int = DEFAULT_ANALYZER_WORKERS,
     private_text_approved: bool | None = None,
     cache: AnalyzerResponseCache | None = None,
 ) -> dict[str, Any]:
+    if max_workers <= 0:
+        raise AnalyzerError("max_workers must be positive")
     original_events = sorted((dict(event) for event in events), key=_event_sort_key)
     if not original_events:
         return {
@@ -1618,16 +1650,42 @@ def analyze_tiered(
         corrections=corrections,
         private_text_approved=private_text_approved,
     )
-    results: list[dict[str, Any]] = []
-    metadata: list[dict[str, Any]] = []
+    # Extraction requests have no cross-chunk dependency.  Keep their output in
+    # input order even though providers complete in a different order; synthesis
+    # below deliberately remains sequential because it joins these results.
     probed: set[AnalyzerEndpoint] = set()
+    probe_errors: dict[AnalyzerEndpoint, AnalyzerError] = {}
+    probe_lock = threading.Lock()
+    cancellation = threading.Event()
 
     def probe_once(endpoint: AnalyzerEndpoint) -> None:
-        if endpoint not in probed:
-            probe_endpoint(endpoint, transport=transport)
+        # Hold the gate through the call so concurrent workers cannot make a
+        # second route probe.  A failed probe is remembered and re-raised, which
+        # fails the run rather than treating an unavailable route as a contract
+        # rejection.
+        with probe_lock:
+            prior_error = probe_errors.get(endpoint)
+            if prior_error is not None:
+                raise AnalyzerError(
+                    f"analyzer endpoint {endpoint.name} probe previously failed"
+                ) from prior_error
+            if endpoint in probed:
+                return
+            try:
+                probe_endpoint(endpoint, transport=transport)
+            except AnalyzerError as exc:
+                probe_errors[endpoint] = exc
+                raise
             probed.add(endpoint)
 
-    for index, chunk in enumerate(chunks):
+    def before_extraction_transport(endpoint: AnalyzerEndpoint) -> None:
+        _raise_if_cancelled(cancellation.is_set)
+        probe_once(endpoint)
+        _raise_if_cancelled(cancellation.is_set)
+
+    def analyze_chunk(index_and_chunk: tuple[int, list[dict[str, Any]]]) -> tuple[dict[str, Any], dict[str, Any]]:
+        index, chunk = index_and_chunk
+        _raise_if_cancelled(cancellation.is_set)
         chunk_ids = {str(event.get("evidence_id")) for event in chunk}
         chunk_spans = {
             evidence_id: span
@@ -1646,9 +1704,11 @@ def analyze_tiered(
                 evidence_time_spans=chunk_spans,
                 private_text_approved=private_text_approved,
                 cache=cache,
-                before_transport=probe_once,
+                before_transport=before_extraction_transport,
+                cancelled=cancellation.is_set,
             )
         except AnalyzerError as primary_error:
+            _raise_if_cancelled(cancellation.is_set)
             if fallback is None:
                 raise AnalyzerError(
                     f"primary analyzer failed for chunk {index + 1}: {primary_error}"
@@ -1664,9 +1724,11 @@ def analyze_tiered(
                     evidence_time_spans=chunk_spans,
                     private_text_approved=private_text_approved,
                     cache=cache,
-                    before_transport=probe_once,
+                    before_transport=before_extraction_transport,
+                    cancelled=cancellation.is_set,
                 )
             except AnalyzerError as fallback_error:
+                _raise_if_cancelled(cancellation.is_set)
                 if not all(isinstance(error, AnalyzerContractError) for error in (
                     primary_error, fallback_error
                 )):
@@ -1709,6 +1771,7 @@ def analyze_tiered(
                 tier = "fallback"
                 fallback_status = "used_after_primary_failure"
         else:
+            _raise_if_cancelled(cancellation.is_set)
             used = primary
             tier = "primary"
             if _requires_stronger_fallback(result) and fallback is not None:
@@ -1724,38 +1787,105 @@ def analyze_tiered(
                         evidence_time_spans=chunk_spans,
                         private_text_approved=private_text_approved,
                         cache=cache,
-                        before_transport=probe_once,
+                        before_transport=before_extraction_transport,
+                        cancelled=cancellation.is_set,
                     )
-                except AnalyzerError:
+                except AnalyzerContractError:
                     # A validated low-confidence primary decision is still useful
                     # evidence.  If the stronger route fails, retain only its
                     # review-safe portions and turn unresolved claims into
                     # explicit exceptions instead of retrying a sealed rejection.
                     result = _defer_unresolved_low_confidence(primary_result)
                     fallback_status = "failed_deferred"
+                except AnalyzerError as fallback_error:
+                    _raise_if_cancelled(cancellation.is_set)
+                    raise AnalyzerError(
+                        f"fallback analyzer failed for low-confidence chunk {index + 1}: "
+                        f"{fallback_error}"
+                    ) from fallback_error
                 else:
                     used = fallback
                     tier = "fallback"
                     fallback_status = "used_for_low_confidence"
+        _raise_if_cancelled(cancellation.is_set)
         if _requires_stronger_fallback(result):
             result = _defer_unresolved_low_confidence(result)
-        results.append(result)
         chunk_metadata = {
-                "chunk": index + 1,
-                "event_count": len(chunk),
-                "evidence_digest": stable_digest(
-                    "ech-", sorted(event["evidence_id"] for event in chunk)
-                ),
-                "endpoint": used.name,
-                "model": used.model,
-                "tier": tier,
-                "fallback_status": fallback_status,
-            }
+            "chunk": index + 1,
+            "event_count": len(chunk),
+            "evidence_digest": stable_digest(
+                "ech-", sorted(event["evidence_id"] for event in chunk)
+            ),
+            "endpoint": used.name,
+            "model": used.model,
+            "tier": tier,
+            "fallback_status": fallback_status,
+        }
         if fallback_status == "failed_exception":
             chunk_metadata["failure_digest"] = fallback_failure_digest
             chunk_metadata["fallback_endpoint"] = fallback.name
             chunk_metadata["fallback_model"] = fallback.model
-        metadata.append(chunk_metadata)
+        return result, chunk_metadata
+
+    if len(chunks) == 1 or max_workers == 1:
+        chunk_outcomes = [analyze_chunk((index, chunk)) for index, chunk in enumerate(chunks)]
+    else:
+        # Submit only a bounded in-flight window.  `Executor.map` queues all
+        # work immediately, which would allow a fatal chunk to be followed by
+        # provider/cache side effects from queued chunks.  On failure, cancel
+        # all not-yet-started futures; a currently running transport cannot be
+        # interrupted, but its cancellation checks prevent fallback, cache
+        # persistence, and later synthesis from using its result.
+        executor = ThreadPoolExecutor(max_workers=min(max_workers, len(chunks)))
+        pending: dict[Future[tuple[dict[str, Any], dict[str, Any]]], int] = {}
+        outcomes: dict[int, tuple[dict[str, Any], dict[str, Any]]] = {}
+        next_index = 0
+        fatal_error: BaseException | None = None
+        try:
+            while next_index < len(chunks) and len(pending) < max_workers:
+                future = executor.submit(analyze_chunk, (next_index, chunks[next_index]))
+                pending[future] = next_index
+                next_index += 1
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                completed = sorted((pending.pop(future), future) for future in done)
+                for index, future in completed:
+                    try:
+                        outcomes[index] = future.result()
+                    except BaseException as exc:
+                        fatal_error = exc
+                        break
+                if fatal_error is not None:
+                    cancellation.set()
+                    for future in pending:
+                        future.cancel()
+                    break
+                # Do not refill a partially completed batch.  A peer in this
+                # batch may still report a fatal failure; waiting to dispatch
+                # the next batch prevents any later chunk from reaching cache
+                # or transport before that failure is observed.
+                if not pending:
+                    while next_index < len(chunks):
+                        future = executor.submit(analyze_chunk, (next_index, chunks[next_index]))
+                        pending[future] = next_index
+                        next_index += 1
+                        if len(pending) >= max_workers:
+                            break
+        except BaseException as exc:
+            fatal_error = exc
+        finally:
+            if fatal_error is not None:
+                cancellation.set()
+                for future in pending:
+                    future.cancel()
+                executor.shutdown(wait=True, cancel_futures=True)
+            else:
+                executor.shutdown(wait=True)
+        if fatal_error is not None:
+            raise fatal_error
+        chunk_outcomes = [outcomes[index] for index in range(len(chunks))]
+    results = [result for result, _metadata in chunk_outcomes]
+    metadata = [chunk_metadata for _result, chunk_metadata in chunk_outcomes]
 
     # Exact stable identities are deterministic duplicates.  Broader workstream
     # grouping is only a candidate set: any semantic merge must pass through a
