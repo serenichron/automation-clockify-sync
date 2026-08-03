@@ -36,6 +36,7 @@ class CollectorBurstContextTests(unittest.TestCase):
 
     def test_runtime_identity_ignores_untracked_sync_and_state_artifacts(self) -> None:
         responses = [
+            mock.Mock(returncode=0, stdout=str(collector.ROOT) + "\n"),
             mock.Mock(returncode=0, stdout="7aa201af\n"),
             mock.Mock(returncode=0, stdout=""),
         ]
@@ -53,7 +54,24 @@ class CollectorBurstContextTests(unittest.TestCase):
                 "--porcelain",
                 "--untracked-files=no",
             ],
-            run.call_args_list[1].args[0],
+            run.call_args_list[2].args[0],
+        )
+
+    def test_runtime_identity_rejects_parent_git_repository_for_archive_bundle(self) -> None:
+        parent_repo = collector.ROOT.parent
+        with mock.patch.object(
+            collector.subprocess,
+            "run",
+            return_value=mock.Mock(returncode=0, stdout=str(parent_repo) + "\n"),
+        ) as run:
+            identity = collector.collector_runtime_identity()
+
+        self.assertIsNone(identity["git_sha"])
+        self.assertIsNone(identity["git_dirty"])
+        self.assertEqual(1, run.call_count)
+        self.assertEqual(
+            ["git", "-C", str(collector.ROOT), "rev-parse", "--show-toplevel"],
+            run.call_args.args[0],
         )
 
     def test_codex_two_bursts_use_distinct_user_context(self) -> None:
@@ -636,6 +654,42 @@ class CollectorBurstContextTests(unittest.TestCase):
         self.assertEqual("initial", result["failure"]["cursor"])
         self.assertEqual(0, result["failure"]["retry_count"])
 
+    def test_fathom_month_scale_deadline_allows_many_ordinary_pages(self) -> None:
+        calls = 0
+
+        def page_response(_url, _headers):
+            nonlocal calls
+            calls += 1
+            return {"items": [], "next_cursor": f"page-{calls}"} if calls < 32 else {"items": []}
+
+        with (
+            mock.patch.object(collector, "http_json", side_effect=page_response),
+            mock.patch.object(collector.time, "monotonic", side_effect=[0] + [181] * 32),
+        ):
+            result = collector.fetch_fathom(
+                {"FATHOM_API_KEY": "not-logged"}, SINCE, UNTIL
+            )
+
+        self.assertEqual("ok", result["status"])
+        self.assertTrue(result["complete"])
+        self.assertEqual(32, result["pages_fetched"])
+        self.assertEqual(0, result["retry_count"])
+        self.assertEqual(900, result["retry_policy"]["retry_deadline_seconds"])
+
+    def test_fathom_month_scale_deadline_still_bounds_collection(self) -> None:
+        with (
+            mock.patch.object(collector, "http_json") as http,
+            mock.patch.object(collector.time, "monotonic", side_effect=[0, 901]),
+        ):
+            result = collector.fetch_fathom(
+                {"FATHOM_API_KEY": "not-logged"}, SINCE, UNTIL
+            )
+
+        self.assertEqual("error", result["status"])
+        self.assertEqual("collection_retry_deadline_exhausted", result["error"])
+        self.assertEqual(1, result["failure"]["page"])
+        http.assert_not_called()
+
     def test_fathom_final_http_error_has_sanitized_failure_provenance(self) -> None:
         unavailable = urllib.error.HTTPError(
             "https://fathom.example.test/meetings?cursor=private", 503,
@@ -679,6 +733,49 @@ class CollectorBurstContextTests(unittest.TestCase):
         command = run.call_args.args[0][-1]
         self.assertIn("--expected-collector-sha256 expected-digest", command)
         self.assertIn("--coordinator-git-sha coordinator-sha", command)
+
+    def test_canonical_export_attestation_ignores_trailing_stdout_noise(self) -> None:
+        machine = {"name": "precision", "host": "precision.example.test", "collector_root": "/work/clockify"}
+        exported = {
+            "machine": "precision", "status": "ok", "claude_bursts": [],
+            "hermes_sessions": [], "hermes_db_sessions": [], "codex_sessions": [],
+            "repository_events": [], "repository_evidence_status": "complete", "errors": [],
+            "canonical_export_attestation": {
+                "collector_script_sha256": "expected-digest",
+                "runtime_identity": {"git_sha": "coordinator-sha", "git_dirty": False},
+            },
+        }
+        stdout = "profile notice\n" + json.dumps(exported) + "\ntrailing status\n"
+        completed = collector.subprocess.CompletedProcess(["ssh"], 0, stdout, "")
+        with (
+            mock.patch.object(collector, "collector_script_sha256", return_value="expected-digest"),
+            mock.patch.object(collector.subprocess, "run", return_value=completed),
+        ):
+            result = collector.collect_remote_sessions(
+                machine, SINCE, UNTIL, [],
+                coordinator_identity={"git_sha": "coordinator-sha", "git_dirty": False},
+            )
+
+        self.assertEqual("canonical_export_v1", result["collector_contract"])
+
+    def test_canonical_export_attestation_fails_closed_without_matching_payload(self) -> None:
+        machine = {"name": "precision", "host": "precision.example.test", "collector_root": "/work/clockify"}
+        stdout = "session detail must not be surfaced\n" + json.dumps({"machine": "other"}) + "\n"
+        completed = collector.subprocess.CompletedProcess(["ssh"], 0, stdout, "")
+        with (
+            mock.patch.object(collector, "collector_script_sha256", return_value="expected-digest"),
+            mock.patch.object(collector.subprocess, "run", return_value=completed) as run,
+        ):
+            result = collector.collect_remote_sessions(
+                machine, SINCE, UNTIL, [],
+                coordinator_identity={"git_sha": "coordinator-sha", "git_dirty": False},
+            )
+
+        self.assertEqual("unavailable", result["status"])
+        self.assertEqual(1, run.call_count)
+        self.assertEqual("invalid_payload", result["canonical_export"]["status"])
+        self.assertEqual(len(stdout.encode("utf-8")), result["canonical_export"]["stdout_bytes"])
+        self.assertNotIn("session detail", " ".join(result["errors"]))
 
     def test_canonical_export_attestation_accepts_matching_non_git_bundle(self) -> None:
         machine = {"name": "desktop", "host": "desktop.example.test", "collector_root": "/work/clockify"}

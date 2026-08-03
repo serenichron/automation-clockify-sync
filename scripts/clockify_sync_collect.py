@@ -38,7 +38,7 @@ FATHOM_MAX_RETRY_ATTEMPTS = 3
 FATHOM_MAX_RETRY_DELAY_SECONDS = 60
 FATHOM_MAX_COLLECTION_RETRIES = 12
 FATHOM_MAX_COLLECTION_RETRY_DELAY_SECONDS = 120
-FATHOM_COLLECTION_RETRY_DEADLINE_SECONDS = 180
+FATHOM_COLLECTION_RETRY_DEADLINE_SECONDS = 900
 CANONICAL_EXPORT_TIMEOUT_SECONDS = 900
 CANONICAL_EXPORT_TIMEOUT_MIN_SECONDS = 60
 CANONICAL_EXPORT_TIMEOUT_MAX_SECONDS = 1800
@@ -97,6 +97,19 @@ def collector_runtime_identity() -> dict[str, Any]:
     sha = None
     dirty = None
     try:
+        top_level = subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        top_level_path = top_level.stdout.strip()
+        if (
+            top_level.returncode != 0
+            or not top_level_path
+            or Path(top_level_path).resolve() != ROOT.resolve()
+        ):
+            raise RuntimeError("collector root is not a Git worktree")
         proc = subprocess.run(
             ["git", "-C", str(ROOT), "rev-parse", "HEAD"],
             capture_output=True,
@@ -264,6 +277,18 @@ def canonical_export_timeout_seconds() -> int:
         CANONICAL_EXPORT_TIMEOUT_MAX_SECONDS,
         max(CANONICAL_EXPORT_TIMEOUT_MIN_SECONDS, configured),
     )
+
+
+def canonical_export_payload(stdout: str, machine_name: str) -> dict[str, Any] | None:
+    """Find the last machine-specific JSON payload without exposing stdout."""
+    for line in reversed(stdout.splitlines()):
+        try:
+            candidate = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict) and candidate.get("machine") == machine_name:
+            return candidate
+    return None
 
 
 def clockify_get(path: str, cenv: dict[str, str]) -> Any:
@@ -1412,14 +1437,18 @@ def collect_remote_sessions(
                 timeout=canonical_timeout,
             )
             if canonical.returncode == 0:
-                try:
-                    exported = json.loads(canonical.stdout.strip().splitlines()[-1])
-                except (IndexError, json.JSONDecodeError):
+                exported = canonical_export_payload(canonical.stdout, machine["name"])
+                if exported is None:
                     result["errors"].append(
                         "canonical remote evidence export returned an invalid attestation payload; no legacy metadata fallback used"
                     )
+                    result["canonical_export"] = {
+                        "status": "invalid_payload",
+                        "returncode": canonical.returncode,
+                        "stdout_bytes": len(canonical.stdout.encode("utf-8", errors="replace")),
+                    }
                     return result
-                if isinstance(exported, dict) and exported.get("machine") == machine["name"]:
+                if isinstance(exported, dict):
                     attestation = exported.get("canonical_export_attestation")
                     if not isinstance(attestation, dict):
                         result["errors"].append(
@@ -1464,10 +1493,6 @@ def collect_remote_sessions(
                         "remote_git_sha": remote_git_sha or None,
                     }
                     return exported
-                result["errors"].append(
-                    "canonical remote evidence export identity mismatch; no legacy metadata fallback used"
-                )
-                return result
             result["errors"].append(
                 "canonical remote evidence export unavailable; legacy metadata fallback used"
             )
