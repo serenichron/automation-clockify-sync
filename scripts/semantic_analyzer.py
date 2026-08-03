@@ -616,6 +616,41 @@ def _body_for(
     }
 
 
+def _escaped_json_content_bytes(value: str) -> int:
+    """Return UTF-8 bytes needed when value is embedded in a JSON string."""
+    # canonical_json(value) includes precisely the two enclosing JSON quotes.
+    return len(canonical_json(value).encode("utf-8")) - 2
+
+
+def _alias_extra_bytes(count: int) -> int:
+    """Return bytes added when extraction aliases grow past ``ref-0001``.
+
+    The aliases are assigned from the sorted evidence-ID set.  Their values do
+    not affect serialization except when the decimal index becomes wider, so
+    the total adjustment depends only on the number of events in the request.
+    """
+    extra = 0
+    start = 10_000
+    width = 5
+    while start <= count:
+        end = min(count, (10 ** width) - 1)
+        extra += (end - start + 1) * (width - 4)
+        start = end + 1
+        width += 1
+    return extra
+
+
+def _chunk_event_bytes(event: dict[str, Any]) -> int:
+    """Return the embedded request-payload size of one projected event."""
+    evidence_id = str(event.get("evidence_id") or "")
+    if not SAFE_EVIDENCE_ID_RE.fullmatch(evidence_id):
+        raise AnalyzerError("cannot alias an unsafe evidence ID")
+    # All aliases through ref-9999 have this same byte length.  Wider aliases
+    # are accounted for collectively by _alias_extra_bytes.
+    model_event = {**event, "evidence_id": "ref-0001"}
+    return _escaped_json_content_bytes(canonical_json(model_event))
+
+
 def _safe_provisional_activity(activity: dict[str, Any]) -> dict[str, Any]:
     """Return the sole activity shape permitted in a cross-chunk request."""
     evidence_ids = sorted(str(value) for value in activity.get("evidence_ids", []))
@@ -732,6 +767,21 @@ def chunk_events(
     """
     # Size exactly what may leave the machine, never the raw immutable ledger.
     ordered = project_events(events)
+    _require_private_text_approval(ordered, private_text_approved)
+    # This empty request gives the exact model/prompt/correction envelope once.
+    # Candidate event text is then accounted for incrementally below; rebuilding
+    # a complete request for every event made large immutable ledgers quadratic.
+    empty_body_bytes = len(
+        canonical_json(
+            _body_for(
+                [],
+                model=model,
+                mode="extract",
+                corrections=corrections,
+                private_text_approved=private_text_approved,
+            )
+        ).encode("utf-8")
+    )
     by_day: dict[str, list[dict[str, Any]]] = {}
     for event in ordered:
         by_day.setdefault(_event_day(event), []).append(event)
@@ -739,40 +789,30 @@ def chunk_events(
     chunks: list[list[dict[str, Any]]] = []
     for day in sorted(by_day):
         current: list[dict[str, Any]] = []
+        current_event_bytes = 0
         for event in by_day[day]:
-            one_size = len(
-                canonical_json(
-                    _body_for(
-                        [event],
-                        model=model,
-                        mode="extract",
-                        corrections=corrections,
-                        private_text_approved=private_text_approved,
-                    )
-                ).encode("utf-8")
-            )
+            event_bytes = _chunk_event_bytes(event)
+            one_size = empty_body_bytes + event_bytes + _alias_extra_bytes(1)
             if one_size > max_body_bytes:
                 raise AnalyzerError(
                     f"evidence event {event.get('evidence_id') or '<unknown>'} "
                     f"exceeds analyzer request ceiling ({one_size} bytes)"
                 )
-            trial = [*current, event]
-            trial_size = len(
-                canonical_json(
-                    _body_for(
-                        trial,
-                        model=model,
-                        mode="extract",
-                        corrections=corrections,
-                        private_text_approved=private_text_approved,
-                    )
-                ).encode("utf-8")
+            trial_count = len(current) + 1
+            trial_size = (
+                empty_body_bytes
+                + current_event_bytes
+                + event_bytes
+                + len(current)
+                + _alias_extra_bytes(trial_count)
             )
             if current and trial_size > max_body_bytes:
                 chunks.append(current)
                 current = [event]
+                current_event_bytes = event_bytes
             else:
-                current = trial
+                current.append(event)
+                current_event_bytes += event_bytes
         if current:
             chunks.append(current)
     return chunks
@@ -1535,9 +1575,8 @@ def analyze_tiered(
     if len(original_by_id) != len(original_events):
         raise AnalyzerError("evidence IDs must be unique before semantic analysis")
     _require_private_text_approval(original_events, private_text_approved)
-    projected_events = project_events(original_events)
     chunks = chunk_events(
-        projected_events,
+        original_events,
         model=primary.model,
         max_body_bytes=max_body_bytes,
         corrections=corrections,

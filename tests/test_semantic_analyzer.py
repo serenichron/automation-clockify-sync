@@ -199,6 +199,37 @@ class SemanticAnalyzerTests(unittest.TestCase):
         with self.assertRaisesRegex(semantic.AnalyzerError, "exceeds analyzer request ceiling"):
             semantic.chunk_events([event("ev-a", content="x" * 10_000)], max_body_bytes=2_000)
 
+    def test_chunking_is_exact_linear_and_keeps_every_event_once(self):
+        events = [
+            event(f"ev-{index:03d}", content="x" * 1_024)
+            for index in range(30)
+        ]
+        ordered = semantic.project_events(events)
+        ceiling = len(
+            semantic.canonical_json(
+                semantic._body_for(ordered[:4], model="test", mode="extract")
+            ).encode("utf-8")
+        )
+
+        with mock.patch.object(semantic, "_body_for", wraps=semantic._body_for) as body_for:
+            chunks = semantic.chunk_events(
+                reversed(events), model="test", max_body_bytes=ceiling
+            )
+
+        self.assertEqual(1, body_for.call_count)
+        self.assertEqual([], body_for.call_args.args[0])
+        self.assertEqual(
+            [item["evidence_id"] for item in ordered],
+            [item["evidence_id"] for chunk in chunks for item in chunk],
+        )
+        self.assertEqual(len(events), len({item["evidence_id"] for chunk in chunks for item in chunk}))
+        self.assertTrue(all(
+            len(semantic.canonical_json(
+                semantic._body_for(chunk, model="test", mode="extract")
+            ).encode("utf-8")) <= ceiling
+            for chunk in chunks
+        ))
+
     def test_projection_preserves_structured_fathom_semantics_without_identity_fields(self):
         meeting = {
             "evidence_id": "ev-meeting",
