@@ -79,6 +79,8 @@ project routing, descriptions, time allocation, review identity, and safety.
 Raw evidence may overlap; proposed and existing Clockify allocations may not.
 Each activity carries minimum, recommended, and maximum active-effort estimates,
 normalized deterministically to five-minute timesheet granularity.
+Action rendering normalizes capitalization and removes only a redundant trailing
+verification verb for the same accomplishment; other compound actions still fail.
 Allocation prioritizes semantic confidence and direct human-attention signals,
 then places only the recommended demand inside observed spans of the cited
 semantic workstream. Unrelated evidence elsewhere that day cannot widen that

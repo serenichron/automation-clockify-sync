@@ -27,7 +27,7 @@ import urllib.request
 
 
 SCHEMA_VERSION = 1
-PROMPT_VERSION = "clockify-semantic-v4"
+PROMPT_VERSION = "clockify-semantic-v5"
 ANALYZER_CACHE_SCHEMA_VERSION = "clockify-analyzer-cache/v1"
 DEFAULT_PRIMARY_MODEL = "deepseek-v4-flash:cloud"
 DEFAULT_MAX_BODY_BYTES = 1_450_000
@@ -506,7 +506,7 @@ Every reviewable activity needs a specific split_rationale explaining why it is 
 atomic accomplishment. Never join verbs with "and", "or", "then", or "also".
 Every activities[] item MUST have a non-empty split_rationale, including an already
 atomic item or an item created by merging duplicate evidence. Never leave it blank.
-The action must be a past-tense verb phrase of one to three words. Put the specific
+The action must start with a capitalized past-tense verb phrase of one to three words. Put the specific
 object and bounded result in object and outcome, not in a long action.
 Give related atomic accomplishments the same short parent workstream name even when
 their specific objects differ; unrelated work must not share a workstream.
@@ -804,6 +804,19 @@ def _normalized_identity(value: Any) -> str:
     return re.sub(r"[^\w]+", " ", text, flags=re.UNICODE).strip()
 
 
+def _normalize_action(value: Any) -> str:
+    """Canonicalize casing and redundant same-change verification verbs only."""
+    action = _one_line(value)
+    redundant_verification = re.fullmatch(
+        r"([\w'-]+)\s+(?:and|then|&)\s+(?:verified|validated|confirmed|tested)",
+        action,
+        flags=re.IGNORECASE | re.UNICODE,
+    )
+    if redundant_verification:
+        action = redundant_verification.group(1)
+    return action[:1].upper() + action[1:] if action else action
+
+
 def _validate_atomic_parts(action: str, obj: str, outcome: str, split_rationale: str) -> None:
     """Reject obvious compound records; semantic edge cases remain review-gated."""
     if not split_rationale:
@@ -881,7 +894,7 @@ def validate_result(
         if lifecycle not in LIFECYCLES:
             raise AnalyzerError(f"invalid lifecycle: {lifecycle!r}")
         evidence_ids = evidence_ids_for(raw.get("evidence_ids"), "activity")
-        action = _one_line(raw.get("action"))
+        action = _normalize_action(raw.get("action"))
         obj = _one_line(raw.get("object"))
         outcome = _one_line(raw.get("outcome"))
         split_rationale = _one_line(raw.get("split_rationale"))
@@ -1298,7 +1311,7 @@ def probe_endpoint(endpoint: AnalyzerEndpoint, transport: Transport = http_trans
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": "Return JSON only."},
-            {"role": "user", "content": '{"probe":"clockify-semantic-v4"}'},
+            {"role": "user", "content": '{"probe":"clockify-semantic-v5"}'},
         ],
     }
     raw = transport(endpoint, body)

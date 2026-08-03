@@ -154,6 +154,26 @@ class SemanticAnalyzerTests(unittest.TestCase):
             result["activities"][0]["effort"],
         )
 
+    def test_redundant_verification_action_is_canonicalized_but_other_compounds_fail(self):
+        response = valid_response("ev-1")
+        response["activities"][0]["action"] = "implemented and verified"
+        result = semantic.validate_result(
+            response,
+            known_evidence_ids={"ev-1"},
+            provider_model="model-a",
+            analyzer_tier="primary",
+        )
+        self.assertEqual("Implemented", result["activities"][0]["action"])
+
+        response["activities"][0]["action"] = "investigated and fixed"
+        with self.assertRaisesRegex(semantic.AnalyzerError, "one atomic verb phrase"):
+            semantic.validate_result(
+                response,
+                known_evidence_ids={"ev-1"},
+                provider_model="model-a",
+                analyzer_tier="primary",
+            )
+
     def test_chunking_never_truncates_events_and_prefers_days(self):
         events = [event("ev-a", "2026-07-10"), event("ev-b", "2026-07-11")]
         chunks = semantic.chunk_events(events, max_body_bytes=50_000)
