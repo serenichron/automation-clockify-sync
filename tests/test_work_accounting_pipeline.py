@@ -540,18 +540,18 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             [early_one, early_two, late_one, late_two], early_analysis
         )
 
-        early = next(
-            row for row in result["proposals"]
-            if row["source_label"] == "Clockify review process"
+        self.assertFalse(
+            any(row["source_label"] == "Clockify review process" for row in result["proposals"])
         )
-        self.assertEqual("2026-07-10T09:00+03:00", early["start"])
-        self.assertEqual("2026-07-10T09:21+03:00", early["end"])
         contested = next(
             row for row in result["ambiguous"]
             if row.get("exception_kind") == "contested_time"
-            and row.get("activity_id") == early["activity_id"]
         )
-        self.assertEqual(39, contested["unallocated_minutes"])
+        self.assertEqual(60, contested["unallocated_minutes"])
+        self.assertIn(
+            ["2026-07-10T09:00+03:00", "2026-07-10T09:21+03:00"],
+            result["allocation"]["unallocated_capacity"]["intervals"],
+        )
 
     def test_title_only_fathom_meeting_is_a_fixed_exception(self):
         meeting = fathom_event("2026-07-10T13:00:00+03:00", "2026-07-10T14:00:00+03:00")

@@ -78,7 +78,9 @@ Models propose semantics only. Deterministic code owns evidence identity,
 project routing, descriptions, time allocation, review identity, and safety.
 Raw evidence may overlap; proposed and existing Clockify allocations may not.
 Each activity carries minimum, recommended, and maximum active-effort estimates,
-normalized deterministically to five-minute timesheet granularity.
+with the recommended estimate normalized to five-minute timesheet granularity.
+Deterministic code derives a conservative minimum/maximum safety band of roughly
+two-thirds to four-thirds around that estimate, rounded outward to five minutes.
 Action rendering normalizes capitalization and removes only a redundant trailing
 verification verb for the same accomplishment; other compound actions still fail.
 Allocation prioritizes semantic confidence and direct human-attention signals,

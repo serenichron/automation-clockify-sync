@@ -150,9 +150,21 @@ class SemanticAnalyzerTests(unittest.TestCase):
             analyzer_tier="primary",
         )
         self.assertEqual(
-            {"minimum_minutes": 10, "recommended_minutes": 35, "maximum_minutes": 35},
+            {"minimum_minutes": 20, "recommended_minutes": 35, "maximum_minutes": 50},
             result["activities"][0]["effort"],
         )
+        response["activities"][0]["effort"] = {
+            "minimum_minutes": 30,
+            "recommended_minutes": 33,
+            "maximum_minutes": 33,
+        }
+        second = semantic.validate_result(
+            response,
+            known_evidence_ids={"ev-1"},
+            provider_model="model-a",
+            analyzer_tier="primary",
+        )
+        self.assertEqual(result["activities"][0]["effort"], second["activities"][0]["effort"])
 
     def test_redundant_verification_action_is_canonicalized_but_other_compounds_fail(self):
         response = valid_response("ev-1")

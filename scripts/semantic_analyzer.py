@@ -27,7 +27,7 @@ import urllib.request
 
 
 SCHEMA_VERSION = 1
-PROMPT_VERSION = "clockify-semantic-v6"
+PROMPT_VERSION = "clockify-semantic-v7"
 ANALYZER_CACHE_SCHEMA_VERSION = "clockify-analyzer-cache/v1"
 DEFAULT_PRIMARY_MODEL = "deepseek-v4-flash:cloud"
 DEFAULT_MAX_BODY_BYTES = 1_450_000
@@ -801,6 +801,15 @@ def _five_minute_effort(value: int) -> int:
     return max(5, ((value + 2) // 5) * 5)
 
 
+def _effort_band(recommended: int) -> tuple[int, int]:
+    """Derive conservative deterministic bounds around a central estimate."""
+    minimum_unrounded = max(1, (recommended * 2) // 3)
+    maximum_unrounded = max(recommended, (recommended * 4 + 2) // 3)
+    minimum = max(5, (minimum_unrounded // 5) * 5)
+    maximum = max(recommended, ((maximum_unrounded + 4) // 5) * 5)
+    return minimum, maximum
+
+
 def _normalized_identity(value: Any) -> str:
     """Normalize harmless wording/punctuation variation for stable semantic IDs."""
     text = _one_line(value).casefold()
@@ -916,9 +925,8 @@ def validate_result(
         raw_maximum = _positive_int(effort.get("maximum_minutes"), "maximum_minutes")
         if not raw_minimum <= raw_recommended <= raw_maximum:
             raise AnalyzerError("effort must satisfy minimum <= recommended <= maximum")
-        minimum = _five_minute_effort(raw_minimum)
         recommended = _five_minute_effort(raw_recommended)
-        maximum = _five_minute_effort(raw_maximum)
+        minimum, maximum = _effort_band(recommended)
         project = raw.get("project_recommendation") or {}
         if not isinstance(project, dict):
             raise AnalyzerError("project_recommendation must be an object")
@@ -1314,7 +1322,7 @@ def probe_endpoint(endpoint: AnalyzerEndpoint, transport: Transport = http_trans
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": "Return JSON only."},
-            {"role": "user", "content": '{"probe":"clockify-semantic-v6"}'},
+            {"role": "user", "content": '{"probe":"clockify-semantic-v7"}'},
         ],
     }
     raw = transport(endpoint, body)
