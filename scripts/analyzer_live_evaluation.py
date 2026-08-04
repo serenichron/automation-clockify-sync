@@ -49,6 +49,7 @@ def _event(
         "content": content,
         "raw_source_span": {"start": start, "end": end},
         "project_context": {"name": "Serenichron Level 2"},
+        **({"source_ref": {"session_id": case_id}} if source_type != "fathom" else {}),
         **({"meeting_context": meeting_context} if meeting_context else {}),
     }
 
@@ -67,14 +68,24 @@ def synthetic_cases() -> list[dict[str, Any]]:
                 _event(
                     atomic,
                     1,
-                    content="Implemented a deny-by-default export gate and verified blocked requests.",
+                    content="Implement a deny-by-default export gate and verify blocked requests.",
                     start="2026-01-05T09:00:00+02:00",
+                    end="2026-01-05T09:01:00+02:00",
+                ),
+                _event(
+                    atomic,
+                    2,
+                    role="assistant",
+                    content="Implemented the export gate and verified blocked requests.",
+                    start="2026-01-05T09:01:00+02:00",
                     end="2026-01-05T09:24:00+02:00",
-                )
+                ),
             ],
-            "expected_activity_partitions": [[_evidence_id(atomic, 1)]],
+            "expected_activity_partitions": [[
+                _evidence_id(atomic, 1), _evidence_id(atomic, 2)
+            ]],
             "expected_activity_concepts": [{
-                "evidence_ids": [_evidence_id(atomic, 1)],
+                "evidence_ids": [_evidence_id(atomic, 1), _evidence_id(atomic, 2)],
                 "required_terms": ["export", "gate", "blocked"],
             }],
         },
@@ -84,29 +95,45 @@ def synthetic_cases() -> list[dict[str, Any]]:
                 _event(
                     split,
                     1,
-                    content="Reduced worker memory by removing duplicate document buffers.",
+                    content="Reduce worker memory by removing duplicate document buffers.",
                     start="2026-01-05T10:00:00+02:00",
-                    end="2026-01-05T10:28:00+02:00",
+                    end="2026-01-05T10:01:00+02:00",
                 ),
                 _event(
                     split,
                     2,
-                    content="Wrote the guarded rollout plan for the worker memory change.",
+                    role="assistant",
+                    content="Reduced worker memory by removing duplicate document buffers.",
+                    start="2026-01-05T10:01:00+02:00",
+                    end="2026-01-05T10:28:00+02:00",
+                ),
+                _event(
+                    split,
+                    3,
+                    content="Write the guarded rollout plan for the worker memory change.",
                     start="2026-01-05T10:30:00+02:00",
+                    end="2026-01-05T10:31:00+02:00",
+                ),
+                _event(
+                    split,
+                    4,
+                    role="assistant",
+                    content="Wrote the guarded rollout plan for the worker memory change.",
+                    start="2026-01-05T10:31:00+02:00",
                     end="2026-01-05T10:48:00+02:00",
                 ),
             ],
             "expected_activity_partitions": [
-                [_evidence_id(split, 1)],
-                [_evidence_id(split, 2)],
+                [_evidence_id(split, 1), _evidence_id(split, 2)],
+                [_evidence_id(split, 3), _evidence_id(split, 4)],
             ],
             "expected_activity_concepts": [
                 {
-                    "evidence_ids": [_evidence_id(split, 1)],
+                    "evidence_ids": [_evidence_id(split, 1), _evidence_id(split, 2)],
                     "required_terms": ["memory", "duplicate", "buffer"],
                 },
                 {
-                    "evidence_ids": [_evidence_id(split, 2)],
+                    "evidence_ids": [_evidence_id(split, 3), _evidence_id(split, 4)],
                     "required_terms": ["rollout", "plan"],
                 },
             ],
@@ -117,23 +144,45 @@ def synthetic_cases() -> list[dict[str, Any]]:
                 _event(
                     merge,
                     1,
-                    content="Implemented stable review identity from activity evidence fingerprints.",
+                    content="Implement stable review identity from activity evidence fingerprints.",
                     start="2026-01-05T11:00:00+02:00",
-                    end="2026-01-05T11:20:00+02:00",
+                    end="2026-01-05T11:01:00+02:00",
                 ),
                 _event(
                     merge,
                     2,
-                    content="Confirmed the same stable review identity survives allocation movement.",
+                    role="assistant",
+                    content="Implemented stable review identity from activity evidence fingerprints.",
+                    start="2026-01-05T11:01:00+02:00",
+                    end="2026-01-05T11:20:00+02:00",
+                ),
+                _event(
+                    merge,
+                    3,
+                    content="Confirm the same stable review identity survives allocation movement.",
                     start="2026-01-05T11:22:00+02:00",
+                    end="2026-01-05T11:23:00+02:00",
+                ),
+                _event(
+                    merge,
+                    4,
+                    role="assistant",
+                    content="Confirmed the same stable review identity survives allocation movement.",
+                    start="2026-01-05T11:23:00+02:00",
                     end="2026-01-05T11:35:00+02:00",
                 ),
             ],
             "expected_activity_partitions": [
-                [_evidence_id(merge, 1), _evidence_id(merge, 2)]
+                [
+                    _evidence_id(merge, 1), _evidence_id(merge, 2),
+                    _evidence_id(merge, 3), _evidence_id(merge, 4),
+                ]
             ],
             "expected_activity_concepts": [{
-                "evidence_ids": [_evidence_id(merge, 1), _evidence_id(merge, 2)],
+                "evidence_ids": [
+                    _evidence_id(merge, 1), _evidence_id(merge, 2),
+                    _evidence_id(merge, 3), _evidence_id(merge, 4),
+                ],
                 "required_terms": ["review", "identity", "allocation"],
             }],
         },

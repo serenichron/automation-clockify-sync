@@ -56,6 +56,13 @@ def _activity(members: list[dict], index: int, concepts: list[str]) -> dict:
 
 
 class AnalyzerLiveEvaluationTests(unittest.TestCase):
+    def test_reviewable_synthetic_partitions_pair_intent_with_result(self) -> None:
+        for case in live.synthetic_cases():
+            events_by_id = {event["evidence_id"]: event for event in case["events"]}
+            for partition in case["expected_activity_partitions"]:
+                roles = {events_by_id[evidence_id]["role"] for evidence_id in partition}
+                self.assertEqual({"user", "assistant"}, roles, case["case_id"])
+
     def test_synthetic_capture_produces_a_passing_digest_bound_scorecard(self) -> None:
         cases = {case["case_id"]: case for case in live.synthetic_cases()}
         ordered_cases = live.synthetic_cases()
@@ -78,8 +85,16 @@ class AnalyzerLiveEvaluationTests(unittest.TestCase):
             ]
             case = ordered_cases[evidence_calls // 2]
             evidence_calls += 1
-            original_ids = sorted(str(event["evidence_id"]) for event in case["events"])
-            aliases = dict(zip(original_ids, members, strict=True))
+            _provider_bundles, manifest = semantic_analyzer._semantic_evidence_bundles(
+                case["events"]
+            )
+            aliases = {
+                evidence_id: {"bundle_ref": bundle["bundle_ref"], **member}
+                for bundle, manifest_item in zip(payload["bundles"], manifest, strict=True)
+                for evidence_id, member in zip(
+                    manifest_item["evidence_ids"], bundle["members"], strict=True
+                )
+            }
             activities = [
                 _activity(
                     [aliases[value] for value in partition],
