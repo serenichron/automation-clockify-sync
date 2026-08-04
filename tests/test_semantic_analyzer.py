@@ -616,7 +616,8 @@ class SemanticAnalyzerTests(unittest.TestCase):
         )
         self.assertEqual(
             [
-                ("primary", "probe"), ("primary", "evidence"), ("primary", "evidence"),
+                ("primary", "probe"), ("primary", "evidence"),
+                ("primary", "evidence"), ("primary", "evidence"),
                 ("fallback", "probe"), ("fallback", "evidence"),
             ],
             calls,
@@ -685,10 +686,44 @@ class SemanticAnalyzerTests(unittest.TestCase):
             "contract_rejected_compound_action",
             requests[1]["repair_feedback"]["failure_code"],
         )
+        self.assertEqual(1, requests[1]["repair_feedback"]["attempt"])
+        self.assertEqual(2, requests[1]["repair_feedback"]["maximum_attempts"])
         repair_call = [call for call in calls if "repair_feedback" in call["payload"]][0]
         self.assertIn("CORRECTIVE RETRY", repair_call["system"])
         self.assertIn("Return one atomic past-tense action", repair_call["system"])
         self.assertNotIn("Fixed and published", repair_call["system"])
+        self.assertEqual("used", result["analysis_chunks"][0]["repair_status"])
+        self.assertEqual("primary", result["analysis_chunks"][0]["tier"])
+
+    def test_contract_rejection_can_use_second_bounded_repair_attempt(self):
+        calls: list[tuple[dict, int]] = []
+
+        def transport(endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            calls.append((payload, body.get("seed")))
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            response = provider_response(payload)
+            attempt = (payload.get("repair_feedback") or {}).get("attempt", 0)
+            if attempt < 2:
+                response["activities"][0]["action"] = "Fixed and published"
+            return response
+
+        result = semantic.analyze_tiered(
+            [event("ev-1")],
+            primary=semantic.AnalyzerEndpoint("primary", "http://primary", "cheap"),
+            transport=transport,
+        )
+
+        evidence_calls = [(payload, seed) for payload, seed in calls if not payload.get("probe")]
+        self.assertEqual([0, 1, 2], [seed for _, seed in evidence_calls])
+        self.assertEqual(
+            [None, 1, 2],
+            [
+                (payload.get("repair_feedback") or {}).get("attempt")
+                for payload, _ in evidence_calls
+            ],
+        )
         self.assertEqual("used", result["analysis_chunks"][0]["repair_status"])
         self.assertEqual("primary", result["analysis_chunks"][0]["tier"])
 
@@ -713,7 +748,10 @@ class SemanticAnalyzerTests(unittest.TestCase):
         )
 
         evidence_calls = [(name, payload) for name, payload in calls if not payload.get("probe")]
-        self.assertEqual(["primary", "primary", "fallback"], [name for name, _ in evidence_calls])
+        self.assertEqual(
+            ["primary", "primary", "primary", "fallback"],
+            [name for name, _ in evidence_calls],
+        )
         self.assertEqual(
             "contract_rejected_compound_action",
             evidence_calls[-1][1]["repair_feedback"]["failure_code"],
@@ -848,7 +886,9 @@ class SemanticAnalyzerTests(unittest.TestCase):
                 ("primary", "probe"),
                 ("primary", "extract"),
                 ("primary", "extract"),
+                ("primary", "extract"),
                 ("fallback", "probe"),
+                ("fallback", "extract"),
                 ("fallback", "extract"),
             ],
             calls,
@@ -1077,12 +1117,18 @@ class SemanticAnalyzerTests(unittest.TestCase):
                     max_events_per_chunk=1,
                     max_workers=2,
                 )
-            # The sealed primary rejection and its one repair rejection may be
-            # persisted.  The
-            # in-flight peer and all queued chunks cannot add cache records.
-            self.assertEqual(2, len(cache_path.read_text(encoding="utf-8").splitlines()))
+            # The sealed primary rejection and its two bounded repair
+            # rejections may be persisted. The in-flight peer and all queued
+            # chunks cannot add cache records.
+            self.assertEqual(3, len(cache_path.read_text(encoding="utf-8").splitlines()))
         self.assertEqual(
-            [("fallback", 10), ("primary", 10), ("primary", 10), ("primary", 11)],
+            [
+                ("fallback", 10),
+                ("primary", 10),
+                ("primary", 10),
+                ("primary", 10),
+                ("primary", 11),
+            ],
             sorted(extract_calls),
         )
 
@@ -1225,7 +1271,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
             [
                 ("primary", "probe"), ("primary", "extract"),
                 ("primary", "extract"), ("primary", "synthesize"),
-                ("primary", "synthesize"),
+                ("primary", "synthesize"), ("primary", "synthesize"),
                 ("fallback", "probe"), ("fallback", "synthesize"),
             ],
             calls,
@@ -1904,6 +1950,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
         self.assertEqual(
             [
                 ("primary", "probe"),
+                ("primary", "evidence"),
                 ("primary", "evidence"),
                 ("primary", "evidence"),
                 ("fallback", "probe"),

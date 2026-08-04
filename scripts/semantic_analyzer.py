@@ -34,7 +34,7 @@ except ImportError:  # pragma: no cover - direct script execution fallback
 
 
 SCHEMA_VERSION = 1
-PROMPT_VERSION = "clockify-semantic-v10"
+PROMPT_VERSION = "clockify-semantic-v11"
 ANALYZER_CACHE_SCHEMA_VERSION = "clockify-analyzer-cache/v2"
 EVIDENCE_BUNDLE_SCHEMA_VERSION = "clockify-semantic-evidence-bundle/v1"
 DEFAULT_PRIMARY_MODEL = "deepseek-v4-flash:cloud"
@@ -45,6 +45,7 @@ DEFAULT_MAX_BODY_BYTES = 1_450_000
 DEFAULT_CHUNK_BODY_BYTES = 250_000
 DEFAULT_MAX_EVENTS_PER_CHUNK = 250
 DEFAULT_ANALYZER_WORKERS = 4
+MAX_CONTRACT_REPAIR_ATTEMPTS = 2
 PRIVATE_TEXT_APPROVAL_ENV = "CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED"
 LIFECYCLES = {
     "completed",
@@ -883,6 +884,7 @@ def _request_messages(
     corrections: list[dict[str, Any]] | None = None,
     private_text_approved: bool | None = None,
     repair_failure_code: str | None = None,
+    repair_attempt: int | None = None,
 ) -> list[dict[str, str]]:
     _require_private_text_approval(events, private_text_approved)
     system = """You reconstruct human work for a Clockify ledger from cited evidence.
@@ -949,6 +951,12 @@ Output object:
 }
 """
     if repair_failure_code is not None:
+        if (
+            not isinstance(repair_attempt, int)
+            or isinstance(repair_attempt, bool)
+            or not 1 <= repair_attempt <= MAX_CONTRACT_REPAIR_ATTEMPTS
+        ):
+            raise AnalyzerError("repair attempt is invalid")
         system += _repair_system_addendum(repair_failure_code)
     model_bundles, _manifest = _semantic_evidence_bundles(events)
     payload = {
@@ -963,6 +971,8 @@ Output object:
         payload["repair_feedback"] = {
             "failure_code": repair_failure_code,
             "instruction": _repair_instruction(repair_failure_code),
+            "attempt": repair_attempt,
+            "maximum_attempts": MAX_CONTRACT_REPAIR_ATTEMPTS,
         }
     return [
         {"role": "system", "content": system},
@@ -978,11 +988,12 @@ def _body_for(
     corrections: list[dict[str, Any]] | None = None,
     private_text_approved: bool | None = None,
     repair_failure_code: str | None = None,
+    repair_attempt: int | None = None,
 ) -> dict[str, Any]:
     return {
         "model": model,
         "temperature": 0,
-        "seed": 0,
+        "seed": repair_attempt or 0,
         "response_format": {"type": "json_object"},
         "messages": _request_messages(
             events,
@@ -990,6 +1001,7 @@ def _body_for(
             corrections=corrections,
             private_text_approved=private_text_approved,
             repair_failure_code=repair_failure_code,
+            repair_attempt=repair_attempt,
         ),
     }
 
@@ -1078,7 +1090,8 @@ def _safe_provisional_activity(activity: dict[str, Any]) -> dict[str, Any]:
 
 
 def _synthesis_messages(
-    activities: list[dict[str, Any]], *, workstream_id: str, repair_failure_code: str | None = None,
+    activities: list[dict[str, Any]], *, workstream_id: str,
+    repair_failure_code: str | None = None, repair_attempt: int | None = None,
 ) -> list[dict[str, str]]:
     """Build a privacy-safe request to reconcile one repeated workstream."""
     if not SAFE_EVIDENCE_ID_RE.fullmatch(workstream_id):
@@ -1111,6 +1124,12 @@ non-empty merge_rationale.
 Do not invent projects, outcomes, effort, or timing. Never include paths, URLs, emails, secrets, IDs,
 or status prose in descriptive fields."""
     if repair_failure_code is not None:
+        if (
+            not isinstance(repair_attempt, int)
+            or isinstance(repair_attempt, bool)
+            or not 1 <= repair_attempt <= MAX_CONTRACT_REPAIR_ATTEMPTS
+        ):
+            raise AnalyzerError("repair attempt is invalid")
         system += _repair_system_addendum(repair_failure_code)
     payload = {
         "mode": "synthesize",
@@ -1123,6 +1142,8 @@ or status prose in descriptive fields."""
         payload["repair_feedback"] = {
             "failure_code": repair_failure_code,
             "instruction": _repair_instruction(repair_failure_code),
+            "attempt": repair_attempt,
+            "maximum_attempts": MAX_CONTRACT_REPAIR_ATTEMPTS,
         }
     return [
         {"role": "system", "content": system},
@@ -1132,15 +1153,16 @@ or status prose in descriptive fields."""
 
 def _synthesis_body(
     activities: list[dict[str, Any]], *, model: str, workstream_id: str,
-    repair_failure_code: str | None = None,
+    repair_failure_code: str | None = None, repair_attempt: int | None = None,
 ) -> dict[str, Any]:
     return {
         "model": model,
         "temperature": 0,
-        "seed": 0,
+        "seed": repair_attempt or 0,
         "response_format": {"type": "json_object"},
         "messages": _synthesis_messages(
-            activities, workstream_id=workstream_id, repair_failure_code=repair_failure_code
+            activities, workstream_id=workstream_id,
+            repair_failure_code=repair_failure_code, repair_attempt=repair_attempt,
         ),
     }
 
@@ -2011,6 +2033,7 @@ def _call_validated(
     before_transport: Callable[[AnalyzerEndpoint], None] | None = None,
     cancelled: Callable[[], bool] | None = None,
     repair_failure_code: str | None = None,
+    repair_attempt: int | None = None,
 ) -> dict[str, Any]:
     body = _body_for(
         events,
@@ -2019,6 +2042,7 @@ def _call_validated(
         corrections=corrections,
         private_text_approved=private_text_approved,
         repair_failure_code=repair_failure_code,
+        repair_attempt=repair_attempt,
     )
     if len(canonical_json(body).encode("utf-8")) > DEFAULT_MAX_BODY_BYTES:
         raise AnalyzerError("analyzer body exceeds configured request ceiling")
@@ -2091,6 +2115,7 @@ def _call_synthesis_validated(
     cache: AnalyzerResponseCache | None = None,
     before_transport: Callable[[AnalyzerEndpoint], None] | None = None,
     repair_failure_code: str | None = None,
+    repair_attempt: int | None = None,
 ) -> dict[str, Any]:
     """Synthesize one repeated workstream and reject any lost evidence."""
     body = _synthesis_body(
@@ -2098,6 +2123,7 @@ def _call_synthesis_validated(
         model=endpoint.model,
         workstream_id=workstream_id,
         repair_failure_code=repair_failure_code,
+        repair_attempt=repair_attempt,
     )
     if len(canonical_json(body).encode("utf-8")) > DEFAULT_MAX_BODY_BYTES:
         raise AnalyzerError("synthesis body exceeds configured request ceiling")
@@ -2336,37 +2362,46 @@ def analyze_tiered(
                 cancelled=cancellation.is_set,
             )
         except AnalyzerContractError as initial_error:
-            # A sealed contract rejection may receive exactly one corrective
-            # request.  The feedback is category-only, so neither rejected
-            # prose nor raw model output can enter a request or the cache.
-            initial_failure_code = _contract_failure_code(initial_error)
-            try:
-                result = _call_validated(
-                    primary,
-                    chunk,
-                    tier="primary",
-                    transport=transport,
-                    corrections=corrections,
-                    known_evidence_ids=chunk_ids,
-                    evidence_time_spans=chunk_spans,
-                    private_text_approved=private_text_approved,
-                    cache=cache,
-                    before_transport=before_extraction_transport,
-                    cancelled=cancellation.is_set,
-                    repair_failure_code=initial_failure_code,
-                )
-            except AnalyzerContractError as repair_error:
+            # A sealed contract rejection receives a small, deterministic
+            # corrective budget. Each attempt has its own seed and cache
+            # identity. Feedback remains category-only, so neither rejected
+            # prose nor raw model output enters a request or the cache.
+            repair_error: AnalyzerContractError = initial_error
+            for repair_attempt in range(1, MAX_CONTRACT_REPAIR_ATTEMPTS + 1):
+                repair_failure_code = _contract_failure_code(repair_error)
+                try:
+                    result = _call_validated(
+                        primary,
+                        chunk,
+                        tier="primary",
+                        transport=transport,
+                        corrections=corrections,
+                        known_evidence_ids=chunk_ids,
+                        evidence_time_spans=chunk_spans,
+                        private_text_approved=private_text_approved,
+                        cache=cache,
+                        before_transport=before_extraction_transport,
+                        cancelled=cancellation.is_set,
+                        repair_failure_code=repair_failure_code,
+                        repair_attempt=repair_attempt,
+                    )
+                except AnalyzerContractError as error:
+                    repair_error = error
+                    continue
+                except AnalyzerError:
+                    # The original sealed rejection remains the contract
+                    # evidence; transport faults are never blindly retried.
+                    primary_error = initial_error
+                    fallback_feedback = _contract_failure_code(initial_error)
+                    repair_status = "transport_failed"
+                    break
+                else:
+                    repair_status = "used"
+                    break
+            else:
                 primary_error = repair_error
                 fallback_feedback = _contract_failure_code(repair_error)
                 repair_status = "rejected"
-            except AnalyzerError:
-                # The original sealed rejection remains the contract evidence;
-                # a repair transport fault is never retried.
-                primary_error = initial_error
-                fallback_feedback = initial_failure_code
-                repair_status = "transport_failed"
-            else:
-                repair_status = "used"
         except AnalyzerError as error:
             primary_error = error
         if primary_error is not None:
@@ -2375,22 +2410,38 @@ def analyze_tiered(
                 raise AnalyzerError(
                     f"primary analyzer failed for chunk {index + 1}: {primary_error}"
                 ) from primary_error
-            try:
-                result = _call_validated(
-                    fallback,
-                    chunk,
-                    tier="fallback",
-                    transport=transport,
-                    corrections=corrections,
-                    known_evidence_ids=chunk_ids,
-                    evidence_time_spans=chunk_spans,
-                    private_text_approved=private_text_approved,
-                    cache=cache,
-                    before_transport=before_extraction_transport,
-                    cancelled=cancellation.is_set,
-                    repair_failure_code=fallback_feedback,
-                )
-            except AnalyzerError as fallback_error:
+            fallback_error: AnalyzerError | None = None
+            fallback_attempt_start = 1 if fallback_feedback is not None else 0
+            for fallback_attempt in range(
+                fallback_attempt_start, MAX_CONTRACT_REPAIR_ATTEMPTS + 1
+            ):
+                try:
+                    result = _call_validated(
+                        fallback,
+                        chunk,
+                        tier="fallback",
+                        transport=transport,
+                        corrections=corrections,
+                        known_evidence_ids=chunk_ids,
+                        evidence_time_spans=chunk_spans,
+                        private_text_approved=private_text_approved,
+                        cache=cache,
+                        before_transport=before_extraction_transport,
+                        cancelled=cancellation.is_set,
+                        repair_failure_code=fallback_feedback,
+                        repair_attempt=(fallback_attempt or None),
+                    )
+                except AnalyzerContractError as error:
+                    fallback_error = error
+                    fallback_feedback = _contract_failure_code(error)
+                    continue
+                except AnalyzerError as error:
+                    fallback_error = error
+                    break
+                else:
+                    fallback_error = None
+                    break
+            if fallback_error is not None:
                 _raise_if_cancelled(cancellation.is_set)
                 if not all(isinstance(error, AnalyzerContractError) for error in (
                     primary_error, fallback_error
@@ -2609,28 +2660,37 @@ def analyze_tiered(
             used = primary
             tier = "primary"
         except AnalyzerContractError as initial_error:
-            initial_failure_code = _contract_failure_code(initial_error)
-            try:
-                synthesized = _call_synthesis_validated(
-                    primary,
-                    provisional,
-                    workstream_id=workstream_id,
-                    tier="primary",
-                    transport=transport,
-                    known_evidence_ids=synthesis_ids,
-                    evidence_time_spans=synthesis_spans,
-                    cache=cache,
-                    before_transport=probe_once,
-                    repair_failure_code=initial_failure_code,
-                )
-                used = primary
-                tier = "primary"
-            except AnalyzerContractError as repair_error:
+            repair_error: AnalyzerContractError = initial_error
+            for repair_attempt in range(1, MAX_CONTRACT_REPAIR_ATTEMPTS + 1):
+                repair_failure_code = _contract_failure_code(repair_error)
+                try:
+                    synthesized = _call_synthesis_validated(
+                        primary,
+                        provisional,
+                        workstream_id=workstream_id,
+                        tier="primary",
+                        transport=transport,
+                        known_evidence_ids=synthesis_ids,
+                        evidence_time_spans=synthesis_spans,
+                        cache=cache,
+                        before_transport=probe_once,
+                        repair_failure_code=repair_failure_code,
+                        repair_attempt=repair_attempt,
+                    )
+                except AnalyzerContractError as error:
+                    repair_error = error
+                    continue
+                except AnalyzerError:
+                    primary_error = initial_error
+                    fallback_feedback = _contract_failure_code(initial_error)
+                    break
+                else:
+                    used = primary
+                    tier = "primary"
+                    break
+            else:
                 primary_error = repair_error
                 fallback_feedback = _contract_failure_code(repair_error)
-            except AnalyzerError:
-                primary_error = initial_error
-                fallback_feedback = initial_failure_code
         except AnalyzerError as error:
             primary_error = error
         if primary_error is not None:
@@ -2638,20 +2698,36 @@ def analyze_tiered(
                 raise AnalyzerError(
                     f"primary analyzer failed for synthesis {workstream_id}: {primary_error}"
                 ) from primary_error
-            try:
-                synthesized = _call_synthesis_validated(
-                    fallback,
-                    provisional,
-                    workstream_id=workstream_id,
-                    tier="fallback",
-                    transport=transport,
-                    known_evidence_ids=synthesis_ids,
-                    evidence_time_spans=synthesis_spans,
-                    cache=cache,
-                    before_transport=probe_once,
-                    repair_failure_code=fallback_feedback,
-                )
-            except AnalyzerError as fallback_error:
+            fallback_error: AnalyzerError | None = None
+            fallback_attempt_start = 1 if fallback_feedback is not None else 0
+            for fallback_attempt in range(
+                fallback_attempt_start, MAX_CONTRACT_REPAIR_ATTEMPTS + 1
+            ):
+                try:
+                    synthesized = _call_synthesis_validated(
+                        fallback,
+                        provisional,
+                        workstream_id=workstream_id,
+                        tier="fallback",
+                        transport=transport,
+                        known_evidence_ids=synthesis_ids,
+                        evidence_time_spans=synthesis_spans,
+                        cache=cache,
+                        before_transport=probe_once,
+                        repair_failure_code=fallback_feedback,
+                        repair_attempt=(fallback_attempt or None),
+                    )
+                except AnalyzerContractError as error:
+                    fallback_error = error
+                    fallback_feedback = _contract_failure_code(error)
+                    continue
+                except AnalyzerError as error:
+                    fallback_error = error
+                    break
+                else:
+                    fallback_error = None
+                    break
+            if fallback_error is not None:
                 if not all(isinstance(error, AnalyzerContractError) for error in (
                     primary_error, fallback_error
                 )):
