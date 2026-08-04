@@ -27,9 +27,14 @@ from typing import Any, Callable, Iterable, Mapping
 import urllib.error
 import urllib.request
 
+try:
+    from scripts import caveman_renderer
+except ImportError:  # pragma: no cover - direct script execution fallback
+    import caveman_renderer  # type: ignore[no-redef]
+
 
 SCHEMA_VERSION = 1
-PROMPT_VERSION = "clockify-semantic-v9"
+PROMPT_VERSION = "clockify-semantic-v10"
 ANALYZER_CACHE_SCHEMA_VERSION = "clockify-analyzer-cache/v2"
 EVIDENCE_BUNDLE_SCHEMA_VERSION = "clockify-semantic-evidence-bundle/v1"
 DEFAULT_PRIMARY_MODEL = "deepseek-v4-flash:cloud"
@@ -147,6 +152,7 @@ _CONTRACT_FAILURE_PATTERNS: tuple[tuple[str, str], ...] = (
     ("missing_atomicity_rationale", "explicit atomicity rationale"),
     ("compound_action", "one atomic verb phrase"),
     ("compound_field", "multiple accomplishment clauses"),
+    ("description_contract", "caveman render contract"),
     ("missing_evidence_span", "nonempty evidence_spans"),
     ("invalid_evidence_span", "valid start and end timestamps"),
     ("unsupported_evidence_span", "not supported by cited evidence"),
@@ -197,6 +203,12 @@ def _repair_instruction(failure_code: str) -> str:
     instructions = {
         "compound_action": "Return one atomic past-tense action per activity; split unrelated actions.",
         "compound_field": "Keep each action, object, and outcome to one accomplishment clause.",
+        "description_contract": (
+            "Rewrite action, object, and outcome so their exact neutral render "
+            "'SC — action object outcome' is 5-14 words, targets 8-14 words, "
+            "and contains no slash, underscore, Markdown, path, URL, hash, "
+            "first-person wording, status prose, or truncation."
+        ),
         "omitted_evidence": "Account for every supplied bundle member exactly once with ranges.",
         "duplicate_evidence": "Keep member ranges disjoint across the full result.",
         "missing_evidence_span": "Give every reviewable activity a supported nonempty evidence span.",
@@ -907,8 +919,10 @@ never overlap. Account for every member of every input bundle exactly once acros
 activities, exceptions, and omissions. Exceptions and omissions also require
 evidence_partitions. Do not return original evidence IDs. Do not allocate start/end
 Clockify blocks.
-Write action + object + outcome so the final prefixed description is 8-14 words,
-using terse past-tense Caveman wording and no Markdown, IDs, paths, URLs, or status prose.
+Write action + object + outcome so the exact neutral render
+"SC — {action} {object} {outcome}" has 5-14 total words and targets 8-14.
+Use terse past-tense Caveman wording. Do not use slashes, underscores, Markdown,
+IDs, paths, URLs, hashes, first-person wording, status prose, or truncation.
 Project prefix and tags are recommendations only. Leave them blank when the evidence
 does not explicitly support them; deterministic routing owns the final project and tags.
 
@@ -1505,6 +1519,19 @@ def validate_result(
             raise AnalyzerError("reviewable activity requires a workstream")
         if lifecycle not in {"planned", "noise"}:
             _validate_atomic_parts(action, obj, outcome, split_rationale)
+            try:
+                caveman_renderer.render(
+                    {
+                        "prefix": "SC",
+                        "action": action,
+                        "object": obj,
+                        "outcome": outcome,
+                    }
+                )
+            except caveman_renderer.CavemanValidationError as exc:
+                raise AnalyzerError(
+                    f"activity violates Caveman render contract: {exc}"
+                ) from exc
         effort = raw.get("effort")
         if not isinstance(effort, dict):
             raise AnalyzerError("activity effort must be an object")

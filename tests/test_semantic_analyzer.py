@@ -181,6 +181,21 @@ class SemanticAnalyzerTests(unittest.TestCase):
                 analyzer_tier="primary",
             )
 
+    def test_rejects_activity_parts_that_cannot_render_as_caveman_text(self):
+        response = valid_response("ev-1")
+        response["activities"][0]["object"] = "Clockify descriptions and allocations"
+        response["activities"][0]["outcome"] = (
+            "removed transcript fragments while preserving every evidence reference without truncation"
+        )
+
+        with self.assertRaisesRegex(semantic.AnalyzerError, "Caveman render contract"):
+            semantic.validate_result(
+                response,
+                known_evidence_ids={"ev-1"},
+                provider_model="model-a",
+                analyzer_tier="primary",
+            )
+
     def test_effort_is_normalized_to_five_minute_granularity(self):
         response = valid_response("ev-1")
         response["activities"][0]["effort"] = {

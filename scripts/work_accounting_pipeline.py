@@ -45,6 +45,11 @@ NOISE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("polling", re.compile(r"^\s*(?:polling|checking again|still running|download(?:s)? running)(?:\s*[:—-].*)?\s*$", re.I)),
     ("injected_wrapper", re.compile(r"<(?:codex_internal_context|command-message|local-command)", re.I)),
 )
+AUTONOMOUS_MULTICA_SESSION_RE = re.compile(
+    r"\byou are running as (?:a )?(?:local coding )?agent for a multica workspace\b|"
+    r"\byour assigned issue id is\b",
+    re.I,
+)
 
 
 class WorkAccountingError(RuntimeError):
@@ -212,6 +217,29 @@ def _analysis_events(events: Iterable[dict[str, Any]]) -> tuple[list[dict[str, A
             == f"{source.get('source_type')}_event"
         )
     }
+    autonomous_session_keys = {
+        (
+            str(source.get("source_type") or ""),
+            str(source.get("machine") or ""),
+            str(source.get("session_id") or ""),
+        )
+        for event in event_list
+        for source in (
+            event.get("source_ref")
+            if isinstance(event.get("source_ref"), Mapping)
+            else {},
+        )
+        if (
+            str(event.get("source_type") or "")
+            in {"codex_sessions", "hermes_db_sessions", "claude_bursts"}
+            and source.get("source_type")
+            and source.get("machine")
+            and source.get("session_id")
+            and AUTONOMOUS_MULTICA_SESSION_RE.search(
+                str(_attributes(event).get("first_user_message") or "")
+            )
+        )
+    }
     for event in event_list:
         source_type = str(event.get("source_type") or "")
         if source_type == "clockify":
@@ -236,21 +264,27 @@ def _analysis_events(events: Iterable[dict[str, Any]]) -> tuple[list[dict[str, A
                     "reason": f"fathom_preclassified:{exclusion or semantic_status}",
                 })
                 continue
+        source = (
+            event.get("source_ref")
+            if isinstance(event.get("source_ref"), Mapping)
+            else {}
+        )
+        session_key = (
+            str(source.get("source_type") or source_type),
+            str(source.get("machine") or ""),
+            str(source.get("session_id") or ""),
+        )
+        if session_key in autonomous_session_keys:
+            noise.append({
+                "evidence_id": str(event.get("evidence_id")),
+                "reason": "autonomous_background_session",
+            })
+            continue
         if has_message_events and source_type.startswith("enriched_"):
             # Canonical message events are richer; old enriched snippets would
             # duplicate and bias the semantic model.
             continue
         if source_type in {"codex_sessions", "hermes_db_sessions", "claude_bursts"}:
-            source = (
-                event.get("source_ref")
-                if isinstance(event.get("source_ref"), Mapping)
-                else {}
-            )
-            session_key = (
-                str(source.get("source_type") or source_type),
-                str(source.get("machine") or ""),
-                str(source.get("session_id") or ""),
-            )
             if session_key in canonical_session_keys:
                 noise.append({
                     "evidence_id": str(event.get("evidence_id")),

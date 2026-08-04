@@ -326,6 +326,65 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             noise,
         )
 
+    def test_multica_coding_agent_sessions_are_autonomous_background(self):
+        summary = {
+            "evidence_id": "ev-summary",
+            "source_type": "hermes_db_sessions",
+            "source_ref": {
+                "source_type": "hermes_db_sessions",
+                "machine": "macbook",
+                "session_id": "agent-session",
+            },
+            "attributes": {
+                "first_user_message": (
+                    "You are running as a local coding agent for a Multica workspace. "
+                    "Your assigned issue ID is: issue-1"
+                ),
+            },
+        }
+        autonomous_event = {
+            "evidence_id": "ev-agent",
+            "source_type": "hermes_db_sessions_event",
+            "source_ref": {
+                "source_type": "hermes_db_sessions",
+                "machine": "macbook",
+                "session_id": "agent-session",
+            },
+            "attributes": {
+                "role": "assistant",
+                "kind": "message",
+                "content": "Completed the assigned issue",
+            },
+        }
+        direct_chat = {
+            "evidence_id": "ev-direct",
+            "source_type": "hermes_db_sessions_event",
+            "source_ref": {
+                "source_type": "hermes_db_sessions",
+                "machine": "macbook",
+                "session_id": "direct-chat",
+            },
+            "attributes": {
+                "role": "user",
+                "kind": "message",
+                "content": "Review the sales workflow",
+            },
+        }
+
+        retained, noise = pipeline._analysis_events(
+            [summary, autonomous_event, direct_chat]
+        )
+
+        self.assertEqual(["ev-direct"], [event["evidence_id"] for event in retained])
+        self.assertEqual(
+            {"ev-summary", "ev-agent"},
+            {
+                item["evidence_id"]
+                for item in noise
+                if item["reason"] == "autonomous_background_session"
+            },
+        )
+
     def test_noise_words_inside_substantive_accomplishments_are_preserved(self):
         for content in (
             "Fixed heartbeat failures in the session monitor",
