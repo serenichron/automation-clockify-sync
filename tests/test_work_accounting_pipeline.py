@@ -287,6 +287,45 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         )
         self.assertFalse(any(item["evidence_id"] == "ev-summary" for item in noise))
 
+    def test_repository_history_is_corroborative_not_standalone_work(self):
+        repository_event = {
+            "evidence_id": "ev-commit",
+            "source_type": "repository_events",
+            "source_ref": {"source_type": "repository_events", "source_id": "commit-1"},
+            "observed_at": "2026-07-10T09:05:00+03:00",
+            "attributes": {
+                "repository_root": "/work/upstream",
+                "subject": "Bump dependency version",
+                "artifacts": ["package.json"],
+            },
+        }
+        session_event = {
+            "evidence_id": "ev-session",
+            "source_type": "codex_sessions_event",
+            "source_ref": {
+                "source_type": "codex_sessions",
+                "machine": "precision",
+                "session_id": "session-1",
+            },
+            "observed_at": "2026-07-10T09:00:00+03:00",
+            "attributes": {
+                "role": "user",
+                "kind": "message",
+                "content": "Fix the review workflow",
+            },
+        }
+
+        retained, noise = pipeline._analysis_events([repository_event, session_event])
+
+        self.assertEqual(["ev-session"], [event["evidence_id"] for event in retained])
+        self.assertIn(
+            {
+                "evidence_id": "ev-commit",
+                "reason": "corroborative_repository_evidence",
+            },
+            noise,
+        )
+
     def test_noise_words_inside_substantive_accomplishments_are_preserved(self):
         for content in (
             "Fixed heartbeat failures in the session monitor",

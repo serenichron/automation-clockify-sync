@@ -216,6 +216,17 @@ def _analysis_events(events: Iterable[dict[str, Any]]) -> tuple[list[dict[str, A
         source_type = str(event.get("source_type") or "")
         if source_type == "clockify":
             continue
+        if source_type == "repository_events":
+            # Git history is immutable corroboration, not proof that Vlad
+            # performed each commit. Repositories observed from a session CWD
+            # may include fetched upstream, dependency-bot, or autonomous-agent
+            # commits. Keep every commit in the evidence ledger, but do not let
+            # an unbound commit become a standalone timesheet activity.
+            noise.append({
+                "evidence_id": str(event.get("evidence_id")),
+                "reason": "corroborative_repository_evidence",
+            })
+            continue
         if source_type == "fathom":
             eligible, exclusion = _meeting_is_eligible(event)
             semantic_status = str(_attributes(event).get("semantic_evidence_status") or "")

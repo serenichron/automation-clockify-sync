@@ -188,6 +188,12 @@ bodies, credentials, emails, URLs, absolute paths, and hashes never cross that
 boundary. Safe text is not clipped; an individually oversized projected event
 blocks analysis.
 
+Repository commits and changed-file lists remain immutable ledger evidence, but
+they are corroborative-only until deterministically bound to a human session or
+issue workstream. Observing a repository from a session CWD does not prove that
+Vlad authored every commit in its July history: fetched upstream, dependency-bot,
+and autonomous-agent commits must never become standalone Clockify activities.
+
 Fathom collection queries records created from one day before the requested
 window through its end, then filters locally by recording or scheduled
 occurrence overlap. Live July validation showed Fathom records were created
