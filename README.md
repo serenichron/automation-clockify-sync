@@ -361,8 +361,11 @@ exception, and omission dispositions, production schema/citation and atomicity
 rules, concrete accomplishment concepts, and renderer/forbidden-description
 compliance. Adjacent repeated words are rejected. Replay stability
 compares the review-relevant decision—disposition, partitions, lifecycle,
-effort, and confidence—rather than arbitrary rationale prose. The append-only
-validated decision cache owns exact output replay and is separately integrity
+effort, and confidence—rather than arbitrary rationale prose.
+For waiting-only evidence, `planned` and `noise` are equivalent omission
+lifecycles because neither creates a review row; activity boundaries and
+exception kinds remain exact.
+The append-only validated decision cache owns exact output replay and is separately integrity
 checked. Long immutable ledger IDs never rely on model copying: local code
 expands disjoint bundle-member ranges before schema and citation validation. Prefix validation
 uses a neutral placeholder because deterministic routing owns the final prefix.

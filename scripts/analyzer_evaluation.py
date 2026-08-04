@@ -180,11 +180,11 @@ def _concepts(value: Any) -> dict[tuple[str, ...], tuple[str, ...]]:
 
 def _nonactivity_expectations(
     value: Any, *, classification: str
-) -> dict[tuple[str, ...], str]:
+) -> dict[tuple[str, ...], tuple[str, ...]]:
     if not isinstance(value, list):
         raise EvaluationError(f"expected_{classification} must be a list")
-    field = "kind" if classification == "exceptions" else "lifecycle"
-    result: dict[tuple[str, ...], str] = {}
+    field = "kind" if classification == "exceptions" else "lifecycles"
+    result: dict[tuple[str, ...], tuple[str, ...]] = {}
     for item in value:
         raw = _require_mapping(item, f"expected_{classification} item")
         _require_keys(
@@ -196,12 +196,15 @@ def _nonactivity_expectations(
             [raw["evidence_ids"]],
             f"expected_{classification}.evidence_ids",
         )[0]
-        decision = str(raw[field] or "").strip()
-        if not re.fullmatch(r"[a-z][a-z_]{1,63}", decision):
+        raw_decisions = [raw[field]] if classification == "exceptions" else raw[field]
+        if not isinstance(raw_decisions, list) or not raw_decisions:
+            raise EvaluationError(f"expected_{classification} {field} is invalid")
+        decisions = tuple(sorted({str(item or "").strip() for item in raw_decisions}))
+        if any(not re.fullmatch(r"[a-z][a-z_]{1,63}", item) for item in decisions):
             raise EvaluationError(f"expected_{classification} {field} is invalid")
         if group in result:
             raise EvaluationError(f"expected_{classification} repeats a partition")
-        result[group] = decision
+        result[group] = decisions
     return result
 
 
@@ -213,8 +216,8 @@ def _validate_case_contract(
     list[str],
     list[tuple[str, ...]],
     dict[tuple[str, ...], tuple[str, ...]],
-    dict[tuple[str, ...], str],
-    dict[tuple[str, ...], str],
+    dict[tuple[str, ...], tuple[str, ...]],
+    dict[tuple[str, ...], tuple[str, ...]],
 ]:
     value = _require_mapping(case, "case")
     _require_keys(
@@ -384,7 +387,7 @@ def _review_decision_signature(result: Mapping[str, Any]) -> str:
     omissions = sorted(
         (
             {
-                "lifecycle": value["lifecycle"],
+                "disposition": "omitted",
                 "evidence_ids": sorted(str(item) for item in value["evidence_ids"]),
             }
             for value in result["omissions"]
@@ -399,8 +402,8 @@ def _review_decision_signature(result: Mapping[str, Any]) -> str:
 def _nonactivity_dispositions_are_valid(
     result: Mapping[str, Any],
     *,
-    expected_exceptions: Mapping[tuple[str, ...], str],
-    expected_omissions: Mapping[tuple[str, ...], str],
+    expected_exceptions: Mapping[tuple[str, ...], tuple[str, ...]],
+    expected_omissions: Mapping[tuple[str, ...], tuple[str, ...]],
 ) -> bool:
     actual_exceptions = {
         tuple(sorted(str(item) for item in value["evidence_ids"])): str(
@@ -415,13 +418,21 @@ def _nonactivity_dispositions_are_valid(
         for value in result["omissions"]
     }
     return (
-        actual_exceptions == dict(expected_exceptions)
-        and actual_omissions == dict(expected_omissions)
+        set(actual_exceptions) == set(expected_exceptions)
+        and all(
+            actual_exceptions[group] in expected_exceptions[group]
+            for group in actual_exceptions
+        )
+        and set(actual_omissions) == set(expected_omissions)
+        and all(
+            actual_omissions[group] in expected_omissions[group]
+            for group in actual_omissions
+        )
     )
 
 
 def _case_score(
-    case: Mapping[str, Any], *, evidence_ids: list[str], expected_partitions: list[tuple[str, ...]], expected_concepts: Mapping[tuple[str, ...], tuple[str, ...]], expected_exceptions: Mapping[tuple[str, ...], str], expected_omissions: Mapping[tuple[str, ...], str], corpus_spans: Mapping[str, dict[str, str]], route: Mapping[str, str]
+    case: Mapping[str, Any], *, evidence_ids: list[str], expected_partitions: list[tuple[str, ...]], expected_concepts: Mapping[tuple[str, ...], tuple[str, ...]], expected_exceptions: Mapping[tuple[str, ...], tuple[str, ...]], expected_omissions: Mapping[tuple[str, ...], tuple[str, ...]], corpus_spans: Mapping[str, dict[str, str]], route: Mapping[str, str]
 ) -> dict[str, Any]:
     normalized: list[dict[str, Any]] = []
     schema_ok = True

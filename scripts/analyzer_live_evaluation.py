@@ -226,7 +226,7 @@ def synthetic_cases() -> list[dict[str, Any]]:
             "expected_exceptions": [],
             "expected_omissions": [{
                 "evidence_ids": [_evidence_id(noise, 1)],
-                "lifecycle": "noise",
+                "lifecycles": ["noise", "planned"],
             }],
         },
     ]

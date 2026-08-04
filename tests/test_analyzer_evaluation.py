@@ -137,6 +137,34 @@ class AnalyzerEvaluationTests(unittest.TestCase):
             scorecard["results"][0]["checks"]["nonactivity_dispositions_valid"]
         )
 
+    def test_planned_and_noise_are_stable_equivalent_omissions(self) -> None:
+        source = document()
+        case = source["cases"][0]
+        evidence = case["evidence_ids"][0]
+        case["expected_activity_partitions"] = []
+        case["expected_activity_concepts"] = []
+        case["expected_omissions"] = [{
+            "evidence_ids": [evidence],
+            "lifecycles": ["noise", "planned"],
+        }]
+        case["replays"] = [
+            {
+                "activities": [],
+                "exceptions": [],
+                "omissions": [{
+                    "lifecycle": lifecycle,
+                    "evidence_ids": [evidence],
+                    "reason": "no work performed",
+                }],
+            }
+            for lifecycle in ("planned", "noise")
+        ]
+
+        scorecard = evaluation.evaluate(source)
+
+        self.assertTrue(scorecard["passed"])
+        self.assertTrue(scorecard["results"][0]["checks"]["stable_replay"])
+
     def test_forbidden_description_content_is_rejected_by_production_renderer(self) -> None:
         source = document()
         for replay in source["cases"][0]["replays"]:
