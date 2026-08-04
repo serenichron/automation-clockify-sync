@@ -121,6 +121,11 @@ the bounded chunk. Without a usable fallback, primary probe/call/schema failures
 block the run. Conflicting or low-confidence claims that remain unresolved become
 explicit exceptions, never proposals.
 
+The built-in default is `deepseek-v4-pro:cloud`, selected only after the v12
+synthetic route gate passed. `deepseek-v4-flash:cloud` remains ineligible as a
+primary until it passes the same stable split/merge evaluation; model family or
+advertised context size never overrides the scorecard.
+
 Analyzer requests retain the fail-closed 1,450,000-byte hard ceiling. Normal
 extraction uses a 250,000-byte and 250-event operational target with four
 deterministically ordered workers so a large-context route does not receive an

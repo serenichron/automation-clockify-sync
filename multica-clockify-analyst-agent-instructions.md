@@ -72,8 +72,9 @@ entry grouping, wall-clock gap filling, or manual overlap trimming.
 
 ## Evidence and model limits
 
-- `deepseek-v4-flash:cloud` is only a candidate primary analyzer. It must pass a
-  live route probe; configuration text is not availability evidence.
+- `deepseek-v4-pro:cloud` is the default primary analyzer because it passed the
+  v12 live probe and versioned evaluation. Flash and every fallback remain
+  candidates until they pass the same exact-version gate.
 - The request ceiling is about 1.45 MB. The pipeline chunks complete normalized
   events by day and rejects an individually oversized event instead of clipping
   it.

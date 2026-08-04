@@ -37,7 +37,7 @@ SCHEMA_VERSION = 1
 PROMPT_VERSION = "clockify-semantic-v12"
 ANALYZER_CACHE_SCHEMA_VERSION = "clockify-analyzer-cache/v2"
 EVIDENCE_BUNDLE_SCHEMA_VERSION = "clockify-semantic-evidence-bundle/v1"
-DEFAULT_PRIMARY_MODEL = "deepseek-v4-flash:cloud"
+DEFAULT_PRIMARY_MODEL = "deepseek-v4-pro:cloud"
 DEFAULT_MAX_BODY_BYTES = 1_450_000
 # Operational limits are deliberately well below the hard request ceiling.  The
 # cloud routes rejected or timed out on larger, mixed workstreams; small bounded
