@@ -197,6 +197,11 @@ CONTRACT_FAILURE_CODES = {
     "contract_rejected_other",
     *(f"contract_rejected_{code}" for code, _needle in _CONTRACT_FAILURE_PATTERNS),
 }
+SYNTHESIS_INTEGRITY_FAILURE_CODES = {
+    "contract_rejected_invalid_evidence_ids",
+    "contract_rejected_omitted_evidence",
+    "contract_rejected_duplicate_evidence",
+}
 
 
 def _contract_failure_code(error: BaseException) -> str:
@@ -2996,9 +3001,37 @@ def analyze_tiered(
             primary_error = error
         if primary_error is not None:
             if fallback is None:
-                raise AnalyzerError(
-                    f"primary analyzer failed for synthesis {workstream_id}: {primary_error}"
-                ) from primary_error
+                if not isinstance(primary_error, AnalyzerContractError):
+                    raise AnalyzerError(
+                        f"primary analyzer failed for synthesis {workstream_id}: {primary_error}"
+                    ) from primary_error
+                if _contract_failure_code(primary_error) in SYNTHESIS_INTEGRITY_FAILURE_CODES:
+                    raise primary_error
+                # Extraction is individually valid, but the only qualified
+                # route could not decide whether these repeated workstream
+                # claims should merge. Keep them out of proposals without
+                # turning a sealed semantic rejection into a route outage.
+                for activity in provisional:
+                    del activities_by_id[activity["activity_id"]]
+                synthesis_exceptions.append({
+                    "kind": "analyzer_synthesis_failure",
+                    "evidence_ids": sorted(synthesis_ids),
+                    "reason": "qualified primary rejected workstream synthesis",
+                    "failure_digest": stable_digest(
+                        "aer-",
+                        {
+                            "mode": "synthesize",
+                            "workstream_id": workstream_id,
+                            "evidence_ids": sorted(synthesis_ids),
+                            "primary": {"name": primary.name, "model": primary.model},
+                            "fallback": None,
+                            "prompt_version": PROMPT_VERSION,
+                            "schema_version": SCHEMA_VERSION,
+                        },
+                    ),
+                    "primary_model": primary.model,
+                })
+                continue
             fallback_error: AnalyzerError | None = None
             fallback_attempt_start = 1 if fallback_feedback is not None else 0
             for fallback_attempt in range(

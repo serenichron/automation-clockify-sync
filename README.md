@@ -138,8 +138,10 @@ source-context or conversation-turn boundaries. This includes a single qualified
 primary with no fallback. A user instruction always stays with its following
 assistant/tool result. A single indivisible turn rejected by every configured
 route becomes one local `analyzer_failure` exception with a failure digest.
-If both routes reject repeated-workstream synthesis, those otherwise valid but
-potentially duplicative claims become one `analyzer_synthesis_failure` exception.
+If every configured qualified route rejects repeated-workstream synthesis,
+including a single primary with no fallback, those otherwise valid but potentially
+duplicative claims become one `analyzer_synthesis_failure` exception. A synthesis
+transport failure still blocks the run.
 Synthesis candidates require the same normalized project, workstream, and
 concrete object; generic model labels alone cannot combine unrelated activities.
 No rejected activity can become a proposal.

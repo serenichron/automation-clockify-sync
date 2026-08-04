@@ -53,6 +53,9 @@ The parent retains recursive child metadata and cannot rejoin synthesis unless
 every evidence ID is classified exactly once. Acceptance and replay accounting
 read the actual leaf model/tier records; the deterministic recovery coordinator
 is never treated as a synthetic analyzer route.
+Repeated-workstream synthesis follows the same route boundary: exhausted sealed
+contract rejection becomes an explicit `analyzer_synthesis_failure`, while a
+probe or transport failure blocks the run.
 
 Planned and noise activities do not become proposals. Title-only meetings,
 missing sources, routing conflicts, low confidence, exhausted recovered chunks,

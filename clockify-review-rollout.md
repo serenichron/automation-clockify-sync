@@ -134,6 +134,8 @@ allocation, or correction-regression contracts recorded there.
    with its following assistant result. Any indivisible or exhausted recovery
    leaf remains a blocking `analyzer_failure`; do not treat bisection itself as a
    model route. Probe or transport failure still blocks before recovery.
+   Repeated-workstream synthesis exhausted across the qualified route set becomes
+   a visible `analyzer_synthesis_failure`; synthesis transport failure still blocks.
 5. Enable `CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED=approved` only when the exact
    validation approval includes redacted private semantic-text egress, and only
    for the approved run scope.

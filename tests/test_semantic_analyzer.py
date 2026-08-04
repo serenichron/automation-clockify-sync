@@ -1605,6 +1605,50 @@ class SemanticAnalyzerTests(unittest.TestCase):
         self.assertEqual(["ev-a", "ev-b"], exception["evidence_ids"])
         self.assertRegex(exception["failure_digest"], r"^aer-[0-9a-f]{24}$")
 
+    def test_single_route_synthesis_rejection_becomes_bounded_exception(self):
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            if payload["mode"] == "extract":
+                return provider_response(payload)
+            return {"choices": [{"message": {"content": "[]"}}]}
+
+        result = semantic.analyze_tiered(
+            [event("ev-a", "2026-07-10"), event("ev-b", "2026-07-11")],
+            primary=semantic.AnalyzerEndpoint("primary", "http://primary", "qualified"),
+            transport=transport,
+        )
+
+        self.assertEqual([], result["activities"])
+        self.assertEqual(1, len(result["exceptions"]))
+        exception = result["exceptions"][0]
+        self.assertEqual("analyzer_synthesis_failure", exception["kind"])
+        self.assertEqual(["ev-a", "ev-b"], exception["evidence_ids"])
+        self.assertEqual("qualified", exception["primary_model"])
+        self.assertNotIn("fallback_model", exception)
+        self.assertRegex(exception["failure_digest"], r"^aer-[0-9a-f]{24}$")
+
+    def test_single_route_synthesis_outage_still_blocks(self):
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            if payload["mode"] == "extract":
+                return provider_response(payload)
+            raise semantic.AnalyzerError("route unavailable")
+
+        with self.assertRaisesRegex(
+            semantic.AnalyzerError, "primary analyzer failed for synthesis"
+        ):
+            semantic.analyze_tiered(
+                [event("ev-a", "2026-07-10"), event("ev-b", "2026-07-11")],
+                primary=semantic.AnalyzerEndpoint(
+                    "primary", "http://primary", "qualified"
+                ),
+                transport=transport,
+            )
+
     def test_double_contract_failure_digest_is_stable_on_cache_replay(self):
         def transport(endpoint, body):
             payload = json.loads(body["messages"][1]["content"])
