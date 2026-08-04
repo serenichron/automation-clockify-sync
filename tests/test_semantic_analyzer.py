@@ -104,6 +104,92 @@ def provider_response(payload: dict, members: list[dict] | None = None) -> dict:
     clear=False,
 )
 class SemanticAnalyzerTests(unittest.TestCase):
+    def test_production_primary_requires_flash_and_rejects_pro(self):
+        base = {
+            "CLOCKIFY_ANALYZER_PRIMARY_URL": "http://analyzer.test/v1/chat",
+            "CLOCKIFY_ANALYZER_PRIMARY_MODEL": "other-model",
+        }
+        with mock.patch.dict(os.environ, base, clear=False):
+            with self.assertRaisesRegex(
+                semantic.AnalyzerError, "primary analyzer must be deepseek-v4-flash"
+            ):
+                semantic.AnalyzerEndpoint.from_env(
+                    "CLOCKIFY_ANALYZER_PRIMARY",
+                    default_model=semantic.DEFAULT_PRIMARY_MODEL,
+                )
+        with self.assertRaisesRegex(semantic.AnalyzerError, "V4 Pro is not approved"):
+            semantic.AnalyzerEndpoint(
+                "fallback", "http://analyzer.test", "deepseek-v4-pro:cloud"
+            )
+
+    def test_provider_metadata_is_ignored_before_extraction_validation(self):
+        events = [event("ev-1")]
+        _bundles, manifest = semantic._semantic_evidence_bundles(events)
+        response = provider_response(
+            json.loads(
+                semantic._body_for(
+                    events,
+                    model="deepseek-v4-flash:cloud",
+                    mode="extract",
+                    private_text_approved=True,
+                )["messages"][1]["content"]
+            )
+        )
+        response["provider_metadata"] = {"release": "current"}
+        response["activities"][0]["provider_note"] = "structured output"
+
+        restored = semantic._restore_extraction_partitions(response, events=events)
+
+        self.assertEqual({"activities", "exceptions", "omissions"}, set(restored))
+        self.assertNotIn("provider_note", restored["activities"][0])
+        self.assertEqual(manifest[0]["evidence_ids"], restored["activities"][0]["evidence_ids"])
+
+    def test_provider_normalization_requires_all_classification_lists(self):
+        with self.assertRaisesRegex(
+            semantic.AnalyzerError,
+            "activities, exceptions, and omissions must be lists",
+        ):
+            semantic._normalize_provider_response(
+                {"activities": [], "exceptions": []}, mode="extract"
+            )
+        with self.assertRaisesRegex(
+            semantic.AnalyzerError,
+            "activities, exceptions, and omissions must be lists",
+        ):
+            semantic._normalize_provider_response(
+                {"activities": [], "exceptions": [], "omissions": {}},
+                mode="extract",
+            )
+
+    def test_provider_normalization_does_not_repair_invalid_citations(self):
+        response = {
+            "activities": [{
+                "lifecycle": "completed",
+                "evidence_partitions": [{
+                    "bundle_ref": "unknown-bundle",
+                    "member_ranges": [[1, 1]],
+                }],
+            }],
+            "exceptions": [],
+            "omissions": [],
+            "provider_metadata": True,
+        }
+        with self.assertRaisesRegex(semantic.AnalyzerError, "unknown or repeated bundle"):
+            semantic._restore_extraction_partitions(response, events=[event("ev-1")])
+
+    def test_synthesis_provider_metadata_is_pruned(self):
+        response = valid_response("ref-0001")
+        response["provider_metadata"] = {"release": "current"}
+        response["activities"][0]["provider_note"] = "structured output"
+
+        normalized = semantic._normalize_provider_response(
+            response, mode="synthesize"
+        )
+
+        self.assertEqual({"activities", "exceptions", "omissions"}, set(normalized))
+        self.assertNotIn("provider_note", normalized["activities"][0])
+        self.assertEqual(["ref-0001"], normalized["activities"][0]["evidence_ids"])
+
     def test_validates_and_assigns_stable_ids(self):
         first = semantic.validate_result(
             valid_response("ev-1"),

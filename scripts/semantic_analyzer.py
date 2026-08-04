@@ -38,6 +38,7 @@ PROMPT_VERSION = "clockify-semantic-v13"
 ANALYZER_CACHE_SCHEMA_VERSION = "clockify-analyzer-cache/v2"
 EVIDENCE_BUNDLE_SCHEMA_VERSION = "clockify-semantic-evidence-bundle/v1"
 DEFAULT_PRIMARY_MODEL = "deepseek-v4-flash:cloud"
+FORBIDDEN_ANALYZER_MODEL_MARKERS = ("deepseek-v4-pro",)
 DEFAULT_MAX_BODY_BYTES = 1_450_000
 # Operational limits are deliberately well below the hard request ceiling.  The
 # cloud routes rejected or timed out on larger, mixed workstreams; small bounded
@@ -156,6 +157,15 @@ PROVIDER_ACTIVITY_FIELDS = {
 }
 PROVIDER_EXCEPTION_FIELDS = {"kind", "evidence_partitions", "reason"}
 PROVIDER_OMISSION_FIELDS = {"lifecycle", "evidence_partitions", "reason"}
+PROVIDER_SYNTHESIS_ACTIVITY_FIELDS = (
+    PROVIDER_ACTIVITY_FIELDS - {"evidence_partitions"}
+) | {"evidence_ids"}
+PROVIDER_SYNTHESIS_EXCEPTION_FIELDS = {
+    "kind", "evidence_ids", "reason",
+}
+PROVIDER_SYNTHESIS_OMISSION_FIELDS = {
+    "lifecycle", "evidence_ids", "reason",
+}
 
 
 class AnalyzerError(RuntimeError):
@@ -856,25 +866,15 @@ def _restore_extraction_partitions(
     response: Mapping[str, Any], *, events: Iterable[dict[str, Any]]
 ) -> dict[str, Any]:
     """Expand model bundle/member ranges to immutable original evidence IDs."""
-    if set(response) != {"activities", "exceptions", "omissions"}:
-        raise AnalyzerError("analyzer extraction response has unsupported fields")
+    response = _normalize_provider_response(response, mode="extract")
     _bundles, manifest = _semantic_evidence_bundles(events)
     by_ref = {str(item["bundle_ref"]): item for item in manifest}
     restored = copy.deepcopy(dict(response))
-    field_contracts = {
-        "activities": PROVIDER_ACTIVITY_FIELDS,
-        "exceptions": PROVIDER_EXCEPTION_FIELDS,
-        "omissions": PROVIDER_OMISSION_FIELDS,
-    }
-    for classification, allowed_fields in field_contracts.items():
+    for classification in ("activities", "exceptions", "omissions"):
         records = restored.get(classification)
         if not isinstance(records, list):
             raise AnalyzerError("activities, exceptions, and omissions must be lists")
         for record in records:
-            if not isinstance(record, dict) or not set(record) <= allowed_fields:
-                raise AnalyzerError(
-                    f"{classification} provider record has unsupported fields"
-                )
             partitions = record.pop("evidence_partitions", None)
             if not isinstance(partitions, list) or not partitions:
                 raise AnalyzerError(
@@ -919,6 +919,55 @@ def _restore_extraction_partitions(
                 raise AnalyzerError("provider record repeats expanded evidence members")
             record["evidence_ids"] = expanded
     return restored
+
+
+def _normalize_provider_response(
+    response: Mapping[str, Any], *, mode: str
+) -> dict[str, Any]:
+    """Discard provider decoration without weakening the semantic contract.
+
+    Cloud routes may nondeterministically add harmless metadata even when asked
+    for structured JSON.  Only the three required classification collections
+    and their allowlisted record fields can affect accounting.  Citation
+    structures and all required semantic fields are deliberately left to the
+    existing strict validators, so missing or malformed decisions still fail
+    closed.
+    """
+    if not isinstance(response, Mapping):
+        raise AnalyzerError("analyzer JSON must be an object")
+    if mode == "extract":
+        field_contracts = {
+            "activities": PROVIDER_ACTIVITY_FIELDS,
+            "exceptions": PROVIDER_EXCEPTION_FIELDS,
+            "omissions": PROVIDER_OMISSION_FIELDS,
+        }
+    elif mode == "synthesize":
+        field_contracts = {
+            "activities": PROVIDER_SYNTHESIS_ACTIVITY_FIELDS,
+            "exceptions": PROVIDER_SYNTHESIS_EXCEPTION_FIELDS,
+            "omissions": PROVIDER_SYNTHESIS_OMISSION_FIELDS,
+        }
+    else:
+        raise AnalyzerError("provider response normalization mode is invalid")
+
+    normalized: dict[str, Any] = {}
+    for classification, allowed_fields in field_contracts.items():
+        records = response.get(classification)
+        if not isinstance(records, list):
+            raise AnalyzerError("activities, exceptions, and omissions must be lists")
+        normalized_records: list[dict[str, Any]] = []
+        for record in records:
+            if not isinstance(record, Mapping):
+                raise AnalyzerError(f"{classification} provider record must be an object")
+            normalized_records.append(
+                {
+                    key: copy.deepcopy(value)
+                    for key, value in record.items()
+                    if key in allowed_fields
+                }
+            )
+        normalized[classification] = normalized_records
+    return normalized
 
 
 def _request_messages(
@@ -1950,12 +1999,19 @@ class AnalyzerEndpoint:
     timeout_seconds: int = 120
     revision: str = ""
 
+    def __post_init__(self) -> None:
+        normalized_model = self.model.strip().casefold()
+        if any(marker in normalized_model for marker in FORBIDDEN_ANALYZER_MODEL_MARKERS):
+            raise AnalyzerError(
+                "DeepSeek V4 Pro is not approved for the Clockify accounting process"
+            )
+
     @classmethod
     def from_env(cls, prefix: str, *, default_model: str = "") -> "AnalyzerEndpoint | None":
         url = os.environ.get(f"{prefix}_URL", "").strip()
         if not url:
             return None
-        return cls(
+        endpoint = cls(
             name=prefix.lower(),
             url=url,
             model=os.environ.get(f"{prefix}_MODEL", default_model).strip(),
@@ -1963,6 +2019,11 @@ class AnalyzerEndpoint:
             timeout_seconds=int(os.environ.get(f"{prefix}_TIMEOUT_SECONDS", "120")),
             revision=os.environ.get(f"{prefix}_REVISION", "").strip(),
         )
+        if prefix == "CLOCKIFY_ANALYZER_PRIMARY" and endpoint.model != DEFAULT_PRIMARY_MODEL:
+            raise AnalyzerError(
+                f"Clockify primary analyzer must be {DEFAULT_PRIMARY_MODEL}"
+            )
+        return endpoint
 
 
 Transport = Callable[[AnalyzerEndpoint, dict[str, Any]], dict[str, Any]]
@@ -2327,6 +2388,7 @@ def _call_validated(
                 )
             raise AnalyzerContractError(str(exc)) from exc
     try:
+        response = _normalize_provider_response(response, mode="extract")
         extraction_ids = known_evidence_ids or {
             str(event.get("evidence_id")) for event in events
         }
@@ -2408,6 +2470,7 @@ def _call_synthesis_validated(
                 )
             raise AnalyzerContractError(str(exc)) from exc
     try:
+        response = _normalize_provider_response(response, mode="synthesize")
         restored_response = _restore_evidence_references(
             response, evidence_ids=known_evidence_ids
         )
