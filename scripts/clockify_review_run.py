@@ -20,9 +20,10 @@ import sys
 from typing import Any
 
 try:
-    from scripts import review_acceptance
+    from scripts import review_acceptance, semantic_analyzer
 except ModuleNotFoundError:  # direct script execution
     import review_acceptance  # type: ignore[no-redef]
+    import semantic_analyzer  # type: ignore[no-redef]
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -445,6 +446,9 @@ def _analysis_versions(document: dict[str, Any]) -> list[str]:
     versions: set[str] = set()
     prompt_version = str(document.get("prompt_version") or "")
     schema_version = document.get("schema_version")
+    evidence_bundle_schema_version = str(
+        document.get("evidence_bundle_schema_version") or ""
+    )
     for key in ("activities", "analysis_chunks"):
         values = document.get(key, [])
         if not isinstance(values, list):
@@ -460,11 +464,39 @@ def _analysis_versions(document: dict[str, Any]) -> list[str]:
                     "tier": tier,
                     "prompt_version": str(raw.get("prompt_version") or prompt_version),
                     "schema_version": raw.get("schema_version", schema_version),
+                    "evidence_bundle_schema_version": str(
+                        raw.get("evidence_bundle_schema_version")
+                        or evidence_bundle_schema_version
+                    ),
                 }
                 versions.add(json.dumps(version, sort_keys=True, separators=(",", ":")))
     if not versions:
         raise ValueError("semantic analysis does not identify an analyzer route/version")
     return sorted(versions)
+
+
+def _analysis_bundle_identity(document: dict[str, Any]) -> dict[str, str]:
+    manifest = document.get("evidence_bundle_manifest")
+    if not isinstance(manifest, dict):
+        raise ValueError("semantic analysis lacks an evidence bundle manifest")
+    schema_version = str(manifest.get("schema_version") or "")
+    digest = str(manifest.get("digest") or "")
+    bundles = manifest.get("bundles")
+    if (
+        not schema_version
+        or not digest.startswith("sebm-")
+        or len(digest) != 69
+        or not isinstance(bundles, list)
+    ):
+        raise ValueError("semantic analysis evidence bundle manifest is invalid")
+    expected = semantic_analyzer.stable_digest(
+        "sebm-", bundles, length=64
+    )
+    if digest != expected:
+        raise ValueError("semantic analysis evidence bundle manifest digest differs")
+    if str(document.get("evidence_bundle_schema_version") or "") != schema_version:
+        raise ValueError("semantic analysis evidence bundle schema differs")
+    return {"schema_version": schema_version, "digest": digest}
 
 
 def _analysis_cache_records(document: dict[str, Any]) -> list[dict[str, str]]:
@@ -499,6 +531,8 @@ def _verify_replay_integrity(source: Path, replay: Path) -> dict[str, Any]:
     replay_versions = _analysis_versions(replay_analysis)
     source_cache_records = _analysis_cache_records(source_analysis)
     replay_cache_records = _analysis_cache_records(replay_analysis)
+    source_bundle_identity = _analysis_bundle_identity(source_analysis)
+    replay_bundle_identity = _analysis_bundle_identity(replay_analysis)
     source_evidence_digest = str(source_analysis.get("ledger_evidence_digest") or "")
     replay_evidence_digest = str(replay_analysis.get("ledger_evidence_digest") or "")
     failures: list[str] = []
@@ -510,6 +544,8 @@ def _verify_replay_integrity(source: Path, replay: Path) -> dict[str, Any]:
         failures.append("analyzer route or version differs")
     if source_cache_records != replay_cache_records:
         failures.append("validated analyzer cache decisions differ")
+    if source_bundle_identity != replay_bundle_identity:
+        failures.append("semantic evidence bundle manifest differs")
     report: dict[str, Any] = {
         "schema_version": 1,
         "status": "pass" if not failures else "blocked",
@@ -519,6 +555,7 @@ def _verify_replay_integrity(source: Path, replay: Path) -> dict[str, Any]:
         "ledger_evidence_digest": replay_evidence_digest,
         "analyzer_versions": [json.loads(value) for value in replay_versions],
         "analyzer_cache_records": replay_cache_records,
+        "evidence_bundle_manifest": replay_bundle_identity,
         "failures": failures,
     }
     report["integrity_digest"] = "sha256:" + hashlib.sha256(
@@ -642,7 +679,7 @@ def main(argv: list[str] | None = None) -> int:
         "--corrections",
         str(args.corrections),
         "--analyzer-cache",
-        str(args.analyzer_cache or (args.state.parent / "analyzer-cache.jsonl")),
+        str(args.analyzer_cache or (args.state.parent / "analyzer-cache-v2.jsonl")),
     ]
     if args.analysis_fixture:
         accounting_command.extend(["--analysis-fixture", str(args.analysis_fixture)])

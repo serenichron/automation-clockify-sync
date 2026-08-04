@@ -35,6 +35,12 @@ split/merge/omit rationale, analyzer provenance, and a render field. The render
 field begins as `null`; deterministic routing and Caveman rendering populate it
 before an activity can become a proposal.
 
+Provider extraction uses content-addressed local semantic bundles and opaque
+request-local bundle references. Models cite inclusive member ranges; local code
+expands them back to immutable ledger IDs, rejects missing or overlapping
+coverage, and computes final activity identity only after expansion. The bundle
+schema and manifest digest are part of immutable replay verification.
+
 Planned and noise activities do not become proposals. Title-only meetings,
 missing sources, routing conflicts, low confidence, double-route chunk or
 workstream-synthesis rejection, and contested capacity become explicit
@@ -52,7 +58,7 @@ operational target with four deterministically ordered workers beneath its
 | 100% non-overlap | Proven locally | Complete guarded allocation report checked against live Clockify blocks |
 | Zero gap filling | Proven locally | Guarded allocation report and audit |
 | Every eligible Fathom meeting reconciled/excluded | Implemented locally; live denominator missing | Complete paginated Fathom inventory and reconciliation artifact |
-| Replay produces `0 new / 0 changed` | Immutable replay path and validated append-only analyzer-decision cache proven locally; live proof missing | First shadow run plus a distinct `--replay-from` run with matching cache-decision digests, passing `replay-integrity.json`, and `0 new / 0 changed` |
+| Replay produces `0 new / 0 changed` | Immutable replay path, evidence-bundle manifest binding, and validated append-only analyzer-decision cache proven locally; live proof missing | First shadow run plus a distinct `--replay-from` run with matching bundle/cache-decision digests, passing `replay-integrity.json`, and `0 new / 0 changed` |
 | Every analyzer route passes digest-bound evaluation | Missing live proof | One verified scorecard per model/tier used in each acceptance period |
 | Versioned 86-record corpus | Proven locally | `tests/fixtures/clockify-regression/v1/manifest.json`; 86 content-addressed records |
 | At least 90% approve unchanged baseline | Missing | One complete integrity-linked `shadow_baseline` report with decisions for every active row, including ambiguous rows |

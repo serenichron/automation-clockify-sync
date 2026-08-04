@@ -136,7 +136,7 @@ allocation, or correction-regression contracts recorded there.
    `state/validation/july-baseline/`. Do not copy Mac state and do not mutate the
    existing production review state.
 7. Replay the exact immutable evidence and model versions through that same
-   validation state and its append-only `analyzer-cache.jsonl` with
+   validation state and its append-only `analyzer-cache-v2.jsonl` with
    `scripts/clockify_review_run.py --replay-from
    /absolute/path/to/runs/<first-run-id>`. Require a passing
    `replay-integrity.json`, identical sealed cache-decision digests, `new=0`,

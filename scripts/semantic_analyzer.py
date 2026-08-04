@@ -29,8 +29,9 @@ import urllib.request
 
 
 SCHEMA_VERSION = 1
-PROMPT_VERSION = "clockify-semantic-v8"
-ANALYZER_CACHE_SCHEMA_VERSION = "clockify-analyzer-cache/v1"
+PROMPT_VERSION = "clockify-semantic-v9"
+ANALYZER_CACHE_SCHEMA_VERSION = "clockify-analyzer-cache/v2"
+EVIDENCE_BUNDLE_SCHEMA_VERSION = "clockify-semantic-evidence-bundle/v1"
 DEFAULT_PRIMARY_MODEL = "deepseek-v4-flash:cloud"
 DEFAULT_MAX_BODY_BYTES = 1_450_000
 # Operational limits are deliberately well below the hard request ceiling.  The
@@ -56,6 +57,7 @@ _ATOMIC_FIELD_SEPARATOR_RE = re.compile(
 )
 _COMPOUND_ACTION_RE = re.compile(r"(?:^|\s)(?:and|or|&|/)(?:\s|$)", re.IGNORECASE)
 SAFE_EVIDENCE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+BUNDLE_REF_RE = re.compile(r"^b-[0-9]{4}$")
 SAFE_TIMESTAMP_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:?\d{2})?)?$"
 )
@@ -107,6 +109,14 @@ PROJECTED_EVENT_FIELDS = {
     "evidence_id", "source_category", "time_span", "role", "content",
     "project_context", "meeting_context",
 }
+PROVIDER_ACTIVITY_FIELDS = {
+    "lifecycle", "workstream", "action", "object", "outcome",
+    "evidence_partitions", "evidence_spans", "project_recommendation",
+    "effort", "semantic_confidence", "timing_confidence",
+    "split_rationale", "merge_rationale", "omit_rationale",
+}
+PROVIDER_EXCEPTION_FIELDS = {"kind", "evidence_partitions", "reason"}
+PROVIDER_OMISSION_FIELDS = {"lifecycle", "evidence_partitions", "reason"}
 
 
 class AnalyzerError(RuntimeError):
@@ -145,6 +155,8 @@ _CONTRACT_FAILURE_PATTERNS: tuple[tuple[str, str], ...] = (
     ("invalid_evidence_ids", "evidence ids"),
     ("invalid_evidence_ids", "unknown evidence reference"),
     ("invalid_evidence_ids", "requires known evidence ids"),
+    ("invalid_evidence_ids", "evidence_partitions"),
+    ("invalid_evidence_ids", "evidence partition"),
     ("missing_activity_fields", "requires action, object, and outcome"),
     ("missing_workstream", "requires a workstream"),
     ("invalid_effort", "effort"),
@@ -185,13 +197,13 @@ def _repair_instruction(failure_code: str) -> str:
     instructions = {
         "compound_action": "Return one atomic past-tense action per activity; split unrelated actions.",
         "compound_field": "Keep each action, object, and outcome to one accomplishment clause.",
-        "omitted_evidence": "Account for every supplied evidence ref exactly once.",
-        "duplicate_evidence": "Cite each supplied evidence ref exactly once across the full result.",
+        "omitted_evidence": "Account for every supplied bundle member exactly once with ranges.",
+        "duplicate_evidence": "Keep member ranges disjoint across the full result.",
         "missing_evidence_span": "Give every reviewable activity a supported nonempty evidence span.",
         "invalid_evidence_span": "Use only valid evidence spans supported by cited refs.",
         "unsupported_evidence_span": "Keep each claimed span within its cited evidence interval.",
         "missing_atomicity_rationale": "Give every reviewable activity a nonempty atomicity rationale.",
-        "invalid_evidence_ids": "Copy only supplied evidence refs and do not repeat them.",
+        "invalid_evidence_ids": "Use only supplied bundle refs and valid inclusive member ranges.",
         "missing_activity_fields": "Include lifecycle, action, object, outcome, evidence, spans, and effort.",
         "missing_workstream": "Give each reviewable activity a short stable workstream name.",
         "invalid_effort": "Use positive ordered effort minutes for every activity.",
@@ -650,6 +662,208 @@ def _semantic_context_key(event: Mapping[str, Any]) -> tuple[str, ...]:
     return ("source", source_type, machine, str(source_ref.get("source_id") or "unknown"))
 
 
+def _bundle_context_key(day: str, context: tuple[str, ...]) -> tuple[str, ...]:
+    """Keep identified contexts whole across midnight; bound unstable sources by day."""
+    if context and context[0] in {"session", "repository", "multica", "meeting"}:
+        return context
+    return ("day", day, *context)
+
+
+def _contextual_events(
+    events: Iterable[dict[str, Any]],
+) -> list[tuple[str, tuple[str, ...], dict[str, Any], dict[str, Any]]]:
+    """Return deterministic local context plus the sole outbound projection."""
+    contextual: list[tuple[str, tuple[str, ...], dict[str, Any], dict[str, Any]]] = []
+    for value in events:
+        raw = dict(value)
+        projected = project_event(raw)
+        if "time_span" in projected and "time_span" not in raw:
+            raw["time_span"] = dict(projected["time_span"])
+        contextual.append(
+            (_event_day(raw), _semantic_context_key(raw), raw, projected)
+        )
+    return sorted(
+        contextual,
+        key=lambda item: (item[0], _event_sort_key(item[3]), item[1]),
+    )
+
+
+def _semantic_evidence_bundles(
+    events: Iterable[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Build reversible local manifests and privacy-safe model bundles.
+
+    Bundle identities are content-addressed locally.  Providers see only a
+    request-local bundle reference and numeric member ordinals; original
+    evidence, session, repository, issue, meeting, and machine identifiers stay
+    in the local manifest.
+    """
+    contextual = _contextual_events(events)
+    # Context-local order is deliberate.  Another machine or session may be
+    # interleaved on the wall clock, but it must not fragment the source
+    # conversation needed for semantic reconstruction.  Member ranges are
+    # ordinal citation partitions, never claims of continuous elapsed time;
+    # every member retains its own timestamp span for later allocation.
+    grouped: dict[tuple[str, ...], list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+    for day, context, raw, projected in contextual:
+        grouped.setdefault(_bundle_context_key(day, context), []).append((raw, projected))
+    ordered_groups = sorted(
+        grouped.items(),
+        key=lambda item: (_event_sort_key(item[1][0][1]), item[0]),
+    )
+    payload_bundles: list[dict[str, Any]] = []
+    manifest: list[dict[str, Any]] = []
+    for ordinal, (context, members) in enumerate(ordered_groups, 1):
+        if ordinal > 9_999:
+            raise AnalyzerError("semantic request contains too many evidence bundles")
+        bundle_ref = f"b-{ordinal:04d}"
+        original_ids = [str(raw.get("evidence_id") or "") for raw, _ in members]
+        if (
+            len(original_ids) != len(set(original_ids))
+            or any(not SAFE_EVIDENCE_ID_RE.fullmatch(value) for value in original_ids)
+        ):
+            raise AnalyzerError("semantic evidence bundle contains invalid evidence IDs")
+        member_payloads = [
+            {
+                "member": index,
+                **{
+                    key: value
+                    for key, value in projected.items()
+                    if key != "evidence_id"
+                },
+            }
+            for index, (_raw, projected) in enumerate(members, 1)
+        ]
+        context_digest = stable_digest(
+            "sec-", {"context": list(context)}, length=64
+        )
+        projected_digest = stable_digest(
+            "sep-", member_payloads, length=64
+        )
+        bundle_id = stable_digest(
+            "seb-",
+            {
+                "schema_version": EVIDENCE_BUNDLE_SCHEMA_VERSION,
+                "context_digest": context_digest,
+                "projected_digest": projected_digest,
+                "evidence_ids": original_ids,
+            },
+            length=64,
+        )
+        payload_bundles.append(
+            {
+                "bundle_ref": bundle_ref,
+                "context_type": context[2] if context[0] == "day" else context[0],
+                "member_count": len(member_payloads),
+                "members": member_payloads,
+            }
+        )
+        manifest.append(
+            {
+                "bundle_id": bundle_id,
+                "bundle_ref": bundle_ref,
+                "context_digest": context_digest,
+                "projected_digest": projected_digest,
+                "member_count": len(member_payloads),
+                "evidence_ids": original_ids,
+            }
+        )
+    return payload_bundles, manifest
+
+
+def _provider_response_cache_safe(
+    response: Mapping[str, Any], *, original_evidence_ids: Iterable[str]
+) -> None:
+    """Reject accepted cache material containing local IDs or private residue."""
+    serialized = canonical_json(response)
+    if any(str(value) in serialized for value in original_evidence_ids):
+        raise AnalyzerError("provider response exposed an original evidence ID")
+
+    def inspect(value: Any) -> None:
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                inspect(key)
+                inspect(item)
+            return
+        if isinstance(value, list):
+            for item in value:
+                inspect(item)
+            return
+        if isinstance(value, str) and _safe_text(value) != _one_line(value):
+            raise AnalyzerError("provider response contains unsafe cache text")
+
+    inspect(response)
+
+
+def _restore_extraction_partitions(
+    response: Mapping[str, Any], *, events: Iterable[dict[str, Any]]
+) -> dict[str, Any]:
+    """Expand model bundle/member ranges to immutable original evidence IDs."""
+    if set(response) != {"activities", "exceptions", "omissions"}:
+        raise AnalyzerError("analyzer extraction response has unsupported fields")
+    _bundles, manifest = _semantic_evidence_bundles(events)
+    by_ref = {str(item["bundle_ref"]): item for item in manifest}
+    restored = copy.deepcopy(dict(response))
+    field_contracts = {
+        "activities": PROVIDER_ACTIVITY_FIELDS,
+        "exceptions": PROVIDER_EXCEPTION_FIELDS,
+        "omissions": PROVIDER_OMISSION_FIELDS,
+    }
+    for classification, allowed_fields in field_contracts.items():
+        records = restored.get(classification)
+        if not isinstance(records, list):
+            raise AnalyzerError("activities, exceptions, and omissions must be lists")
+        for record in records:
+            if not isinstance(record, dict) or not set(record) <= allowed_fields:
+                raise AnalyzerError(
+                    f"{classification} provider record has unsupported fields"
+                )
+            partitions = record.pop("evidence_partitions", None)
+            if not isinstance(partitions, list) or not partitions:
+                raise AnalyzerError(
+                    f"{classification} evidence_partitions must be a nonempty list"
+                )
+            expanded: list[str] = []
+            seen_bundle_refs: set[str] = set()
+            for partition in partitions:
+                if not isinstance(partition, dict) or set(partition) != {
+                    "bundle_ref", "member_ranges"
+                }:
+                    raise AnalyzerError("evidence partition has unsupported fields")
+                bundle_ref = str(partition.get("bundle_ref") or "")
+                if (
+                    not BUNDLE_REF_RE.fullmatch(bundle_ref)
+                    or bundle_ref not in by_ref
+                    or bundle_ref in seen_bundle_refs
+                ):
+                    raise AnalyzerError("evidence partition has an unknown or repeated bundle ref")
+                seen_bundle_refs.add(bundle_ref)
+                ranges = partition.get("member_ranges")
+                if not isinstance(ranges, list) or not ranges:
+                    raise AnalyzerError("evidence partition member_ranges must be nonempty")
+                member_ids = list(by_ref[bundle_ref]["evidence_ids"])
+                covered: set[int] = set()
+                for bounds in ranges:
+                    if (
+                        not isinstance(bounds, list)
+                        or len(bounds) != 2
+                        or any(isinstance(value, bool) or not isinstance(value, int) for value in bounds)
+                    ):
+                        raise AnalyzerError("evidence partition range must contain two integers")
+                    start, end = bounds
+                    if start < 1 or end < start or end > len(member_ids):
+                        raise AnalyzerError("evidence partition range is reversed or out of bounds")
+                    positions = set(range(start, end + 1))
+                    if covered.intersection(positions):
+                        raise AnalyzerError("evidence partition ranges overlap")
+                    covered.update(positions)
+                expanded.extend(member_ids[index - 1] for index in sorted(covered))
+            if len(expanded) != len(set(expanded)):
+                raise AnalyzerError("provider record repeats expanded evidence members")
+            record["evidence_ids"] = expanded
+    return restored
+
+
 def _request_messages(
     events: list[dict[str, Any]],
     *,
@@ -683,11 +897,16 @@ background execution as planned or noise, not completed human work. A blocker is
 loggable only when the evidence proves substantive diagnosis or remediation.
 Do not invent projects, outcomes, evidence, effort, or meeting purpose. For a
 title-only meeting with no supported outcome, emit an exception. Effort is human
-attention, not process runtime or empty wall-clock time. Evidence IDs are short refs
-such as ref-0001 and must be copied exactly from the input. Account for every input
-evidence ref exactly once across
-activities, exceptions, and omissions. Exceptions and omissions require cited
-evidence refs. Do not allocate start/end Clockify blocks.
+attention, not process runtime or empty wall-clock time. Evidence arrives as
+semantic bundles. Each bundle has a short bundle_ref and ordered numeric members.
+Cite evidence only with evidence_partitions shaped as
+{"bundle_ref":"b-0001","member_ranges":[[1,4],[7,7]]}. Ranges are inclusive.
+Use one range for a whole contiguous accomplishment instead of copying every member.
+You may split one bundle across multiple atomic activities, but member ranges must
+never overlap. Account for every member of every input bundle exactly once across
+activities, exceptions, and omissions. Exceptions and omissions also require
+evidence_partitions. Do not return original evidence IDs. Do not allocate start/end
+Clockify blocks.
 Write action + object + outcome so the final prefixed description is 8-14 words,
 using terse past-tense Caveman wording and no Markdown, IDs, paths, URLs, or status prose.
 Project prefix and tags are recommendations only. Leave them blank when the evidence
@@ -701,7 +920,7 @@ Output object:
     "action": "short verb phrase",
     "object": "specific work object",
     "outcome": "bounded evidenced outcome",
-    "evidence_ids": ["ref-0001"],
+    "evidence_partitions": [{"bundle_ref":"b-0001","member_ranges":[[1,4]]}],
     "evidence_spans": [{"start":"ISO-like", "end":"ISO-like"}],
     "project_recommendation": {"name":"", "prefix":"", "tag_names":[]},
     "effort": {"minimum_minutes":1, "recommended_minutes":1, "maximum_minutes":1},
@@ -711,23 +930,19 @@ Output object:
     "merge_rationale": "",
     "omit_rationale": ""
   }],
-  "exceptions": [{"kind":"insufficient_evidence|conflicting_evidence", "evidence_ids":[], "reason":""}],
-  "omissions": [{"lifecycle":"planned|noise", "evidence_ids":[], "reason":""}]
+  "exceptions": [{"kind":"insufficient_evidence|conflicting_evidence", "evidence_partitions":[{"bundle_ref":"b-0002","member_ranges":[[1,2]]}], "reason":""}],
+  "omissions": [{"lifecycle":"planned|noise", "evidence_partitions":[{"bundle_ref":"b-0003","member_ranges":[[1,5]]}], "reason":""}]
 }
 """
     if repair_failure_code is not None:
         system += _repair_system_addendum(repair_failure_code)
-    projected = project_events(events)
-    aliases, _ = _evidence_reference_maps(event["evidence_id"] for event in projected)
-    model_events = [
-        {**event, "evidence_id": aliases[event["evidence_id"]]}
-        for event in projected
-    ]
+    model_bundles, _manifest = _semantic_evidence_bundles(events)
     payload = {
         "mode": mode,
         "schema_version": SCHEMA_VERSION,
         "prompt_version": PROMPT_VERSION,
-        "events": model_events,
+        "evidence_bundle_schema_version": EVIDENCE_BUNDLE_SCHEMA_VERSION,
+        "bundles": model_bundles,
         "review_corrections": _project_corrections(corrections),
     }
     if repair_failure_code is not None:
@@ -790,14 +1005,17 @@ def _alias_extra_bytes(count: int) -> int:
 
 
 def _chunk_event_bytes(event: dict[str, Any]) -> int:
-    """Return the embedded request-payload size of one projected event."""
+    """Return a conservative embedded size for one projected bundle member."""
     evidence_id = str(event.get("evidence_id") or "")
     if not SAFE_EVIDENCE_ID_RE.fullmatch(evidence_id):
         raise AnalyzerError("cannot alias an unsafe evidence ID")
-    # All aliases through ref-9999 have this same byte length.  Wider aliases
-    # are accounted for collectively by _alias_extra_bytes.
-    model_event = {**event, "evidence_id": "ref-0001"}
-    return _escaped_json_content_bytes(canonical_json(model_event))
+    model_member = {
+        "member": 1,
+        **{key: value for key, value in event.items() if key != "evidence_id"},
+    }
+    # Amortize the bundle envelope into each member.  Final transport sizing is
+    # still enforced by _call_validated against the hard ceiling.
+    return _escaped_json_content_bytes(canonical_json(model_member)) + 128
 
 
 def _safe_provisional_activity(activity: dict[str, Any]) -> dict[str, Any]:
@@ -938,14 +1156,8 @@ def chunk_events(
     # Size exactly what may leave the machine, never the raw immutable ledger.
     # Retain local context keys only long enough to keep each session, repository,
     # issue, or meeting contiguous.  The keys themselves never enter a request.
-    contextual = sorted(
-        (
-            (_event_day(raw), _semantic_context_key(raw), project_event(dict(raw)))
-            for raw in events
-        ),
-        key=lambda item: (_event_sort_key(item[2]), item[1]),
-    )
-    ordered = [projected for _day, _context, projected in contextual]
+    contextual = _contextual_events(events)
+    ordered = [projected for _day, _context, _raw, projected in contextual]
     _require_private_text_approval(ordered, private_text_approved)
     # This empty request gives the exact model/prompt/correction envelope once.
     # Candidate event text is then accounted for incrementally below; rebuilding
@@ -961,74 +1173,106 @@ def chunk_events(
             )
         ).encode("utf-8")
     )
-    by_day: dict[str, dict[tuple[str, ...], list[dict[str, Any]]]] = {}
-    for day, context, projected in contextual:
-        by_day.setdefault(day, {}).setdefault(context, []).append(projected)
+    by_context: dict[
+        tuple[str, ...], list[tuple[str, dict[str, Any], dict[str, Any]]]
+    ] = {}
+    for day, context, raw, projected in contextual:
+        by_context.setdefault(_bundle_context_key(day, context), []).append(
+            (day, raw, projected)
+        )
 
     chunks: list[list[dict[str, Any]]] = []
-    for day in sorted(by_day):
-        current: list[dict[str, Any]] = []
-        current_event_bytes = 0
-        bundles = sorted(
-            by_day[day].items(),
-            key=lambda item: (_event_sort_key(item[1][0]), item[0]),
+    current: list[dict[str, Any]] = []
+    current_event_bytes = 0
+    current_day: str | None = None
+    bundles = sorted(
+        by_context.items(),
+        key=lambda item: (_event_sort_key(item[1][0][2]), item[0]),
+    )
+    for _context, contextual_bundle in bundles:
+        bundle_day = contextual_bundle[0][0]
+        bundle = [(raw, projected) for _day, raw, projected in contextual_bundle]
+        bundle_bytes = [_chunk_event_bytes(projected) for _raw, projected in bundle]
+        bundle_count = len(bundle)
+        combined_count = len(current) + bundle_count
+        combined_size = (
+            empty_body_bytes
+            + current_event_bytes
+            + sum(bundle_bytes)
+            + max(0, combined_count - 1)
+            + _alias_extra_bytes(combined_count)
         )
-        for _context, bundle in bundles:
-            bundle_bytes = [_chunk_event_bytes(event) for event in bundle]
-            bundle_count = len(bundle)
-            combined_count = len(current) + bundle_count
-            combined_size = (
+        bundle_size = (
+            empty_body_bytes
+            + sum(bundle_bytes)
+            + max(0, bundle_count - 1)
+            + _alias_extra_bytes(bundle_count)
+        )
+        if (
+            current
+            and bundle_count <= max_events_per_chunk
+            and bundle_size <= target_body_bytes
+            and (
+                bundle_day != current_day
+                or combined_count > max_events_per_chunk
+                or combined_size > target_body_bytes
+            )
+        ):
+            chunks.append(current)
+            current = []
+            current_event_bytes = 0
+            current_day = None
+        for (raw, projected), event_bytes in zip(bundle, bundle_bytes, strict=True):
+            approximate_one_size = empty_body_bytes + event_bytes + 1_024
+            one_size = approximate_one_size
+            if approximate_one_size > max_body_bytes:
+                one_size = len(canonical_json(_body_for(
+                    [raw],
+                    model=model,
+                    mode="extract",
+                    corrections=corrections,
+                    private_text_approved=private_text_approved,
+                )).encode("utf-8"))
+            if one_size > max_body_bytes:
+                raise AnalyzerError(
+                    f"evidence event {projected.get('evidence_id') or '<unknown>'} "
+                    f"exceeds analyzer request ceiling ({one_size} bytes)"
+                )
+            trial_count = len(current) + 1
+            trial_size = (
                 empty_body_bytes
                 + current_event_bytes
-                + sum(bundle_bytes)
-                + max(0, combined_count - 1)
-                + _alias_extra_bytes(combined_count)
+                + event_bytes
+                + len(current)
+                + _alias_extra_bytes(trial_count)
             )
-            bundle_size = (
-                empty_body_bytes
-                + sum(bundle_bytes)
-                + max(0, bundle_count - 1)
-                + _alias_extra_bytes(bundle_count)
-            )
-            if (
-                current
-                and bundle_count <= max_events_per_chunk
-                and bundle_size <= target_body_bytes
-                and (
-                    combined_count > max_events_per_chunk
-                    or combined_size > target_body_bytes
-                )
+            if current and (
+                trial_size > target_body_bytes
+                or len(current) >= max_events_per_chunk
             ):
                 chunks.append(current)
-                current = []
-                current_event_bytes = 0
-            for event, event_bytes in zip(bundle, bundle_bytes, strict=True):
-                one_size = empty_body_bytes + event_bytes + _alias_extra_bytes(1)
-                if one_size > max_body_bytes:
-                    raise AnalyzerError(
-                        f"evidence event {event.get('evidence_id') or '<unknown>'} "
-                        f"exceeds analyzer request ceiling ({one_size} bytes)"
-                    )
-                trial_count = len(current) + 1
-                trial_size = (
-                    empty_body_bytes
-                    + current_event_bytes
-                    + event_bytes
-                    + len(current)
-                    + _alias_extra_bytes(trial_count)
-                )
-                if current and (
-                    trial_size > target_body_bytes
-                    or len(current) >= max_events_per_chunk
-                ):
-                    chunks.append(current)
-                    current = [event]
-                    current_event_bytes = event_bytes
-                else:
-                    current.append(event)
-                    current_event_bytes += event_bytes
-        if current:
-            chunks.append(current)
+                current = [raw]
+                current_event_bytes = event_bytes
+                current_day = _event_day(raw)
+            else:
+                current.append(raw)
+                current_event_bytes += event_bytes
+                if current_day is None:
+                    current_day = bundle_day
+    if current:
+        chunks.append(current)
+    for chunk in chunks:
+        body_size = len(canonical_json(_body_for(
+            chunk,
+            model=model,
+            mode="extract",
+            corrections=corrections,
+            private_text_approved=private_text_approved,
+        )).encode("utf-8"))
+        if body_size > max_body_bytes:
+            raise AnalyzerError(
+                f"semantic evidence chunk exceeds analyzer request ceiling ({body_size} bytes)"
+            )
     return chunks
 
 
@@ -1527,6 +1771,15 @@ class AnalyzerResponseCache:
         decision = {"status": status, variant_field: value[variant_field]}
         if status == "accepted" and not isinstance(value.get("response"), dict):
             raise AnalyzerError(f"analyzer cache line {line_number} response is invalid")
+        if status == "accepted":
+            try:
+                _provider_response_cache_safe(
+                    value["response"], original_evidence_ids=[]
+                )
+            except AnalyzerError as exc:
+                raise AnalyzerError(
+                    f"analyzer cache line {line_number} response is unsafe"
+                ) from exc
         if status == "rejected" and value.get("failure_code") not in CONTRACT_FAILURE_CODES:
             raise AnalyzerError(f"analyzer cache line {line_number} rejection is invalid")
         if self._decision_digest(decision) != value.get("decision_digest"):
@@ -1626,6 +1879,9 @@ class AnalyzerResponseCache:
     ) -> None:
         identity = self._request_identity(endpoint, body)
         response_value = copy.deepcopy(dict(response))
+        _provider_response_cache_safe(
+            response_value, original_evidence_ids=[]
+        )
         decision = {"status": "accepted", "response": response_value}
         record = {
             "schema_version": ANALYZER_CACHE_SCHEMA_VERSION,
@@ -1762,14 +2018,18 @@ def _call_validated(
                 )
             raise AnalyzerContractError(str(exc)) from exc
     try:
-        restored_response = _restore_evidence_references(
-            response,
-            evidence_ids=known_evidence_ids
-            or {str(event.get("evidence_id")) for event in events},
+        extraction_ids = known_evidence_ids or {
+            str(event.get("evidence_id")) for event in events
+        }
+        _provider_response_cache_safe(
+            response, original_evidence_ids=extraction_ids
+        )
+        restored_response = _restore_extraction_partitions(
+            response, events=events
         )
         result = validate_result(
             restored_response,
-            known_evidence_ids=known_evidence_ids or {str(event.get("evidence_id")) for event in events},
+            known_evidence_ids=extraction_ids,
             provider_model=endpoint.model,
             analyzer_tier=tier,
             evidence_time_spans=evidence_time_spans,
@@ -1957,7 +2217,14 @@ def analyze_tiered(
         return {
             "schema_version": SCHEMA_VERSION,
             "prompt_version": PROMPT_VERSION,
+            "evidence_bundle_schema_version": EVIDENCE_BUNDLE_SCHEMA_VERSION,
+            "evidence_bundle_manifest": {
+                "schema_version": EVIDENCE_BUNDLE_SCHEMA_VERSION,
+                "digest": stable_digest("sebm-", [], length=64),
+                "bundles": [],
+            },
             "ledger_event_count": 0,
+            "ledger_evidence_digest": stable_digest("led-", []),
             "activities": [],
             "exceptions": [],
             "omissions": [],
@@ -2179,6 +2446,7 @@ def analyze_tiered(
         _raise_if_cancelled(cancellation.is_set)
         if _requires_stronger_fallback(result):
             result = _defer_unresolved_low_confidence(result)
+        _payload_bundles, chunk_bundle_manifest = _semantic_evidence_bundles(chunk)
         chunk_metadata = {
             "chunk": index + 1,
             "event_count": len(chunk),
@@ -2190,6 +2458,12 @@ def analyze_tiered(
             "tier": tier,
             "fallback_status": fallback_status,
             "repair_status": repair_status,
+            "evidence_bundle_schema_version": EVIDENCE_BUNDLE_SCHEMA_VERSION,
+            "bundle_count": len(chunk_bundle_manifest),
+            "bundle_manifest_digest": stable_digest(
+                "sebm-", chunk_bundle_manifest, length=64
+            ),
+            "_bundle_manifest": chunk_bundle_manifest,
         }
         if fallback_status == "failed_exception":
             chunk_metadata["failure_digest"] = fallback_failure_digest
@@ -2256,6 +2530,12 @@ def analyze_tiered(
         chunk_outcomes = [outcomes[index] for index in range(len(chunks))]
     results = [result for result, _metadata in chunk_outcomes]
     metadata = [chunk_metadata for _result, chunk_metadata in chunk_outcomes]
+    bundle_manifest: list[dict[str, Any]] = []
+    for chunk_metadata in metadata:
+        chunk_number = int(chunk_metadata["chunk"])
+        for record in chunk_metadata.pop("_bundle_manifest"):
+            bundle_manifest.append({"chunk": chunk_number, **record})
+    bundle_manifest.sort(key=lambda value: (value["chunk"], value["bundle_ref"]))
 
     # Exact stable identities are deterministic duplicates.  Broader workstream
     # grouping is only a candidate set: any semantic merge must pass through a
@@ -2393,6 +2673,12 @@ def analyze_tiered(
     return {
         "schema_version": SCHEMA_VERSION,
         "prompt_version": PROMPT_VERSION,
+        "evidence_bundle_schema_version": EVIDENCE_BUNDLE_SCHEMA_VERSION,
+        "evidence_bundle_manifest": {
+            "schema_version": EVIDENCE_BUNDLE_SCHEMA_VERSION,
+            "digest": stable_digest("sebm-", bundle_manifest, length=64),
+            "bundles": bundle_manifest,
+        },
         "ledger_event_count": len(original_events),
         "ledger_evidence_digest": stable_digest(
             "led-", sorted(event["evidence_id"] for event in original_events)
@@ -2454,8 +2740,15 @@ def main(argv: list[str] | None = None) -> int:
             provider_model="fixture",
             analyzer_tier="fixture",
         )
+        _fixture_payload, fixture_manifest = _semantic_evidence_bundles(events)
         result = {
             **fixture,
+            "evidence_bundle_schema_version": EVIDENCE_BUNDLE_SCHEMA_VERSION,
+            "evidence_bundle_manifest": {
+                "schema_version": EVIDENCE_BUNDLE_SCHEMA_VERSION,
+                "digest": stable_digest("sebm-", fixture_manifest, length=64),
+                "bundles": fixture_manifest,
+            },
             "ledger_event_count": len(events),
             "ledger_evidence_digest": stable_digest(
                 "led-", sorted(event["evidence_id"] for event in events)

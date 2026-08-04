@@ -24,7 +24,7 @@ except ModuleNotFoundError:
 
 INPUT_SCHEMA_VERSION = "clockify-analyzer-evaluation-input/v1"
 SCORECARD_SCHEMA_VERSION = "clockify-analyzer-evaluation-scorecard/v1"
-EVALUATOR_VERSION = "clockify-analyzer-evaluator/v3"
+EVALUATOR_VERSION = "clockify-analyzer-evaluator/v4"
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 _CASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _ROUTE_FIELDS = frozenset({"route_id", "model", "tier"})
@@ -103,7 +103,10 @@ def _validate_document(document: Any) -> tuple[Mapping[str, Any], list[dict[str,
     value = _require_mapping(document, "evaluation document")
     _require_keys(
         value,
-        {"schema_version", "corpus", "route", "prompt_version", "semantic_schema_version", "cases"},
+        {
+            "schema_version", "corpus", "route", "prompt_version",
+            "semantic_schema_version", "evidence_bundle_schema_version", "cases",
+        },
         "evaluation document",
     )
     if value["schema_version"] != INPUT_SCHEMA_VERSION:
@@ -112,6 +115,8 @@ def _validate_document(document: Any) -> tuple[Mapping[str, Any], list[dict[str,
         raise EvaluationError("prompt version does not match the production analyzer")
     if value["semantic_schema_version"] != semantic_analyzer.SCHEMA_VERSION:
         raise EvaluationError("semantic schema version does not match the production analyzer")
+    if value["evidence_bundle_schema_version"] != semantic_analyzer.EVIDENCE_BUNDLE_SCHEMA_VERSION:
+        raise EvaluationError("evidence bundle schema version does not match the production analyzer")
     corpus, corpus_digest = _corpus(value)
     route = _route(value)
     cases = value["cases"]
@@ -384,6 +389,7 @@ def evaluate(document: Any) -> dict[str, Any]:
         "route": route,
         "prompt_version": value["prompt_version"],
         "semantic_schema_version": value["semantic_schema_version"],
+        "evidence_bundle_schema_version": value["evidence_bundle_schema_version"],
         "case_count": len(results),
         "results": results,
         "passed": all(item["passed"] for item in results),
@@ -396,7 +402,8 @@ def verify_scorecard(scorecard: Any) -> dict[str, Any]:
     value = _require_mapping(scorecard, "scorecard")
     required = {
         "schema_version", "evaluator_version", "input_corpus_digest", "input_digest", "route", "prompt_version",
-        "semantic_schema_version", "case_count", "results", "passed", "scorecard_digest",
+        "semantic_schema_version", "evidence_bundle_schema_version", "case_count",
+        "results", "passed", "scorecard_digest",
     }
     _require_keys(value, required, "scorecard")
     if value["schema_version"] != SCORECARD_SCHEMA_VERSION or value["evaluator_version"] != EVALUATOR_VERSION:

@@ -211,8 +211,8 @@ def capture_evaluation(
             )
             raw = _response_object(transport(endpoint, body))
             replays.append(
-                semantic_analyzer._restore_evidence_references(
-                    raw, evidence_ids=evidence_ids
+                semantic_analyzer._restore_extraction_partitions(
+                    raw, events=events
                 )
             )
         captured_cases.append(
@@ -241,6 +241,7 @@ def capture_evaluation(
         },
         "prompt_version": semantic_analyzer.PROMPT_VERSION,
         "semantic_schema_version": semantic_analyzer.SCHEMA_VERSION,
+        "evidence_bundle_schema_version": semantic_analyzer.EVIDENCE_BUNDLE_SCHEMA_VERSION,
         "cases": captured_cases,
     }
 

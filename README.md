@@ -45,7 +45,8 @@ Outputs:
 - `runs/<run-id>/evidence/evidence-ledger.json`: immutable evidence and
   completeness manifest;
 - `runs/<run-id>/semantic-analysis.json`: cited atomic activities, omissions,
-  and analyzer provenance;
+  analyzer provenance, and the reversible content-addressed evidence-bundle
+  manifest used for local member expansion;
 - `runs/<run-id>/work-accounting-result.json`: semantic, allocation, Fathom,
   and exception contract;
 - `runs/<run-id>/allocation-report.json`: strict allocation and contested time;
@@ -128,8 +129,17 @@ Synthesis candidates require the same normalized project, workstream, and
 concrete object; generic model labels alone cannot combine unrelated activities.
 No rejected activity can become a proposal.
 
-Validated analyzer decisions are stored in an append-only local cache beside
-the durable review state. Cache keys bind the endpoint, model, prompt/schema
+Within each operational chunk, contiguous evidence from one stable session,
+repository, issue, or meeting context is represented as a content-addressed
+local bundle. The provider receives only request-local bundle references,
+ordered redacted members, and inclusive numeric ranges. It never receives the
+original ledger IDs or context identifiers. Models may split one bundle into
+multiple atomic accomplishments by returning disjoint member ranges. Local code
+expands those ranges to the original immutable evidence IDs and then enforces
+complete exactly-once coverage before computing activity identities.
+
+Validated analyzer decisions are stored in the append-only local
+`analyzer-cache-v2.jsonl` beside the durable review state. Cache keys bind the endpoint, model, prompt/schema
 versions, and complete request-body digest without storing request prose. Both
 accepted responses and contract-rejected primary decisions are sealed, so an
 immutable replay cannot randomly switch provider wording or fallback routing.
@@ -170,7 +180,8 @@ export CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED=approved
 Do not persist or enable that value merely because a route probe succeeded;
 setting it authorizes redacted private prose to leave the local machine for the
 configured analyzer endpoint. When explicitly enabled, cloud requests receive
-only a strict semantic projection: short deterministic evidence references and spans, redacted
+only a strict semantic projection: opaque bundle references, numeric member
+ranges and spans, redacted
 user/assistant text, structured Fathom summary/action-item/transcript text,
 safe commit subjects, and artifact basenames. Tool-call inputs, tool-result
 bodies, credentials, emails, URLs, absolute paths, and hashes never cross that
@@ -275,7 +286,7 @@ python3 scripts/clockify_review_run.py \
 The replay command creates a distinct run, copies the evidence ledger
 byte-for-byte, reruns deterministic accounting through the same validated
 analyzer-decision cache, and fails before durable-state ingestion if the ledger
-identity, semantic evidence digest, analyzer route/version, or sealed cache
+identity, semantic evidence digest, evidence-bundle manifest, analyzer route/version, or sealed cache
 decision differs. Its `replay-integrity.json` is required alongside replay
 `0 new / 0 changed`; running the ordinary collector twice is not replay proof.
 
@@ -325,8 +336,8 @@ compliance. Adjacent repeated words are rejected. Replay stability
 compares the review-relevant decision—disposition, partitions, lifecycle,
 effort, and confidence—rather than arbitrary rationale prose. The append-only
 validated decision cache owns exact output replay and is separately integrity
-checked. Long immutable ledger IDs never rely on model copying: local code maps
-short references back before schema and citation validation. Prefix validation
+checked. Long immutable ledger IDs never rely on model copying: local code
+expands disjoint bundle-member ranges before schema and citation validation. Prefix validation
 uses a neutral placeholder because deterministic routing owns the final prefix.
 A passing synthetic
 route scorecard proves contract fitness, not July semantic accuracy; the latter

@@ -25,6 +25,14 @@ def item(item_id: str, description: str) -> dict:
     }
 
 
+def bundle_manifest() -> dict:
+    return {
+        "schema_version": "clockify-semantic-evidence-bundle/v1",
+        "digest": review_run.semantic_analyzer.stable_digest("sebm-", [], length=64),
+        "bundles": [],
+    }
+
+
 class ReviewRunResultTests(unittest.TestCase):
     def test_immutable_replay_copies_only_ledger_and_binds_source_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -50,6 +58,8 @@ class ReviewRunResultTests(unittest.TestCase):
                 json.dumps({
                     "schema_version": 1,
                     "prompt_version": "prompt-v1",
+                    "evidence_bundle_schema_version": "clockify-semantic-evidence-bundle/v1",
+                    "evidence_bundle_manifest": bundle_manifest(),
                     "ledger_evidence_digest": "sha256:" + "c" * 64,
                     "activities": [{
                         "analyzer_model": "model-a",
@@ -95,6 +105,8 @@ class ReviewRunResultTests(unittest.TestCase):
                     json.dumps({
                         "schema_version": 1,
                         "prompt_version": "prompt-v1",
+                        "evidence_bundle_schema_version": "clockify-semantic-evidence-bundle/v1",
+                        "evidence_bundle_manifest": bundle_manifest(),
                         "ledger_evidence_digest": "sha256:" + "c" * 64,
                         "activities": [{
                             "analyzer_model": model,
@@ -134,6 +146,8 @@ class ReviewRunResultTests(unittest.TestCase):
                     json.dumps({
                         "schema_version": 1,
                         "prompt_version": "prompt-v1",
+                        "evidence_bundle_schema_version": "clockify-semantic-evidence-bundle/v1",
+                        "evidence_bundle_manifest": bundle_manifest(),
                         "ledger_evidence_digest": "sha256:" + "c" * 64,
                         "activities": [{
                             "analyzer_model": "model-a",
@@ -367,7 +381,7 @@ class ReviewRunResultTests(unittest.TestCase):
             accounting_command = run.call_args_list[1].args[0]
             cache_index = accounting_command.index("--analyzer-cache") + 1
             self.assertEqual(
-                str(Path(tmp) / "analyzer-cache.jsonl"), accounting_command[cache_index]
+                str(Path(tmp) / "analyzer-cache-v2.jsonl"), accounting_command[cache_index]
             )
             for option, expected in (
                 ("--analyzer-target-body-bytes", "250000"),

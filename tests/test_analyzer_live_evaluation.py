@@ -15,15 +15,28 @@ from scripts import analyzer_live_evaluation as live  # noqa: E402
 from scripts import semantic_analyzer  # noqa: E402
 
 
-def _activity(evidence_ids: list[str], spans: dict[str, dict[str, str]], index: int, concepts: list[str]) -> dict:
+def _partitions(members: list[dict]) -> list[dict]:
+    grouped: dict[str, list[int]] = {}
+    for member in members:
+        grouped.setdefault(member["bundle_ref"], []).append(member["member"])
+    return [
+        {
+            "bundle_ref": bundle_ref,
+            "member_ranges": [[position, position] for position in sorted(positions)],
+        }
+        for bundle_ref, positions in grouped.items()
+    ]
+
+
+def _activity(members: list[dict], index: int, concepts: list[str]) -> dict:
     return {
         "lifecycle": "completed",
         "workstream": "synthetic route evaluation",
         "action": "Verified",
         "object": f"{' '.join(concepts)} behavior {index}",
         "outcome": "against fixed evidence partitions",
-        "evidence_ids": evidence_ids,
-        "evidence_spans": [spans[evidence_id] for evidence_id in evidence_ids],
+        "evidence_partitions": _partitions(members),
+        "evidence_spans": [member["time_span"] for member in members],
         "project_recommendation": {
             "name": "Serenichron Level 2",
             "prefix": "SC",
@@ -56,17 +69,20 @@ class AnalyzerLiveEvaluationTests(unittest.TestCase):
             if '"probe"' in user_content:
                 return {"probe": "ok"}
             payload = json.loads(user_content)
-            events = payload["events"]
-            evidence_ids = sorted(str(event["evidence_id"]) for event in events)
+            self.assertIn("bundles", payload)
+            self.assertNotIn("events", payload)
+            members = [
+                {"bundle_ref": bundle["bundle_ref"], **member}
+                for bundle in payload["bundles"]
+                for member in bundle["members"]
+            ]
             case = ordered_cases[evidence_calls // 2]
             evidence_calls += 1
             original_ids = sorted(str(event["evidence_id"]) for event in case["events"])
-            aliases = dict(zip(original_ids, evidence_ids, strict=True))
-            spans = {str(event["evidence_id"]): event["time_span"] for event in events}
+            aliases = dict(zip(original_ids, members, strict=True))
             activities = [
                 _activity(
                     [aliases[value] for value in partition],
-                    spans,
                     index,
                     case["expected_activity_concepts"][index - 1]["required_terms"],
                 )
@@ -78,13 +94,13 @@ class AnalyzerLiveEvaluationTests(unittest.TestCase):
                 if case["case_id"].endswith("title-only-meeting"):
                     exceptions = [{
                         "kind": "insufficient_evidence",
-                        "evidence_ids": evidence_ids,
+                        "evidence_partitions": _partitions(members),
                         "reason": "title alone cannot support a meeting outcome",
                     }]
                 else:
                     omissions = [{
                         "lifecycle": "noise",
-                        "evidence_ids": evidence_ids,
+                        "evidence_partitions": _partitions(members),
                         "reason": "waiting status contains no substantive work",
                     }]
             return {"activities": activities, "exceptions": exceptions, "omissions": omissions}

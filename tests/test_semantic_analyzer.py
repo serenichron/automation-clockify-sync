@@ -57,6 +57,47 @@ def valid_response(evidence_id: str) -> dict:
     }
 
 
+def provider_members(payload: dict) -> list[dict]:
+    """Return only opaque, provider-visible evidence members in request order."""
+    return [
+        {"bundle_ref": bundle["bundle_ref"], **member}
+        for bundle in payload["bundles"]
+        for member in bundle["members"]
+    ]
+
+
+def provider_partitions(members: list[dict]) -> list[dict]:
+    """Compact opaque members into the extraction partition contract."""
+    grouped: dict[str, list[int]] = {}
+    for member in members:
+        grouped.setdefault(member["bundle_ref"], []).append(member["member"])
+    partitions = []
+    for bundle_ref, positions in grouped.items():
+        ordered = sorted(positions)
+        ranges = []
+        start = end = ordered[0]
+        for position in ordered[1:]:
+            if position == end + 1:
+                end = position
+            else:
+                ranges.append([start, end])
+                start = end = position
+        ranges.append([start, end])
+        partitions.append({"bundle_ref": bundle_ref, "member_ranges": ranges})
+    return partitions
+
+
+def provider_response(payload: dict, members: list[dict] | None = None) -> dict:
+    """Fixture provider response: opaque partitions, never local evidence IDs."""
+    selected = members if members is not None else provider_members(payload)
+    response = valid_response("unused-local-id")
+    activity = response["activities"][0]
+    activity.pop("evidence_ids")
+    activity["evidence_partitions"] = provider_partitions(selected)
+    activity["evidence_spans"] = [member["time_span"] for member in selected]
+    return response
+
+
 @mock.patch.dict(
     os.environ,
     {"CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED": "approved"},
@@ -303,8 +344,10 @@ class SemanticAnalyzerTests(unittest.TestCase):
                 reversed(events), model="test", max_body_bytes=ceiling
             )
 
-        self.assertEqual(1, body_for.call_count)
-        self.assertEqual([], body_for.call_args.args[0])
+        # Packing may build a bounded number of bundle-aware sizing bodies,
+        # but must remain linear and start with the empty-envelope baseline.
+        self.assertLessEqual(body_for.call_count, len(events) + 1)
+        self.assertEqual([], body_for.call_args_list[0].args[0])
         self.assertEqual(
             [item["evidence_id"] for item in ordered],
             [item["evidence_id"] for chunk in chunks for item in chunk],
@@ -361,6 +404,39 @@ class SemanticAnalyzerTests(unittest.TestCase):
         self.assertEqual(
             {item["evidence_id"] for item in events},
             {item["evidence_id"] for chunk in chunks for item in chunk},
+        )
+
+    def test_identified_session_crossing_midnight_remains_one_semantic_bundle(self):
+        events = []
+        for evidence_id, start, end in (
+            ("ev-before-midnight", "2026-07-10 23:58", "2026-07-10 23:59"),
+            ("ev-after-midnight", "2026-07-11 00:01", "2026-07-11 00:03"),
+        ):
+            item = event(evidence_id)
+            item.update({
+                "observed_start": start,
+                "observed_end": end,
+                "source_ref": {
+                    "source_type": "codex_sessions",
+                    "machine": "test-machine",
+                    "session_id": "cross-midnight-session",
+                },
+            })
+            events.append(item)
+
+        chunks = semantic.chunk_events(events, max_body_bytes=50_000)
+        self.assertEqual(1, len(chunks))
+        body = semantic._body_for(chunks[0], model="test", mode="extract")
+        payload = json.loads(body["messages"][1]["content"])
+        self.assertEqual(1, len(payload["bundles"]))
+        self.assertEqual(2, payload["bundles"][0]["member_count"])
+
+        restored = semantic._restore_extraction_partitions(
+            provider_response(payload), events=chunks[0]
+        )
+        self.assertEqual(
+            ["ev-after-midnight", "ev-before-midnight"],
+            sorted(restored["activities"][0]["evidence_ids"]),
         )
 
     def test_operational_target_does_not_reject_event_below_hard_ceiling(self):
@@ -509,13 +585,13 @@ class SemanticAnalyzerTests(unittest.TestCase):
         calls = []
 
         def transport(endpoint, body):
-            calls.append((endpoint.name, "probe" if "events" not in body["messages"][1]["content"] else "evidence"))
-            if "events" not in body["messages"][1]["content"]:
+            calls.append((endpoint.name, "probe" if '"bundles"' not in body["messages"][1]["content"] else "evidence"))
+            if '"bundles"' not in body["messages"][1]["content"]:
                 return {"probe": "ok"}
             if endpoint.name == "primary":
                 return {"choices": [{"message": {"content": "not-json"}}]}
             payload = json.loads(body["messages"][1]["content"])
-            return valid_response(payload["events"][0]["evidence_id"])
+            return provider_response(payload)
 
         result = semantic.analyze_tiered(
             [event("ev-1")],
@@ -543,7 +619,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
                 return {"probe": "ok"}
             if endpoint.name == "primary":
                 raise semantic.AnalyzerError("primary call unavailable")
-            return valid_response(payload["events"][0]["evidence_id"])
+            return provider_response(payload)
 
         result = semantic.analyze_tiered(
             [event("ev-1")],
@@ -576,7 +652,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
             })
             if payload.get("probe"):
                 return {"probe": "ok"}
-            response = valid_response(payload["events"][0]["evidence_id"])
+            response = provider_response(payload)
             if "repair_feedback" not in payload:
                 response["activities"][0]["action"] = "Fixed and published"
             return response
@@ -609,7 +685,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
             calls.append((endpoint.name, payload))
             if payload.get("probe"):
                 return {"probe": "ok"}
-            response = valid_response(payload["events"][0]["evidence_id"])
+            response = provider_response(payload)
             if endpoint.name == "primary":
                 response["activities"][0]["action"] = "Fixed and published"
             return response
@@ -640,7 +716,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
                 return {"probe": "ok"}
             if endpoint.name == "primary":
                 raise semantic.AnalyzerError("primary route unavailable")
-            return valid_response(payload["events"][0]["evidence_id"])
+            return provider_response(payload)
 
         result = semantic.analyze_tiered(
             [event("ev-1")],
@@ -663,7 +739,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
                 calls.append((endpoint.name, "probe"))
                 return {"probe": "ok"}
             calls.append((endpoint.name, "extract"))
-            response = valid_response(payload["events"][0]["evidence_id"])
+            response = provider_response(payload)
             if endpoint.name == "primary":
                 response["activities"][0]["semantic_confidence"] = "low"
             return response
@@ -686,7 +762,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
             payload = json.loads(body["messages"][1]["content"])
             if payload.get("probe"):
                 return {"probe": "ok"}
-            response = valid_response(payload["events"][0]["evidence_id"])
+            response = provider_response(payload)
             response["activities"][0]["timing_confidence"] = "low"
             return response
 
@@ -708,7 +784,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
             calls.append((endpoint.name, payload.get("mode", "probe")))
             if payload.get("probe"):
                 return {"probe": "ok"}
-            response = valid_response(payload["events"][0]["evidence_id"])
+            response = provider_response(payload)
             if endpoint.name == "primary":
                 response["activities"][0]["semantic_confidence"] = "low"
                 return response
@@ -793,16 +869,10 @@ class SemanticAnalyzerTests(unittest.TestCase):
 
     def test_tiered_analysis_is_deterministic_under_event_permutation(self):
         def transport(endpoint, body):
-            if "events" not in body["messages"][1]["content"]:
+            if '"bundles"' not in body["messages"][1]["content"]:
                 return {"probe": "ok"}
             payload = json.loads(body["messages"][1]["content"])
-            ordered_events = sorted(payload["events"], key=lambda item: item["evidence_id"])
-            response = valid_response(ordered_events[0]["evidence_id"])
-            response["activities"][0].update({
-                "evidence_ids": [item["evidence_id"] for item in ordered_events],
-                "evidence_spans": [item["time_span"] for item in ordered_events],
-            })
-            return response
+            return provider_response(payload)
 
         endpoint = semantic.AnalyzerEndpoint("primary", "http://primary", "cheap")
         first = semantic.analyze_tiered(
@@ -818,14 +888,14 @@ class SemanticAnalyzerTests(unittest.TestCase):
 
         def transport(endpoint, body):
             payload = json.loads(body["messages"][1]["content"])
-            calls.append((endpoint.name, "probe" if "events" not in payload else "evidence"))
-            if "events" not in payload:
+            calls.append((endpoint.name, "probe" if "bundles" not in payload else "evidence"))
+            if "bundles" not in payload:
                 self.assertNotIn("ev-", json.dumps(body))
                 return {"probe": "ok"}
-            response = valid_response(payload["events"][0]["evidence_id"])
-            if payload["events"][0]["time_span"]["start"].startswith("2026-07-11"):
+            member = provider_members(payload)[0]
+            response = provider_response(payload)
+            if member["time_span"]["start"].startswith("2026-07-11"):
                 response["activities"][0]["object"] = "Clockify review state"
-            response["activities"][0]["evidence_spans"] = [payload["events"][0]["time_span"]]
             return response
 
         semantic.analyze_tiered(
@@ -853,17 +923,16 @@ class SemanticAnalyzerTests(unittest.TestCase):
                 max_active = max(max_active, active)
             # Reverse completion order so the assertion cannot pass merely
             # because requests happened to finish in source order.
-            evidence_id = payload["events"][0]["evidence_id"]
-            day = int(payload["events"][0]["time_span"]["start"][8:10])
+            member = provider_members(payload)[0]
+            day = int(member["time_span"]["start"][8:10])
             time.sleep(0.01 * (20 - day))
             with lock:
                 active -= 1
-            response = valid_response(evidence_id)
-            marker = payload["events"][0]["time_span"]["start"]
+            response = provider_response(payload)
+            marker = member["time_span"]["start"]
             response["activities"][0].update({
                 "object": f"Clockify item {marker}",
                 "workstream": f"Clockify stream {marker}",
-                "evidence_spans": [payload["events"][0]["time_span"]],
             })
             return response
 
@@ -896,12 +965,12 @@ class SemanticAnalyzerTests(unittest.TestCase):
                 calls.append((endpoint.name, "probe" if payload.get("probe") else "extract"))
             if payload.get("probe"):
                 return {"probe": "ok"}
-            response = valid_response(payload["events"][0]["evidence_id"])
-            marker = payload["events"][0]["time_span"]["start"]
+            member = provider_members(payload)[0]
+            response = provider_response(payload)
+            marker = member["time_span"]["start"]
             response["activities"][0].update({
                 "object": f"Clockify item {marker}",
                 "workstream": f"Clockify stream {marker}",
-                "evidence_spans": [payload["events"][0]["time_span"]],
             })
             return response
 
@@ -927,12 +996,12 @@ class SemanticAnalyzerTests(unittest.TestCase):
                 if endpoint.name == "primary":
                     raise semantic.AnalyzerError("route unavailable")
                 return {"probe": "ok"}
-            response = valid_response(payload["events"][0]["evidence_id"])
-            marker = payload["events"][0]["time_span"]["start"]
+            member = provider_members(payload)[0]
+            response = provider_response(payload)
+            marker = member["time_span"]["start"]
             response["activities"][0].update({
                 "object": f"Clockify item {marker}",
                 "workstream": f"Clockify stream {marker}",
-                "evidence_spans": [payload["events"][0]["time_span"]],
             })
             return response
 
@@ -959,7 +1028,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
             payload = json.loads(body["messages"][-1]["content"])
             if payload.get("probe"):
                 return {"probe": "ok"}
-            event_payload = payload["events"][0]
+            event_payload = provider_members(payload)[0]
             day = int(event_payload["time_span"]["start"][8:10])
             with lock:
                 extract_calls.append((endpoint.name, day))
@@ -976,9 +1045,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
                 # Already in flight: it may complete, but cancellation must
                 # discard it before cache persistence, fallback, or synthesis.
                 time.sleep(0.1)
-                response = valid_response(event_payload["evidence_id"])
-                response["activities"][0]["evidence_spans"] = [event_payload["time_span"]]
-                return response
+                return provider_response(payload)
             self.fail("a queued chunk must not reach the transport")
 
         primary = semantic.AnalyzerEndpoint("primary", "http://primary", "cheap")
@@ -1013,10 +1080,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
             if payload.get("probe"):
                 return {"probe": "ok"}
             if payload["mode"] == "extract":
-                evidence = payload["events"][0]
-                response = valid_response(evidence["evidence_id"])
-                response["activities"][0]["evidence_spans"] = [evidence["time_span"]]
-                return response
+                return provider_response(payload)
             provisional = payload["provisional_activities"]
             response = valid_response(provisional[0]["evidence_ids"][0])
             response["activities"][0].update({
@@ -1053,8 +1117,8 @@ class SemanticAnalyzerTests(unittest.TestCase):
                 return {"probe": "ok"}
             if payload["mode"] == "synthesize":
                 self.fail("different concrete objects must not become a synthesis candidate")
-            evidence = payload["events"][0]
-            response = valid_response(evidence["evidence_id"])
+            evidence = provider_members(payload)[0]
+            response = provider_response(payload)
             response["activities"][0].update({
                 "workstream": "General maintenance",
                 "object": (
@@ -1062,7 +1126,6 @@ class SemanticAnalyzerTests(unittest.TestCase):
                     if evidence["time_span"]["start"].startswith("2026-07-10")
                     else "Fathom meeting routing"
                 ),
-                "evidence_spans": [evidence["time_span"]],
             })
             return response
 
@@ -1085,10 +1148,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
             if payload.get("probe"):
                 return {"probe": "ok"}
             if payload["mode"] == "extract":
-                evidence = payload["events"][0]
-                response = valid_response(evidence["evidence_id"])
-                response["activities"][0]["evidence_spans"] = [evidence["time_span"]]
-                return response
+                return provider_response(payload)
             activities = []
             for index, provisional in enumerate(payload["provisional_activities"], start=1):
                 response = valid_response(provisional["evidence_ids"][0])
@@ -1122,10 +1182,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
             if payload.get("probe"):
                 return {"probe": "ok"}
             if payload["mode"] == "extract":
-                evidence = payload["events"][0]
-                response = valid_response(evidence["evidence_id"])
-                response["activities"][0]["evidence_spans"] = [evidence["time_span"]]
-                return response
+                return provider_response(payload)
             provisional = payload["provisional_activities"]
             response = valid_response(provisional[0]["evidence_ids"][0])
             if endpoint.name == "primary":
@@ -1169,10 +1226,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
             if payload.get("probe"):
                 return {"probe": "ok"}
             if payload["mode"] == "extract":
-                evidence = payload["events"][0]
-                response = valid_response(evidence["evidence_id"])
-                response["activities"][0]["evidence_spans"] = [evidence["time_span"]]
-                return response
+                return provider_response(payload)
             synthesis_requests.append(payload)
             provisional = payload["provisional_activities"]
             response = valid_response(provisional[0]["evidence_ids"][0])
@@ -1212,10 +1266,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
             if payload.get("probe"):
                 return {"probe": "ok"}
             if payload["mode"] == "extract":
-                evidence = payload["events"][0]
-                response = valid_response(evidence["evidence_id"])
-                response["activities"][0]["evidence_spans"] = [evidence["time_span"]]
-                return response
+                return provider_response(payload)
             return {"activities": [], "exceptions": [], "omissions": []}
 
         result = semantic.analyze_tiered(
@@ -1272,10 +1323,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
             if payload.get("probe"):
                 return {"probe": "ok"}
             if payload["mode"] == "extract":
-                evidence = payload["events"][0]
-                response = valid_response(evidence["evidence_id"])
-                response["activities"][0]["evidence_spans"] = [evidence["time_span"]]
-                return response
+                return provider_response(payload)
             captured.update(payload)
             provisional = payload["provisional_activities"]
             response = valid_response(provisional[0]["evidence_ids"][0])
@@ -1315,10 +1363,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
                 if payload.get("probe"):
                     return {"probe": "ok"}
                 if payload["mode"] == "extract":
-                    evidence = payload["events"][0]
-                    response = valid_response(evidence["evidence_id"])
-                    response["activities"][0]["evidence_spans"] = [evidence["time_span"]]
-                    return response
+                    return provider_response(payload)
                 provisional = payload["provisional_activities"]
                 response = valid_response(response_evidence_ids[0])
                 response["activities"][0].update({
@@ -1348,10 +1393,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
             if payload.get("probe"):
                 return {"probe": "ok"}
             if payload["mode"] == "extract":
-                evidence = payload["events"][0]
-                response = valid_response(evidence["evidence_id"])
-                response["activities"][0]["evidence_spans"] = [evidence["time_span"]]
-                return response
+                return provider_response(payload)
             provisional = payload["provisional_activities"]
             response = valid_response(provisional[0]["evidence_ids"][0])
             response["activities"][0].update({
@@ -1418,9 +1460,16 @@ class SemanticAnalyzerTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, request_json)
         payload = json.loads(body["messages"][1]["content"])
-        safe = next(item for item in payload["events"] if item["role"] == "assistant")
-        tool_projection = next(item for item in payload["events"] if item["role"] == "tool")
-        self.assertEqual({"ref-0001", "ref-0002"}, {item["evidence_id"] for item in payload["events"]})
+        self.assertIn("bundles", payload)
+        self.assertNotIn("events", payload)
+        members = provider_members(payload)
+        safe = next(item for item in members if item["role"] == "assistant")
+        tool_projection = next(item for item in members if item["role"] == "tool")
+        self.assertEqual(2, len(members))
+        self.assertTrue(all(item["member"] == 1 for item in members))
+        self.assertEqual(2, len({item["bundle_ref"] for item in members}))
+        self.assertNotIn("ev-safe", json.dumps(payload))
+        self.assertNotIn("ev-tool", json.dumps(payload))
         self.assertIn("Completed safe reconciliation", safe["content"])
         self.assertIn("Validated safe semantic outcome", safe["content"])
         self.assertEqual("agent_session", safe["source_category"])
@@ -1605,8 +1654,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
                 calls.append("probe")
                 return {"probe": "ok"}
             calls.append("evidence")
-            evidence_id = payload["events"][0]["evidence_id"]
-            return valid_response(evidence_id)
+            return provider_response(payload)
 
         endpoint = semantic.AnalyzerEndpoint("primary", "http://primary", "cheap")
         with tempfile.TemporaryDirectory() as directory:
@@ -1644,7 +1692,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
             calls.append(payload)
             if payload.get("probe"):
                 return {"probe": "ok"}
-            response = valid_response(payload["events"][0]["evidence_id"])
+            response = provider_response(payload)
             if "repair_feedback" not in payload:
                 response["activities"][0]["action"] = "Fixed and published"
             return response
@@ -1808,10 +1856,9 @@ class SemanticAnalyzerTests(unittest.TestCase):
                 calls.append((endpoint.name, "probe"))
                 return {"probe": "ok"}
             calls.append((endpoint.name, "evidence"))
-            evidence_id = payload["events"][0]["evidence_id"]
             if endpoint.name == "primary":
                 return {"activities": [], "exceptions": [], "omissions": []}
-            return valid_response(evidence_id)
+            return provider_response(payload)
 
         primary = semantic.AnalyzerEndpoint("primary", "http://primary", "cheap")
         fallback = semantic.AnalyzerEndpoint("fallback", "http://fallback", "strong")
@@ -1883,6 +1930,154 @@ class SemanticAnalyzerTests(unittest.TestCase):
                 semantic.AnalyzerError, "cannot replace an existing decision"
             ):
                 stale.store_accepted(endpoint, body, conflicting)
+
+    def test_provider_body_contains_only_opaque_bundles(self):
+        events = [event("ev-local-a"), event("ev-local-b")]
+        for item in events:
+            item["source_ref"] = {
+                "source_type": "codex_sessions",
+                "machine": "private-machine-id",
+                "session_id": "private-session-id",
+            }
+        body = semantic._body_for(
+            events, model="fixture", mode="extract", private_text_approved=True
+        )
+        payload = json.loads(body["messages"][-1]["content"])
+        outbound = semantic.canonical_json(payload)
+        self.assertEqual(semantic.EVIDENCE_BUNDLE_SCHEMA_VERSION, payload["evidence_bundle_schema_version"])
+        self.assertIn("bundles", payload)
+        self.assertNotIn("events", payload)
+        for forbidden in ("ev-local-a", "ev-local-b", "private-machine-id", "private-session-id"):
+            self.assertNotIn(forbidden, outbound)
+        self.assertEqual({"b-0001"}, {item["bundle_ref"] for item in payload["bundles"]})
+
+    def test_bundle_manifest_is_content_addressed_and_stable_under_input_permutation(self):
+        events = [event("ev-z", content="z work"), event("ev-a", content="a work")]
+        for item in events:
+            item["source_ref"] = {
+                "source_type": "codex_sessions", "machine": "host", "session_id": "same"
+            }
+        _, first = semantic._semantic_evidence_bundles(events)
+        _, second = semantic._semantic_evidence_bundles(reversed(events))
+        self.assertEqual(first, second)
+        self.assertTrue(all(item["bundle_id"].startswith("seb-") for item in first))
+
+    def test_partition_split_and_whole_range_expand_to_original_evidence_ids(self):
+        events = [event("ev-a"), event("ev-b"), event("ev-c")]
+        for item in events:
+            item["source_ref"] = {
+                "source_type": "codex_sessions", "machine": "host", "session_id": "same"
+            }
+        payload = json.loads(semantic._body_for(
+            events, model="fixture", mode="extract", private_text_approved=True
+        )["messages"][-1]["content"])
+        members = provider_members(payload)
+        split_left = provider_response(payload, members[:1])
+        split_right = provider_response(payload, members[1:])
+        restored_split = semantic._restore_extraction_partitions(
+            {
+                "activities": split_left["activities"] + split_right["activities"],
+                "exceptions": [],
+                "omissions": [],
+            },
+            events=events,
+        )
+        self.assertEqual([["ev-a"], ["ev-b", "ev-c"]], [
+            item["evidence_ids"] for item in restored_split["activities"]
+        ])
+        restored_whole = semantic._restore_extraction_partitions(
+            provider_response(payload), events=events
+        )
+        self.assertEqual(["ev-a", "ev-b", "ev-c"], restored_whole["activities"][0]["evidence_ids"])
+
+    def test_invalid_provider_partitions_fail_closed(self):
+        events = [event("ev-a"), event("ev-b")]
+        for item in events:
+            item["source_ref"] = {
+                "source_type": "codex_sessions", "machine": "host", "session_id": "same"
+            }
+        payload = json.loads(semantic._body_for(
+            events, model="fixture", mode="extract", private_text_approved=True
+        )["messages"][-1]["content"])
+        base = provider_response(payload)
+        activity = base["activities"][0]
+        variants = [
+            ("unknown", [{"bundle_ref": "b-9999", "member_ranges": [[1, 1]]}]),
+            ("repeated bundle ref", [
+                {"bundle_ref": "b-0001", "member_ranges": [[1, 1]]},
+                {"bundle_ref": "b-0001", "member_ranges": [[2, 2]]},
+            ]),
+            ("ranges overlap", [{"bundle_ref": "b-0001", "member_ranges": [[1, 2], [2, 2]]}]),
+            ("reversed or out of bounds", [{"bundle_ref": "b-0001", "member_ranges": [[2, 1]]}]),
+            ("reversed or out of bounds", [{"bundle_ref": "b-0001", "member_ranges": [[1, 3]]}]),
+        ]
+        for message, partitions in variants:
+            candidate = json.loads(json.dumps(base))
+            candidate["activities"][0]["evidence_partitions"] = partitions
+            with self.subTest(message=message), self.assertRaisesRegex(semantic.AnalyzerError, message):
+                semantic._restore_extraction_partitions(candidate, events=events)
+
+        missing = provider_response(payload, provider_members(payload)[:1])
+        restored = semantic._restore_extraction_partitions(missing, events=events)
+        with self.assertRaisesRegex(semantic.AnalyzerError, "omitted known evidence"):
+            semantic.validate_result(
+                restored, known_evidence_ids={"ev-a", "ev-b"},
+                provider_model="fixture", analyzer_tier="primary",
+            )
+
+    def test_accepted_extraction_cache_never_contains_local_ids_or_private_prose(self):
+        local_id = "ev-private-local"
+        private = "PRIVATE_EXACT_TEXT"
+        item = event(local_id, content=private)
+        endpoint = semantic.AnalyzerEndpoint("primary", "http://primary", "fixture")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cache.jsonl"
+            semantic.analyze_tiered(
+                [item], primary=endpoint, private_text_approved=True,
+                cache=semantic.AnalyzerResponseCache(path),
+                transport=lambda _endpoint, body: (
+                    {"probe": "ok"}
+                    if json.loads(body["messages"][-1]["content"]).get("probe")
+                    else provider_response(json.loads(body["messages"][-1]["content"]))
+                ),
+            )
+            cached = path.read_text(encoding="utf-8")
+        self.assertNotIn(local_id, cached)
+        self.assertNotIn(private, cached)
+        self.assertNotIn("evidence_ids", cached)
+        self.assertIn("evidence_partitions", cached)
+
+    def test_oversized_stable_context_splits_without_evidence_loss(self):
+        events = [event(f"ev-{index:02d}") for index in range(7)]
+        for item in events:
+            item["source_ref"] = {
+                "source_type": "codex_sessions", "machine": "host", "session_id": "same"
+            }
+        chunks = semantic.chunk_events(
+            events, max_body_bytes=50_000, max_events_per_chunk=2
+        )
+        self.assertEqual([2, 2, 2, 1], [len(chunk) for chunk in chunks])
+        self.assertEqual(
+            sorted(item["evidence_id"] for item in events),
+            sorted(item["evidence_id"] for chunk in chunks for item in chunk),
+        )
+
+    def test_unchanged_bundle_request_and_manifest_are_deterministic(self):
+        events = [event("ev-a", content="same"), event("ev-b", content="same")]
+        for item in events:
+            item["source_ref"] = {
+                "source_type": "codex_sessions", "machine": "host", "session_id": "same"
+            }
+        first_body = semantic._body_for(
+            events, model="fixture", mode="extract", private_text_approved=True
+        )
+        second_body = semantic._body_for(
+            events, model="fixture", mode="extract", private_text_approved=True
+        )
+        _, first_manifest = semantic._semantic_evidence_bundles(events)
+        _, second_manifest = semantic._semantic_evidence_bundles(events)
+        self.assertEqual(semantic.canonical_json(first_body), semantic.canonical_json(second_body))
+        self.assertEqual(first_manifest, second_manifest)
 
 
 if __name__ == "__main__":

@@ -40,8 +40,9 @@ def document() -> dict:
         "schema_version": evaluation.INPUT_SCHEMA_VERSION,
         "corpus": {"records": records, "digest": evaluation.sha256_hex(records)},
         "route": {"route_id": "ollama-cloud-primary", "model": "deepseek-v4-flash:cloud", "tier": "primary"},
-        "prompt_version": "clockify-semantic-v8",
+        "prompt_version": "clockify-semantic-v9",
         "semantic_schema_version": 1,
+        "evidence_bundle_schema_version": "clockify-semantic-evidence-bundle/v1",
         "cases": [{
             "case_id": "one-atomic-outcome",
             "evidence_ids": [evidence],
@@ -59,7 +60,7 @@ class AnalyzerEvaluationTests(unittest.TestCase):
     def test_produces_digest_bound_passing_scorecard(self) -> None:
         scorecard = evaluation.evaluate(document())
         self.assertTrue(scorecard["passed"])
-        self.assertEqual("clockify-analyzer-evaluator/v3", scorecard["evaluator_version"])
+        self.assertEqual("clockify-analyzer-evaluator/v4", scorecard["evaluator_version"])
         self.assertEqual("deepseek-v4-flash:cloud", scorecard["route"]["model"])
         self.assertEqual(64, len(scorecard["input_corpus_digest"]))
         self.assertEqual(scorecard, evaluation.verify_scorecard(scorecard))

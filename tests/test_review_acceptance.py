@@ -173,8 +173,9 @@ def _scorecard(evidence_id: str) -> dict:
             "schema_version": analyzer_evaluation.INPUT_SCHEMA_VERSION,
             "corpus": {"records": records, "digest": analyzer_evaluation.sha256_hex(records)},
             "route": {"route_id": "fixture-route", "model": "fixture-model", "tier": "primary"},
-            "prompt_version": "clockify-semantic-v8",
+            "prompt_version": "clockify-semantic-v9",
             "semantic_schema_version": 1,
+            "evidence_bundle_schema_version": "clockify-semantic-evidence-bundle/v1",
             "cases": [
                 {
                     "case_id": "acceptance-route",
