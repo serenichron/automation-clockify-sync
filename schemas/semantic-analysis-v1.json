@@ -88,6 +88,7 @@
         "omit_rationale": {"type": "string"},
         "rendered_description": {"type": ["string", "null"]},
         "analyzer_model": {"type": "string"},
+        "analyzer_revision": {"type": "string"},
         "analyzer_tier": {"enum": ["primary", "fallback", "fixture"]},
         "prompt_version": {"const": "clockify-semantic-v13"},
         "schema_version": {"const": 1}
@@ -173,6 +174,7 @@
         "evidence_digest": {"type": "string", "pattern": "^ech-[a-f0-9]{24}$"},
         "endpoint": {"type": "string"},
         "model": {"type": "string"},
+        "revision": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
         "tier": {"enum": ["primary", "fallback", "exception"]},
         "partition_path": {"type": "string", "pattern": "^root(?:\\.[ab])*$"},
         "partition_depth": {"type": "integer", "minimum": 0, "maximum": 8},
@@ -194,6 +196,7 @@
         "failure_digest": {"type": "string", "pattern": "^aer-[a-f0-9]{24}$"},
         "fallback_endpoint": {"type": "string", "minLength": 1},
         "fallback_model": {"type": "string", "minLength": 1},
+        "fallback_revision": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
         "evidence_bundle_schema_version": {"const": "clockify-semantic-evidence-bundle/v1"},
         "bundle_count": {"type": "integer", "minimum": 1},
         "bundle_manifest_digest": {"type": "string", "pattern": "^sebm-[a-f0-9]{64}$"}

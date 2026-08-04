@@ -279,9 +279,16 @@ def capture_evaluation(
         },
         "route": {
             "route_id": semantic_analyzer.stable_digest(
-                "route-", {"name": endpoint.name, "model": endpoint.model, "tier": tier}
+                "route-",
+                {
+                    "name": endpoint.name,
+                    "model": endpoint.model,
+                    "revision": endpoint.revision,
+                    "tier": tier,
+                },
             ),
             "model": endpoint.model,
+            "revision": endpoint.revision,
             "tier": tier,
         },
         "prompt_version": semantic_analyzer.PROMPT_VERSION,

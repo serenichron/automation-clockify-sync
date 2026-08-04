@@ -2415,6 +2415,22 @@ class SemanticAnalyzerTests(unittest.TestCase):
             with self.assertRaisesRegex(semantic.AnalyzerError, "identity digest differs"):
                 semantic.AnalyzerResponseCache(path)
 
+    def test_response_cache_identity_binds_model_revision(self):
+        body = {"model": "deepseek-v4-flash:cloud", "messages": []}
+        first = semantic.AnalyzerEndpoint(
+            "primary", "http://primary", "deepseek-v4-flash:cloud",
+            revision="a" * 64,
+        )
+        second = semantic.AnalyzerEndpoint(
+            "primary", "http://primary", "deepseek-v4-flash:cloud",
+            revision="b" * 64,
+        )
+
+        self.assertNotEqual(
+            semantic.AnalyzerResponseCache._request_identity(first, body)["cache_key"],
+            semantic.AnalyzerResponseCache._request_identity(second, body)["cache_key"],
+        )
+
     def test_response_cache_retains_prior_prompt_records_without_reusing_them(self):
         endpoint = semantic.AnalyzerEndpoint("primary", "http://primary", "cheap")
         body = semantic._body_for(

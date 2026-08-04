@@ -121,12 +121,14 @@ class AnalyzerLiveEvaluationTests(unittest.TestCase):
             return {"activities": activities, "exceptions": exceptions, "omissions": omissions}
 
         endpoint = semantic_analyzer.AnalyzerEndpoint(
-            name="synthetic-test", url="https://example.invalid/v1/chat", model="fixture-model"
+            name="synthetic-test", url="https://example.invalid/v1/chat", model="fixture-model",
+            revision="a" * 64,
         )
         capture = live.capture_evaluation(endpoint, tier="primary", transport=transport)
         scorecard = analyzer_evaluation.evaluate(capture)
 
         self.assertTrue(scorecard["passed"])
+        self.assertEqual("a" * 64, scorecard["route"]["revision"])
         self.assertEqual(5, scorecard["case_count"])
         self.assertEqual(11, len(calls))
         outbound = semantic_analyzer.canonical_json(calls)

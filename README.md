@@ -123,10 +123,11 @@ recovery below even when the primary is the only qualified route. Conflicting or
 low-confidence claims that remain unresolved become explicit exceptions, never
 proposals.
 
-The built-in default is `deepseek-v4-pro:cloud`, selected only after the v13
-synthetic route gate passed. `deepseek-v4-flash:cloud` remains ineligible as a
-primary until it passes the same stable split/merge evaluation; model family or
-advertised context size never overrides the scorecard.
+The required primary is `deepseek-v4-flash:cloud`. The current release passed
+the v13 synthetic route gate after its moving Ollama tag was refreshed. Every
+live cloud route must include the resolved 64-character model revision so the
+scorecard, analyzer cache, semantic run, and replay cannot silently mix model
+releases. `deepseek-v4-pro:cloud` is not an approved route for this process.
 
 Analyzer requests retain the fail-closed 1,450,000-byte hard ceiling. Normal
 extraction uses a 250,000-byte and 250-event operational target with four

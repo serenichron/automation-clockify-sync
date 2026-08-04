@@ -94,6 +94,7 @@ def _versions(analysis: Mapping[str, Any]) -> list[dict[str, Any]]:
         activity = _require_mapping(raw, "semantic activity")
         version = {
             "model": str(activity.get("analyzer_model") or ""),
+            "revision": str(activity.get("analyzer_revision") or ""),
             "tier": str(activity.get("analyzer_tier") or ""),
             "prompt_version": str(activity.get("prompt_version") or analysis.get("prompt_version") or ""),
             "schema_version": activity.get("schema_version", analysis.get("schema_version")),
@@ -160,6 +161,7 @@ def _versions(analysis: Mapping[str, Any]) -> list[dict[str, Any]]:
             continue
         version = {
             "model": model,
+            "revision": str(chunk.get("revision") or ""),
             "tier": tier,
             "prompt_version": str(analysis.get("prompt_version") or ""),
             "schema_version": analysis.get("schema_version"),
@@ -314,13 +316,18 @@ def build_period_report(
     evaluated_routes = {
         (
             str(scorecard.get("route", {}).get("model") or ""),
+            str(scorecard.get("route", {}).get("revision") or ""),
             str(scorecard.get("route", {}).get("tier") or ""),
         )
         for scorecard in verified_scorecards
         if scorecard.get("passed") is True and isinstance(scorecard.get("route"), Mapping)
     }
     analyzer_evaluation_pass = bool(verified_scorecards) and {
-        (str(version.get("model") or ""), str(version.get("tier") or ""))
+        (
+            str(version.get("model") or ""),
+            str(version.get("revision") or ""),
+            str(version.get("tier") or ""),
+        )
         for version in versions
     } <= evaluated_routes
     coverage_clean = not snapshot.get("coverage_warnings") and not replay_snapshot.get("coverage_warnings")

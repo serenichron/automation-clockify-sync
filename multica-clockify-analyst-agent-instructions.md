@@ -72,9 +72,10 @@ entry grouping, wall-clock gap filling, or manual overlap trimming.
 
 ## Evidence and model limits
 
-- `deepseek-v4-pro:cloud` is the default primary analyzer because it passed the
-  v12 live probe and versioned evaluation. Flash and every fallback remain
-  candidates until they pass the same exact-version gate.
+- `deepseek-v4-flash:cloud` is the required primary analyzer. Resolve and pass
+  its current 64-character Ollama revision through
+  `CLOCKIFY_ANALYZER_PRIMARY_REVISION`; moving cloud tags without a release
+  binding fail closed. `deepseek-v4-pro:cloud` is not approved for this process.
 - The request ceiling is about 1.45 MB. The pipeline chunks complete normalized
   events by day and rejects an individually oversized event instead of clipping
   it.

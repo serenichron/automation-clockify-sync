@@ -27,7 +27,8 @@ SCORECARD_SCHEMA_VERSION = "clockify-analyzer-evaluation-scorecard/v1"
 EVALUATOR_VERSION = "clockify-analyzer-evaluator/v4"
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 _CASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-_ROUTE_FIELDS = frozenset({"route_id", "model", "tier"})
+_REQUIRED_ROUTE_FIELDS = frozenset({"route_id", "model", "tier"})
+_ROUTE_FIELDS = _REQUIRED_ROUTE_FIELDS | {"revision"}
 _RESPONSE_FIELDS = frozenset({"activities", "exceptions", "omissions"})
 
 
@@ -92,10 +93,15 @@ def _corpus(document: Mapping[str, Any]) -> tuple[list[dict[str, Any]], str]:
 
 def _route(document: Mapping[str, Any]) -> dict[str, str]:
     raw = _require_mapping(document.get("route"), "route")
-    _require_keys(raw, set(_ROUTE_FIELDS), "route")
-    route = {key: str(raw[key] or "").strip() for key in _ROUTE_FIELDS}
+    if not _REQUIRED_ROUTE_FIELDS <= set(raw) or not set(raw) <= _ROUTE_FIELDS:
+        raise EvaluationError("route has unsupported fields")
+    route = {key: str(raw.get(key) or "").strip() for key in _ROUTE_FIELDS}
     if not route["route_id"] or not route["model"] or route["tier"] not in {"primary", "fallback"}:
         raise EvaluationError("route requires route_id, model, and a primary or fallback tier")
+    if route["model"].endswith(":cloud") and not re.fullmatch(
+        r"[a-f0-9]{64}", route["revision"]
+    ):
+        raise EvaluationError("moving cloud model routes require a release revision")
     return route
 
 
@@ -408,6 +414,7 @@ def verify_scorecard(scorecard: Any) -> dict[str, Any]:
     _require_keys(value, required, "scorecard")
     if value["schema_version"] != SCORECARD_SCHEMA_VERSION or value["evaluator_version"] != EVALUATOR_VERSION:
         raise EvaluationError("unsupported scorecard version")
+    _route(value)
     if not _SHA256_RE.fullmatch(str(value["input_corpus_digest"])) or not _SHA256_RE.fullmatch(str(value["input_digest"])):
         raise EvaluationError("scorecard has invalid input digest")
     body = {key: value[key] for key in value if key != "scorecard_digest"}

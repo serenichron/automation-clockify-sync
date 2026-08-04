@@ -39,7 +39,12 @@ def document() -> dict:
     return {
         "schema_version": evaluation.INPUT_SCHEMA_VERSION,
         "corpus": {"records": records, "digest": evaluation.sha256_hex(records)},
-        "route": {"route_id": "ollama-cloud-primary", "model": "deepseek-v4-flash:cloud", "tier": "primary"},
+        "route": {
+            "route_id": "ollama-cloud-primary",
+            "model": "deepseek-v4-flash:cloud",
+            "revision": "6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc",
+            "tier": "primary",
+        },
         "prompt_version": "clockify-semantic-v13",
         "semantic_schema_version": 1,
         "evidence_bundle_schema_version": "clockify-semantic-evidence-bundle/v1",
@@ -57,6 +62,12 @@ def document() -> dict:
 
 
 class AnalyzerEvaluationTests(unittest.TestCase):
+    def test_moving_cloud_route_requires_release_revision(self) -> None:
+        source = document()
+        del source["route"]["revision"]
+        with self.assertRaisesRegex(evaluation.EvaluationError, "release revision"):
+            evaluation.evaluate(source)
+
     def test_produces_digest_bound_passing_scorecard(self) -> None:
         scorecard = evaluation.evaluate(document())
         self.assertTrue(scorecard["passed"])

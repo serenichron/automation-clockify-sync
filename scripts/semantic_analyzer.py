@@ -37,7 +37,7 @@ SCHEMA_VERSION = 1
 PROMPT_VERSION = "clockify-semantic-v13"
 ANALYZER_CACHE_SCHEMA_VERSION = "clockify-analyzer-cache/v2"
 EVIDENCE_BUNDLE_SCHEMA_VERSION = "clockify-semantic-evidence-bundle/v1"
-DEFAULT_PRIMARY_MODEL = "deepseek-v4-pro:cloud"
+DEFAULT_PRIMARY_MODEL = "deepseek-v4-flash:cloud"
 DEFAULT_MAX_BODY_BYTES = 1_450_000
 # Operational limits are deliberately well below the hard request ceiling.  The
 # cloud routes rejected or timed out on larger, mixed workstreams; small bounded
@@ -1696,6 +1696,7 @@ def validate_result(
     known_evidence_ids: set[str],
     provider_model: str,
     analyzer_tier: str,
+    provider_revision: str = "",
     evidence_time_spans: dict[str, dict[str, str]] | None = None,
     evidence_support: Mapping[str, Mapping[str, str]] | None = None,
 ) -> dict[str, Any]:
@@ -1831,6 +1832,7 @@ def validate_result(
                 "omit_rationale": _one_line(raw.get("omit_rationale")),
                 "rendered_description": None,
                 "analyzer_model": provider_model,
+                "analyzer_revision": provider_revision,
                 "analyzer_tier": analyzer_tier,
                 "prompt_version": PROMPT_VERSION,
                 "schema_version": SCHEMA_VERSION,
@@ -1905,6 +1907,7 @@ class AnalyzerEndpoint:
     model: str
     api_key: str = ""
     timeout_seconds: int = 120
+    revision: str = ""
 
     @classmethod
     def from_env(cls, prefix: str, *, default_model: str = "") -> "AnalyzerEndpoint | None":
@@ -1917,6 +1920,7 @@ class AnalyzerEndpoint:
             model=os.environ.get(f"{prefix}_MODEL", default_model).strip(),
             api_key=os.environ.get(f"{prefix}_API_KEY", "").strip(),
             timeout_seconds=int(os.environ.get(f"{prefix}_TIMEOUT_SECONDS", "120")),
+            revision=os.environ.get(f"{prefix}_REVISION", "").strip(),
         )
 
 
@@ -1945,7 +1949,12 @@ class AnalyzerResponseCache:
         body_digest = hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
         route_digest = hashlib.sha256(
             canonical_json(
-                {"name": endpoint.name, "url": endpoint.url, "model": endpoint.model}
+                {
+                    "name": endpoint.name,
+                    "url": endpoint.url,
+                    "model": endpoint.model,
+                    "revision": endpoint.revision,
+                }
             ).encode("utf-8")
         ).hexdigest()
         cache_key = stable_digest(
@@ -2201,6 +2210,12 @@ def http_transport(endpoint: AnalyzerEndpoint, body: dict[str, Any]) -> dict[str
 
 
 def probe_endpoint(endpoint: AnalyzerEndpoint, transport: Transport = http_transport) -> dict[str, Any]:
+    if endpoint.model.endswith(":cloud") and not re.fullmatch(
+        r"[a-f0-9]{64}", endpoint.revision
+    ):
+        raise AnalyzerError(
+            "moving cloud model tags require an explicit 64-character release revision"
+        )
     body = {
         "model": endpoint.model,
         "temperature": 0,
@@ -2212,7 +2227,13 @@ def probe_endpoint(endpoint: AnalyzerEndpoint, transport: Transport = http_trans
     }
     raw = transport(endpoint, body)
     response = raw if isinstance(raw, dict) and "choices" not in raw else _json_object_from_response(raw)
-    return {"status": "ok", "endpoint": endpoint.name, "model": endpoint.model, "response": response}
+    return {
+        "status": "ok",
+        "endpoint": endpoint.name,
+        "model": endpoint.model,
+        "revision": endpoint.revision,
+        "response": response,
+    }
 
 
 def _call_validated(
@@ -2279,6 +2300,7 @@ def _call_validated(
             known_evidence_ids=extraction_ids,
             provider_model=endpoint.model,
             analyzer_tier=tier,
+            provider_revision=endpoint.revision,
             evidence_time_spans=evidence_time_spans,
             evidence_support=_evidence_support(events),
         )
@@ -2349,6 +2371,7 @@ def _call_synthesis_validated(
             known_evidence_ids=known_evidence_ids,
             provider_model=endpoint.model,
             analyzer_tier=tier,
+            provider_revision=endpoint.revision,
             evidence_time_spans=evidence_time_spans,
         )
         if result["exceptions"] or result["omissions"]:
@@ -2881,12 +2904,16 @@ def analyze_tiered(
             ),
             "_bundle_manifest": chunk_bundle_manifest,
         }
+        if used.revision:
+            chunk_metadata["revision"] = used.revision
         if fallback_status in {"failed_exception", "primary_failed_exception"}:
             assert failure_digest is not None
             chunk_metadata["failure_digest"] = failure_digest
         if fallback_status == "failed_exception":
             chunk_metadata["fallback_endpoint"] = fallback.name
             chunk_metadata["fallback_model"] = fallback.model
+            if fallback.revision:
+                chunk_metadata["fallback_revision"] = fallback.revision
         return result, chunk_metadata
 
     if len(chunks) == 1 or max_workers == 1:
