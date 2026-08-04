@@ -185,6 +185,8 @@ def _scorecard(evidence_id: str) -> dict:
                         "evidence_ids": [evidence_id],
                         "required_terms": ["review", "evidence"],
                     }],
+                    "expected_exceptions": [],
+                    "expected_omissions": [],
                     "replays": [response, response],
                 }
             ],

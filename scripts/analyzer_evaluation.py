@@ -24,7 +24,7 @@ except ModuleNotFoundError:
 
 INPUT_SCHEMA_VERSION = "clockify-analyzer-evaluation-input/v1"
 SCORECARD_SCHEMA_VERSION = "clockify-analyzer-evaluation-scorecard/v1"
-EVALUATOR_VERSION = "clockify-analyzer-evaluator/v4"
+EVALUATOR_VERSION = "clockify-analyzer-evaluator/v5"
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 _CASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _REQUIRED_ROUTE_FIELDS = frozenset({"route_id", "model", "tier"})
@@ -178,25 +178,93 @@ def _concepts(value: Any) -> dict[tuple[str, ...], tuple[str, ...]]:
     return result
 
 
-def _validate_case_contract(case: Any, corpus_spans: Mapping[str, dict[str, str]]) -> tuple[Mapping[str, Any], list[str], list[tuple[str, ...]], dict[tuple[str, ...], tuple[str, ...]]]:
+def _nonactivity_expectations(
+    value: Any, *, classification: str
+) -> dict[tuple[str, ...], str]:
+    if not isinstance(value, list):
+        raise EvaluationError(f"expected_{classification} must be a list")
+    field = "kind" if classification == "exceptions" else "lifecycle"
+    result: dict[tuple[str, ...], str] = {}
+    for item in value:
+        raw = _require_mapping(item, f"expected_{classification} item")
+        _require_keys(
+            raw,
+            {"evidence_ids", field},
+            f"expected_{classification} item",
+        )
+        group = _partitions(
+            [raw["evidence_ids"]],
+            f"expected_{classification}.evidence_ids",
+        )[0]
+        decision = str(raw[field] or "").strip()
+        if not re.fullmatch(r"[a-z][a-z_]{1,63}", decision):
+            raise EvaluationError(f"expected_{classification} {field} is invalid")
+        if group in result:
+            raise EvaluationError(f"expected_{classification} repeats a partition")
+        result[group] = decision
+    return result
+
+
+def _validate_case_contract(
+    case: Any,
+    corpus_spans: Mapping[str, dict[str, str]],
+) -> tuple[
+    Mapping[str, Any],
+    list[str],
+    list[tuple[str, ...]],
+    dict[tuple[str, ...], tuple[str, ...]],
+    dict[tuple[str, ...], str],
+    dict[tuple[str, ...], str],
+]:
     value = _require_mapping(case, "case")
-    _require_keys(value, {"case_id", "evidence_ids", "expected_activity_partitions", "expected_activity_concepts", "replays"}, "case")
+    _require_keys(
+        value,
+        {
+            "case_id", "evidence_ids", "expected_activity_partitions",
+            "expected_activity_concepts", "expected_exceptions",
+            "expected_omissions", "replays",
+        },
+        "case",
+    )
     case_id = str(value["case_id"] or "")
     if not _CASE_ID_RE.fullmatch(case_id):
         raise EvaluationError("case_id is invalid")
     ids = _case_evidence(value, corpus_spans)
     partitions = _partitions(value["expected_activity_partitions"], "expected_activity_partitions")
     concepts = _concepts(value["expected_activity_concepts"])
+    expected_exceptions = _nonactivity_expectations(
+        value["expected_exceptions"], classification="exceptions"
+    )
+    expected_omissions = _nonactivity_expectations(
+        value["expected_omissions"], classification="omissions"
+    )
     if set(item for group in partitions for item in group) - set(ids):
         raise EvaluationError("expected activity partition cites out-of-case evidence")
     if set(concepts) != set(partitions):
         raise EvaluationError("expected activity concepts must cover every expected partition")
+    expected_groups = [
+        *partitions,
+        *expected_exceptions,
+        *expected_omissions,
+    ]
+    expected_ids = [item for group in expected_groups for item in group]
+    if sorted(expected_ids) != ids or len(expected_ids) != len(set(expected_ids)):
+        raise EvaluationError(
+            "expected activity, exception, and omission partitions must cover case evidence exactly once"
+        )
     replays = value["replays"]
     if not isinstance(replays, list) or len(replays) < 2:
         raise EvaluationError("case requires at least two captured replays")
     if not all(isinstance(replay, Mapping) for replay in replays):
         raise EvaluationError("case replays must be analyzer JSON objects")
-    return value, ids, partitions, concepts
+    return (
+        value,
+        ids,
+        partitions,
+        concepts,
+        expected_exceptions,
+        expected_omissions,
+    )
 
 
 def _response_shape(response: Mapping[str, Any]) -> None:
@@ -315,7 +383,10 @@ def _review_decision_signature(result: Mapping[str, Any]) -> str:
     )
     omissions = sorted(
         (
-            {"evidence_ids": sorted(str(item) for item in value["evidence_ids"])}
+            {
+                "lifecycle": value["lifecycle"],
+                "evidence_ids": sorted(str(item) for item in value["evidence_ids"]),
+            }
             for value in result["omissions"]
         ),
         key=canonical_json,
@@ -325,8 +396,32 @@ def _review_decision_signature(result: Mapping[str, Any]) -> str:
     )
 
 
+def _nonactivity_dispositions_are_valid(
+    result: Mapping[str, Any],
+    *,
+    expected_exceptions: Mapping[tuple[str, ...], str],
+    expected_omissions: Mapping[tuple[str, ...], str],
+) -> bool:
+    actual_exceptions = {
+        tuple(sorted(str(item) for item in value["evidence_ids"])): str(
+            value.get("kind") or ""
+        )
+        for value in result["exceptions"]
+    }
+    actual_omissions = {
+        tuple(sorted(str(item) for item in value["evidence_ids"])): str(
+            value.get("lifecycle") or ""
+        )
+        for value in result["omissions"]
+    }
+    return (
+        actual_exceptions == dict(expected_exceptions)
+        and actual_omissions == dict(expected_omissions)
+    )
+
+
 def _case_score(
-    case: Mapping[str, Any], *, evidence_ids: list[str], expected_partitions: list[tuple[str, ...]], expected_concepts: Mapping[tuple[str, ...], tuple[str, ...]], corpus_spans: Mapping[str, dict[str, str]], route: Mapping[str, str]
+    case: Mapping[str, Any], *, evidence_ids: list[str], expected_partitions: list[tuple[str, ...]], expected_concepts: Mapping[tuple[str, ...], tuple[str, ...]], expected_exceptions: Mapping[tuple[str, ...], str], expected_omissions: Mapping[tuple[str, ...], str], corpus_spans: Mapping[str, dict[str, str]], route: Mapping[str, str]
 ) -> dict[str, Any]:
     normalized: list[dict[str, Any]] = []
     schema_ok = True
@@ -345,15 +440,24 @@ def _case_score(
     semantic_content_ok = complete and all(
         _semantic_content_is_valid(item, expected_concepts) for item in normalized
     )
+    dispositions_ok = complete and all(
+        _nonactivity_dispositions_are_valid(
+            item,
+            expected_exceptions=expected_exceptions,
+            expected_omissions=expected_omissions,
+        )
+        for item in normalized
+    )
     checks = {
         "schema_valid": schema_ok,
         "evidence_citations_valid": schema_ok,
         "atomicity_valid": atomic_ok,
         "semantic_content_valid": semantic_content_ok,
+        "nonactivity_dispositions_valid": dispositions_ok,
         "forbidden_descriptions_rejected": descriptions_ok,
         "stable_replay": replay_ok,
     }
-    input_digest = sha256_hex({"case_id": case["case_id"], "evidence_ids": evidence_ids, "expected_activity_partitions": expected_partitions, "expected_activity_concepts": case["expected_activity_concepts"], "replays": case["replays"]})
+    input_digest = sha256_hex({"case_id": case["case_id"], "evidence_ids": evidence_ids, "expected_activity_partitions": expected_partitions, "expected_activity_concepts": case["expected_activity_concepts"], "expected_exceptions": case["expected_exceptions"], "expected_omissions": case["expected_omissions"], "replays": case["replays"]})
     return {
         "case_id": case["case_id"],
         "case_input_digest": input_digest,
@@ -382,13 +486,20 @@ def evaluate(document: Any) -> dict[str, Any]:
     assigned_evidence: list[str] = []
     results: list[dict[str, Any]] = []
     for raw_case in value["cases"]:
-        case, evidence_ids, partitions, concepts = _validate_case_contract(raw_case, corpus_spans)
+        (
+            case,
+            evidence_ids,
+            partitions,
+            concepts,
+            expected_exceptions,
+            expected_omissions,
+        ) = _validate_case_contract(raw_case, corpus_spans)
         case_id = str(case["case_id"])
         if case_id in seen_cases:
             raise EvaluationError("case IDs must be unique")
         seen_cases.add(case_id)
         assigned_evidence.extend(evidence_ids)
-        results.append(_case_score(case, evidence_ids=evidence_ids, expected_partitions=partitions, expected_concepts=concepts, corpus_spans=corpus_spans, route=route))
+        results.append(_case_score(case, evidence_ids=evidence_ids, expected_partitions=partitions, expected_concepts=concepts, expected_exceptions=expected_exceptions, expected_omissions=expected_omissions, corpus_spans=corpus_spans, route=route))
     if sorted(assigned_evidence) != sorted(corpus_spans):
         raise EvaluationError("cases do not cover the complete corpus exactly once")
     results.sort(key=lambda item: item["case_id"])

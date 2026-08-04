@@ -353,9 +353,12 @@ python3 scripts/analyzer_evaluation.py \
   --output /absolute/path/to/analyzer-scorecard.json
 ```
 
-The evaluator validates every raw replay independently for complete corpus
-coverage, fixed expected evidence partitions, production schema/citation and
-atomicity rules, concrete accomplishment concepts, and renderer/forbidden-description
+The live harness validates each replay through the same bounded production
+contract-repair and partition-recovery path used by real analysis; exhausted
+leaves remain failures rather than being hidden by the harness. The offline
+evaluator then checks complete corpus coverage, fixed expected activity,
+exception, and omission dispositions, production schema/citation and atomicity
+rules, concrete accomplishment concepts, and renderer/forbidden-description
 compliance. Adjacent repeated words are rejected. Replay stability
 compares the review-relevant decision—disposition, partitions, lifecycle,
 effort, and confidence—rather than arbitrary rationale prose. The append-only

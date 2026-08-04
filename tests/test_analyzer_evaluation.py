@@ -56,6 +56,8 @@ def document() -> dict:
                 "evidence_ids": [evidence],
                 "required_terms": ["clockify"],
             }],
+            "expected_exceptions": [],
+            "expected_omissions": [],
             "replays": [response(evidence), response(evidence)],
         }],
     }
@@ -82,7 +84,7 @@ class AnalyzerEvaluationTests(unittest.TestCase):
     def test_produces_digest_bound_passing_scorecard(self) -> None:
         scorecard = evaluation.evaluate(document())
         self.assertTrue(scorecard["passed"])
-        self.assertEqual("clockify-analyzer-evaluator/v4", scorecard["evaluator_version"])
+        self.assertEqual("clockify-analyzer-evaluator/v5", scorecard["evaluator_version"])
         self.assertEqual("deepseek-v4-flash:cloud", scorecard["route"]["model"])
         self.assertEqual(64, len(scorecard["input_corpus_digest"]))
         self.assertEqual(scorecard, evaluation.verify_scorecard(scorecard))
@@ -99,9 +101,41 @@ class AnalyzerEvaluationTests(unittest.TestCase):
         source = document()
         source["cases"][0]["expected_activity_partitions"] = []
         source["cases"][0]["expected_activity_concepts"] = []
+        source["cases"][0]["expected_exceptions"] = [{
+            "evidence_ids": source["cases"][0]["evidence_ids"],
+            "kind": "insufficient_evidence",
+        }]
         scorecard = evaluation.evaluate(source)
         self.assertFalse(scorecard["passed"])
         self.assertFalse(scorecard["results"][0]["checks"]["atomicity_valid"])
+
+    def test_wrong_nonactivity_disposition_is_rejected(self) -> None:
+        source = document()
+        case = source["cases"][0]
+        evidence = case["evidence_ids"][0]
+        case["expected_activity_partitions"] = []
+        case["expected_activity_concepts"] = []
+        case["expected_exceptions"] = [{
+            "evidence_ids": [evidence],
+            "kind": "insufficient_evidence",
+        }]
+        wrong = {
+            "activities": [],
+            "exceptions": [],
+            "omissions": [{
+                "lifecycle": "noise",
+                "evidence_ids": [evidence],
+                "reason": "wrong disposition",
+            }],
+        }
+        case["replays"] = [wrong, copy.deepcopy(wrong)]
+
+        scorecard = evaluation.evaluate(source)
+
+        self.assertFalse(scorecard["passed"])
+        self.assertFalse(
+            scorecard["results"][0]["checks"]["nonactivity_dispositions_valid"]
+        )
 
     def test_forbidden_description_content_is_rejected_by_production_renderer(self) -> None:
         source = document()

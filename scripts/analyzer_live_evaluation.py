@@ -88,6 +88,8 @@ def synthetic_cases() -> list[dict[str, Any]]:
                 "evidence_ids": [_evidence_id(atomic, 1), _evidence_id(atomic, 2)],
                 "required_terms": ["export", "gate", "blocked"],
             }],
+            "expected_exceptions": [],
+            "expected_omissions": [],
         },
         {
             "case_id": split,
@@ -137,6 +139,8 @@ def synthetic_cases() -> list[dict[str, Any]]:
                     "required_terms": ["rollout", "plan"],
                 },
             ],
+            "expected_exceptions": [],
+            "expected_omissions": [],
         },
         {
             "case_id": merge,
@@ -181,6 +185,8 @@ def synthetic_cases() -> list[dict[str, Any]]:
                 ],
                 "required_terms": ["review", "identity", "allocation"],
             }],
+            "expected_exceptions": [],
+            "expected_omissions": [],
         },
         {
             "case_id": meeting,
@@ -198,6 +204,11 @@ def synthetic_cases() -> list[dict[str, Any]]:
             ],
             "expected_activity_partitions": [],
             "expected_activity_concepts": [],
+            "expected_exceptions": [{
+                "evidence_ids": [_evidence_id(meeting, 1)],
+                "kind": "insufficient_evidence",
+            }],
+            "expected_omissions": [],
         },
         {
             "case_id": noise,
@@ -212,6 +223,11 @@ def synthetic_cases() -> list[dict[str, Any]]:
             ],
             "expected_activity_partitions": [],
             "expected_activity_concepts": [],
+            "expected_exceptions": [],
+            "expected_omissions": [{
+                "evidence_ids": [_evidence_id(noise, 1)],
+                "lifecycle": "noise",
+            }],
         },
     ]
 
@@ -234,6 +250,20 @@ def capture_evaluation(
     if replay_count < 2:
         raise analyzer_evaluation.EvaluationError("live evaluation requires at least two replays")
     semantic_analyzer.probe_endpoint(endpoint, transport=transport)
+
+    def qualified_transport(
+        candidate: semantic_analyzer.AnalyzerEndpoint,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Reuse the proven route while exercising production analysis logic."""
+        try:
+            payload = json.loads(body["messages"][-1]["content"])
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+            payload = {}
+        if payload.get("probe"):
+            return {"probe": "ok"}
+        return transport(candidate, body)
+
     corpus: list[dict[str, Any]] = []
     captured_cases: list[dict[str, Any]] = []
     for case in synthetic_cases():
@@ -248,24 +278,26 @@ def capture_evaluation(
             corpus.append({"evidence_id": event["evidence_id"], "time_span": span})
         replays: list[dict[str, Any]] = []
         for _ in range(replay_count):
-            body = semantic_analyzer._body_for(
+            analysis = semantic_analyzer.analyze_tiered(
                 events,
-                model=endpoint.model,
-                mode="extract",
+                primary=endpoint,
+                transport=qualified_transport,
+                max_workers=1,
+                max_events_per_chunk=max(1, len(events)),
                 private_text_approved=True,
             )
-            raw = _response_object(transport(endpoint, body))
-            replays.append(
-                semantic_analyzer._restore_extraction_partitions(
-                    raw, events=events
-                )
-            )
+            replays.append({
+                key: analysis[key]
+                for key in ("activities", "exceptions", "omissions")
+            })
         captured_cases.append(
             {
                 "case_id": case["case_id"],
                 "evidence_ids": evidence_ids,
                 "expected_activity_partitions": case["expected_activity_partitions"],
                 "expected_activity_concepts": case["expected_activity_concepts"],
+                "expected_exceptions": case["expected_exceptions"],
+                "expected_omissions": case["expected_omissions"],
                 "replays": replays,
             }
         )

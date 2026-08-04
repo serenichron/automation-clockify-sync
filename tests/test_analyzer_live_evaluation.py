@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import sys
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -135,6 +136,52 @@ class AnalyzerLiveEvaluationTests(unittest.TestCase):
         self.assertNotIn("/Users/", outbound)
         self.assertNotIn("/home/", outbound)
         self.assertNotIn("@", outbound)
+
+    def test_live_capture_scores_the_bounded_production_repair_path(self) -> None:
+        case = live.synthetic_cases()[0]
+        calls: list[dict] = []
+
+        def transport(_endpoint: semantic_analyzer.AnalyzerEndpoint, body: dict) -> dict:
+            calls.append(body)
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            members = [
+                {"bundle_ref": bundle["bundle_ref"], **member}
+                for bundle in payload["bundles"]
+                for member in bundle["members"]
+            ]
+            activity = _activity(
+                members,
+                1,
+                case["expected_activity_concepts"][0]["required_terms"],
+            )
+            if "repair_feedback" not in payload:
+                activity["action"] = "Verified and published"
+            return {"activities": [activity], "exceptions": [], "omissions": []}
+
+        endpoint = semantic_analyzer.AnalyzerEndpoint(
+            name="synthetic-test",
+            url="https://example.invalid/v1/chat",
+            model="fixture-model",
+            revision="a" * 64,
+        )
+        with mock.patch.object(live, "synthetic_cases", return_value=[case]):
+            capture = live.capture_evaluation(
+                endpoint,
+                tier="primary",
+                transport=transport,
+            )
+
+        scorecard = analyzer_evaluation.evaluate(capture)
+        evidence_payloads = [
+            json.loads(body["messages"][-1]["content"])
+            for body in calls
+            if '"probe"' not in body["messages"][-1]["content"]
+        ]
+        self.assertTrue(scorecard["passed"])
+        self.assertEqual(4, len(evidence_payloads))
+        self.assertEqual(2, sum("repair_feedback" in item for item in evidence_payloads))
 
     def test_live_capture_requires_two_replays(self) -> None:
         endpoint = semantic_analyzer.AnalyzerEndpoint(

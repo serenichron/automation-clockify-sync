@@ -15,6 +15,7 @@
       "properties": {
         "route_id": {"type": "string", "minLength": 1},
         "model": {"type": "string", "minLength": 1},
+        "revision": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
         "tier": {"enum": ["primary", "fallback"]}
       }
     },
@@ -42,7 +43,7 @@
       ],
       "properties": {
         "schema_version": {"const": "clockify-analyzer-evaluation-scorecard/v1"},
-        "evaluator_version": {"const": "clockify-analyzer-evaluator/v4"},
+        "evaluator_version": {"const": "clockify-analyzer-evaluator/v5"},
         "input_corpus_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
         "input_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
         "route": {"$ref": "#/$defs/route"},
