@@ -34,7 +34,7 @@ except ImportError:  # pragma: no cover - direct script execution fallback
 
 
 SCHEMA_VERSION = 1
-PROMPT_VERSION = "clockify-semantic-v12"
+PROMPT_VERSION = "clockify-semantic-v13"
 ANALYZER_CACHE_SCHEMA_VERSION = "clockify-analyzer-cache/v2"
 EVIDENCE_BUNDLE_SCHEMA_VERSION = "clockify-semantic-evidence-bundle/v1"
 DEFAULT_PRIMARY_MODEL = "deepseek-v4-pro:cloud"
@@ -74,6 +74,25 @@ _SECONDARY_ACTION_RE = re.compile(
     r"[a-z][a-z'-]*(?:ed|en)|built|brought|cut|did|found|kept|made|ran|sent|set|"
     r"taught|took|wrote"
     r")\b",
+    re.IGNORECASE,
+)
+_PARALLEL_RESULT_RE = re.compile(
+    r"\b(?:[a-z][a-z'-]*\s+){0,3}(?:[a-z][a-z'-]*(?:ed|en)|built|found|made|"
+    r"sent|set|wrote)\s+and\s+(?:[a-z][a-z'-]*\s+){0,3}(?:"
+    r"[a-z][a-z'-]*(?:ed|en)|built|found|made|sent|set|wrote)\b",
+    re.IGNORECASE,
+)
+_OUTCOME_ACTION_START_RE = re.compile(
+    r"^(?:created|generated|produced|scheduled|wrote|built|launched|provisioned|"
+    r"implemented|integrated|updated|provided|sent|saved|committed|drafted|"
+    r"configured|deployed|published|uploaded|migrated|installed|executed|completed|"
+    r"processed|researched|recommended|incorporated|aligned|wired)\b",
+    re.IGNORECASE,
+)
+_ANTI_SPLIT_RATIONALE_RE = re.compile(
+    r"\bboth(?:\s+[a-z][a-z'-]*){0,4}\s+and\b|\b(?:performed|delivered)\s+both\b|"
+    r"\b(?:two|three|multiple|several)\s+(?:[a-z][a-z'-]*\s+){0,2}"
+    r"(?:requests|tasks|deliverables|outcomes|changes)\b",
     re.IGNORECASE,
 )
 SAFE_EVIDENCE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
@@ -920,6 +939,11 @@ For example, implementing a stable identity and confirming that same identity su
 allocation movement must be one activity citing both evidence items, with a specific
 merge_rationale. Verification becomes separate only when it produces an independently
 meaningful deliverable or diagnoses a distinct problem.
+One user message, one assistant response, or one continuous work session does not make
+multiple deliverables atomic. Split independent objects, artifacts, and outcomes even
+when the user requested them together. Never compress result lists into comma-separated
+object or outcome clauses. The split_rationale must describe the single accomplishment;
+it must not justify merging by saying multiple requests or deliverables happened together.
 Every reviewable activity needs a specific split_rationale explaining why it is one
 atomic accomplishment. Never join verbs with "and", "or", "then", or "also".
 Every activities[] item MUST have a non-empty split_rationale, including an already
@@ -1174,6 +1198,8 @@ def _synthesis_messages(
 Return JSON only, using the same activities/exceptions/omissions schema supplied for extraction.
 Merge provisional activities only when their cited evidence proves the same single atomic accomplishment.
 When accomplishments differ, preserve separate activities and give each a distinct, specific object.
+One request, response, or continuous session does not justify merging independent deliverables.
+Never compress multiple objects or results into comma-separated fields.
 Preserve the supplied parent workstream name for related atomic accomplishments.
 Every input evidence ref must appear in exactly one returned activity; do not add, omit, or move evidence
 to exceptions or omissions. Copy the short evidence refs and evidence spans exactly from supported input.
@@ -1560,16 +1586,24 @@ def _validate_atomic_parts(action: str, obj: str, outcome: str, split_rationale:
     """Reject obvious compound records; semantic edge cases remain review-gated."""
     if not split_rationale:
         raise AnalyzerError("reviewable activity requires an explicit atomicity rationale")
+    if _ANTI_SPLIT_RATIONALE_RE.search(split_rationale):
+        raise AnalyzerError(
+            "activity split rationale contains multiple accomplishment clauses"
+        )
     action_words = re.findall(r"[\w'-]+", action, flags=re.UNICODE)
     if not action_words or len(action_words) > 3 or _COMPOUND_ACTION_RE.search(action):
         raise AnalyzerError("activity action must express one atomic verb phrase")
     for name, value in (("action", action), ("object", obj), ("outcome", outcome)):
         if (
             _ATOMIC_FIELD_SEPARATOR_RE.search(value)
+            or "," in value
             or _SECONDARY_ACTION_RE.search(value)
+            or _PARALLEL_RESULT_RE.search(value)
             or re.search(r"[.!?]\s+[A-Z]", value)
         ):
             raise AnalyzerError(f"activity {name} contains multiple accomplishment clauses")
+    if _OUTCOME_ACTION_START_RE.search(outcome):
+        raise AnalyzerError("activity outcome contains a second accomplishment action")
 
 
 def _evidence_support(events: Iterable[dict[str, Any]]) -> dict[str, dict[str, str]]:

@@ -19,7 +19,7 @@
   ],
   "properties": {
     "schema_version": {"const": 1},
-    "prompt_version": {"const": "clockify-semantic-v12"},
+    "prompt_version": {"const": "clockify-semantic-v13"},
     "evidence_bundle_schema_version": {"const": "clockify-semantic-evidence-bundle/v1"},
     "evidence_bundle_manifest": {"$ref": "#/$defs/evidenceBundleManifest"},
     "ledger_event_count": {"type": "integer", "minimum": 0},
@@ -89,7 +89,7 @@
         "rendered_description": {"type": ["string", "null"]},
         "analyzer_model": {"type": "string"},
         "analyzer_tier": {"enum": ["primary", "fallback", "fixture"]},
-        "prompt_version": {"const": "clockify-semantic-v12"},
+        "prompt_version": {"const": "clockify-semantic-v13"},
         "schema_version": {"const": 1}
       }
     },

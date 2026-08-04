@@ -123,7 +123,7 @@ recovery below even when the primary is the only qualified route. Conflicting or
 low-confidence claims that remain unresolved become explicit exceptions, never
 proposals.
 
-The built-in default is `deepseek-v4-pro:cloud`, selected only after the v12
+The built-in default is `deepseek-v4-pro:cloud`, selected only after the v13
 synthetic route gate passed. `deepseek-v4-flash:cloud` remains ineligible as a
 primary until it passes the same stable split/merge evaluation; model family or
 advertised context size never overrides the scorecard.

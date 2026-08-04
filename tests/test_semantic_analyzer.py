@@ -1952,6 +1952,46 @@ class SemanticAnalyzerTests(unittest.TestCase):
                 analyzer_tier="primary",
             )
 
+    def test_rejects_list_like_and_rationalized_compound_accomplishments(self):
+        variants = [
+            (
+                "comma results",
+                {"outcome": "endpoint disabled, credentials sanitized, pipeline hardened"},
+                "multiple accomplishment clauses",
+            ),
+            (
+                "parallel passive results",
+                {"outcome": "root cause identified and report written"},
+                "multiple accomplishment clauses",
+            ),
+            (
+                "second outcome action",
+                {"outcome": "scheduled client follow-up for Friday"},
+                "second accomplishment action",
+            ),
+            (
+                "same-message excuse",
+                {
+                    "split_rationale": (
+                        "The assistant delivered both transcripts and analysis in one response."
+                    )
+                },
+                "multiple accomplishment clauses",
+            ),
+        ]
+        for label, changes, message in variants:
+            response = valid_response("ev-1")
+            response["activities"][0].update(changes)
+            with self.subTest(label=label), self.assertRaisesRegex(
+                semantic.AnalyzerError, message
+            ):
+                semantic.validate_result(
+                    response,
+                    known_evidence_ids={"ev-1"},
+                    provider_model="model",
+                    analyzer_tier="primary",
+                )
+
     def test_rejects_user_request_or_assistant_status_as_human_accomplishment(self):
         for role in ("user", "assistant"):
             source = event(f"ev-{role}")
