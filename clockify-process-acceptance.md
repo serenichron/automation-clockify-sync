@@ -42,8 +42,12 @@ coverage, and computes final activity identity only after expansion. The bundle
 schema and manifest digest are part of immutable replay verification.
 
 Dual-route contract rejections use deterministic failed-partition recovery:
-contiguous halves are analyzed through the same routes, cancellation gate, and
-append-only cache until they pass or reach the bounded singleton/depth limit.
+children split only at context or complete conversation-turn boundaries and are
+analyzed through the same routes, cancellation gate, and append-only cache until
+they pass or reach an indivisible turn, singleton, or bounded depth limit.
+Explicit session accomplishments must cite paired user intent and assistant
+result from the same conversation; user requests and assistant-only status cannot
+become human-attention work. Meetings remain separately eligible.
 The parent retains recursive child metadata and cannot rejoin synthesis unless
 every evidence ID is classified exactly once. Acceptance and replay accounting
 read the actual leaf model/tier records; the deterministic recovery coordinator
@@ -112,15 +116,14 @@ operational target with four deterministically ordered workers beneath its
 
 ## Current rollout status
 
-A clean candidate is committed locally on
-`codex/clockify-evidence-work-accounting`; resolve and record its exact SHA at
-the approval boundary because any later edit creates a new candidate. It has
-not been pushed, merged, probed against a live analyzer, deployed, or authorized
-for private-text egress. No Sheet, Clockify, Multica, or schedule mutation has
-been performed for this candidate. Exact-SHA fleet deployment/readback, one
-complete July 1–August 3 shadow run plus immutable replay, full-denominator
-acceptance periods, and any review-surface refresh remain separate guarded
-gates.
+The guarded candidate is maintained on
+`codex/clockify-analyzer-determinism`; resolve and record its exact SHA at every
+publication, deployment, and run boundary because any later edit creates a new
+candidate. It is not merged to `master`. No Clockify, Multica, or schedule
+mutation is authorized. Exact-SHA fleet readback, fresh v12 route scorecards,
+the fixed-denominator canary, one complete July 1–August 4 shadow run plus
+immutable replay, and any approved stable-ID review-surface patch remain
+evidence gates rather than assumptions.
 
 ## Local verification
 

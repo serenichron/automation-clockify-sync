@@ -1816,6 +1816,195 @@ class SemanticAnalyzerTests(unittest.TestCase):
                 analyzer_tier="primary",
             )
 
+    def test_rejects_secondary_action_hidden_in_outcome(self):
+        response = valid_response("ev-1")
+        response["activities"][0]["outcome"] = (
+            "verified SER work and created coordination agent"
+        )
+        with self.assertRaisesRegex(semantic.AnalyzerError, "multiple accomplishment clauses"):
+            semantic.validate_result(
+                response,
+                known_evidence_ids={"ev-1"},
+                provider_model="model",
+                analyzer_tier="primary",
+            )
+
+    def test_rejects_user_request_or_assistant_status_as_human_accomplishment(self):
+        for role in ("user", "assistant"):
+            source = event(f"ev-{role}")
+            source.update({
+                "role": role,
+                "source_ref": {"session_id": "session-one", "machine": "precision"},
+            })
+            response = valid_response(f"ev-{role}")
+            with self.subTest(role=role), self.assertRaisesRegex(
+                semantic.AnalyzerError, "human accomplishment support"
+            ):
+                semantic.validate_result(
+                    response,
+                    known_evidence_ids={f"ev-{role}"},
+                    provider_model="model",
+                    analyzer_tier="primary",
+                    evidence_support=semantic._evidence_support([source]),
+                )
+
+    def test_accepts_paired_user_intent_and_assistant_result_from_same_session(self):
+        user = event("ev-user")
+        assistant = event("ev-assistant")
+        for source, role in ((user, "user"), (assistant, "assistant")):
+            source.update({
+                "role": role,
+                "source_ref": {"session_id": "session-one", "machine": "precision"},
+            })
+        response = valid_response("ev-user")
+        response["activities"][0]["evidence_ids"] = ["ev-user", "ev-assistant"]
+        result = semantic.validate_result(
+            response,
+            known_evidence_ids={"ev-user", "ev-assistant"},
+            provider_model="model",
+            analyzer_tier="primary",
+            evidence_support=semantic._evidence_support([user, assistant]),
+        )
+        self.assertEqual(
+            ["ev-assistant", "ev-user"], result["activities"][0]["evidence_ids"]
+        )
+
+    def test_turn_aware_recovery_keeps_each_user_with_following_result(self):
+        events = []
+        for ordinal, role in enumerate(("user", "assistant", "user", "assistant"), 1):
+            source = event(f"ev-{ordinal}")
+            source.update({
+                "role": role,
+                "source_ref": {
+                    "session_id": "session-one",
+                    "machine": "precision",
+                    "ordinal": ordinal,
+                },
+            })
+            events.append(source)
+        split = semantic._turn_aware_recovery_split(events)
+        self.assertIsNotNone(split)
+        assert split is not None
+        left, right, split_at = split
+        self.assertEqual(2, split_at)
+        self.assertEqual(["ev-1", "ev-2"], [item["evidence_id"] for item in left])
+        self.assertEqual(["ev-3", "ev-4"], [item["evidence_id"] for item in right])
+
+    def test_operational_chunking_never_splits_conversation_turns(self):
+        events = []
+        for ordinal, role in enumerate(("user", "assistant", "user", "assistant"), 1):
+            source = event(f"ev-{ordinal}")
+            source.update({
+                "role": role,
+                "source_ref": {
+                    "session_id": "session-one",
+                    "machine": "precision",
+                    "ordinal": ordinal,
+                },
+            })
+            events.append(source)
+        chunks = semantic.chunk_events(events, max_events_per_chunk=1)
+        self.assertEqual(
+            [["ev-1", "ev-2"], ["ev-3", "ev-4"]],
+            [[item["evidence_id"] for item in chunk] for chunk in chunks],
+        )
+
+    def test_turn_aware_recovery_will_not_split_one_indivisible_turn(self):
+        events = []
+        for ordinal, role in enumerate(("user", "assistant", "tool"), 1):
+            source = event(f"ev-{ordinal}")
+            source.update({
+                "role": role,
+                "source_ref": {"session_id": "session-one", "ordinal": ordinal},
+            })
+            events.append(source)
+        self.assertIsNone(semantic._turn_aware_recovery_split(events))
+
+    def test_dual_rejection_recovery_never_orphans_results_from_user_turns(self):
+        child_roles: list[list[str]] = []
+
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            if payload["mode"] == "synthesize":
+                provisional = payload["provisional_activities"]
+                response = valid_response(provisional[0]["evidence_ids"][0])
+                response["activities"][0].update({
+                    "evidence_ids": sorted(
+                        evidence_id
+                        for activity in provisional
+                        for evidence_id in activity["evidence_ids"]
+                    ),
+                    "evidence_spans": [
+                        span
+                        for activity in provisional
+                        for span in activity["evidence_spans"]
+                    ],
+                    "merge_rationale": "same accomplishment across recovered turns",
+                })
+                return response
+            members = provider_members(payload)
+            if len(members) > 2:
+                return {"activities": [], "exceptions": [], "omissions": []}
+            child_roles.append([member["role"] for member in members])
+            return provider_response(payload)
+
+        events = []
+        for ordinal, role in enumerate(("user", "assistant", "user", "assistant"), 1):
+            source = event(f"ev-{ordinal}")
+            source.update({
+                "role": role,
+                "source_ref": {
+                    "session_id": "session-one",
+                    "machine": "precision",
+                    "ordinal": ordinal,
+                },
+            })
+            events.append(source)
+        result = semantic.analyze_tiered(
+            events,
+            primary=semantic.AnalyzerEndpoint("primary", "http://primary", "cheap"),
+            fallback=semantic.AnalyzerEndpoint("fallback", "http://fallback", "strong"),
+            transport=transport,
+            max_events_per_chunk=4,
+        )
+        self.assertEqual([], result["exceptions"])
+        self.assertEqual([["user", "assistant"], ["user", "assistant"]], child_roles)
+        self.assertEqual("recovered_by_partition", result["analysis_chunks"][0]["recovery_status"])
+
+    def test_dual_rejection_of_indivisible_turn_becomes_safe_exception(self):
+        extract_sizes: list[int] = []
+
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            extract_sizes.append(len(provider_members(payload)))
+            return {"activities": [], "exceptions": [], "omissions": []}
+
+        events = []
+        for ordinal, role in enumerate(("user", "assistant", "tool"), 1):
+            source = event(f"ev-{ordinal}")
+            source.update({
+                "role": role,
+                "source_ref": {"session_id": "session-one", "ordinal": ordinal},
+            })
+            events.append(source)
+        result = semantic.analyze_tiered(
+            events,
+            primary=semantic.AnalyzerEndpoint("primary", "http://primary", "cheap"),
+            fallback=semantic.AnalyzerEndpoint("fallback", "http://fallback", "strong"),
+            transport=transport,
+            max_events_per_chunk=3,
+        )
+        self.assertTrue(extract_sizes)
+        self.assertEqual({3}, set(extract_sizes))
+        self.assertEqual("analyzer_failure", result["exceptions"][0]["kind"])
+        self.assertEqual(
+            ["ev-1", "ev-2", "ev-3"], result["exceptions"][0]["evidence_ids"]
+        )
+
     def test_rejects_missing_invalid_or_unsupported_reviewable_spans(self):
         response = valid_response("ev-1")
         response["activities"][0]["evidence_spans"] = []

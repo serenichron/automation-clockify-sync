@@ -105,6 +105,11 @@ System messages, tool transport, heartbeats, session-control commands, pure
 standing-by or approval-waiting messages, polling updates, and injected wrappers
 are excluded. Substantive accomplishments that merely mention words such as
 "heartbeat", "approval", or "polling" remain eligible.
+For explicit conversational evidence, a non-meeting accomplishment must cite a
+user instruction and an assistant result from the same session. User-only
+requests and assistant-only status/autonomous output fail the semantic contract
+and must be omitted or surfaced as exceptions. Meetings remain independently
+eligible through their fixed Fathom evidence contract.
 
 The primary analyzer must pass a minimal live probe and its structured response
 contract. A sealed contract rejection receives exactly one content-addressed
@@ -120,9 +125,11 @@ Analyzer requests retain the fail-closed 1,450,000-byte hard ceiling. Normal
 extraction uses a 250,000-byte and 250-event operational target with four
 deterministically ordered workers so a large-context route does not receive an
 unnecessarily broad semantic partition. A single event may exceed the target but
-never the hard ceiling; it is never clipped. When both
-evaluated routes reject one bounded chunk, the complete chunk becomes one local
-`analyzer_failure` exception with a failure digest and processing continues.
+never the hard ceiling; it is never clipped. When both evaluated routes reject
+one bounded chunk, deterministic recovery bisects only at source-context or
+conversation-turn boundaries. A user instruction always stays with its following
+assistant/tool result. A single indivisible turn that both routes reject becomes
+one local `analyzer_failure` exception with a failure digest.
 If both routes reject repeated-workstream synthesis, those otherwise valid but
 potentially duplicative claims become one `analyzer_synthesis_failure` exception.
 Synthesis candidates require the same normalized project, workstream, and
@@ -346,10 +353,12 @@ checked. Long immutable ledger IDs never rely on model copying: local code
 expands disjoint bundle-member ranges before schema and citation validation. Prefix validation
 uses a neutral placeholder because deterministic routing owns the final prefix.
 If both routes reject a bounded extraction partition, the analyzer bisects its
-evidence into contiguous halves and retries each child through the same routes,
-cancellation gate, and sealed cache. Recovery is bounded at singleton evidence
-or depth eight, records every child route decision, and cannot rejoin normal
-cross-chunk synthesis unless every evidence ID is classified exactly once.
+evidence at the nearest context or complete conversation-turn boundary and
+retries each child through the same routes, cancellation gate, and sealed cache.
+Recovery never separates user intent from its following assistant result. It is
+bounded at an indivisible turn, singleton evidence, or depth eight, records every
+child route decision, and cannot rejoin normal cross-chunk synthesis unless every
+evidence ID is classified exactly once.
 A passing synthetic
 route scorecard proves contract fitness, not July semantic accuracy; the latter
 still requires full-denominator human dispositions and the measured acceptance

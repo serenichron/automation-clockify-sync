@@ -34,7 +34,7 @@ except ImportError:  # pragma: no cover - direct script execution fallback
 
 
 SCHEMA_VERSION = 1
-PROMPT_VERSION = "clockify-semantic-v11"
+PROMPT_VERSION = "clockify-semantic-v12"
 ANALYZER_CACHE_SCHEMA_VERSION = "clockify-analyzer-cache/v2"
 EVIDENCE_BUNDLE_SCHEMA_VERSION = "clockify-semantic-evidence-bundle/v1"
 DEFAULT_PRIMARY_MODEL = "deepseek-v4-flash:cloud"
@@ -69,6 +69,13 @@ _ATOMIC_FIELD_SEPARATOR_RE = re.compile(
     re.IGNORECASE,
 )
 _COMPOUND_ACTION_RE = re.compile(r"(?:^|\s)(?:and|or|&|/)(?:\s|$)", re.IGNORECASE)
+_SECONDARY_ACTION_RE = re.compile(
+    r"\b(?:and|then|also)\s+(?:"
+    r"[a-z][a-z'-]*(?:ed|en)|built|brought|cut|did|found|kept|made|ran|sent|set|"
+    r"taught|took|wrote"
+    r")\b",
+    re.IGNORECASE,
+)
 SAFE_EVIDENCE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 BUNDLE_REF_RE = re.compile(r"^b-[0-9]{4}$")
 SAFE_TIMESTAMP_RE = re.compile(
@@ -160,6 +167,7 @@ _CONTRACT_FAILURE_PATTERNS: tuple[tuple[str, str], ...] = (
     ("missing_atomicity_rationale", "explicit atomicity rationale"),
     ("compound_action", "one atomic verb phrase"),
     ("compound_field", "multiple accomplishment clauses"),
+    ("unsupported_human_work", "human accomplishment support"),
     ("description_contract", "caveman render contract"),
     ("missing_evidence_span", "nonempty evidence_spans"),
     ("invalid_evidence_span", "valid start and end timestamps"),
@@ -211,6 +219,11 @@ def _repair_instruction(failure_code: str) -> str:
     instructions = {
         "compound_action": "Return one atomic past-tense action per activity; split unrelated actions.",
         "compound_field": "Keep each action, object, and outcome to one accomplishment clause.",
+        "unsupported_human_work": (
+            "Do not turn a user request or assistant status into completed human work. "
+            "A non-meeting accomplishment must cite both the human instruction and its "
+            "result from the same conversation; otherwise emit an omission or exception."
+        ),
         "description_contract": (
             "Rewrite action, object, and outcome so their exact neutral render "
             "'SC — action object outcome' is 5-14 words, targets 8-14 words, "
@@ -916,6 +929,10 @@ their specific objects differ; unrelated work must not share a workstream.
 Classify planned work, waiting, polling, agent chatter, heartbeats, and autonomous
 background execution as planned or noise, not completed human work. A blocker is
 loggable only when the evidence proves substantive diagnosis or remediation.
+User-role evidence is intent, not proof that requested work happened. Assistant-role
+evidence alone is status or autonomous output, not proof of human-attention work.
+Except for meetings, a completed, advanced, investigated, or blocked accomplishment
+must cite both a user instruction and an assistant result from the same conversation.
 Do not invent projects, outcomes, evidence, effort, or meeting purpose. For a
 title-only meeting with no supported outcome, emit an exception. Effort is human
 attention, not process runtime or empty wall-clock time. Evidence arrives as
@@ -1049,6 +1066,35 @@ def _chunk_event_bytes(event: dict[str, Any]) -> int:
     # Amortize the bundle envelope into each member.  Final transport sizing is
     # still enforced by _call_validated against the hard ceiling.
     return _escaped_json_content_bytes(canonical_json(model_member)) + 128
+
+
+def _context_turn_units(
+    context: tuple[str, ...], events: list[dict[str, Any]]
+) -> list[list[dict[str, Any]]]:
+    """Keep each user instruction with its following assistant/tool evidence."""
+    if not context or context[0] != "session":
+        return [[event] for event in events]
+    roles = [str(project_event(event).get("role") or "source") for event in events]
+    if "user" not in roles:
+        return [[event] for event in events]
+    units: list[list[dict[str, Any]]] = []
+    prefix: list[dict[str, Any]] = []
+    turn: list[dict[str, Any]] = []
+    for event, role in zip(events, roles, strict=True):
+        if role == "user":
+            if turn:
+                units.append(turn)
+            turn = [*prefix, event]
+            prefix = []
+        elif turn:
+            turn.append(event)
+        else:
+            prefix.append(event)
+    if turn:
+        units.append(turn)
+    elif prefix:
+        units.append(prefix)
+    return units
 
 
 def _safe_provisional_activity(activity: dict[str, Any]) -> dict[str, Any]:
@@ -1232,7 +1278,7 @@ def chunk_events(
         by_context.items(),
         key=lambda item: (_event_sort_key(item[1][0][2]), item[0]),
     )
-    for _context, contextual_bundle in bundles:
+    for context, contextual_bundle in bundles:
         bundle_day = contextual_bundle[0][0]
         bundle = [(raw, projected) for _day, raw, projected in contextual_bundle]
         bundle_bytes = [_chunk_event_bytes(projected) for _raw, projected in bundle]
@@ -1265,41 +1311,50 @@ def chunk_events(
             current = []
             current_event_bytes = 0
             current_day = None
-        for (raw, projected), event_bytes in zip(bundle, bundle_bytes, strict=True):
-            approximate_one_size = empty_body_bytes + event_bytes + 1_024
-            one_size = approximate_one_size
-            if approximate_one_size > max_body_bytes:
-                one_size = len(canonical_json(_body_for(
-                    [raw],
+        event_bytes_by_id = {
+            str(raw.get("evidence_id")): event_bytes
+            for (raw, _projected), event_bytes in zip(bundle, bundle_bytes, strict=True)
+        }
+        for unit in _context_turn_units(context, [raw for raw, _projected in bundle]):
+            unit_event_bytes = sum(
+                event_bytes_by_id[str(raw.get("evidence_id"))] for raw in unit
+            )
+            approximate_unit_size = (
+                empty_body_bytes + unit_event_bytes + max(0, len(unit) - 1) + 1_024
+            )
+            unit_size = approximate_unit_size
+            if approximate_unit_size > max_body_bytes:
+                unit_size = len(canonical_json(_body_for(
+                    unit,
                     model=model,
                     mode="extract",
                     corrections=corrections,
                     private_text_approved=private_text_approved,
                 )).encode("utf-8"))
-            if one_size > max_body_bytes:
+            if unit_size > max_body_bytes:
                 raise AnalyzerError(
-                    f"evidence event {projected.get('evidence_id') or '<unknown>'} "
-                    f"exceeds analyzer request ceiling ({one_size} bytes)"
+                    f"indivisible evidence turn {unit[0].get('evidence_id') or '<unknown>'} "
+                    f"exceeds analyzer request ceiling ({unit_size} bytes)"
                 )
-            trial_count = len(current) + 1
+            trial_count = len(current) + len(unit)
             trial_size = (
                 empty_body_bytes
                 + current_event_bytes
-                + event_bytes
-                + len(current)
+                + unit_event_bytes
+                + max(0, trial_count - 1)
                 + _alias_extra_bytes(trial_count)
             )
             if current and (
                 trial_size > target_body_bytes
-                or len(current) >= max_events_per_chunk
+                or trial_count > max_events_per_chunk
             ):
                 chunks.append(current)
-                current = [raw]
-                current_event_bytes = event_bytes
-                current_day = _event_day(raw)
+                current = list(unit)
+                current_event_bytes = unit_event_bytes
+                current_day = _event_day(unit[0])
             else:
-                current.append(raw)
-                current_event_bytes += event_bytes
+                current.extend(unit)
+                current_event_bytes += unit_event_bytes
                 if current_day is None:
                     current_day = bundle_day
     if current:
@@ -1317,6 +1372,42 @@ def chunk_events(
                 f"semantic evidence chunk exceeds analyzer request ceiling ({body_size} bytes)"
             )
     return chunks
+
+
+def _turn_aware_recovery_split(
+    chunk: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int] | None:
+    """Bisect at a context or user-turn boundary without orphaning results.
+
+    A user message starts an indivisible conversation turn containing the
+    assistant/tool evidence up to the next user message.  Session metadata that
+    precedes the first user message travels with that first turn.  A single
+    remaining turn is deliberately unsplittable and becomes a safe analyzer
+    exception if both routes reject it.
+    """
+    grouped: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+    for event in chunk:
+        grouped.setdefault(_semantic_context_key(event), []).append(event)
+
+    units: list[list[dict[str, Any]]] = []
+    for context, events in grouped.items():
+        units.extend(_context_turn_units(context, events))
+
+    if len(units) < 2:
+        return None
+    total = sum(len(unit) for unit in units)
+    boundary = min(
+        range(1, len(units)),
+        key=lambda index: (
+            abs(sum(len(unit) for unit in units[:index]) * 2 - total),
+            index,
+        ),
+    )
+    left = [event for unit in units[:boundary] for event in unit]
+    right = [event for unit in units[boundary:] for event in unit]
+    if not left or not right:
+        return None
+    return left, right, len(left)
 
 
 def _json_object_from_response(value: Any) -> dict[str, Any]:
@@ -1468,8 +1559,65 @@ def _validate_atomic_parts(action: str, obj: str, outcome: str, split_rationale:
     if not action_words or len(action_words) > 3 or _COMPOUND_ACTION_RE.search(action):
         raise AnalyzerError("activity action must express one atomic verb phrase")
     for name, value in (("action", action), ("object", obj), ("outcome", outcome)):
-        if _ATOMIC_FIELD_SEPARATOR_RE.search(value) or re.search(r"[.!?]\s+[A-Z]", value):
+        if (
+            _ATOMIC_FIELD_SEPARATOR_RE.search(value)
+            or _SECONDARY_ACTION_RE.search(value)
+            or re.search(r"[.!?]\s+[A-Z]", value)
+        ):
             raise AnalyzerError(f"activity {name} contains multiple accomplishment clauses")
+
+
+def _evidence_support(events: Iterable[dict[str, Any]]) -> dict[str, dict[str, str]]:
+    """Return local-only human-attention support for deterministic truth gates."""
+    support: dict[str, dict[str, str]] = {}
+    for event in events:
+        projected = project_event(event)
+        evidence_id = str(projected["evidence_id"])
+        support[evidence_id] = {
+            "role": str(projected.get("role") or "source"),
+            "source_category": str(projected.get("source_category") or "other"),
+            "context": canonical_json(_semantic_context_key(event)),
+        }
+    return support
+
+
+def _validate_human_accomplishment(
+    lifecycle: str,
+    evidence_ids: Iterable[str],
+    evidence_support: Mapping[str, Mapping[str, str]] | None,
+) -> None:
+    """Reject requests and autonomous status as completed human-attention work.
+
+    Source snapshots and non-session corroboration remain neutral.  When explicit
+    conversational roles are cited, however, a reviewable non-meeting claim must
+    contain a user instruction and an assistant result from the same session.
+    """
+    if evidence_support is None or lifecycle in {"planned", "noise"}:
+        return
+    cited = [evidence_support.get(evidence_id, {}) for evidence_id in evidence_ids]
+    if lifecycle == "meeting":
+        if not any(item.get("source_category") == "meeting" for item in cited):
+            raise AnalyzerError("meeting lacks human accomplishment support")
+        return
+    if lifecycle not in {"completed", "advanced", "investigated", "blocked"}:
+        return
+    explicit_session_roles = [
+        item
+        for item in cited
+        if item.get("source_category") == "agent_session"
+        and item.get("role") in {"user", "assistant"}
+    ]
+    if not explicit_session_roles:
+        return
+    roles_by_context: dict[str, set[str]] = {}
+    for item in explicit_session_roles:
+        roles_by_context.setdefault(str(item.get("context") or ""), set()).add(
+            str(item.get("role") or "")
+        )
+    if not any({"user", "assistant"} <= roles for roles in roles_by_context.values()):
+        raise AnalyzerError(
+            "reviewable activity lacks paired human accomplishment support"
+        )
 
 
 def _validated_spans(
@@ -1510,6 +1658,7 @@ def validate_result(
     provider_model: str,
     analyzer_tier: str,
     evidence_time_spans: dict[str, dict[str, str]] | None = None,
+    evidence_support: Mapping[str, Mapping[str, str]] | None = None,
 ) -> dict[str, Any]:
     activities = result.get("activities", [])
     exceptions = result.get("exceptions", [])
@@ -1537,6 +1686,7 @@ def validate_result(
         if lifecycle not in LIFECYCLES:
             raise AnalyzerError(f"invalid lifecycle: {lifecycle!r}")
         evidence_ids = evidence_ids_for(raw.get("evidence_ids"), "activity")
+        _validate_human_accomplishment(lifecycle, evidence_ids, evidence_support)
         action = _normalize_action(raw.get("action"))
         obj = _one_line(raw.get("object"))
         outcome = _one_line(raw.get("outcome"))
@@ -2091,6 +2241,7 @@ def _call_validated(
             provider_model=endpoint.model,
             analyzer_tier=tier,
             evidence_time_spans=evidence_time_spans,
+            evidence_support=_evidence_support(events),
         )
     except AnalyzerError as exc:
         _raise_if_cancelled(cancelled)
@@ -2478,17 +2629,21 @@ def analyze_tiered(
                     len(chunk) > MIN_PARTITION_RECOVERY_EVENTS
                     and recovery_depth < MAX_PARTITION_RECOVERY_DEPTH
                 ):
-                    # Keep source order and do not repack by byte size here:
-                    # this recovery is an exact subdivision of the failed
-                    # partition, so evidence ownership remains auditable.
-                    split_at = len(chunk) // 2
+                    # Preserve conversation turns: a raw midpoint can orphan an
+                    # assistant result from the user intent that made it human
+                    # work. An indivisible complex turn fails closed below.
+                    recovery_split = _turn_aware_recovery_split(chunk)
+                else:
+                    recovery_split = None
+                if recovery_split is not None:
+                    left_child, right_child, split_at = recovery_split
                     child_outcomes = [
                         analyze_chunk(
                             (index, child),
                             recovery_depth=recovery_depth + 1,
                             recovery_path=f"{recovery_path}.{label}",
                         )
-                        for label, child in (("a", chunk[:split_at]), ("b", chunk[split_at:]))
+                        for label, child in (("a", left_child), ("b", right_child))
                     ]
                     _raise_if_cancelled(cancellation.is_set)
                     child_results = [child_result for child_result, _child_metadata in child_outcomes]
