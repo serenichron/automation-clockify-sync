@@ -1690,6 +1690,47 @@ def _validated_spans(
     return result
 
 
+def bind_activity_evidence_spans(
+    result: Mapping[str, Any],
+    *,
+    evidence_time_spans: Mapping[str, Mapping[str, str]] | None,
+) -> dict[str, Any]:
+    """Replace model-copied spans with exact immutable-ledger spans.
+
+    Models decide semantic membership, not timestamps.  Once cited evidence
+    references have been restored locally, the ledger is the only authority for
+    activity spans.  Missing or malformed ledger spans remain visible because
+    ``validate_result`` still rejects a reviewable activity without a valid
+    supported span.
+    """
+    bound = copy.deepcopy(dict(result))
+    activities = bound.get("activities")
+    if not isinstance(activities, list):
+        return bound
+    source = evidence_time_spans or {}
+    for activity in activities:
+        if not isinstance(activity, dict):
+            continue
+        lifecycle = str(activity.get("lifecycle") or "").strip().lower()
+        if lifecycle in {"planned", "noise"}:
+            activity["evidence_spans"] = []
+            continue
+        evidence_ids = activity.get("evidence_ids")
+        if not isinstance(evidence_ids, list):
+            continue
+        spans = {
+            (str(span.get("start") or ""), str(span.get("end") or ""))
+            for evidence_id in evidence_ids
+            if isinstance((span := source.get(str(evidence_id))), Mapping)
+        }
+        activity["evidence_spans"] = [
+            {"start": start, "end": end}
+            for start, end in sorted(spans)
+            if start and end
+        ]
+    return bound
+
+
 def validate_result(
     result: dict[str, Any],
     *,
@@ -2295,6 +2336,10 @@ def _call_validated(
         restored_response = _restore_extraction_partitions(
             response, events=events
         )
+        restored_response = bind_activity_evidence_spans(
+            restored_response,
+            evidence_time_spans=evidence_time_spans,
+        )
         result = validate_result(
             restored_response,
             known_evidence_ids=extraction_ids,
@@ -2365,6 +2410,10 @@ def _call_synthesis_validated(
     try:
         restored_response = _restore_evidence_references(
             response, evidence_ids=known_evidence_ids
+        )
+        restored_response = bind_activity_evidence_spans(
+            restored_response,
+            evidence_time_spans=evidence_time_spans,
         )
         result = validate_result(
             restored_response,

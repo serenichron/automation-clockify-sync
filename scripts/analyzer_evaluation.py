@@ -218,10 +218,15 @@ def _evaluate_replay(
 ) -> tuple[dict[str, Any] | None, str | None]:
     try:
         _response_shape(response)
+        response = semantic_analyzer.bind_activity_evidence_spans(
+            response,
+            evidence_time_spans={item: corpus_spans[item] for item in evidence_ids},
+        )
         return semantic_analyzer.validate_result(
             dict(response),
             known_evidence_ids=set(evidence_ids),
             provider_model=route["model"],
+            provider_revision=route.get("revision", ""),
             analyzer_tier=route["tier"],
             evidence_time_spans={item: corpus_spans[item] for item in evidence_ids},
         ), None

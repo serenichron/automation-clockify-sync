@@ -68,6 +68,17 @@ class AnalyzerEvaluationTests(unittest.TestCase):
         with self.assertRaisesRegex(evaluation.EvaluationError, "release revision"):
             evaluation.evaluate(source)
 
+    def test_ledger_spans_replace_missing_or_model_invented_spans(self) -> None:
+        source = document()
+        source["cases"][0]["replays"][0]["activities"][0].pop("evidence_spans")
+        source["cases"][0]["replays"][1]["activities"][0]["evidence_spans"] = [
+            {"start": "1999-01-01T00:00:00Z", "end": "1999-01-01T01:00:00Z"}
+        ]
+
+        scorecard = evaluation.evaluate(source)
+
+        self.assertTrue(scorecard["passed"])
+
     def test_produces_digest_bound_passing_scorecard(self) -> None:
         scorecard = evaluation.evaluate(document())
         self.assertTrue(scorecard["passed"])
