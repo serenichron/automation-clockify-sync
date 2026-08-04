@@ -34,7 +34,7 @@ except ImportError:  # pragma: no cover - direct script execution fallback
 
 
 SCHEMA_VERSION = 1
-PROMPT_VERSION = "clockify-semantic-v14"
+PROMPT_VERSION = "clockify-semantic-v15"
 ANALYZER_CACHE_SCHEMA_VERSION = "clockify-analyzer-cache/v2"
 EVIDENCE_BUNDLE_SCHEMA_VERSION = "clockify-semantic-evidence-bundle/v1"
 DEFAULT_PRIMARY_MODEL = "deepseek-v4-flash:cloud"
@@ -1019,6 +1019,12 @@ of that bundle's members. It MUST NOT produce an activity. Words such as discove
 review, planning, or delivery in the title do not prove meeting purpose or outcome.
 Effort is human attention, not process runtime or empty wall-clock time. Evidence arrives as
 semantic bundles. Each bundle has a short bundle_ref and ordered numeric members.
+Apply confidence consistently. Semantic confidence is high when a direct user
+instruction and matching assistant result prove the same outcome, medium when the
+outcome is supported indirectly, and low only for conflict or insufficiency. Timing
+confidence is high for a fixed recorded meeting, medium for timestamped paired
+conversation evidence, and low only when spans are missing, coarse, or conflicting.
+Do not mark timing low merely because human-effort minutes remain an estimate.
 Cite evidence only with evidence_partitions shaped as
 {"bundle_ref":"b-0001","member_ranges":[[1,4],[7,7]]}. Ranges are inclusive.
 Use one range for a whole contiguous accomplishment instead of copying every member.

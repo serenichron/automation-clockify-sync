@@ -111,10 +111,12 @@ class SemanticAnalyzerTests(unittest.TestCase):
             private_text_approved=True,
         )[0]["content"]
 
-        self.assertEqual("clockify-semantic-v14", semantic.PROMPT_VERSION)
+        self.assertEqual("clockify-semantic-v15", semantic.PROMPT_VERSION)
         self.assertIn("MEETING SUFFICIENCY IS A HARD GATE", system)
         self.assertIn("MUST NOT produce an activity", system)
         self.assertIn("exactly one insufficient_evidence exception", system)
+        self.assertIn("medium for timestamped paired", system)
+        self.assertIn("Do not mark timing low merely", system)
 
     def test_production_primary_requires_flash_and_rejects_pro(self):
         base = {
