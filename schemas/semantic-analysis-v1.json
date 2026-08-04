@@ -121,14 +121,26 @@
         {
           "if": {"properties": {"tier": {"const": "exception"}}, "required": ["tier"]},
           "then": {
-            "required": ["failure_digest", "fallback_endpoint", "fallback_model"],
-            "properties": {"fallback_status": {"const": "failed_exception"}}
+            "required": ["failure_digest"],
+            "properties": {
+              "fallback_status": {"enum": ["failed_exception", "primary_failed_exception"]}
+            }
           },
           "else": {"not": {"required": ["failure_digest"]}}
         },
         {
           "if": {"properties": {"fallback_status": {"const": "failed_exception"}}, "required": ["fallback_status"]},
-          "then": {"properties": {"tier": {"const": "exception"}}}
+          "then": {
+            "required": ["fallback_endpoint", "fallback_model"],
+            "properties": {"tier": {"const": "exception"}}
+          }
+        },
+        {
+          "if": {"properties": {"fallback_status": {"const": "primary_failed_exception"}}, "required": ["fallback_status"]},
+          "then": {
+            "properties": {"tier": {"const": "exception"}},
+            "not": {"anyOf": [{"required": ["fallback_endpoint"]}, {"required": ["fallback_model"]}]}
+          }
         },
         {
           "if": {
@@ -172,7 +184,8 @@
             "used_after_primary_failure",
             "used_for_low_confidence",
             "failed_deferred",
-            "failed_exception"
+            "failed_exception",
+            "primary_failed_exception"
           ]
         },
         "repair_status": {

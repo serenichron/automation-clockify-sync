@@ -41,9 +41,10 @@ expands them back to immutable ledger IDs, rejects missing or overlapping
 coverage, and computes final activity identity only after expansion. The bundle
 schema and manifest digest are part of immutable replay verification.
 
-Dual-route contract rejections use deterministic failed-partition recovery:
+Exhausted qualified-route contract rejections use deterministic
+failed-partition recovery, including when only one qualified primary is configured:
 children split only at context or complete conversation-turn boundaries and are
-analyzed through the same routes, cancellation gate, and append-only cache until
+analyzed through the same route set, cancellation gate, and append-only cache until
 they pass or reach an indivisible turn, singleton, or bounded depth limit.
 Explicit session accomplishments must cite paired user intent and assistant
 result from the same conversation; user requests and assistant-only status cannot

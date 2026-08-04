@@ -968,6 +968,85 @@ class SemanticAnalyzerTests(unittest.TestCase):
             child["partition_path"] for child in chunk["recovery"]["children"]
         ])
 
+    def test_single_qualified_route_recovers_sealed_contract_partition(self):
+        child_number = 0
+
+        def transport(_endpoint, body):
+            nonlocal child_number
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            members = provider_members(payload)
+            if len(members) > 1:
+                return {"activities": [], "exceptions": [], "omissions": []}
+            child_number += 1
+            response = provider_response(payload)
+            response["activities"][0].update({
+                "object": f"recovered outcome {child_number}",
+                "workstream": f"recovered stream {child_number}",
+            })
+            return response
+
+        result = semantic.analyze_tiered(
+            [event("ev-a"), event("ev-b")],
+            primary=semantic.AnalyzerEndpoint("primary", "http://primary", "qualified"),
+            transport=transport,
+            max_events_per_chunk=2,
+        )
+        self.assertEqual([], result["exceptions"])
+        self.assertEqual(2, len(result["activities"]))
+        chunk = result["analysis_chunks"][0]
+        self.assertEqual("recovered_by_partition", chunk["recovery_status"])
+        self.assertEqual("recovered", chunk["recovery"]["status"])
+
+    def test_single_route_outage_blocks_without_partition_recovery(self):
+        evidence_calls: list[int] = []
+
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            evidence_calls.append(len(provider_members(payload)))
+            raise semantic.AnalyzerError("route unavailable")
+
+        with self.assertRaisesRegex(semantic.AnalyzerError, "primary analyzer failed"):
+            semantic.analyze_tiered(
+                [event("ev-a"), event("ev-b")],
+                primary=semantic.AnalyzerEndpoint("primary", "http://primary", "qualified"),
+                transport=transport,
+                max_events_per_chunk=2,
+            )
+        self.assertEqual([2], evidence_calls)
+
+    def test_single_route_indivisible_rejection_is_visible_exception(self):
+        events = []
+        for ordinal, role in enumerate(("user", "assistant"), 1):
+            source = event(f"ev-{ordinal}")
+            source.update({
+                "role": role,
+                "source_ref": {"session_id": "session-one", "ordinal": ordinal},
+            })
+            events.append(source)
+
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            return {"activities": [], "exceptions": [], "omissions": []}
+
+        result = semantic.analyze_tiered(
+            events,
+            primary=semantic.AnalyzerEndpoint("primary", "http://primary", "qualified"),
+            transport=transport,
+            max_events_per_chunk=2,
+        )
+        self.assertEqual("analyzer_failure", result["exceptions"][0]["kind"])
+        chunk = result["analysis_chunks"][0]
+        self.assertEqual("exception", chunk["tier"])
+        self.assertEqual("primary_failed_exception", chunk["fallback_status"])
+        self.assertNotIn("fallback_endpoint", chunk)
+        self.assertNotIn("fallback_model", chunk)
+
     def test_partition_recovery_is_sealed_and_replays_without_transport(self):
         calls: list[str] = []
         child_successes = 0

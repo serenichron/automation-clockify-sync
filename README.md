@@ -117,9 +117,11 @@ repair request containing only its allowlisted failure category and narrow
 corrective guidance; raw rejected output is never copied into that request or
 cache record. Transport and probe failures are not retried. If repair still
 fails, a configured stronger fallback receives the safe category and handles
-the bounded chunk. Without a usable fallback, primary probe/call/schema failures
-block the run. Conflicting or low-confidence claims that remain unresolved become
-explicit exceptions, never proposals.
+the bounded chunk. Primary probe and transport failures block the run. A sealed
+semantic-contract rejection may instead enter the deterministic partition
+recovery below even when the primary is the only qualified route. Conflicting or
+low-confidence claims that remain unresolved become explicit exceptions, never
+proposals.
 
 The built-in default is `deepseek-v4-pro:cloud`, selected only after the v12
 synthetic route gate passed. `deepseek-v4-flash:cloud` remains ineligible as a
@@ -130,11 +132,12 @@ Analyzer requests retain the fail-closed 1,450,000-byte hard ceiling. Normal
 extraction uses a 250,000-byte and 250-event operational target with four
 deterministically ordered workers so a large-context route does not receive an
 unnecessarily broad semantic partition. A single event may exceed the target but
-never the hard ceiling; it is never clipped. When both evaluated routes reject
-one bounded chunk, deterministic recovery bisects only at source-context or
-conversation-turn boundaries. A user instruction always stays with its following
-assistant/tool result. A single indivisible turn that both routes reject becomes
-one local `analyzer_failure` exception with a failure digest.
+never the hard ceiling; it is never clipped. When every configured qualified
+route rejects one bounded chunk, deterministic recovery bisects only at
+source-context or conversation-turn boundaries. This includes a single qualified
+primary with no fallback. A user instruction always stays with its following
+assistant/tool result. A single indivisible turn rejected by every configured
+route becomes one local `analyzer_failure` exception with a failure digest.
 If both routes reject repeated-workstream synthesis, those otherwise valid but
 potentially duplicative claims become one `analyzer_synthesis_failure` exception.
 Synthesis candidates require the same normalized project, workstream, and
@@ -357,9 +360,9 @@ validated decision cache owns exact output replay and is separately integrity
 checked. Long immutable ledger IDs never rely on model copying: local code
 expands disjoint bundle-member ranges before schema and citation validation. Prefix validation
 uses a neutral placeholder because deterministic routing owns the final prefix.
-If both routes reject a bounded extraction partition, the analyzer bisects its
+If every configured qualified route rejects a bounded extraction partition, the analyzer bisects its
 evidence at the nearest context or complete conversation-turn boundary and
-retries each child through the same routes, cancellation gate, and sealed cache.
+retries each child through the same route set, cancellation gate, and sealed cache.
 Recovery never separates user intent from its following assistant result. It is
 bounded at an indivisible turn, singleton evidence, or depth eight, records every
 child route decision, and cannot rejoin normal cross-chunk synthesis unless every
