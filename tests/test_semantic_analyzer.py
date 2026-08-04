@@ -1118,6 +1118,95 @@ class SemanticAnalyzerTests(unittest.TestCase):
             )
         self.assertEqual([2], evidence_calls)
 
+    def test_single_route_timeout_partitions_and_replays_from_sealed_cache(self):
+        calls: list[tuple[str, int]] = []
+        child_number = 0
+
+        def transport(_endpoint, body):
+            nonlocal child_number
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                calls.append(("probe", 0))
+                return {"probe": "ok"}
+            if payload.get("mode") == "synthesize":
+                provisional = payload["provisional_activities"]
+                calls.append(("synthesize", len(provisional)))
+                response = valid_response(provisional[0]["evidence_ids"][0])
+                response["activities"][0].update({
+                    "evidence_ids": sorted(
+                        evidence_id
+                        for activity in provisional
+                        for evidence_id in activity["evidence_ids"]
+                    ),
+                    "evidence_spans": [
+                        span
+                        for activity in provisional
+                        for span in activity["evidence_spans"]
+                    ],
+                    "merge_rationale": "same recovered timeout work",
+                })
+                return response
+            members = provider_members(payload)
+            calls.append(("extract", len(members)))
+            if len(members) > 1:
+                raise semantic.AnalyzerTimeoutError("bounded request timed out")
+            child_number += 1
+            response = provider_response(payload)
+            response["activities"][0].update({
+                "object": f"recovered timeout {child_number}",
+                "workstream": f"timeout stream {child_number}",
+            })
+            return response
+
+        endpoint = semantic.AnalyzerEndpoint("primary", "http://primary", "qualified")
+        events = [event("ev-a"), event("ev-b")]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "analyzer-cache.jsonl"
+            first = semantic.analyze_tiered(
+                events,
+                primary=endpoint,
+                transport=transport,
+                max_events_per_chunk=2,
+                cache=semantic.AnalyzerResponseCache(path),
+            )
+            records = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+            ]
+            second = semantic.analyze_tiered(
+                events,
+                primary=endpoint,
+                transport=lambda *_: self.fail(
+                    "sealed timeout recovery replay must not call transport"
+                ),
+                max_events_per_chunk=2,
+                cache=semantic.AnalyzerResponseCache(path),
+            )
+
+        self.assertEqual(first["activities"], second["activities"])
+        self.assertEqual(first["analysis_chunks"], second["analysis_chunks"])
+        self.assertEqual(
+            "transport_timeout",
+            first["analysis_chunks"][0]["recovery"]["trigger"],
+        )
+        self.assertEqual("recovered", first["analysis_chunks"][0]["recovery"]["status"])
+        self.assertEqual(
+            1,
+            sum(
+                record.get("failure_code") == "transport_timeout"
+                for record in records
+            ),
+        )
+        self.assertEqual(
+            [
+                ("probe", 0),
+                ("extract", 2),
+                ("extract", 1),
+                ("synthesize", 2),
+            ],
+            calls,
+        )
+
     def test_single_route_indivisible_rejection_is_visible_exception(self):
         events = []
         for ordinal, role in enumerate(("user", "assistant"), 1):

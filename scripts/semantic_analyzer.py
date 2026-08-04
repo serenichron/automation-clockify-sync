@@ -172,6 +172,10 @@ class AnalyzerError(RuntimeError):
     """Fail-closed analyzer or contract error."""
 
 
+class AnalyzerTimeoutError(AnalyzerError):
+    """A bounded analyzer transport timed out without a usable response."""
+
+
 class _ValidatedAnalysis(dict[str, Any]):
     """Schema-shaped analysis plus ephemeral fallback-only timing evidence."""
 
@@ -226,6 +230,7 @@ CONTRACT_FAILURE_CODES = {
     "contract_rejected_other",
     *(f"contract_rejected_{code}" for code, _needle in _CONTRACT_FAILURE_PATTERNS),
 }
+CACHE_REJECTION_CODES = CONTRACT_FAILURE_CODES | {"transport_timeout"}
 SYNTHESIS_INTEGRITY_FAILURE_CODES = {
     "contract_rejected_invalid_evidence_ids",
     "contract_rejected_omitted_evidence",
@@ -2146,7 +2151,7 @@ class AnalyzerResponseCache:
                 raise AnalyzerError(
                     f"analyzer cache line {line_number} response is unsafe"
                 ) from exc
-        if status == "rejected" and value.get("failure_code") not in CONTRACT_FAILURE_CODES:
+        if status == "rejected" and value.get("failure_code") not in CACHE_REJECTION_CODES:
             raise AnalyzerError(f"analyzer cache line {line_number} rejection is invalid")
         if self._decision_digest(decision) != value.get("decision_digest"):
             raise AnalyzerError(f"analyzer cache line {line_number} decision digest differs")
@@ -2198,6 +2203,10 @@ class AnalyzerResponseCache:
             self.hits += 1
             self.used[identity["cache_key"]] = str(record["decision_digest"])
             if record["status"] == "rejected":
+                if record["failure_code"] == "transport_timeout":
+                    raise AnalyzerTimeoutError(
+                        "analyzer cache records transport_timeout"
+                    )
                 raise AnalyzerContractError(
                     f"analyzer cache records {record['failure_code']}"
                 )
@@ -2268,7 +2277,7 @@ class AnalyzerResponseCache:
         *,
         failure_code: str = "contract_rejected",
     ) -> None:
-        if failure_code not in CONTRACT_FAILURE_CODES:
+        if failure_code not in CACHE_REJECTION_CODES:
             raise AnalyzerError("analyzer cache rejection code is invalid")
         identity = self._request_identity(endpoint, body)
         decision = {"status": "rejected", "failure_code": failure_code}
@@ -2316,7 +2325,21 @@ def http_transport(endpoint: AnalyzerEndpoint, body: dict[str, Any]) -> dict[str
     try:
         with urllib.request.urlopen(request, timeout=endpoint.timeout_seconds) as response:
             return json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+    except TimeoutError as exc:
+        # A timeout has no usable provider response. Keep it distinguishable so
+        # extraction can seal the exact failed request and bisect only at safe
+        # conversation-turn boundaries; no identical request is retried.
+        raise AnalyzerTimeoutError(
+            f"analyzer endpoint {endpoint.name} failed: TimeoutError"
+        ) from exc
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, TimeoutError):
+            raise AnalyzerTimeoutError(
+                f"analyzer endpoint {endpoint.name} failed: TimeoutError"
+            ) from exc
+        # Never include request headers/body: they can contain credentials or evidence.
+        raise AnalyzerError(f"analyzer endpoint {endpoint.name} failed: URLError") from exc
+    except json.JSONDecodeError as exc:
         # Never include request headers/body: they can contain credentials or evidence.
         raise AnalyzerError(f"analyzer endpoint {endpoint.name} failed: {type(exc).__name__}") from exc
 
@@ -2384,7 +2407,17 @@ def _call_validated(
         if before_transport is not None:
             before_transport(endpoint)
         _raise_if_cancelled(cancelled)
-        raw_response = transport(endpoint, body)
+        try:
+            raw_response = transport(endpoint, body)
+        except AnalyzerTimeoutError:
+            _raise_if_cancelled(cancelled)
+            if cache is not None and cache_miss:
+                cache.store_rejected(
+                    endpoint,
+                    body,
+                    failure_code="transport_timeout",
+                )
+            raise
         _raise_if_cancelled(cancelled)
         try:
             response = _json_object_from_response(raw_response)
@@ -2698,6 +2731,8 @@ def analyze_tiered(
 
         def recover_partition(
             parent_failure_digest: str,
+            *,
+            trigger: str = "contract_rejection",
         ) -> tuple[dict[str, Any], dict[str, Any]] | None:
             if (
                 len(chunk) <= MIN_PARTITION_RECOVERY_EVENTS
@@ -2790,6 +2825,7 @@ def analyze_tiered(
                 ),
                 "recovery": {
                     "status": "recovered" if not unresolved else "exhausted",
+                    "trigger": trigger,
                     "path": recovery_path,
                     "depth": recovery_depth,
                     "max_depth": MAX_PARTITION_RECOVERY_DEPTH,
@@ -2859,6 +2895,28 @@ def analyze_tiered(
         if primary_error is not None:
             _raise_if_cancelled(cancellation.is_set)
             if fallback is None:
+                if isinstance(primary_error, AnalyzerTimeoutError):
+                    failure_digest = stable_digest(
+                        "aer-",
+                        {
+                            "mode": "extract",
+                            "failure": "transport_timeout",
+                            "evidence_ids": sorted(chunk_ids),
+                            "primary": {"name": primary.name, "model": primary.model},
+                            "fallback": None,
+                            "prompt_version": PROMPT_VERSION,
+                            "schema_version": SCHEMA_VERSION,
+                        },
+                    )
+                    recovered = recover_partition(
+                        failure_digest,
+                        trigger="transport_timeout",
+                    )
+                    if recovered is not None:
+                        return recovered
+                    raise AnalyzerError(
+                        f"primary analyzer timed out for indivisible chunk {index + 1}"
+                    ) from primary_error
                 if not isinstance(primary_error, AnalyzerContractError):
                     raise AnalyzerError(
                         f"primary analyzer failed for chunk {index + 1}: {primary_error}"

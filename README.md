@@ -115,11 +115,13 @@ The primary analyzer must pass a minimal live probe and its structured response
 contract. A sealed contract rejection receives exactly one content-addressed
 repair request containing only its allowlisted failure category and narrow
 corrective guidance; raw rejected output is never copied into that request or
-cache record. Transport and probe failures are not retried. If repair still
-fails, a configured stronger fallback receives the safe category and handles
-the bounded chunk. Primary probe and transport failures block the run. A sealed
-semantic-contract rejection may instead enter the deterministic partition
-recovery below even when the primary is the only qualified route. Conflicting or
+cache record. Probe, connection, authentication, and malformed-response failures
+are not retried and block the run. A timed-out extraction request is sealed in
+the local cache and bisected only at a safe context or complete-turn boundary;
+the identical timed-out body is never sent again. If repair still fails, a
+configured stronger fallback receives the safe category and handles the bounded
+chunk. A sealed semantic-contract rejection may also enter the deterministic
+partition recovery below even when the primary is the only qualified route. Conflicting or
 low-confidence claims that remain unresolved become explicit exceptions, never
 proposals.
 
@@ -134,11 +136,12 @@ extraction uses a 250,000-byte and 250-event operational target with four
 deterministically ordered workers so a large-context route does not receive an
 unnecessarily broad semantic partition. A single event may exceed the target but
 never the hard ceiling; it is never clipped. When every configured qualified
-route rejects one bounded chunk, deterministic recovery bisects only at
+route rejects or times out on one bounded extraction chunk, deterministic recovery bisects only at
 source-context or conversation-turn boundaries. This includes a single qualified
 primary with no fallback. A user instruction always stays with its following
 assistant/tool result. A single indivisible turn rejected by every configured
-route becomes one local `analyzer_failure` exception with a failure digest.
+route becomes one local `analyzer_failure` exception with a failure digest; an
+indivisible transport timeout blocks because no smaller privacy-safe unit exists.
 If every configured qualified route rejects repeated-workstream synthesis,
 including a single primary with no fallback, those otherwise valid but potentially
 duplicative claims become one `analyzer_synthesis_failure` exception. A synthesis
@@ -159,7 +162,8 @@ complete exactly-once coverage before computing activity identities.
 Validated analyzer decisions are stored in the append-only local
 `analyzer-cache-v2.jsonl` beside the durable review state. Cache keys bind the endpoint, model, prompt/schema
 versions, and complete request-body digest without storing request prose. Both
-accepted responses and contract-rejected primary decisions are sealed, so an
+accepted responses, contract-rejected primary decisions, and extraction timeout
+decisions are sealed, so an
 immutable replay cannot randomly switch provider wording or fallback routing.
 Every cache hit is revalidated; replayed decisions do not require another live
 provider probe. Concurrent or stale writers are locked and conflicting decisions
@@ -369,9 +373,10 @@ The append-only validated decision cache owns exact output replay and is separat
 checked. Long immutable ledger IDs never rely on model copying: local code
 expands disjoint bundle-member ranges before schema and citation validation. Prefix validation
 uses a neutral placeholder because deterministic routing owns the final prefix.
-If every configured qualified route rejects a bounded extraction partition, the analyzer bisects its
+If every configured qualified route rejects or times out on a bounded extraction partition, the analyzer bisects its
 evidence at the nearest context or complete conversation-turn boundary and
-retries each child through the same route set, cancellation gate, and sealed cache.
+analyzes each child through the same route set, cancellation gate, and sealed cache.
+It never retries the identical parent request.
 Recovery never separates user intent from its following assistant result. It is
 bounded at an indivisible turn, singleton evidence, or depth eight, records every
 child route decision, and cannot rejoin normal cross-chunk synthesis unless every

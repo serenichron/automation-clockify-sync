@@ -78,7 +78,9 @@ entry grouping, wall-clock gap filling, or manual overlap trimming.
   binding fail closed. `deepseek-v4-pro:cloud` is not approved for this process.
 - The request ceiling is about 1.45 MB. The pipeline chunks complete normalized
   events by day and rejects an individually oversized event instead of clipping
-  it.
+  it. A timed-out extraction request is sealed locally and bisected only at a
+  safe context or complete-turn boundary; the identical parent request is never
+  retried. Other transport failures still block.
 - The immutable raw ledger remains local. A route probe contains no evidence.
   Private semantic projection is denied unless the separately approved runtime
   explicitly sets `CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED=approved`. Probe
