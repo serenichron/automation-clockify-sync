@@ -104,8 +104,20 @@
     "chunk": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["chunk", "event_count", "evidence_digest", "endpoint", "model", "tier", "fallback_status", "evidence_bundle_schema_version", "bundle_count", "bundle_manifest_digest"],
+      "required": ["chunk", "event_count", "evidence_digest", "endpoint", "evidence_bundle_schema_version", "bundle_count", "bundle_manifest_digest"],
       "allOf": [
+        {
+          "oneOf": [
+            {
+              "required": ["model", "tier", "fallback_status"],
+              "not": {"anyOf": [{"required": ["recovery_status"]}, {"required": ["recovery"]}]}
+            },
+            {
+              "required": ["partition_path", "partition_depth", "repair_status", "recovery_status", "recovery"],
+              "not": {"anyOf": [{"required": ["model"]}, {"required": ["tier"]}, {"required": ["fallback_status"]}]}
+            }
+          ]
+        },
         {
           "if": {"properties": {"tier": {"const": "exception"}}, "required": ["tier"]},
           "then": {
@@ -117,6 +129,30 @@
         {
           "if": {"properties": {"fallback_status": {"const": "failed_exception"}}, "required": ["fallback_status"]},
           "then": {"properties": {"tier": {"const": "exception"}}}
+        },
+        {
+          "if": {
+            "properties": {
+              "recovery": {
+                "properties": {"status": {"const": "recovered"}},
+                "required": ["status"]
+              }
+            },
+            "required": ["recovery"]
+          },
+          "then": {"properties": {"recovery_status": {"const": "recovered_by_partition"}}}
+        },
+        {
+          "if": {
+            "properties": {
+              "recovery": {
+                "properties": {"status": {"const": "exhausted"}},
+                "required": ["status"]
+              }
+            },
+            "required": ["recovery"]
+          },
+          "then": {"properties": {"recovery_status": {"const": "partition_exception"}}}
         }
       ],
       "properties": {
@@ -126,6 +162,10 @@
         "endpoint": {"type": "string"},
         "model": {"type": "string"},
         "tier": {"enum": ["primary", "fallback", "exception"]},
+        "partition_path": {"type": "string", "pattern": "^root(?:\\.[ab])*$"},
+        "partition_depth": {"type": "integer", "minimum": 0, "maximum": 8},
+        "recovery_status": {"enum": ["recovered_by_partition", "partition_exception"]},
+        "recovery": {"$ref": "#/$defs/recovery"},
         "fallback_status": {
           "enum": [
             "not_needed",
@@ -136,7 +176,7 @@
           ]
         },
         "repair_status": {
-          "enum": ["not_attempted", "used", "rejected", "transport_failed"]
+          "enum": ["not_attempted", "used", "rejected", "transport_failed", "partitioned"]
         },
         "failure_digest": {"type": "string", "pattern": "^aer-[a-f0-9]{24}$"},
         "fallback_endpoint": {"type": "string", "minLength": 1},
@@ -144,6 +184,25 @@
         "evidence_bundle_schema_version": {"const": "clockify-semantic-evidence-bundle/v1"},
         "bundle_count": {"type": "integer", "minimum": 1},
         "bundle_manifest_digest": {"type": "string", "pattern": "^sebm-[a-f0-9]{64}$"}
+      }
+    },
+    "recovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "path", "depth", "max_depth", "split_at_event", "parent_failure_digest", "children"],
+      "properties": {
+        "status": {"enum": ["recovered", "exhausted"]},
+        "path": {"type": "string", "pattern": "^root(?:\\.[ab])*$"},
+        "depth": {"type": "integer", "minimum": 0, "maximum": 8},
+        "max_depth": {"const": 8},
+        "split_at_event": {"type": "integer", "minimum": 1},
+        "parent_failure_digest": {"type": "string", "pattern": "^aer-[a-f0-9]{24}$"},
+        "children": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {"$ref": "#/$defs/chunk"}
+        }
       }
     },
     "evidenceBundleManifest": {

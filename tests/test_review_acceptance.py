@@ -193,6 +193,61 @@ def _scorecard(evidence_id: str) -> dict:
 
 
 class ReviewAcceptanceTests(unittest.TestCase):
+    def test_versions_include_activity_and_partition_leaf_routes(self):
+        versions = acceptance._versions({
+            "schema_version": 1,
+            "prompt_version": "prompt-one",
+            "activities": [{
+                "analyzer_model": "model-a",
+                "analyzer_tier": "primary",
+                "prompt_version": "prompt-one",
+                "schema_version": 1,
+            }],
+            "analysis_chunks": [{
+                "event_count": 2,
+                "partition_path": "root",
+                "partition_depth": 0,
+                "recovery_status": "recovered_by_partition",
+                "recovery": {
+                    "status": "recovered",
+                    "path": "root",
+                    "depth": 0,
+                    "children": [
+                        {"model": "model-a", "tier": "primary", "event_count": 1, "partition_path": "root.a", "partition_depth": 1},
+                        {"model": "model-b", "tier": "fallback", "event_count": 1, "partition_path": "root.b", "partition_depth": 1},
+                    ]
+                },
+            }],
+        })
+
+        self.assertEqual(
+            [("model-a", "primary"), ("model-b", "fallback")],
+            [(value["model"], value["tier"]) for value in versions],
+        )
+
+    def test_versions_reject_malformed_partition_tree(self):
+        with self.assertRaisesRegex(acceptance.AcceptanceError, "path or depth"):
+            acceptance._versions({
+                "schema_version": 1,
+                "prompt_version": "prompt-one",
+                "activities": [],
+                "analysis_chunks": [{
+                    "event_count": 2,
+                    "partition_path": "root",
+                    "partition_depth": 0,
+                    "recovery_status": "recovered_by_partition",
+                    "recovery": {
+                        "status": "recovered",
+                        "path": "root",
+                        "depth": 0,
+                        "children": [
+                            {"model": "a", "tier": "primary", "event_count": 1, "partition_path": "wrong", "partition_depth": 1},
+                            {"model": "b", "tier": "fallback", "event_count": 1, "partition_path": "root.b", "partition_depth": 1},
+                        ],
+                    },
+                }],
+            })
+
     def test_full_denominator_includes_ambiguous_and_rejects_missing_decision(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -453,9 +453,57 @@ def _analysis_versions(document: dict[str, Any]) -> list[str]:
         values = document.get(key, [])
         if not isinstance(values, list):
             raise ValueError(f"semantic analysis {key} must be a list")
-        for raw in values:
+        pending = [(value, None, None) for value in values]
+        recovery_nodes = 0
+        while pending:
+            raw, expected_path, expected_depth = pending.pop(0)
             if not isinstance(raw, dict):
                 raise ValueError(f"semantic analysis {key} item must be an object")
+            if expected_path is not None and (
+                raw.get("partition_path") != expected_path
+                or raw.get("partition_depth") != expected_depth
+            ):
+                raise ValueError("semantic analysis recovery path or depth is invalid")
+            recovery = raw.get("recovery")
+            if recovery is not None:
+                recovery_nodes += 1
+                if recovery_nodes > 511:
+                    raise ValueError("semantic analysis recovery tree exceeds its bound")
+                if not isinstance(recovery, dict) or not isinstance(
+                    recovery.get("children"), list
+                ):
+                    raise ValueError("semantic analysis recovery metadata is invalid")
+                path = str(raw.get("partition_path") or "")
+                depth = raw.get("partition_depth")
+                children = recovery["children"]
+                child_counts = [
+                    child.get("event_count") if isinstance(child, dict) else None
+                    for child in children
+                ]
+                expected_recovery_status = {
+                    "recovered": "recovered_by_partition",
+                    "exhausted": "partition_exception",
+                }.get(str(recovery.get("status") or ""))
+                if (
+                    not path
+                    or not isinstance(depth, int)
+                    or isinstance(depth, bool)
+                    or recovery.get("path") != path
+                    or recovery.get("depth") != depth
+                    or len(children) != 2
+                    or depth >= semantic_analyzer.MAX_PARTITION_RECOVERY_DEPTH
+                    or any(
+                        not isinstance(count, int) or isinstance(count, bool) or count <= 0
+                        for count in child_counts
+                    )
+                    or sum(child_counts) != raw.get("event_count")
+                    or raw.get("recovery_status") != expected_recovery_status
+                ):
+                    raise ValueError("semantic analysis recovery metadata is invalid")
+                pending[0:0] = [
+                    (child, f"{path}.{label}", depth + 1)
+                    for label, child in zip(("a", "b"), children, strict=True)
+                ]
             model = str(raw.get("analyzer_model") or raw.get("model") or "")
             tier = str(raw.get("analyzer_tier") or raw.get("tier") or "")
             if model and tier:

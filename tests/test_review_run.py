@@ -34,6 +34,61 @@ def bundle_manifest() -> dict:
 
 
 class ReviewRunResultTests(unittest.TestCase):
+    def test_analysis_versions_recurses_partition_recovery_children(self):
+        document = {
+            "schema_version": 1,
+            "prompt_version": "prompt-v1",
+            "evidence_bundle_schema_version": "bundle-v1",
+            "activities": [],
+            "analysis_chunks": [{
+                "endpoint": "partition-recovery",
+                "event_count": 2,
+                "partition_path": "root",
+                "partition_depth": 0,
+                "recovery_status": "recovered_by_partition",
+                "recovery": {
+                    "status": "recovered",
+                    "path": "root",
+                    "depth": 0,
+                    "children": [
+                        {"model": "model-a", "tier": "primary", "event_count": 1, "partition_path": "root.a", "partition_depth": 1},
+                        {"model": "model-b", "tier": "fallback", "event_count": 1, "partition_path": "root.b", "partition_depth": 1},
+                    ]
+                },
+            }],
+        }
+
+        versions = [json.loads(value) for value in review_run._analysis_versions(document)]
+
+        self.assertEqual(
+            [("model-a", "primary"), ("model-b", "fallback")],
+            [(value["model"], value["tier"]) for value in versions],
+        )
+
+    def test_analysis_versions_rejects_malformed_partition_tree(self):
+        with self.assertRaisesRegex(ValueError, "path or depth"):
+            review_run._analysis_versions({
+                "schema_version": 1,
+                "prompt_version": "prompt-v1",
+                "evidence_bundle_schema_version": "bundle-v1",
+                "activities": [],
+                "analysis_chunks": [{
+                    "event_count": 2,
+                    "partition_path": "root",
+                    "partition_depth": 0,
+                    "recovery_status": "recovered_by_partition",
+                    "recovery": {
+                        "status": "recovered",
+                        "path": "root",
+                        "depth": 0,
+                        "children": [
+                            {"model": "a", "tier": "primary", "event_count": 1, "partition_path": "wrong", "partition_depth": 1},
+                            {"model": "b", "tier": "fallback", "event_count": 1, "partition_path": "root.b", "partition_depth": 1},
+                        ],
+                    },
+                }],
+            })
+
     def test_immutable_replay_copies_only_ledger_and_binds_source_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
             runs = Path(tmp) / "runs"

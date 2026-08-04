@@ -102,22 +102,72 @@ def _versions(analysis: Mapping[str, Any]) -> list[dict[str, Any]]:
         if key not in values:
             values.add(key)
             output.append(version)
-    if not output:
-        chunks = analysis.get("analysis_chunks", [])
-        if not isinstance(chunks, list):
-            raise AcceptanceError("analysis_chunks must be a list")
-        for raw in chunks:
-            chunk = _require_mapping(raw, "analysis chunk")
-            version = {
-                "model": str(chunk.get("model") or ""),
-                "tier": str(chunk.get("tier") or ""),
-                "prompt_version": str(analysis.get("prompt_version") or ""),
-                "schema_version": analysis.get("schema_version"),
-            }
-            key = canonical_json(version)
-            if key not in values:
-                values.add(key)
-                output.append(version)
+    chunks = analysis.get("analysis_chunks", [])
+    if not isinstance(chunks, list):
+        raise AcceptanceError("analysis_chunks must be a list")
+    pending = [(chunk, None, None) for chunk in chunks]
+    recovery_nodes = 0
+    while pending:
+        raw_chunk, expected_path, expected_depth = pending.pop(0)
+        chunk = _require_mapping(raw_chunk, "analysis chunk")
+        if expected_path is not None and (
+            chunk.get("partition_path") != expected_path
+            or chunk.get("partition_depth") != expected_depth
+        ):
+            raise AcceptanceError("analysis recovery path or depth is invalid")
+        recovery = chunk.get("recovery")
+        if recovery is not None:
+            recovery_nodes += 1
+            if recovery_nodes > 511:
+                raise AcceptanceError("analysis recovery tree exceeds its bound")
+            recovery_record = _require_mapping(recovery, "analysis recovery")
+            children = recovery_record.get("children")
+            if not isinstance(children, list):
+                raise AcceptanceError("analysis recovery children must be a list")
+            path = str(chunk.get("partition_path") or "")
+            depth = chunk.get("partition_depth")
+            child_counts = [
+                child.get("event_count") if isinstance(child, Mapping) else None
+                for child in children
+            ]
+            expected_recovery_status = {
+                "recovered": "recovered_by_partition",
+                "exhausted": "partition_exception",
+            }.get(str(recovery_record.get("status") or ""))
+            if (
+                not path
+                or not isinstance(depth, int)
+                or isinstance(depth, bool)
+                or recovery_record.get("path") != path
+                or recovery_record.get("depth") != depth
+                or len(children) != 2
+                or depth >= 8
+                or any(
+                    not isinstance(count, int) or isinstance(count, bool) or count <= 0
+                    for count in child_counts
+                )
+                or sum(child_counts) != chunk.get("event_count")
+                or chunk.get("recovery_status") != expected_recovery_status
+            ):
+                raise AcceptanceError("analysis recovery metadata is invalid")
+            pending[0:0] = [
+                (child, f"{path}.{label}", depth + 1)
+                for label, child in zip(("a", "b"), children, strict=True)
+            ]
+        model = str(chunk.get("model") or "")
+        tier = str(chunk.get("tier") or "")
+        if not model or not tier:
+            continue
+        version = {
+            "model": model,
+            "tier": tier,
+            "prompt_version": str(analysis.get("prompt_version") or ""),
+            "schema_version": analysis.get("schema_version"),
+        }
+        key = canonical_json(version)
+        if key not in values:
+            values.add(key)
+            output.append(version)
     return sorted(output, key=canonical_json)
 
 

@@ -345,6 +345,11 @@ validated decision cache owns exact output replay and is separately integrity
 checked. Long immutable ledger IDs never rely on model copying: local code
 expands disjoint bundle-member ranges before schema and citation validation. Prefix validation
 uses a neutral placeholder because deterministic routing owns the final prefix.
+If both routes reject a bounded extraction partition, the analyzer bisects its
+evidence into contiguous halves and retries each child through the same routes,
+cancellation gate, and sealed cache. Recovery is bounded at singleton evidence
+or depth eight, records every child route decision, and cannot rejoin normal
+cross-chunk synthesis unless every evidence ID is classified exactly once.
 A passing synthetic
 route scorecard proves contract fitness, not July semantic accuracy; the latter
 still requires full-denominator human dispositions and the measured acceptance

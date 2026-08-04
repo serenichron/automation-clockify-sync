@@ -41,8 +41,16 @@ expands them back to immutable ledger IDs, rejects missing or overlapping
 coverage, and computes final activity identity only after expansion. The bundle
 schema and manifest digest are part of immutable replay verification.
 
+Dual-route contract rejections use deterministic failed-partition recovery:
+contiguous halves are analyzed through the same routes, cancellation gate, and
+append-only cache until they pass or reach the bounded singleton/depth limit.
+The parent retains recursive child metadata and cannot rejoin synthesis unless
+every evidence ID is classified exactly once. Acceptance and replay accounting
+read the actual leaf model/tier records; the deterministic recovery coordinator
+is never treated as a synthetic analyzer route.
+
 Planned and noise activities do not become proposals. Title-only meetings,
-missing sources, routing conflicts, low confidence, double-route chunk or
+missing sources, routing conflicts, low confidence, exhausted recovered chunks,
 workstream-synthesis rejection, and contested capacity become explicit
 exclusions or exceptions. The analyzer uses a 250,000-byte and 250-event
 operational target with four deterministically ordered workers beneath its

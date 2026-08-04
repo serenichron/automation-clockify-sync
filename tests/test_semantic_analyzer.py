@@ -902,6 +902,188 @@ class SemanticAnalyzerTests(unittest.TestCase):
         self.assertEqual("fallback", result["analysis_chunks"][0]["fallback_endpoint"])
         self.assertEqual("strong", result["analysis_chunks"][0]["fallback_model"])
 
+    def test_dual_contract_failure_recovers_by_contiguous_bisection(self):
+        extract_sizes: list[tuple[str, int]] = []
+        child_successes = 0
+
+        def transport(endpoint, body):
+            nonlocal child_successes
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            if payload["mode"] == "synthesize":
+                provisional = payload["provisional_activities"]
+                response = valid_response(provisional[0]["evidence_ids"][0])
+                response["activities"][0].update({
+                    "evidence_ids": sorted(
+                        evidence_id
+                        for activity in provisional
+                        for evidence_id in activity["evidence_ids"]
+                    ),
+                    "evidence_spans": [
+                        span for activity in provisional for span in activity["evidence_spans"]
+                    ],
+                    "merge_rationale": "same recovered Clockify work",
+                })
+                return response
+            members = provider_members(payload)
+            extract_sizes.append((endpoint.name, len(members)))
+            if len(members) > 1:
+                return {"activities": [], "exceptions": [], "omissions": []}
+            response = provider_response(payload)
+            child_successes += 1
+            response["activities"][0].update({
+                "object": f"Clockify description {child_successes}",
+                "workstream": f"Clockify stream {child_successes}",
+            })
+            return response
+
+        events = [event("ev-a"), event("ev-b")]
+        result = semantic.analyze_tiered(
+            events,
+            primary=semantic.AnalyzerEndpoint("primary", "http://primary", "cheap"),
+            fallback=semantic.AnalyzerEndpoint("fallback", "http://fallback", "strong"),
+            transport=transport,
+            max_events_per_chunk=2,
+        )
+
+        self.assertEqual([], result["exceptions"])
+        self.assertEqual(["ev-a", "ev-b"], sorted(
+            evidence_id
+            for activity in result["activities"]
+            for evidence_id in activity["evidence_ids"]
+        ))
+        self.assertEqual(
+            [
+                ("fallback", 2), ("fallback", 2),
+                ("primary", 1), ("primary", 1),
+                ("primary", 2), ("primary", 2), ("primary", 2),
+            ],
+            sorted(extract_sizes),
+        )
+        chunk = result["analysis_chunks"][0]
+        self.assertEqual("recovered_by_partition", chunk["recovery_status"])
+        self.assertEqual("recovered", chunk["recovery"]["status"])
+        self.assertEqual(["root.a", "root.b"], [
+            child["partition_path"] for child in chunk["recovery"]["children"]
+        ])
+
+    def test_partition_recovery_is_sealed_and_replays_without_transport(self):
+        calls: list[str] = []
+        child_successes = 0
+
+        def transport(endpoint, body):
+            nonlocal child_successes
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                calls.append("probe")
+                return {"probe": "ok"}
+            if payload["mode"] == "synthesize":
+                provisional = payload["provisional_activities"]
+                response = valid_response(provisional[0]["evidence_ids"][0])
+                response["activities"][0].update({
+                    "evidence_ids": sorted(
+                        evidence_id
+                        for activity in provisional
+                        for evidence_id in activity["evidence_ids"]
+                    ),
+                    "evidence_spans": [
+                        span for activity in provisional for span in activity["evidence_spans"]
+                    ],
+                    "merge_rationale": "same recovered Clockify work",
+                })
+                return response
+            calls.append(endpoint.name)
+            members = provider_members(payload)
+            if len(members) > 1:
+                return {"activities": [], "exceptions": [], "omissions": []}
+            response = provider_response(payload)
+            child_successes += 1
+            response["activities"][0].update({
+                "object": f"Clockify description {child_successes}",
+                "workstream": f"Clockify stream {child_successes}",
+            })
+            return response
+
+        endpoint = semantic.AnalyzerEndpoint("primary", "http://primary", "cheap")
+        fallback = semantic.AnalyzerEndpoint("fallback", "http://fallback", "strong")
+        events = [event("ev-a"), event("ev-b")]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "analyzer-cache.jsonl"
+            first = semantic.analyze_tiered(
+                events, primary=endpoint, fallback=fallback, transport=transport,
+                max_events_per_chunk=2, cache=semantic.AnalyzerResponseCache(path),
+            )
+            second = semantic.analyze_tiered(
+                events, primary=endpoint, fallback=fallback,
+                transport=lambda *_: self.fail("partition recovery replay must use sealed cache"),
+                max_events_per_chunk=2, cache=semantic.AnalyzerResponseCache(path),
+            )
+
+        self.assertTrue(calls)
+        self.assertEqual(first["activities"], second["activities"])
+        self.assertEqual(first["analysis_chunks"], second["analysis_chunks"])
+        self.assertIn("recovery", first["analysis_chunks"][0])
+        self.assertEqual("recovered", second["analysis_chunks"][0]["recovery"]["status"])
+
+    def test_partition_recovery_stops_at_single_evidence_without_loss_or_duplication(self):
+        extract_calls: list[tuple[str, int]] = []
+
+        def transport(endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            extract_calls.append((endpoint.name, len(provider_members(payload))))
+            return {"activities": [], "exceptions": [], "omissions": []}
+
+        events = [event(f"ev-{number}") for number in range(4)]
+        result = semantic.analyze_tiered(
+            events,
+            primary=semantic.AnalyzerEndpoint("primary", "http://primary", "cheap"),
+            fallback=semantic.AnalyzerEndpoint("fallback", "http://fallback", "strong"),
+            transport=transport,
+            max_events_per_chunk=4,
+        )
+
+        self.assertEqual(35, len(extract_calls))  # 7 deterministic tree nodes × (3 primary + 2 fallback)
+        self.assertTrue(all(size >= 1 for _endpoint, size in extract_calls))
+        self.assertEqual(
+            [item["evidence_id"] for item in events],
+            sorted(
+                evidence_id
+                for exception in result["exceptions"]
+                for evidence_id in exception["evidence_ids"]
+            ),
+        )
+        recovery = result["analysis_chunks"][0]["recovery"]
+        self.assertEqual("exhausted", recovery["status"])
+        self.assertLessEqual(recovery["max_depth"], semantic.MAX_PARTITION_RECOVERY_DEPTH)
+
+    def test_partition_recovery_rejects_colliding_child_activity_identities(self):
+        def fake_call(_endpoint, chunk, **_kwargs):
+            if len(chunk) > 1:
+                raise semantic.AnalyzerContractError("sealed contract rejection")
+            return {
+                "activities": [{
+                    "activity_id": "act-colliding",
+                    "evidence_ids": [chunk[0]["evidence_id"]],
+                }],
+                "exceptions": [],
+                "omissions": [],
+            }
+
+        with mock.patch.object(semantic, "_call_validated", side_effect=fake_call):
+            with self.assertRaisesRegex(
+                semantic.AnalyzerError,
+                "partition recovery emitted colliding activity identities",
+            ):
+                semantic.analyze_tiered(
+                    [event("ev-a"), event("ev-b")],
+                    primary=semantic.AnalyzerEndpoint("primary", "http://primary", "cheap"),
+                    fallback=semantic.AnalyzerEndpoint("fallback", "http://fallback", "strong"),
+                    max_events_per_chunk=2,
+                )
+
     def test_fallback_outage_blocks_instead_of_becoming_contract_exception(self):
         def transport(endpoint, body):
             payload = json.loads(body["messages"][1]["content"])

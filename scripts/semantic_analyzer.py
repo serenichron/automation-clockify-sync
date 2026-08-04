@@ -46,6 +46,13 @@ DEFAULT_CHUNK_BODY_BYTES = 250_000
 DEFAULT_MAX_EVENTS_PER_CHUNK = 250
 DEFAULT_ANALYZER_WORKERS = 4
 MAX_CONTRACT_REPAIR_ATTEMPTS = 2
+# A dual contract rejection can be caused by a request that is semantically too
+# dense for both available routes, not by the underlying evidence being bad.
+# Recover only by deterministic bisection.  The default extraction limit is
+# 250 events, so eight splits reach singleton evidence without an unbounded
+# retry tree.
+MAX_PARTITION_RECOVERY_DEPTH = 8
+MIN_PARTITION_RECOVERY_EVENTS = 1
 PRIVATE_TEXT_APPROVAL_ENV = "CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED"
 LIFECYCLES = {
     "completed",
@@ -2334,7 +2341,12 @@ def analyze_tiered(
         probe_once(endpoint)
         _raise_if_cancelled(cancellation.is_set)
 
-    def analyze_chunk(index_and_chunk: tuple[int, list[dict[str, Any]]]) -> tuple[dict[str, Any], dict[str, Any]]:
+    def analyze_chunk(
+        index_and_chunk: tuple[int, list[dict[str, Any]]],
+        *,
+        recovery_depth: int = 0,
+        recovery_path: str = "root",
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         index, chunk = index_and_chunk
         _raise_if_cancelled(cancellation.is_set)
         chunk_ids = {str(event.get("evidence_id")) for event in chunk}
@@ -2451,10 +2463,120 @@ def analyze_tiered(
                         f"rejection for chunk {index + 1}: primary={primary_error}; "
                         f"fallback={fallback_error}"
                     ) from fallback_error
-                # Both configured routes were usable at startup but rejected this
-                # bounded semantic partition.  Preserve complete evidence as one
-                # explicit local exception so a single model failure cannot halt
-                # reconciliation of every other chunk.
+                fallback_failure_digest = stable_digest(
+                    "aer-",
+                    {
+                        "mode": "extract",
+                        "evidence_ids": sorted(chunk_ids),
+                        "primary": {"name": primary.name, "model": primary.model},
+                        "fallback": {"name": fallback.name, "model": fallback.model},
+                        "prompt_version": PROMPT_VERSION,
+                        "schema_version": SCHEMA_VERSION,
+                    },
+                )
+                if (
+                    len(chunk) > MIN_PARTITION_RECOVERY_EVENTS
+                    and recovery_depth < MAX_PARTITION_RECOVERY_DEPTH
+                ):
+                    # Keep source order and do not repack by byte size here:
+                    # this recovery is an exact subdivision of the failed
+                    # partition, so evidence ownership remains auditable.
+                    split_at = len(chunk) // 2
+                    child_outcomes = [
+                        analyze_chunk(
+                            (index, child),
+                            recovery_depth=recovery_depth + 1,
+                            recovery_path=f"{recovery_path}.{label}",
+                        )
+                        for label, child in (("a", chunk[:split_at]), ("b", chunk[split_at:]))
+                    ]
+                    _raise_if_cancelled(cancellation.is_set)
+                    child_results = [child_result for child_result, _child_metadata in child_outcomes]
+                    child_metadata = [
+                        {
+                            key: value
+                            for key, value in metadata.items()
+                            if key != "_bundle_manifest"
+                        }
+                        for _child_result, metadata in child_outcomes
+                    ]
+                    child_classified_ids = [
+                        str(evidence_id)
+                        for child_result in child_results
+                        for collection in ("activities", "exceptions", "omissions")
+                        for item in child_result[collection]
+                        for evidence_id in item["evidence_ids"]
+                    ]
+                    if sorted(child_classified_ids) != sorted(chunk_ids):
+                        raise AnalyzerError(
+                            "partition recovery did not preserve evidence exactly once"
+                        )
+                    recovered_activities = [
+                        item
+                        for child_result in child_results
+                        for item in child_result["activities"]
+                    ]
+                    if len({item["activity_id"] for item in recovered_activities}) != len(
+                        recovered_activities
+                    ):
+                        raise AnalyzerError(
+                            "partition recovery emitted colliding activity identities"
+                        )
+                    _payload_bundles, chunk_bundle_manifest = _semantic_evidence_bundles(chunk)
+                    unresolved = any(
+                        item.get("kind") == "analyzer_failure"
+                        for child_result in child_results
+                        for item in child_result["exceptions"]
+                    )
+                    return {
+                        "schema_version": SCHEMA_VERSION,
+                        "prompt_version": PROMPT_VERSION,
+                        "activities": recovered_activities,
+                        "exceptions": [
+                            item
+                            for child_result in child_results
+                            for item in child_result["exceptions"]
+                        ],
+                        "omissions": [
+                            item
+                            for child_result in child_results
+                            for item in child_result["omissions"]
+                        ],
+                    }, {
+                        "chunk": index + 1,
+                        "event_count": len(chunk),
+                        "evidence_digest": stable_digest(
+                            "ech-", sorted(event["evidence_id"] for event in chunk)
+                        ),
+                        "endpoint": "partition-recovery",
+                        "partition_path": recovery_path,
+                        "partition_depth": recovery_depth,
+                        "recovery_status": (
+                            "recovered_by_partition"
+                            if not unresolved
+                            else "partition_exception"
+                        ),
+                        "repair_status": "partitioned",
+                        "evidence_bundle_schema_version": EVIDENCE_BUNDLE_SCHEMA_VERSION,
+                        "bundle_count": len(chunk_bundle_manifest),
+                        "bundle_manifest_digest": stable_digest(
+                            "sebm-", chunk_bundle_manifest, length=64
+                        ),
+                        "recovery": {
+                            "status": "recovered" if not unresolved else "exhausted",
+                            "path": recovery_path,
+                            "depth": recovery_depth,
+                            "max_depth": MAX_PARTITION_RECOVERY_DEPTH,
+                            "split_at_event": split_at,
+                            "parent_failure_digest": fallback_failure_digest,
+                            "children": child_metadata,
+                        },
+                        "_bundle_manifest": chunk_bundle_manifest,
+                    }
+                # Both configured routes were usable at startup but rejected a
+                # singleton (or a partition at the explicit recursion limit).
+                # Preserve its evidence as a local exception without weakening
+                # the existing contract gates.
                 result = {
                     "schema_version": SCHEMA_VERSION,
                     "prompt_version": PROMPT_VERSION,
@@ -2469,17 +2591,6 @@ def analyze_tiered(
                 used = primary
                 tier = "exception"
                 fallback_status = "failed_exception"
-                fallback_failure_digest = stable_digest(
-                    "aer-",
-                    {
-                        "mode": "extract",
-                        "evidence_ids": sorted(chunk_ids),
-                        "primary": {"name": primary.name, "model": primary.model},
-                        "fallback": {"name": fallback.name, "model": fallback.model},
-                        "prompt_version": PROMPT_VERSION,
-                        "schema_version": SCHEMA_VERSION,
-                    },
-                )
             else:
                 used = fallback
                 tier = "fallback"
@@ -2534,6 +2645,8 @@ def analyze_tiered(
             "endpoint": used.name,
             "model": used.model,
             "tier": tier,
+            "partition_path": recovery_path,
+            "partition_depth": recovery_depth,
             "fallback_status": fallback_status,
             "repair_status": repair_status,
             "evidence_bundle_schema_version": EVIDENCE_BUNDLE_SCHEMA_VERSION,

@@ -128,6 +128,9 @@ allocation, or correction-regression contracts recorded there.
    concrete-concept, rendering, or review-decision-stability failure; retain its synthetic capture
    and sealed scorecard. Harmless rationale wording may vary, but evidence
    disposition, partitions, lifecycle, effort, and confidence may not.
+   A dual-route extraction rejection may continue only through the bounded
+   deterministic partition-recovery path. Any exhausted recovery leaf remains a
+   blocking `analyzer_failure`; do not treat bisection itself as a model route.
 5. Enable `CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED=approved` only when the exact
    validation approval includes redacted private semantic-text egress, and only
    for the approved run scope.
