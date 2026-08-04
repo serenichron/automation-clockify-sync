@@ -144,7 +144,10 @@ def synthetic_cases() -> list[dict[str, Any]]:
                 _event(
                     merge,
                     1,
-                    content="Implement stable review identity from activity evidence fingerprints.",
+                    content=(
+                        "Implement stable review identity from activity evidence fingerprints "
+                        "and confirm it survives allocation movement."
+                    ),
                     start="2026-01-05T11:00:00+02:00",
                     end="2026-01-05T11:01:00+02:00",
                 ),
@@ -159,29 +162,22 @@ def synthetic_cases() -> list[dict[str, Any]]:
                 _event(
                     merge,
                     3,
-                    content="Confirm the same stable review identity survives allocation movement.",
-                    start="2026-01-05T11:22:00+02:00",
-                    end="2026-01-05T11:23:00+02:00",
-                ),
-                _event(
-                    merge,
-                    4,
                     role="assistant",
                     content="Confirmed the same stable review identity survives allocation movement.",
-                    start="2026-01-05T11:23:00+02:00",
+                    start="2026-01-05T11:22:00+02:00",
                     end="2026-01-05T11:35:00+02:00",
                 ),
             ],
             "expected_activity_partitions": [
                 [
                     _evidence_id(merge, 1), _evidence_id(merge, 2),
-                    _evidence_id(merge, 3), _evidence_id(merge, 4),
+                    _evidence_id(merge, 3),
                 ]
             ],
             "expected_activity_concepts": [{
                 "evidence_ids": [
                     _evidence_id(merge, 1), _evidence_id(merge, 2),
-                    _evidence_id(merge, 3), _evidence_id(merge, 4),
+                    _evidence_id(merge, 3),
                 ],
                 "required_terms": ["review", "identity", "allocation"],
             }],
