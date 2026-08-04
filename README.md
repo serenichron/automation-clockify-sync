@@ -123,8 +123,8 @@ recovery below even when the primary is the only qualified route. Conflicting or
 low-confidence claims that remain unresolved become explicit exceptions, never
 proposals.
 
-The required primary is `deepseek-v4-flash:cloud`. The current release passed
-the v13 synthetic route gate after its moving Ollama tag was refreshed. Every
+The required primary is `deepseek-v4-flash:cloud`. The current release must pass
+the v14 synthetic route gate after its moving Ollama tag is refreshed. Every
 live cloud route must include the resolved 64-character model revision so the
 scorecard, analyzer cache, semantic run, and replay cannot silently mix model
 releases. `deepseek-v4-pro:cloud` is not an approved route for this process.

@@ -22,7 +22,7 @@ may not overlap fixed blocks or one another.
 | Separate evidence and allocation timelines | Proven locally | `scripts/evidence_ledger.py`; `scripts/work_allocator.py`; `tests/test_work_allocator.py` |
 | Honest non-overlapping effort allocation | Proven locally | `scripts/work_allocator.py`; allocator and pipeline tests for fixed blocks, no gap filling, minimum rollback, and `contested_time` |
 | Deterministic Caveman descriptions | Proven locally for emitted fixtures and the 86-record corpus | `scripts/caveman_renderer.py`; `tests/test_caveman_renderer.py`; `tests/test_regression_corpus.py` |
-| Tiered privacy-gated model analysis | DeepSeek V4 Flash is the required primary; deny-by-default private-text gating, bounded concurrent chunks, release-bound live evaluation, and fail-closed analyzer exceptions are proven locally; authorized July accuracy remains under validation | `scripts/semantic_analyzer.py`; `scripts/analyzer_live_evaluation.py`; `scripts/analyzer_evaluation.py`; a fresh v13 scorecard bound to the resolved Flash release |
+| Tiered privacy-gated model analysis | DeepSeek V4 Flash is the required primary; deny-by-default private-text gating, bounded concurrent chunks, release-bound live evaluation, and fail-closed analyzer exceptions are proven locally; authorized July accuracy remains under validation | `scripts/semantic_analyzer.py`; `scripts/analyzer_live_evaluation.py`; `scripts/analyzer_evaluation.py`; a fresh v14 scorecard bound to the resolved Flash release |
 | Evidence-bound correction learning | Proven locally for approve, skip, modify, structural split partitions, omission, wording, routing, and allocation behavior; live decision ingestion unproven | `scripts/review_corrections.py`; `tests/test_review_corrections.py`; correction integration tests in `tests/test_work_accounting_pipeline.py` |
 | Exceptions-only durable review | Not activated; `shadow_all` is the default and the executable acceptance gate remains unproven live | `scripts/clockify_review_run.py`; `scripts/review_acceptance.py`; related tests and integrity-linked period ledger |
 
@@ -124,7 +124,7 @@ The guarded candidate is maintained on
 `codex/clockify-analyzer-determinism`; resolve and record its exact SHA at every
 publication, deployment, and run boundary because any later edit creates a new
 candidate. It is not merged to `master`. No Clockify, Multica, or schedule
-mutation is authorized. Exact-SHA fleet readback, fresh v13 route scorecards,
+mutation is authorized. Exact-SHA fleet readback, fresh v14 route scorecards,
 the fixed-denominator canary, one complete July 1–August 4 shadow run plus
 immutable replay, and any approved stable-ID review-surface patch remain
 evidence gates rather than assumptions.

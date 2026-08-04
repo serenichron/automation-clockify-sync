@@ -34,7 +34,7 @@ except ImportError:  # pragma: no cover - direct script execution fallback
 
 
 SCHEMA_VERSION = 1
-PROMPT_VERSION = "clockify-semantic-v13"
+PROMPT_VERSION = "clockify-semantic-v14"
 ANALYZER_CACHE_SCHEMA_VERSION = "clockify-analyzer-cache/v2"
 EVIDENCE_BUNDLE_SCHEMA_VERSION = "clockify-semantic-evidence-bundle/v1"
 DEFAULT_PRIMARY_MODEL = "deepseek-v4-flash:cloud"
@@ -1011,9 +1011,13 @@ User-role evidence is intent, not proof that requested work happened. Assistant-
 evidence alone is status or autonomous output, not proof of human-attention work.
 Except for meetings, a completed, advanced, investigated, or blocked accomplishment
 must cite both a user instruction and an assistant result from the same conversation.
-Do not invent projects, outcomes, evidence, effort, or meeting purpose. For a
-title-only meeting with no supported outcome, emit an exception. Effort is human
-attention, not process runtime or empty wall-clock time. Evidence arrives as
+Do not invent projects, outcomes, evidence, effort, or meeting purpose.
+MEETING SUFFICIENCY IS A HARD GATE. A Fathom bundle containing only a title and
+timestamps, with no summary, action items, transcript, or other outcome-bearing
+content, MUST produce exactly one insufficient_evidence exception covering all
+of that bundle's members. It MUST NOT produce an activity. Words such as discovery,
+review, planning, or delivery in the title do not prove meeting purpose or outcome.
+Effort is human attention, not process runtime or empty wall-clock time. Evidence arrives as
 semantic bundles. Each bundle has a short bundle_ref and ordered numeric members.
 Cite evidence only with evidence_partitions shaped as
 {"bundle_ref":"b-0001","member_ranges":[[1,4],[7,7]]}. Ranges are inclusive.

@@ -104,6 +104,18 @@ def provider_response(payload: dict, members: list[dict] | None = None) -> dict:
     clear=False,
 )
 class SemanticAnalyzerTests(unittest.TestCase):
+    def test_prompt_hard_gates_title_only_meetings(self):
+        system = semantic._request_messages(
+            [event("ev-1")],
+            mode="extract",
+            private_text_approved=True,
+        )[0]["content"]
+
+        self.assertEqual("clockify-semantic-v14", semantic.PROMPT_VERSION)
+        self.assertIn("MEETING SUFFICIENCY IS A HARD GATE", system)
+        self.assertIn("MUST NOT produce an activity", system)
+        self.assertIn("exactly one insufficient_evidence exception", system)
+
     def test_production_primary_requires_flash_and_rejects_pro(self):
         base = {
             "CLOCKIFY_ANALYZER_PRIMARY_URL": "http://analyzer.test/v1/chat",
