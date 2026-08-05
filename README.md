@@ -141,7 +141,9 @@ source-context or conversation-turn boundaries. This includes a single qualified
 primary with no fallback. A user instruction always stays with its following
 assistant/tool result. A single indivisible turn rejected by every configured
 route becomes one local `analyzer_failure` exception with a failure digest; an
-indivisible transport timeout blocks because no smaller privacy-safe unit exists.
+indivisible transport timeout receives exactly one content-addressed recovery
+request on the same route with a distinct seed and timeout marker. The identical
+timed-out body is never resent, and a second timeout still blocks.
 If every configured qualified route rejects repeated-workstream synthesis,
 including a single primary with no fallback, those otherwise valid but potentially
 duplicative claims become one `analyzer_synthesis_failure` exception. A synthesis

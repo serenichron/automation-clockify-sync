@@ -47,6 +47,7 @@ DEFAULT_CHUNK_BODY_BYTES = 250_000
 DEFAULT_MAX_EVENTS_PER_CHUNK = 250
 DEFAULT_ANALYZER_WORKERS = 4
 MAX_CONTRACT_REPAIR_ATTEMPTS = 2
+MAX_TIMEOUT_RECOVERY_ATTEMPTS = 1
 # A dual contract rejection can be caused by a request that is semantically too
 # dense for both available routes, not by the underlying evidence being bad.
 # Recover only by deterministic bisection.  The default extraction limit is
@@ -983,6 +984,7 @@ def _request_messages(
     private_text_approved: bool | None = None,
     repair_failure_code: str | None = None,
     repair_attempt: int | None = None,
+    timeout_recovery_attempt: int | None = None,
 ) -> list[dict[str, str]]:
     _require_private_text_approval(events, private_text_approved)
     system = """You reconstruct human work for a Clockify ledger from cited evidence.
@@ -1075,6 +1077,19 @@ Output object:
         ):
             raise AnalyzerError("repair attempt is invalid")
         system += _repair_system_addendum(repair_failure_code)
+    if timeout_recovery_attempt is not None:
+        if (
+            repair_failure_code is not None
+            or not isinstance(timeout_recovery_attempt, int)
+            or isinstance(timeout_recovery_attempt, bool)
+            or not 1 <= timeout_recovery_attempt <= MAX_TIMEOUT_RECOVERY_ATTEMPTS
+        ):
+            raise AnalyzerError("timeout recovery attempt is invalid")
+        system += (
+            "\n\nTIMEOUT RECOVERY: The prior request returned no response. Produce the "
+            "complete JSON result concisely in this single bounded attempt. Do not "
+            "quote or mention the prior request."
+        )
     model_bundles, _manifest = _semantic_evidence_bundles(events)
     payload = {
         "mode": mode,
@@ -1091,6 +1106,11 @@ Output object:
             "attempt": repair_attempt,
             "maximum_attempts": MAX_CONTRACT_REPAIR_ATTEMPTS,
         }
+    if timeout_recovery_attempt is not None:
+        payload["timeout_recovery"] = {
+            "attempt": timeout_recovery_attempt,
+            "maximum_attempts": MAX_TIMEOUT_RECOVERY_ATTEMPTS,
+        }
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": canonical_json(payload)},
@@ -1106,11 +1126,16 @@ def _body_for(
     private_text_approved: bool | None = None,
     repair_failure_code: str | None = None,
     repair_attempt: int | None = None,
+    timeout_recovery_attempt: int | None = None,
 ) -> dict[str, Any]:
     return {
         "model": model,
         "temperature": 0,
-        "seed": repair_attempt or 0,
+        "seed": (
+            1_000 + timeout_recovery_attempt
+            if timeout_recovery_attempt is not None
+            else repair_attempt or 0
+        ),
         "response_format": {"type": "json_object"},
         "messages": _request_messages(
             events,
@@ -1119,6 +1144,7 @@ def _body_for(
             private_text_approved=private_text_approved,
             repair_failure_code=repair_failure_code,
             repair_attempt=repair_attempt,
+            timeout_recovery_attempt=timeout_recovery_attempt,
         ),
     }
 
@@ -2386,6 +2412,7 @@ def _call_validated(
     cancelled: Callable[[], bool] | None = None,
     repair_failure_code: str | None = None,
     repair_attempt: int | None = None,
+    timeout_recovery_attempt: int | None = None,
 ) -> dict[str, Any]:
     body = _body_for(
         events,
@@ -2395,6 +2422,7 @@ def _call_validated(
         private_text_approved=private_text_approved,
         repair_failure_code=repair_failure_code,
         repair_attempt=repair_attempt,
+        timeout_recovery_attempt=timeout_recovery_attempt,
     )
     if len(canonical_json(body).encode("utf-8")) > DEFAULT_MAX_BODY_BYTES:
         raise AnalyzerError("analyzer body exceeds configured request ceiling")
@@ -2725,6 +2753,7 @@ def analyze_tiered(
         }
         fallback_status = "not_needed"
         repair_status = "not_attempted"
+        timeout_recovery_status = "not_attempted"
         primary_error: AnalyzerError | None = None
         fallback_feedback: str | None = None
         failure_digest: str | None = None
@@ -2914,41 +2943,76 @@ def analyze_tiered(
                     )
                     if recovered is not None:
                         return recovered
-                    raise AnalyzerError(
-                        f"primary analyzer timed out for indivisible chunk {index + 1}"
-                    ) from primary_error
-                if not isinstance(primary_error, AnalyzerContractError):
+                    timeout_recovery_status = "attempted"
+                    try:
+                        result = _call_validated(
+                            primary,
+                            chunk,
+                            tier="primary",
+                            transport=transport,
+                            corrections=corrections,
+                            known_evidence_ids=chunk_ids,
+                            evidence_time_spans=chunk_spans,
+                            private_text_approved=private_text_approved,
+                            cache=cache,
+                            before_transport=before_extraction_transport,
+                            cancelled=cancellation.is_set,
+                            timeout_recovery_attempt=1,
+                        )
+                    except AnalyzerTimeoutError as recovery_error:
+                        raise AnalyzerError(
+                            "primary analyzer timed out for indivisible chunk "
+                            f"{index + 1} after bounded recovery attempt"
+                        ) from recovery_error
+                    except AnalyzerContractError as recovery_error:
+                        primary_error = recovery_error
+                        repair_status = "timeout_recovery_rejected"
+                        timeout_recovery_status = "contract_rejected"
+                    except AnalyzerError as recovery_error:
+                        raise AnalyzerError(
+                            "primary analyzer failed during indivisible timeout "
+                            f"recovery for chunk {index + 1}: {recovery_error}"
+                        ) from recovery_error
+                    else:
+                        primary_error = None
+                        used = primary
+                        tier = "primary"
+                        timeout_recovery_status = "used"
+                if primary_error is not None and not isinstance(
+                    primary_error, AnalyzerContractError
+                ):
                     raise AnalyzerError(
                         f"primary analyzer failed for chunk {index + 1}: {primary_error}"
                     ) from primary_error
-                failure_digest = stable_digest(
-                    "aer-",
-                    {
-                        "mode": "extract",
-                        "evidence_ids": sorted(chunk_ids),
-                        "primary": {"name": primary.name, "model": primary.model},
-                        "fallback": None,
-                        "prompt_version": PROMPT_VERSION,
+                if primary_error is not None:
+                    failure_digest = stable_digest(
+                        "aer-",
+                        {
+                            "mode": "extract",
+                            "evidence_ids": sorted(chunk_ids),
+                            "primary": {"name": primary.name, "model": primary.model},
+                            "fallback": None,
+                            "prompt_version": PROMPT_VERSION,
+                            "schema_version": SCHEMA_VERSION,
+                        },
+                    )
+                    recovered = recover_partition(failure_digest)
+                    if recovered is not None:
+                        return recovered
+                    result = {
                         "schema_version": SCHEMA_VERSION,
-                    },
-                )
-                recovered = recover_partition(failure_digest)
-                if recovered is not None:
-                    return recovered
-                result = {
-                    "schema_version": SCHEMA_VERSION,
-                    "prompt_version": PROMPT_VERSION,
-                    "activities": [],
-                    "exceptions": [{
-                        "kind": "analyzer_failure",
-                        "evidence_ids": sorted(chunk_ids),
-                        "reason": "qualified primary rejected this semantic chunk",
-                    }],
-                    "omissions": [],
-                }
-                used = primary
-                tier = "exception"
-                fallback_status = "primary_failed_exception"
+                        "prompt_version": PROMPT_VERSION,
+                        "activities": [],
+                        "exceptions": [{
+                            "kind": "analyzer_failure",
+                            "evidence_ids": sorted(chunk_ids),
+                            "reason": "qualified primary rejected this semantic chunk",
+                        }],
+                        "omissions": [],
+                    }
+                    used = primary
+                    tier = "exception"
+                    fallback_status = "primary_failed_exception"
             else:
                 fallback_error: AnalyzerError | None = None
                 fallback_attempt_start = 1 if fallback_feedback is not None else 0
@@ -3077,6 +3141,7 @@ def analyze_tiered(
             "partition_depth": recovery_depth,
             "fallback_status": fallback_status,
             "repair_status": repair_status,
+            "timeout_recovery_status": timeout_recovery_status,
             "evidence_bundle_schema_version": EVIDENCE_BUNDLE_SCHEMA_VERSION,
             "bundle_count": len(chunk_bundle_manifest),
             "bundle_manifest_digest": stable_digest(

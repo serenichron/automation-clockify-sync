@@ -1207,6 +1207,96 @@ class SemanticAnalyzerTests(unittest.TestCase):
             calls,
         )
 
+    def test_single_route_indivisible_timeout_gets_one_sealed_recovery_attempt(self):
+        calls: list[str] = []
+
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                calls.append("probe")
+                return {"probe": "ok"}
+            if payload.get("timeout_recovery"):
+                calls.append("timeout_recovery")
+                return provider_response(payload)
+            calls.append("extract")
+            raise semantic.AnalyzerTimeoutError("bounded request timed out")
+
+        endpoint = semantic.AnalyzerEndpoint("primary", "http://primary", "qualified")
+        events = [event("ev-a")]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "analyzer-cache.jsonl"
+            first = semantic.analyze_tiered(
+                events,
+                primary=endpoint,
+                transport=transport,
+                cache=semantic.AnalyzerResponseCache(path),
+            )
+            records = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+            ]
+            second = semantic.analyze_tiered(
+                events,
+                primary=endpoint,
+                transport=lambda *_: self.fail(
+                    "sealed indivisible timeout replay must not call transport"
+                ),
+                cache=semantic.AnalyzerResponseCache(path),
+            )
+
+        self.assertEqual(first["activities"], second["activities"])
+        self.assertEqual(first["analysis_chunks"], second["analysis_chunks"])
+        self.assertEqual(
+            "used", first["analysis_chunks"][0]["timeout_recovery_status"]
+        )
+        self.assertEqual(
+            1,
+            sum(
+                record.get("failure_code") == "transport_timeout"
+                for record in records
+            ),
+        )
+        self.assertEqual(["probe", "extract", "timeout_recovery"], calls)
+
+    def test_single_route_indivisible_timeout_blocks_after_recovery_timeout(self):
+        calls: list[str] = []
+
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                calls.append("probe")
+                return {"probe": "ok"}
+            calls.append(
+                "timeout_recovery" if payload.get("timeout_recovery") else "extract"
+            )
+            raise semantic.AnalyzerTimeoutError("bounded request timed out")
+
+        endpoint = semantic.AnalyzerEndpoint("primary", "http://primary", "qualified")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "analyzer-cache.jsonl"
+            with self.assertRaisesRegex(
+                semantic.AnalyzerError, "after bounded recovery attempt"
+            ):
+                semantic.analyze_tiered(
+                    [event("ev-a")],
+                    primary=endpoint,
+                    transport=transport,
+                    cache=semantic.AnalyzerResponseCache(path),
+                )
+            records = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(["probe", "extract", "timeout_recovery"], calls)
+        self.assertEqual(
+            2,
+            sum(
+                record.get("failure_code") == "transport_timeout"
+                for record in records
+            ),
+        )
+
     def test_single_route_indivisible_rejection_is_visible_exception(self):
         events = []
         for ordinal, role in enumerate(("user", "assistant"), 1):
