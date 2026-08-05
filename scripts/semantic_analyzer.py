@@ -48,6 +48,7 @@ DEFAULT_MAX_EVENTS_PER_CHUNK = 250
 DEFAULT_ANALYZER_WORKERS = 4
 MAX_CONTRACT_REPAIR_ATTEMPTS = 2
 MAX_TIMEOUT_RECOVERY_ATTEMPTS = 1
+MAX_CONNECTION_RECOVERY_ATTEMPTS = 1
 # A dual contract rejection can be caused by a request that is semantically too
 # dense for both available routes, not by the underlying evidence being bad.
 # Recover only by deterministic bisection.  The default extraction limit is
@@ -177,6 +178,10 @@ class AnalyzerTimeoutError(AnalyzerError):
     """A bounded analyzer transport timed out without a usable response."""
 
 
+class AnalyzerTransportError(AnalyzerError):
+    """A request-specific connection failed without an HTTP response."""
+
+
 class _ValidatedAnalysis(dict[str, Any]):
     """Schema-shaped analysis plus ephemeral fallback-only timing evidence."""
 
@@ -231,7 +236,10 @@ CONTRACT_FAILURE_CODES = {
     "contract_rejected_other",
     *(f"contract_rejected_{code}" for code, _needle in _CONTRACT_FAILURE_PATTERNS),
 }
-CACHE_REJECTION_CODES = CONTRACT_FAILURE_CODES | {"transport_timeout"}
+CACHE_REJECTION_CODES = CONTRACT_FAILURE_CODES | {
+    "transport_error",
+    "transport_timeout",
+}
 SYNTHESIS_INTEGRITY_FAILURE_CODES = {
     "contract_rejected_invalid_evidence_ids",
     "contract_rejected_omitted_evidence",
@@ -985,6 +993,7 @@ def _request_messages(
     repair_failure_code: str | None = None,
     repair_attempt: int | None = None,
     timeout_recovery_attempt: int | None = None,
+    connection_recovery_attempt: int | None = None,
 ) -> list[dict[str, str]]:
     _require_private_text_approval(events, private_text_approved)
     system = """You reconstruct human work for a Clockify ledger from cited evidence.
@@ -1090,6 +1099,22 @@ Output object:
             "complete JSON result concisely in this single bounded attempt. Do not "
             "quote or mention the prior request."
         )
+    if connection_recovery_attempt is not None:
+        if (
+            repair_failure_code is not None
+            or timeout_recovery_attempt is not None
+            or not isinstance(connection_recovery_attempt, int)
+            or isinstance(connection_recovery_attempt, bool)
+            or not 1
+            <= connection_recovery_attempt
+            <= MAX_CONNECTION_RECOVERY_ATTEMPTS
+        ):
+            raise AnalyzerError("connection recovery attempt is invalid")
+        system += (
+            "\n\nCONNECTION RECOVERY: The prior transport returned no HTTP response. "
+            "Produce the complete JSON result concisely in this single bounded "
+            "attempt. Do not quote or mention the prior request."
+        )
     model_bundles, _manifest = _semantic_evidence_bundles(events)
     payload = {
         "mode": mode,
@@ -1111,6 +1136,11 @@ Output object:
             "attempt": timeout_recovery_attempt,
             "maximum_attempts": MAX_TIMEOUT_RECOVERY_ATTEMPTS,
         }
+    if connection_recovery_attempt is not None:
+        payload["connection_recovery"] = {
+            "attempt": connection_recovery_attempt,
+            "maximum_attempts": MAX_CONNECTION_RECOVERY_ATTEMPTS,
+        }
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": canonical_json(payload)},
@@ -1127,14 +1157,19 @@ def _body_for(
     repair_failure_code: str | None = None,
     repair_attempt: int | None = None,
     timeout_recovery_attempt: int | None = None,
+    connection_recovery_attempt: int | None = None,
 ) -> dict[str, Any]:
     return {
         "model": model,
         "temperature": 0,
         "seed": (
-            1_000 + timeout_recovery_attempt
-            if timeout_recovery_attempt is not None
-            else repair_attempt or 0
+            2_000 + connection_recovery_attempt
+            if connection_recovery_attempt is not None
+            else (
+                1_000 + timeout_recovery_attempt
+                if timeout_recovery_attempt is not None
+                else repair_attempt or 0
+            )
         ),
         "response_format": {"type": "json_object"},
         "messages": _request_messages(
@@ -1145,6 +1180,7 @@ def _body_for(
             repair_failure_code=repair_failure_code,
             repair_attempt=repair_attempt,
             timeout_recovery_attempt=timeout_recovery_attempt,
+            connection_recovery_attempt=connection_recovery_attempt,
         ),
     }
 
@@ -2233,6 +2269,10 @@ class AnalyzerResponseCache:
                     raise AnalyzerTimeoutError(
                         "analyzer cache records transport_timeout"
                     )
+                if record["failure_code"] == "transport_error":
+                    raise AnalyzerTransportError(
+                        "analyzer cache records transport_error"
+                    )
                 raise AnalyzerContractError(
                     f"analyzer cache records {record['failure_code']}"
                 )
@@ -2358,13 +2398,20 @@ def http_transport(endpoint: AnalyzerEndpoint, body: dict[str, Any]) -> dict[str
         raise AnalyzerTimeoutError(
             f"analyzer endpoint {endpoint.name} failed: TimeoutError"
         ) from exc
+    except urllib.error.HTTPError as exc:
+        # HTTP/auth failures are route failures, not transient connection loss.
+        raise AnalyzerError(
+            f"analyzer endpoint {endpoint.name} failed: HTTPError"
+        ) from exc
     except urllib.error.URLError as exc:
         if isinstance(exc.reason, TimeoutError):
             raise AnalyzerTimeoutError(
                 f"analyzer endpoint {endpoint.name} failed: TimeoutError"
             ) from exc
         # Never include request headers/body: they can contain credentials or evidence.
-        raise AnalyzerError(f"analyzer endpoint {endpoint.name} failed: URLError") from exc
+        raise AnalyzerTransportError(
+            f"analyzer endpoint {endpoint.name} failed: URLError"
+        ) from exc
     except json.JSONDecodeError as exc:
         # Never include request headers/body: they can contain credentials or evidence.
         raise AnalyzerError(f"analyzer endpoint {endpoint.name} failed: {type(exc).__name__}") from exc
@@ -2413,6 +2460,7 @@ def _call_validated(
     repair_failure_code: str | None = None,
     repair_attempt: int | None = None,
     timeout_recovery_attempt: int | None = None,
+    connection_recovery_attempt: int | None = None,
 ) -> dict[str, Any]:
     body = _body_for(
         events,
@@ -2423,6 +2471,7 @@ def _call_validated(
         repair_failure_code=repair_failure_code,
         repair_attempt=repair_attempt,
         timeout_recovery_attempt=timeout_recovery_attempt,
+        connection_recovery_attempt=connection_recovery_attempt,
     )
     if len(canonical_json(body).encode("utf-8")) > DEFAULT_MAX_BODY_BYTES:
         raise AnalyzerError("analyzer body exceeds configured request ceiling")
@@ -2444,6 +2493,15 @@ def _call_validated(
                     endpoint,
                     body,
                     failure_code="transport_timeout",
+                )
+            raise
+        except AnalyzerTransportError:
+            _raise_if_cancelled(cancelled)
+            if cache is not None and cache_miss:
+                cache.store_rejected(
+                    endpoint,
+                    body,
+                    failure_code="transport_error",
                 )
             raise
         _raise_if_cancelled(cancelled)
@@ -2754,6 +2812,7 @@ def analyze_tiered(
         fallback_status = "not_needed"
         repair_status = "not_attempted"
         timeout_recovery_status = "not_attempted"
+        connection_recovery_status = "not_attempted"
         primary_error: AnalyzerError | None = None
         fallback_feedback: str | None = None
         failure_digest: str | None = None
@@ -2978,6 +3037,47 @@ def analyze_tiered(
                         used = primary
                         tier = "primary"
                         timeout_recovery_status = "used"
+                if isinstance(primary_error, AnalyzerTransportError):
+                    connection_recovery_status = "attempted"
+                    # A connection loss is eligible for one retry only after the
+                    # same pinned route passes a fresh evidence-free probe.
+                    with probe_lock:
+                        probed.discard(primary)
+                        probe_errors.pop(primary, None)
+                    try:
+                        result = _call_validated(
+                            primary,
+                            chunk,
+                            tier="primary",
+                            transport=transport,
+                            corrections=corrections,
+                            known_evidence_ids=chunk_ids,
+                            evidence_time_spans=chunk_spans,
+                            private_text_approved=private_text_approved,
+                            cache=cache,
+                            before_transport=before_extraction_transport,
+                            cancelled=cancellation.is_set,
+                            connection_recovery_attempt=1,
+                        )
+                    except AnalyzerTransportError as recovery_error:
+                        raise AnalyzerError(
+                            "primary analyzer lost connection for chunk "
+                            f"{index + 1} after bounded recovery attempt"
+                        ) from recovery_error
+                    except AnalyzerContractError as recovery_error:
+                        primary_error = recovery_error
+                        repair_status = "connection_recovery_rejected"
+                        connection_recovery_status = "contract_rejected"
+                    except AnalyzerError as recovery_error:
+                        raise AnalyzerError(
+                            "primary analyzer failed during connection recovery "
+                            f"for chunk {index + 1}: {recovery_error}"
+                        ) from recovery_error
+                    else:
+                        primary_error = None
+                        used = primary
+                        tier = "primary"
+                        connection_recovery_status = "used"
                 if primary_error is not None and not isinstance(
                     primary_error, AnalyzerContractError
                 ):
@@ -3142,6 +3242,7 @@ def analyze_tiered(
             "fallback_status": fallback_status,
             "repair_status": repair_status,
             "timeout_recovery_status": timeout_recovery_status,
+            "connection_recovery_status": connection_recovery_status,
             "evidence_bundle_schema_version": EVIDENCE_BUNDLE_SCHEMA_VERSION,
             "bundle_count": len(chunk_bundle_manifest),
             "bundle_manifest_digest": stable_digest(

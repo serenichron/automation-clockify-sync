@@ -135,7 +135,9 @@ allocation, or correction-regression contracts recorded there.
    leaf remains a blocking `analyzer_failure`; do not treat bisection itself as a
    model route. An indivisible transport timeout gets one distinct,
    content-addressed recovery request on the same qualified route; a second
-   timeout still blocks. Probe failures still block before recovery.
+   timeout still blocks. A connection loss without an HTTP response gets the same
+   one-request bound only after a fresh probe of the pinned route. Probe, HTTP, and
+   authentication failures still block before recovery.
    Repeated-workstream synthesis exhausted across the qualified route set becomes
    a visible `analyzer_synthesis_failure`; synthesis transport failure still blocks.
 5. Enable `CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED=approved` only when the exact
