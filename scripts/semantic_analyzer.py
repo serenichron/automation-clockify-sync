@@ -179,7 +179,15 @@ class AnalyzerTimeoutError(AnalyzerError):
 
 
 class AnalyzerTransportError(AnalyzerError):
-    """A request-specific connection failed without an HTTP response."""
+    """A request-specific transport failed without a usable response."""
+
+
+class AnalyzerRetryableHTTPError(AnalyzerTransportError):
+    """A transient HTTP status is eligible for bounded transport recovery."""
+
+    def __init__(self, message: str, *, status_code: int):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class _ValidatedAnalysis(dict[str, Any]):
@@ -1111,7 +1119,7 @@ Output object:
         ):
             raise AnalyzerError("connection recovery attempt is invalid")
         system += (
-            "\n\nCONNECTION RECOVERY: The prior transport returned no HTTP response. "
+            "\n\nCONNECTION RECOVERY: The prior transport returned no usable response. "
             "Produce the complete JSON result concisely in this single bounded "
             "attempt. Do not quote or mention the prior request."
         )
@@ -2399,7 +2407,14 @@ def http_transport(endpoint: AnalyzerEndpoint, body: dict[str, Any]) -> dict[str
             f"analyzer endpoint {endpoint.name} failed: TimeoutError"
         ) from exc
     except urllib.error.HTTPError as exc:
-        # HTTP/auth failures are route failures, not transient connection loss.
+        status_code = int(exc.code)
+        if status_code in {408, 425, 429} or 500 <= status_code <= 599:
+            raise AnalyzerRetryableHTTPError(
+                f"analyzer endpoint {endpoint.name} failed: retryable HTTPError",
+                status_code=status_code,
+            ) from exc
+        # Authentication and other client failures are route/configuration
+        # errors, not transient request loss.
         raise AnalyzerError(
             f"analyzer endpoint {endpoint.name} failed: HTTPError"
         ) from exc

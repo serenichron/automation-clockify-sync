@@ -10,6 +10,7 @@ import threading
 import time
 import unittest
 from unittest import mock
+import urllib.error
 
 from scripts import semantic_analyzer as semantic
 
@@ -104,6 +105,31 @@ def provider_response(payload: dict, members: list[dict] | None = None) -> dict:
     clear=False,
 )
 class SemanticAnalyzerTests(unittest.TestCase):
+    def test_http_transport_separates_retryable_and_hard_http_failures(self):
+        endpoint = semantic.AnalyzerEndpoint("primary", "http://primary", "qualified")
+        body = {"model": "qualified", "messages": []}
+        retryable = urllib.error.HTTPError(
+            endpoint.url, 503, "unavailable", None, None
+        )
+        with mock.patch(
+            "scripts.semantic_analyzer.urllib.request.urlopen",
+            side_effect=retryable,
+        ):
+            with self.assertRaises(semantic.AnalyzerRetryableHTTPError) as raised:
+                semantic.http_transport(endpoint, body)
+        self.assertEqual(503, raised.exception.status_code)
+        retryable.close()
+
+        hard = urllib.error.HTTPError(endpoint.url, 401, "unauthorized", None, None)
+        with mock.patch(
+            "scripts.semantic_analyzer.urllib.request.urlopen",
+            side_effect=hard,
+        ):
+            with self.assertRaises(semantic.AnalyzerError) as raised:
+                semantic.http_transport(endpoint, body)
+        self.assertNotIsInstance(raised.exception, semantic.AnalyzerTransportError)
+        hard.close()
+
     def test_prompt_hard_gates_title_only_meetings(self):
         system = semantic._request_messages(
             [event("ev-1")],

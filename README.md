@@ -115,10 +115,11 @@ The primary analyzer must pass a minimal live probe and its structured response
 contract. A sealed contract rejection receives exactly one content-addressed
 repair request containing only its allowlisted failure category and narrow
 corrective guidance; raw rejected output is never copied into that request or
-cache record. Probe, authentication, HTTP, and malformed-response failures are
-not retried and block the run. A connection loss without an HTTP response is sealed;
-after the same pinned route passes a fresh evidence-free probe, it receives exactly
-one distinct content-addressed recovery request. A second connection loss blocks.
+cache record. Probe, authentication, non-retryable HTTP, and malformed-response
+failures are not retried and block the run. A connection loss or retryable HTTP
+status (`408`, `425`, `429`, or `5xx`) is sealed; after the same pinned route
+passes a fresh evidence-free probe, it receives exactly one distinct
+content-addressed recovery request. A second transport failure blocks.
 A timed-out extraction request is sealed in
 the local cache and bisected only at a safe context or complete-turn boundary;
 the identical timed-out body is never sent again. If repair still fails, a
