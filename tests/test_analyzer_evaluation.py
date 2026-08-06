@@ -45,7 +45,7 @@ def document() -> dict:
             "revision": "6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc",
             "tier": "primary",
         },
-        "prompt_version": "clockify-semantic-v15",
+        "prompt_version": "clockify-semantic-v16",
         "semantic_schema_version": 1,
         "evidence_bundle_schema_version": "clockify-semantic-evidence-bundle/v1",
         "cases": [{

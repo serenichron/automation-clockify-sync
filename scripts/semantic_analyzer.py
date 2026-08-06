@@ -34,7 +34,7 @@ except ImportError:  # pragma: no cover - direct script execution fallback
 
 
 SCHEMA_VERSION = 1
-PROMPT_VERSION = "clockify-semantic-v15"
+PROMPT_VERSION = "clockify-semantic-v16"
 ANALYZER_CACHE_SCHEMA_VERSION = "clockify-analyzer-cache/v2"
 EVIDENCE_BUNDLE_SCHEMA_VERSION = "clockify-semantic-evidence-bundle/v1"
 DEFAULT_PRIMARY_MODEL = "deepseek-v4-flash:cloud"
@@ -1025,7 +1025,10 @@ The action must start with a capitalized past-tense verb phrase of one to three 
 object and bounded result in object and outcome, not in a long action.
 Preserve the evidence's concrete nouns and quantities in object and outcome. Never
 replace a specific result such as removing duplicate buffers with a generic claim such
-as reducing usage. Do not repeat the object's final word as the outcome's first word.
+as reducing usage. Preserve domain qualifiers that distinguish the work object: if the
+evidence says "review identity", the object or outcome must retain both "review" and
+"identity"; putting the qualifier only in workstream does not preserve it for the
+Clockify description. Do not repeat the object's final word as the outcome's first word.
 Give related atomic accomplishments the same short parent workstream name even when
 their specific objects differ; unrelated work must not share a workstream.
 Classify planned work, waiting, polling, agent chatter, heartbeats, and autonomous
@@ -1333,6 +1336,8 @@ def _synthesis_messages(
 Return JSON only, using the same activities/exceptions/omissions schema supplied for extraction.
 Merge provisional activities only when their cited evidence proves the same single atomic accomplishment.
 When accomplishments differ, preserve separate activities and give each a distinct, specific object.
+Preserve every concrete domain qualifier from the provisional objects in the returned object or outcome;
+putting a qualifier only in workstream does not preserve it for the Clockify description.
 One request, response, or continuous session does not justify merging independent deliverables.
 Never compress multiple objects or results into comma-separated fields.
 Preserve the supplied parent workstream name for related atomic accomplishments.
