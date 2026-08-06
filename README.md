@@ -118,8 +118,10 @@ corrective guidance; raw rejected output is never copied into that request or
 cache record. Probe, authentication, non-retryable HTTP, and malformed-response
 failures are not retried and block the run. A connection loss or retryable HTTP
 status (`408`, `425`, `429`, or `5xx`) is sealed; after the same pinned route
-passes a fresh evidence-free probe, it receives exactly one distinct
-content-addressed recovery request. A second transport failure blocks.
+passes a fresh evidence-free probe, it receives up to three distinct
+content-addressed recovery requests. Exhausted request-specific transport
+recovery becomes an evidence-bound exception; it never invents a proposal and
+does not abort unrelated workstreams.
 A timed-out extraction request is sealed in
 the local cache and bisected only at a safe context or complete-turn boundary;
 the identical timed-out body is never sent again. If repair still fails, a
@@ -146,12 +148,15 @@ primary with no fallback. A user instruction always stays with its following
 assistant/tool result. A single indivisible turn rejected by every configured
 route becomes one local `analyzer_failure` exception with a failure digest; an
 indivisible transport timeout receives exactly one content-addressed recovery
-request on the same route with a distinct seed and timeout marker. The identical
-timed-out body is never resent, and a second timeout still blocks.
+series of at most three requests on the same route with distinct seeds and
+timeout markers. The identical timed-out body is never resent. Exhaustion
+becomes one `analyzer_failure` exception covering the complete indivisible
+evidence unit.
 If every configured qualified route rejects repeated-workstream synthesis,
 including a single primary with no fallback, those otherwise valid but potentially
 duplicative claims become one `analyzer_synthesis_failure` exception. A synthesis
-transport failure still blocks the run.
+transport failure receives the same sealed, probe-gated recovery bound; exhaustion
+keeps the whole candidate workstream out of proposals as one visible exception.
 Synthesis candidates require the same normalized project, workstream, and
 concrete object; generic model labels alone cannot combine unrelated activities.
 No rejected activity can become a proposal.
@@ -393,6 +398,28 @@ still requires full-denominator human dispositions and the measured acceptance
 thresholds. Neither a probe nor a passing synthetic scorecard authorizes
 private-text egress.
 
+## Durable Precision execution
+
+Month-scale accounting must run under the Precision user service, not an SSH
+foreground process. `scripts/clockify_accounting_runner.py` holds a nonblocking
+single-instance lock, resumes the append-only analyzer cache, and atomically
+writes `runner-status.json` with only lifecycle metadata. It never serializes
+the analyzer environment or credentials. Accounting artifacts are atomically
+published before the validated `work-accounting-result.json` completion marker;
+the runner trusts that marker only when the complete required artifact set is
+present. A completed result is idempotent and will not be recomputed.
+
+The reviewed unit is `ops/systemd/clockify-work-accounting.service`. Install it
+as `~/.config/systemd/user/clockify-work-accounting.service`, create the private
+mode-0600 environment file from
+`ops/systemd/clockify-work-accounting.env.example`, and enable user lingering on
+Precision so the unit survives SSH/Mac disconnection and Precision reboot. The
+unit clears all inherited fallback-route variables so this validation can use
+only the approved pinned Flash route. It restarts unexpected crashes, but
+`RestartPreventExitStatus=2` prevents a known fail-closed configuration,
+authentication, integrity, or route error from looping indefinitely. Logs remain
+in the Precision user journal.
+
 ## Safety contract
 
 - Collector, quality, and review-state steps do not write to Clockify.
@@ -427,6 +454,7 @@ python3 -m py_compile \
   scripts/review_acceptance.py \
   scripts/analyzer_evaluation.py \
   scripts/analyzer_live_evaluation.py \
+  scripts/clockify_accounting_runner.py \
   scripts/clockify_sync_collect.py \
   scripts/clockify_sync_quality.py \
   scripts/clockify_review_state.py \

@@ -47,8 +47,8 @@ DEFAULT_CHUNK_BODY_BYTES = 250_000
 DEFAULT_MAX_EVENTS_PER_CHUNK = 250
 DEFAULT_ANALYZER_WORKERS = 4
 MAX_CONTRACT_REPAIR_ATTEMPTS = 2
-MAX_TIMEOUT_RECOVERY_ATTEMPTS = 1
-MAX_CONNECTION_RECOVERY_ATTEMPTS = 1
+MAX_TIMEOUT_RECOVERY_ATTEMPTS = 3
+MAX_CONNECTION_RECOVERY_ATTEMPTS = 3
 # A dual contract rejection can be caused by a request that is semantically too
 # dense for both available routes, not by the underlying evidence being bad.
 # Recover only by deterministic bisection.  The default extraction limit is
@@ -1308,6 +1308,7 @@ def _safe_provisional_activity(activity: dict[str, Any]) -> dict[str, Any]:
 def _synthesis_messages(
     activities: list[dict[str, Any]], *, workstream_id: str,
     repair_failure_code: str | None = None, repair_attempt: int | None = None,
+    transport_recovery_attempt: int | None = None,
 ) -> list[dict[str, str]]:
     """Build a privacy-safe request to reconcile one repeated workstream."""
     if not SAFE_EVIDENCE_ID_RE.fullmatch(workstream_id):
@@ -1349,6 +1350,21 @@ or status prose in descriptive fields."""
         ):
             raise AnalyzerError("repair attempt is invalid")
         system += _repair_system_addendum(repair_failure_code)
+    if transport_recovery_attempt is not None:
+        if (
+            repair_failure_code is not None
+            or not isinstance(transport_recovery_attempt, int)
+            or isinstance(transport_recovery_attempt, bool)
+            or not 1
+            <= transport_recovery_attempt
+            <= MAX_CONNECTION_RECOVERY_ATTEMPTS
+        ):
+            raise AnalyzerError("synthesis transport recovery attempt is invalid")
+        system += (
+            "\n\nTRANSPORT RECOVERY: The prior synthesis transport returned no "
+            "usable response. Reconcile the complete supplied workstream in this "
+            "single bounded attempt. Do not quote or mention the prior request."
+        )
     payload = {
         "mode": "synthesize",
         "schema_version": SCHEMA_VERSION,
@@ -1363,6 +1379,11 @@ or status prose in descriptive fields."""
             "attempt": repair_attempt,
             "maximum_attempts": MAX_CONTRACT_REPAIR_ATTEMPTS,
         }
+    if transport_recovery_attempt is not None:
+        payload["transport_recovery"] = {
+            "attempt": transport_recovery_attempt,
+            "maximum_attempts": MAX_CONNECTION_RECOVERY_ATTEMPTS,
+        }
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": canonical_json(payload)},
@@ -1372,15 +1393,21 @@ or status prose in descriptive fields."""
 def _synthesis_body(
     activities: list[dict[str, Any]], *, model: str, workstream_id: str,
     repair_failure_code: str | None = None, repair_attempt: int | None = None,
+    transport_recovery_attempt: int | None = None,
 ) -> dict[str, Any]:
     return {
         "model": model,
         "temperature": 0,
-        "seed": repair_attempt or 0,
+        "seed": (
+            3_000 + transport_recovery_attempt
+            if transport_recovery_attempt is not None
+            else repair_attempt or 0
+        ),
         "response_format": {"type": "json_object"},
         "messages": _synthesis_messages(
             activities, workstream_id=workstream_id,
             repair_failure_code=repair_failure_code, repair_attempt=repair_attempt,
+            transport_recovery_attempt=transport_recovery_attempt,
         ),
     }
 
@@ -2586,6 +2613,7 @@ def _call_synthesis_validated(
     before_transport: Callable[[AnalyzerEndpoint], None] | None = None,
     repair_failure_code: str | None = None,
     repair_attempt: int | None = None,
+    transport_recovery_attempt: int | None = None,
 ) -> dict[str, Any]:
     """Synthesize one repeated workstream and reject any lost evidence."""
     body = _synthesis_body(
@@ -2594,6 +2622,7 @@ def _call_synthesis_validated(
         workstream_id=workstream_id,
         repair_failure_code=repair_failure_code,
         repair_attempt=repair_attempt,
+        transport_recovery_attempt=transport_recovery_attempt,
     )
     if len(canonical_json(body).encode("utf-8")) > DEFAULT_MAX_BODY_BYTES:
         raise AnalyzerError("synthesis body exceeds configured request ceiling")
@@ -2602,7 +2631,24 @@ def _call_synthesis_validated(
     if response is None:
         if before_transport is not None:
             before_transport(endpoint)
-        raw_response = transport(endpoint, body)
+        try:
+            raw_response = transport(endpoint, body)
+        except AnalyzerTimeoutError:
+            if cache is not None and cache_miss:
+                cache.store_rejected(
+                    endpoint,
+                    body,
+                    failure_code="transport_timeout",
+                )
+            raise
+        except AnalyzerTransportError:
+            if cache is not None and cache_miss:
+                cache.store_rejected(
+                    endpoint,
+                    body,
+                    failure_code="transport_error",
+                )
+            raise
         try:
             response = _json_object_from_response(raw_response)
         except AnalyzerError as exc:
@@ -3018,81 +3064,156 @@ def analyze_tiered(
                     if recovered is not None:
                         return recovered
                     timeout_recovery_status = "attempted"
-                    try:
-                        result = _call_validated(
-                            primary,
-                            chunk,
-                            tier="primary",
-                            transport=transport,
-                            corrections=corrections,
-                            known_evidence_ids=chunk_ids,
-                            evidence_time_spans=chunk_spans,
-                            private_text_approved=private_text_approved,
-                            cache=cache,
-                            before_transport=before_extraction_transport,
-                            cancelled=cancellation.is_set,
-                            timeout_recovery_attempt=1,
-                        )
-                    except AnalyzerTimeoutError as recovery_error:
-                        raise AnalyzerError(
-                            "primary analyzer timed out for indivisible chunk "
-                            f"{index + 1} after bounded recovery attempt"
-                        ) from recovery_error
-                    except AnalyzerContractError as recovery_error:
-                        primary_error = recovery_error
-                        repair_status = "timeout_recovery_rejected"
-                        timeout_recovery_status = "contract_rejected"
-                    except AnalyzerError as recovery_error:
-                        raise AnalyzerError(
-                            "primary analyzer failed during indivisible timeout "
-                            f"recovery for chunk {index + 1}: {recovery_error}"
-                        ) from recovery_error
+                    for timeout_attempt in range(
+                        1, MAX_TIMEOUT_RECOVERY_ATTEMPTS + 1
+                    ):
+                        # A cached failed attempt never calls the probe or
+                        # transport.  A new attempt must first prove that the
+                        # exact pinned route is healthy, and its attempt number
+                        # gives it a distinct request/cache identity.
+                        with probe_lock:
+                            probed.discard(primary)
+                            probe_errors.pop(primary, None)
+                        try:
+                            result = _call_validated(
+                                primary,
+                                chunk,
+                                tier="primary",
+                                transport=transport,
+                                corrections=corrections,
+                                known_evidence_ids=chunk_ids,
+                                evidence_time_spans=chunk_spans,
+                                private_text_approved=private_text_approved,
+                                cache=cache,
+                                before_transport=before_extraction_transport,
+                                cancelled=cancellation.is_set,
+                                timeout_recovery_attempt=timeout_attempt,
+                            )
+                        except AnalyzerTimeoutError:
+                            continue
+                        except AnalyzerTransportError as recovery_error:
+                            primary_error = recovery_error
+                            repair_status = "timeout_recovery_transport_failed"
+                            timeout_recovery_status = "transport_failed"
+                            break
+                        except AnalyzerContractError as recovery_error:
+                            primary_error = recovery_error
+                            repair_status = "timeout_recovery_rejected"
+                            timeout_recovery_status = "contract_rejected"
+                            break
+                        except AnalyzerError as recovery_error:
+                            raise AnalyzerError(
+                                "primary analyzer failed during indivisible timeout "
+                                f"recovery for chunk {index + 1}: {recovery_error}"
+                            ) from recovery_error
+                        else:
+                            primary_error = None
+                            used = primary
+                            tier = "primary"
+                            timeout_recovery_status = "used"
+                            break
                     else:
+                        # Exhausted retryable transport is an evidence exception,
+                        # not permission to drop the evidence or abort every
+                        # unrelated workstream in a month-scale run.
                         primary_error = None
+                        result = {
+                            "schema_version": SCHEMA_VERSION,
+                            "prompt_version": PROMPT_VERSION,
+                            "activities": [],
+                            "exceptions": [{
+                                "kind": "analyzer_failure",
+                                "evidence_ids": sorted(chunk_ids),
+                                "reason": (
+                                    "qualified primary exhausted bounded timeout recovery"
+                                ),
+                            }],
+                            "omissions": [],
+                        }
                         used = primary
-                        tier = "primary"
-                        timeout_recovery_status = "used"
+                        tier = "exception"
+                        fallback_status = "primary_timeout_exception"
+                        timeout_recovery_status = "exhausted_exception"
                 if isinstance(primary_error, AnalyzerTransportError):
                     connection_recovery_status = "attempted"
-                    # A connection loss is eligible for one retry only after the
-                    # same pinned route passes a fresh evidence-free probe.
-                    with probe_lock:
-                        probed.discard(primary)
-                        probe_errors.pop(primary, None)
-                    try:
-                        result = _call_validated(
-                            primary,
-                            chunk,
-                            tier="primary",
-                            transport=transport,
-                            corrections=corrections,
-                            known_evidence_ids=chunk_ids,
-                            evidence_time_spans=chunk_spans,
-                            private_text_approved=private_text_approved,
-                            cache=cache,
-                            before_transport=before_extraction_transport,
-                            cancelled=cancellation.is_set,
-                            connection_recovery_attempt=1,
-                        )
-                    except AnalyzerTransportError as recovery_error:
-                        raise AnalyzerError(
-                            "primary analyzer lost connection for chunk "
-                            f"{index + 1} after bounded recovery attempt"
-                        ) from recovery_error
-                    except AnalyzerContractError as recovery_error:
-                        primary_error = recovery_error
-                        repair_status = "connection_recovery_rejected"
-                        connection_recovery_status = "contract_rejected"
-                    except AnalyzerError as recovery_error:
-                        raise AnalyzerError(
-                            "primary analyzer failed during connection recovery "
-                            f"for chunk {index + 1}: {recovery_error}"
-                        ) from recovery_error
+                    for connection_attempt in range(
+                        1, MAX_CONNECTION_RECOVERY_ATTEMPTS + 1
+                    ):
+                        # Every new transport attempt is gated by a fresh probe
+                        # of the same pinned route. Cached failures remain
+                        # replay-only and do not produce network traffic.
+                        with probe_lock:
+                            probed.discard(primary)
+                            probe_errors.pop(primary, None)
+                        try:
+                            result = _call_validated(
+                                primary,
+                                chunk,
+                                tier="primary",
+                                transport=transport,
+                                corrections=corrections,
+                                known_evidence_ids=chunk_ids,
+                                evidence_time_spans=chunk_spans,
+                                private_text_approved=private_text_approved,
+                                cache=cache,
+                                before_transport=before_extraction_transport,
+                                cancelled=cancellation.is_set,
+                                connection_recovery_attempt=connection_attempt,
+                            )
+                        except AnalyzerTransportError:
+                            continue
+                        except AnalyzerTimeoutError:
+                            continue
+                        except AnalyzerContractError as recovery_error:
+                            primary_error = recovery_error
+                            repair_status = "connection_recovery_rejected"
+                            connection_recovery_status = "contract_rejected"
+                            break
+                        except AnalyzerError as recovery_error:
+                            raise AnalyzerError(
+                                "primary analyzer failed during connection recovery "
+                                f"for chunk {index + 1}: {recovery_error}"
+                            ) from recovery_error
+                        else:
+                            primary_error = None
+                            used = primary
+                            tier = "primary"
+                            connection_recovery_status = "used"
+                            break
                     else:
+                        failure_digest = stable_digest(
+                            "aer-",
+                            {
+                                "mode": "extract",
+                                "failure": "transport_error",
+                                "evidence_ids": sorted(chunk_ids),
+                                "primary": {
+                                    "name": primary.name,
+                                    "model": primary.model,
+                                },
+                                "fallback": None,
+                                "prompt_version": PROMPT_VERSION,
+                                "schema_version": SCHEMA_VERSION,
+                            },
+                        )
                         primary_error = None
+                        result = {
+                            "schema_version": SCHEMA_VERSION,
+                            "prompt_version": PROMPT_VERSION,
+                            "activities": [],
+                            "exceptions": [{
+                                "kind": "analyzer_failure",
+                                "evidence_ids": sorted(chunk_ids),
+                                "reason": (
+                                    "qualified primary exhausted bounded transport recovery"
+                                ),
+                            }],
+                            "omissions": [],
+                        }
                         used = primary
-                        tier = "primary"
-                        connection_recovery_status = "used"
+                        tier = "exception"
+                        fallback_status = "primary_transport_exception"
+                        connection_recovery_status = "exhausted_exception"
                 if primary_error is not None and not isinstance(
                     primary_error, AnalyzerContractError
                 ):
@@ -3267,7 +3388,12 @@ def analyze_tiered(
         }
         if used.revision:
             chunk_metadata["revision"] = used.revision
-        if fallback_status in {"failed_exception", "primary_failed_exception"}:
+        if fallback_status in {
+            "failed_exception",
+            "primary_failed_exception",
+            "primary_timeout_exception",
+            "primary_transport_exception",
+        }:
             assert failure_digest is not None
             chunk_metadata["failure_digest"] = failure_digest
         if fallback_status == "failed_exception":
@@ -3355,6 +3481,50 @@ def analyze_tiered(
     for activity in activities_by_id.values():
         grouped.setdefault(_synthesis_candidate_key(activity), []).append(activity)
 
+    def synthesize_with_transport_recovery(
+        provisional: list[dict[str, Any]],
+        *,
+        workstream_id: str,
+        synthesis_ids: set[str],
+        synthesis_spans: dict[str, dict[str, str]],
+    ) -> dict[str, Any]:
+        """Retry only sealed request-specific synthesis transport failures."""
+        try:
+            return _call_synthesis_validated(
+                primary,
+                provisional,
+                workstream_id=workstream_id,
+                tier="primary",
+                transport=transport,
+                known_evidence_ids=synthesis_ids,
+                evidence_time_spans=synthesis_spans,
+                cache=cache,
+                before_transport=probe_once,
+            )
+        except (AnalyzerTimeoutError, AnalyzerTransportError) as initial_error:
+            last_error: AnalyzerError = initial_error
+        for attempt in range(1, MAX_CONNECTION_RECOVERY_ATTEMPTS + 1):
+            with probe_lock:
+                probed.discard(primary)
+                probe_errors.pop(primary, None)
+            try:
+                return _call_synthesis_validated(
+                    primary,
+                    provisional,
+                    workstream_id=workstream_id,
+                    tier="primary",
+                    transport=transport,
+                    known_evidence_ids=synthesis_ids,
+                    evidence_time_spans=synthesis_spans,
+                    cache=cache,
+                    before_transport=probe_once,
+                    transport_recovery_attempt=attempt,
+                )
+            except (AnalyzerTimeoutError, AnalyzerTransportError) as error:
+                last_error = error
+                continue
+        raise last_error
+
     synthesis_exceptions: list[dict[str, Any]] = []
     for candidate_key in sorted(grouped):
         provisional = sorted(grouped[candidate_key], key=lambda value: value["activity_id"])
@@ -3374,16 +3544,11 @@ def analyze_tiered(
         primary_error: AnalyzerError | None = None
         fallback_feedback: str | None = None
         try:
-            synthesized = _call_synthesis_validated(
-                primary,
+            synthesized = synthesize_with_transport_recovery(
                 provisional,
                 workstream_id=workstream_id,
-                tier="primary",
-                transport=transport,
-                known_evidence_ids=synthesis_ids,
-                evidence_time_spans=synthesis_spans,
-                cache=cache,
-                before_transport=probe_once,
+                synthesis_ids=synthesis_ids,
+                synthesis_spans=synthesis_spans,
             )
             used = primary
             tier = "primary"
@@ -3423,6 +3588,41 @@ def analyze_tiered(
             primary_error = error
         if primary_error is not None:
             if fallback is None:
+                if isinstance(
+                    primary_error, (AnalyzerTimeoutError, AnalyzerTransportError)
+                ):
+                    # The individual extraction activities remain valid, but an
+                    # unresolved merge could duplicate billing. Keep the whole
+                    # candidate workstream out of proposals and surface one
+                    # evidence-bound exception instead of aborting the month.
+                    for activity in provisional:
+                        del activities_by_id[activity["activity_id"]]
+                    synthesis_exceptions.append({
+                        "kind": "analyzer_synthesis_failure",
+                        "evidence_ids": sorted(synthesis_ids),
+                        "reason": (
+                            "qualified primary exhausted bounded synthesis "
+                            "transport recovery"
+                        ),
+                        "failure_digest": stable_digest(
+                            "aer-",
+                            {
+                                "mode": "synthesize",
+                                "failure": "transport_error",
+                                "workstream_id": workstream_id,
+                                "evidence_ids": sorted(synthesis_ids),
+                                "primary": {
+                                    "name": primary.name,
+                                    "model": primary.model,
+                                },
+                                "fallback": None,
+                                "prompt_version": PROMPT_VERSION,
+                                "schema_version": SCHEMA_VERSION,
+                            },
+                        ),
+                        "primary_model": primary.model,
+                    })
+                    continue
                 if not isinstance(primary_error, AnalyzerContractError):
                     raise AnalyzerError(
                         f"primary analyzer failed for synthesis {workstream_id}: {primary_error}"

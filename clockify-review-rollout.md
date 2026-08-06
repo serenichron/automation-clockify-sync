@@ -133,13 +133,15 @@ allocation, or correction-regression contracts recorded there.
    including when only one qualified primary is configured. User intent must stay
    with its following assistant result. Any indivisible or exhausted recovery
    leaf remains a blocking `analyzer_failure`; do not treat bisection itself as a
-   model route. An indivisible transport timeout gets one distinct,
-   content-addressed recovery request on the same qualified route; a second
-   timeout still blocks. A connection loss or retryable HTTP status (`408`, `425`,
-   `429`, or `5xx`) gets the same one-request bound only after a fresh probe of the
-   pinned route. Probe, authentication, and other HTTP failures still block.
+   model route. An indivisible transport timeout gets at most three distinct,
+   content-addressed recovery requests on the same qualified route, each gated
+   by a fresh probe before live transport. Exhaustion becomes a complete
+   evidence-bound `analyzer_failure` exception. A connection loss or retryable
+   HTTP status (`408`, `425`, `429`, or `5xx`) gets the same bound. Probe,
+   authentication, and other HTTP failures still block.
    Repeated-workstream synthesis exhausted across the qualified route set becomes
-   a visible `analyzer_synthesis_failure`; synthesis transport failure still blocks.
+   a visible `analyzer_synthesis_failure`; exhausted retryable synthesis transport
+   does the same so unresolved duplicates cannot enter proposals.
 5. Enable `CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED=approved` only when the exact
    validation approval includes redacted private semantic-text egress, and only
    for the approved run scope.
@@ -158,6 +160,16 @@ allocation, or correction-regression contracts recorded there.
 8. Attach every passing route scorecard to the complete evidence-bound review
    denominator. Do not refresh Google Sheets or record a passing acceptance
    period until every active row has a human disposition.
+
+## Precision runner requirement
+
+Guarded month-scale runs must use the reviewed user unit at
+`ops/systemd/clockify-work-accounting.service` with a private environment file,
+user lingering enabled, and `scripts/clockify_accounting_runner.py` as its only
+entry point. Verify the exact deployed SHA, unit file hash, `Linger=yes`, active
+service state, cache growth, and `runner-status.json`. Do not use an SSH-owned
+foreground process. The service may restart unexpected crashes; exit status 2
+is a durable known blocker and must not restart-loop.
 
 ## Separately approved production rollout order
 

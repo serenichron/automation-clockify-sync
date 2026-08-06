@@ -1,0 +1,31 @@
+[Unit]
+Description=Clockify evidence-grounded work accounting
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Work/serenichron/automation/clockify-sync
+EnvironmentFile=%h/.config/serenichron/clockify-work-accounting.env
+Environment=PYTHONUNBUFFERED=1
+UnsetEnvironment=CLOCKIFY_ANALYZER_FALLBACK_URL CLOCKIFY_ANALYZER_FALLBACK_MODEL CLOCKIFY_ANALYZER_FALLBACK_API_KEY CLOCKIFY_ANALYZER_FALLBACK_TIMEOUT_SECONDS CLOCKIFY_ANALYZER_FALLBACK_REVISION
+ExecStart=/usr/bin/python3 scripts/clockify_accounting_runner.py
+Restart=on-failure
+RestartPreventExitStatus=2
+RestartSec=60
+KillMode=control-group
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/Work/serenichron/automation/clockify-sync/runs
+ReadWritePaths=%h/Work/serenichron/automation/clockify-sync/state
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=clockify-work-accounting
+
+[Install]
+WantedBy=default.target

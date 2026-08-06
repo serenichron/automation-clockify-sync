@@ -994,6 +994,22 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             semantic_result["activities"][0]["rendered_description"],
         )
 
+    def test_completion_marker_is_published_after_required_artifacts(self):
+        first = session_event("session-1:event:1", "2026-07-10T09:00:00+03:00")
+        last = session_event("session-1:event:2", "2026-07-10T10:00:00+03:00")
+        with mock.patch.object(
+            pipeline, "_write_json", wraps=pipeline._write_json
+        ) as writer:
+            self.make_run(
+                [first, last],
+                analysis_for([first.evidence_id, last.evidence_id], recommended=30),
+            )
+
+        self.assertEqual(
+            "work-accounting-result.json",
+            writer.call_args_list[-1].args[0].name,
+        )
+
     def test_correction_log_is_integrity_checked_and_generalized_before_analysis(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)

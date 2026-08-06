@@ -1282,9 +1282,11 @@ class SemanticAnalyzerTests(unittest.TestCase):
                 for record in records
             ),
         )
-        self.assertEqual(["probe", "extract", "timeout_recovery"], calls)
+        self.assertEqual(
+            ["probe", "extract", "probe", "timeout_recovery"], calls
+        )
 
-    def test_single_route_indivisible_timeout_blocks_after_recovery_timeout(self):
+    def test_single_route_indivisible_timeout_becomes_visible_exception_after_recovery(self):
         calls: list[str] = []
 
         def transport(_endpoint, body):
@@ -1292,31 +1294,56 @@ class SemanticAnalyzerTests(unittest.TestCase):
             if payload.get("probe"):
                 calls.append("probe")
                 return {"probe": "ok"}
+            recovery = payload.get("timeout_recovery")
             calls.append(
-                "timeout_recovery" if payload.get("timeout_recovery") else "extract"
+                f"timeout_recovery_{recovery['attempt']}" if recovery else "extract"
             )
             raise semantic.AnalyzerTimeoutError("bounded request timed out")
 
         endpoint = semantic.AnalyzerEndpoint("primary", "http://primary", "qualified")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "analyzer-cache.jsonl"
-            with self.assertRaisesRegex(
-                semantic.AnalyzerError, "after bounded recovery attempt"
-            ):
-                semantic.analyze_tiered(
-                    [event("ev-a")],
-                    primary=endpoint,
-                    transport=transport,
-                    cache=semantic.AnalyzerResponseCache(path),
-                )
+            first = semantic.analyze_tiered(
+                [event("ev-a")],
+                primary=endpoint,
+                transport=transport,
+                cache=semantic.AnalyzerResponseCache(path),
+            )
             records = [
                 json.loads(line)
                 for line in path.read_text(encoding="utf-8").splitlines()
             ]
+            second = semantic.analyze_tiered(
+                [event("ev-a")],
+                primary=endpoint,
+                transport=lambda *_: self.fail(
+                    "sealed exhausted timeout replay must not call transport"
+                ),
+                cache=semantic.AnalyzerResponseCache(path),
+            )
 
-        self.assertEqual(["probe", "extract", "timeout_recovery"], calls)
+        self.assertEqual(first["exceptions"], second["exceptions"])
+        self.assertEqual([], first["activities"])
+        self.assertEqual("analyzer_failure", first["exceptions"][0]["kind"])
         self.assertEqual(
-            2,
+            "exhausted_exception",
+            first["analysis_chunks"][0]["timeout_recovery_status"],
+        )
+        self.assertEqual(
+            [
+                "probe",
+                "extract",
+                "probe",
+                "timeout_recovery_1",
+                "probe",
+                "timeout_recovery_2",
+                "probe",
+                "timeout_recovery_3",
+            ],
+            calls,
+        )
+        self.assertEqual(
+            1 + semantic.MAX_TIMEOUT_RECOVERY_ATTEMPTS,
             sum(
                 record.get("failure_code") == "transport_timeout"
                 for record in records
@@ -1376,7 +1403,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
             ["probe", "extract", "probe", "connection_recovery"], calls
         )
 
-    def test_single_route_connection_loss_blocks_after_recovery_loss(self):
+    def test_single_route_connection_loss_becomes_visible_exception_after_recovery(self):
         calls: list[str] = []
 
         def transport(_endpoint, body):
@@ -1384,9 +1411,10 @@ class SemanticAnalyzerTests(unittest.TestCase):
             if payload.get("probe"):
                 calls.append("probe")
                 return {"probe": "ok"}
+            recovery = payload.get("connection_recovery")
             calls.append(
-                "connection_recovery"
-                if payload.get("connection_recovery")
+                f"connection_recovery_{recovery['attempt']}"
+                if recovery
                 else "extract"
             )
             raise semantic.AnalyzerTransportError("connection lost")
@@ -1394,25 +1422,47 @@ class SemanticAnalyzerTests(unittest.TestCase):
         endpoint = semantic.AnalyzerEndpoint("primary", "http://primary", "qualified")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "analyzer-cache.jsonl"
-            with self.assertRaisesRegex(
-                semantic.AnalyzerError, "after bounded recovery attempt"
-            ):
-                semantic.analyze_tiered(
-                    [event("ev-a")],
-                    primary=endpoint,
-                    transport=transport,
-                    cache=semantic.AnalyzerResponseCache(path),
-                )
+            first = semantic.analyze_tiered(
+                [event("ev-a")],
+                primary=endpoint,
+                transport=transport,
+                cache=semantic.AnalyzerResponseCache(path),
+            )
             records = [
                 json.loads(line)
                 for line in path.read_text(encoding="utf-8").splitlines()
             ]
+            second = semantic.analyze_tiered(
+                [event("ev-a")],
+                primary=endpoint,
+                transport=lambda *_: self.fail(
+                    "sealed exhausted connection replay must not call transport"
+                ),
+                cache=semantic.AnalyzerResponseCache(path),
+            )
 
+        self.assertEqual(first["exceptions"], second["exceptions"])
+        self.assertEqual([], first["activities"])
+        self.assertEqual("analyzer_failure", first["exceptions"][0]["kind"])
         self.assertEqual(
-            ["probe", "extract", "probe", "connection_recovery"], calls
+            "exhausted_exception",
+            first["analysis_chunks"][0]["connection_recovery_status"],
         )
         self.assertEqual(
-            2,
+            [
+                "probe",
+                "extract",
+                "probe",
+                "connection_recovery_1",
+                "probe",
+                "connection_recovery_2",
+                "probe",
+                "connection_recovery_3",
+            ],
+            calls,
+        )
+        self.assertEqual(
+            1 + semantic.MAX_CONNECTION_RECOVERY_ATTEMPTS,
             sum(
                 record.get("failure_code") == "transport_error"
                 for record in records
@@ -2026,6 +2076,82 @@ class SemanticAnalyzerTests(unittest.TestCase):
         exception = result["exceptions"][0]
         self.assertEqual("analyzer_synthesis_failure", exception["kind"])
         self.assertEqual(["ev-a", "ev-b"], exception["evidence_ids"])
+        self.assertEqual("qualified", exception["primary_model"])
+        self.assertNotIn("fallback_model", exception)
+        self.assertRegex(exception["failure_digest"], r"^aer-[0-9a-f]{24}$")
+
+    def test_single_route_synthesis_timeout_becomes_replayable_exception(self):
+        calls: list[str] = []
+
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                calls.append("probe")
+                return {"probe": "ok"}
+            if payload["mode"] == "extract":
+                calls.append("extract")
+                return provider_response(payload)
+            recovery = payload.get("transport_recovery")
+            calls.append(
+                f"synthesis_recovery_{recovery['attempt']}"
+                if recovery
+                else "synthesize"
+            )
+            raise semantic.AnalyzerTimeoutError("synthesis timed out")
+
+        endpoint = semantic.AnalyzerEndpoint(
+            "primary", "http://primary", "qualified"
+        )
+        events = [event("ev-a", "2026-07-10"), event("ev-b", "2026-07-11")]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "analyzer-cache.jsonl"
+            first = semantic.analyze_tiered(
+                events,
+                primary=endpoint,
+                transport=transport,
+                cache=semantic.AnalyzerResponseCache(path),
+            )
+            records = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+            ]
+            second = semantic.analyze_tiered(
+                events,
+                primary=endpoint,
+                transport=lambda *_: self.fail(
+                    "sealed synthesis timeout replay must not call transport"
+                ),
+                cache=semantic.AnalyzerResponseCache(path),
+            )
+
+        self.assertEqual([], first["activities"])
+        self.assertEqual(first["exceptions"], second["exceptions"])
+        exception = first["exceptions"][0]
+        self.assertEqual(
+            "analyzer_synthesis_failure", exception["kind"]
+        )
+        self.assertEqual(
+            1 + semantic.MAX_CONNECTION_RECOVERY_ATTEMPTS,
+            sum(
+                record.get("failure_code") == "transport_timeout"
+                for record in records
+            ),
+        )
+        self.assertEqual(
+            [
+                "probe",
+                "extract",
+                "extract",
+                "synthesize",
+                "probe",
+                "synthesis_recovery_1",
+                "probe",
+                "synthesis_recovery_2",
+                "probe",
+                "synthesis_recovery_3",
+            ],
+            calls,
+        )
         self.assertEqual("qualified", exception["primary_model"])
         self.assertNotIn("fallback_model", exception)
         self.assertRegex(exception["failure_digest"], r"^aer-[0-9a-f]{24}$")

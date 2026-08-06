@@ -12,6 +12,7 @@ import dataclasses
 import datetime as dt
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -62,10 +63,15 @@ def _read_json(path: Path) -> Any:
 
 def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _parse_dt(value: Any) -> dt.datetime | None:
@@ -1050,7 +1056,6 @@ def run_accounting(
         "correction_regression": correction_regression,
         "external_writes": False,
     }
-    _write_json(run_dir / "work-accounting-result.json", result)
     # The initial analyzer artifact is written before deterministic routing and
     # rendering so failures remain inspectable. Rewrite it with the final
     # rendered_description values for activities that became proposals.
@@ -1061,6 +1066,9 @@ def run_accounting(
     _write_json(run_dir / "proposals.json", proposals)
     _write_json(run_dir / "ambiguous.json", ambiguous)
     _write_json(run_dir / "skipped.json", skipped)
+    # This is the durable completion marker consumed by the service runner.
+    # Publish it only after every required artifact has been atomically replaced.
+    _write_json(run_dir / "work-accounting-result.json", result)
     return result
 
 

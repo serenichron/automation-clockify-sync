@@ -55,7 +55,10 @@ read the actual leaf model/tier records; the deterministic recovery coordinator
 is never treated as a synthetic analyzer route.
 Repeated-workstream synthesis follows the same route boundary: exhausted sealed
 contract rejection becomes an explicit `analyzer_synthesis_failure`, while a
-probe or transport failure blocks the run.
+probe, authentication, or non-retryable route failure blocks the run. Retryable
+request transport gets three distinct cache-bound, probe-gated attempts;
+exhaustion becomes an evidence-bound extraction or synthesis exception so one
+unavailable semantic unit cannot discard unrelated month-scale work.
 
 Planned and noise activities do not become proposals. Title-only meetings,
 missing sources, routing conflicts, low confidence, exhausted recovered chunks,
