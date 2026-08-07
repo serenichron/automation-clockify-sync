@@ -159,10 +159,35 @@ class SemanticAnalyzerTests(unittest.TestCase):
                     "CLOCKIFY_ANALYZER_PRIMARY",
                     default_model=semantic.DEFAULT_PRIMARY_MODEL,
                 )
+        preview_alias = {
+            "CLOCKIFY_ANALYZER_PRIMARY_URL": "http://analyzer.test/v1/chat",
+            "CLOCKIFY_ANALYZER_PRIMARY_MODEL": "deepseek-v4-flash:cloud",
+        }
+        with mock.patch.dict(os.environ, preview_alias, clear=False):
+            with self.assertRaisesRegex(
+                semantic.AnalyzerError,
+                "primary analyzer must be deepseek-v4-flash:0731-cloud",
+            ):
+                semantic.AnalyzerEndpoint.from_env(
+                    "CLOCKIFY_ANALYZER_PRIMARY",
+                    default_model=semantic.DEFAULT_PRIMARY_MODEL,
+                )
         with self.assertRaisesRegex(semantic.AnalyzerError, "V4 Pro is not approved"):
             semantic.AnalyzerEndpoint(
                 "fallback", "http://analyzer.test", "deepseek-v4-pro:cloud"
             )
+
+    def test_explicit_0731_cloud_tag_requires_release_revision(self):
+        endpoint = semantic.AnalyzerEndpoint(
+            "primary",
+            "http://analyzer.test/v1/chat",
+            semantic.DEFAULT_PRIMARY_MODEL,
+        )
+        with self.assertRaisesRegex(
+            semantic.AnalyzerError,
+            "cloud model tags require an explicit 64-character release revision",
+        ):
+            semantic.probe_endpoint(endpoint, transport=lambda *_args: {"probe": "ok"})
 
     def test_provider_metadata_is_ignored_before_extraction_validation(self):
         events = [event("ev-1")]
@@ -171,7 +196,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
             json.loads(
                 semantic._body_for(
                     events,
-                    model="deepseek-v4-flash:cloud",
+                    model=semantic.DEFAULT_PRIMARY_MODEL,
                     mode="extract",
                     private_text_approved=True,
                 )["messages"][1]["content"]
@@ -2945,13 +2970,13 @@ class SemanticAnalyzerTests(unittest.TestCase):
                 semantic.AnalyzerResponseCache(path)
 
     def test_response_cache_identity_binds_model_revision(self):
-        body = {"model": "deepseek-v4-flash:cloud", "messages": []}
+        body = {"model": semantic.DEFAULT_PRIMARY_MODEL, "messages": []}
         first = semantic.AnalyzerEndpoint(
-            "primary", "http://primary", "deepseek-v4-flash:cloud",
+            "primary", "http://primary", semantic.DEFAULT_PRIMARY_MODEL,
             revision="a" * 64,
         )
         second = semantic.AnalyzerEndpoint(
-            "primary", "http://primary", "deepseek-v4-flash:cloud",
+            "primary", "http://primary", semantic.DEFAULT_PRIMARY_MODEL,
             revision="b" * 64,
         )
 

@@ -131,8 +131,10 @@ partition recovery below even when the primary is the only qualified route. Conf
 low-confidence claims that remain unresolved become explicit exceptions, never
 proposals.
 
-The required primary is `deepseek-v4-flash:cloud`. The current release must pass
-the v16 synthetic route gate after its moving Ollama tag is refreshed. Every
+The required primary is `deepseek-v4-flash:0731-cloud`, whose manifest must resolve
+to `remote_model: deepseek-v4-flash:0731`. The generic
+`deepseek-v4-flash:cloud` alias currently resolves to the older `:preview` model
+and is not approved. The pinned 0731 release must pass the v16 synthetic route gate. Every
 live cloud route must include the resolved 64-character model revision so the
 scorecard, analyzer cache, semantic run, and replay cannot silently mix model
 releases. `deepseek-v4-pro:cloud` is not an approved route for this process.

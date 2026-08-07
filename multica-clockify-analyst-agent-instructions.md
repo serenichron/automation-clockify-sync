@@ -72,10 +72,12 @@ entry grouping, wall-clock gap filling, or manual overlap trimming.
 
 ## Evidence and model limits
 
-- `deepseek-v4-flash:cloud` is the required primary analyzer. Resolve and pass
-  its current 64-character Ollama revision through
-  `CLOCKIFY_ANALYZER_PRIMARY_REVISION`; moving cloud tags without a release
-  binding fail closed. `deepseek-v4-pro:cloud` is not approved for this process.
+- `deepseek-v4-flash:0731-cloud` is the required primary analyzer. Its Ollama
+  manifest must resolve to `remote_model: deepseek-v4-flash:0731`; the generic
+  `deepseek-v4-flash:cloud` alias resolves to `:preview` and is not approved.
+  Resolve and pass the exact 64-character Ollama revision through
+  `CLOCKIFY_ANALYZER_PRIMARY_REVISION`; cloud tags without a release binding
+  fail closed. `deepseek-v4-pro:cloud` is not approved for this process.
 - The request ceiling is about 1.45 MB. The pipeline chunks complete normalized
   events by day and rejects an individually oversized event instead of clipping
   it. A timed-out extraction request is sealed locally and bisected only at a

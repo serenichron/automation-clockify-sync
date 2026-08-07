@@ -41,8 +41,8 @@ def document() -> dict:
         "corpus": {"records": records, "digest": evaluation.sha256_hex(records)},
         "route": {
             "route_id": "ollama-cloud-primary",
-            "model": "deepseek-v4-flash:cloud",
-            "revision": "6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc",
+            "model": "deepseek-v4-flash:0731-cloud",
+            "revision": "d3f1c87447216481a8001f48c517a51e13bfb141853a8df5e52f81bf765dabc3",
             "tier": "primary",
         },
         "prompt_version": "clockify-semantic-v16",
@@ -85,7 +85,7 @@ class AnalyzerEvaluationTests(unittest.TestCase):
         scorecard = evaluation.evaluate(document())
         self.assertTrue(scorecard["passed"])
         self.assertEqual("clockify-analyzer-evaluator/v5", scorecard["evaluator_version"])
-        self.assertEqual("deepseek-v4-flash:cloud", scorecard["route"]["model"])
+        self.assertEqual("deepseek-v4-flash:0731-cloud", scorecard["route"]["model"])
         self.assertEqual(64, len(scorecard["input_corpus_digest"]))
         self.assertEqual(scorecard, evaluation.verify_scorecard(scorecard))
 

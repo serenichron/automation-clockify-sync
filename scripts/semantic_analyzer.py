@@ -37,7 +37,7 @@ SCHEMA_VERSION = 1
 PROMPT_VERSION = "clockify-semantic-v16"
 ANALYZER_CACHE_SCHEMA_VERSION = "clockify-analyzer-cache/v2"
 EVIDENCE_BUNDLE_SCHEMA_VERSION = "clockify-semantic-evidence-bundle/v1"
-DEFAULT_PRIMARY_MODEL = "deepseek-v4-flash:cloud"
+DEFAULT_PRIMARY_MODEL = "deepseek-v4-flash:0731-cloud"
 FORBIDDEN_ANALYZER_MODEL_MARKERS = ("deepseek-v4-pro",)
 DEFAULT_MAX_BODY_BYTES = 1_450_000
 # Operational limits are deliberately well below the hard request ceiling.  The
@@ -2465,7 +2465,7 @@ def http_transport(endpoint: AnalyzerEndpoint, body: dict[str, Any]) -> dict[str
 
 
 def probe_endpoint(endpoint: AnalyzerEndpoint, transport: Transport = http_transport) -> dict[str, Any]:
-    if endpoint.model.endswith(":cloud") and not re.fullmatch(
+    if endpoint.model.endswith((":cloud", "-cloud")) and not re.fullmatch(
         r"[a-f0-9]{64}", endpoint.revision
     ):
         raise AnalyzerError(

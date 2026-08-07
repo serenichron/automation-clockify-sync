@@ -98,7 +98,7 @@ def _route(document: Mapping[str, Any]) -> dict[str, str]:
     route = {key: str(raw.get(key) or "").strip() for key in _ROUTE_FIELDS}
     if not route["route_id"] or not route["model"] or route["tier"] not in {"primary", "fallback"}:
         raise EvaluationError("route requires route_id, model, and a primary or fallback tier")
-    if route["model"].endswith(":cloud") and not re.fullmatch(
+    if route["model"].endswith((":cloud", "-cloud")) and not re.fullmatch(
         r"[a-f0-9]{64}", route["revision"]
     ):
         raise EvaluationError("moving cloud model routes require a release revision")
