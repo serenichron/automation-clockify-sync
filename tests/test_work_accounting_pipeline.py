@@ -287,7 +287,7 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         )
         self.assertFalse(any(item["evidence_id"] == "ev-summary" for item in noise))
 
-    def test_repository_history_is_corroborative_not_standalone_work(self):
+    def test_repository_history_reaches_semantic_review_as_corroboration(self):
         repository_event = {
             "evidence_id": "ev-commit",
             "source_type": "repository_events",
@@ -317,14 +317,11 @@ class WorkAccountingPipelineTests(unittest.TestCase):
 
         retained, noise = pipeline._analysis_events([repository_event, session_event])
 
-        self.assertEqual(["ev-session"], [event["evidence_id"] for event in retained])
-        self.assertIn(
-            {
-                "evidence_id": "ev-commit",
-                "reason": "corroborative_repository_evidence",
-            },
-            noise,
+        self.assertEqual(
+            ["ev-commit", "ev-session"],
+            [event["evidence_id"] for event in retained],
         )
+        self.assertFalse(any(item["evidence_id"] == "ev-commit" for item in noise))
 
     def test_multica_coding_agent_sessions_are_autonomous_background(self):
         summary = {
@@ -423,6 +420,135 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         self.assertIn("multiple deterministic routes", error)
         self.assertIn("semantic split required", error)
 
+    def test_flash_review_project_and_task_selection_owns_routing(self):
+        routing = json.loads((ROOT / "routing.json").read_text())
+        activity = {
+            "semantic_reviewer_model": "deepseek-v4-flash:0731-cloud",
+            "project_recommendation": {
+                "name": "Serenichron Level 1",
+                "prefix": "SC",
+                "tag_names": ["Project Management"],
+            },
+        }
+        cited = [
+            evidence_ledger.evidence_event(
+                "codex_sessions_event",
+                {"source_type": "codex_sessions", "source_id": "reviewed"},
+                observed_at="2026-07-10T09:00:00+03:00",
+                raw_source_span={
+                    "path": "/Users/blackthorne/Work/serenichron/session.jsonl"
+                },
+                attributes={"role": "user", "kind": "message"},
+            ).document()
+        ]
+
+        route, error = pipeline.resolve_route(activity, cited, routing)
+
+        self.assertIsNone(error)
+        self.assertEqual("Serenichron Level 1", route["project_name"])
+        self.assertEqual(["Project Management"], route["tag_names"])
+
+    def test_emblemstudio_uses_serenichron_project_with_es_prefix(self):
+        routing = json.loads((ROOT / "routing.json").read_text())
+        cited = [
+            evidence_ledger.evidence_event(
+                "codex_sessions_event",
+                {"source_type": "codex_sessions", "source_id": "emblem"},
+                observed_at="2026-07-10T09:00:00+03:00",
+                raw_source_span={
+                    "path": "/Users/blackthorne/Work/master-emblem-studio/session.jsonl",
+                    "cwd": "/Users/blackthorne/Work/master-emblem-studio",
+                },
+                attributes={"role": "user", "kind": "message", "content": "Refine EmblemStudio launch plan"},
+            ).document()
+        ]
+        activity = {
+            "semantic_reviewer_model": "deepseek-v4-flash:cloud",
+            "project_recommendation": {
+                "name": "Serenichron Level 2",
+                "prefix": "ES",
+                "tag_names": ["Business development"],
+            },
+        }
+
+        route, error = pipeline.resolve_route(activity, cited, routing)
+
+        self.assertIsNone(error)
+        self.assertEqual("Serenichron Level 2", route["project_name"])
+        self.assertEqual("ES", route["prefix"])
+        self.assertEqual(["Business development"], route["tag_names"])
+
+    def test_ordinary_serenichron_keeps_sc_when_es_alias_exists(self):
+        routing = json.loads((ROOT / "routing.json").read_text())
+        taxonomy = pipeline._semantic_review_taxonomy(routing)
+        prefixes = {
+            row["prefix"]
+            for row in taxonomy
+            if row["project_name"] == "Serenichron Level 2"
+            and row["tag_names"] == ["System development"]
+        }
+        self.assertEqual({"ES", "SC"}, prefixes)
+
+        cited = [session_event("ordinary", "2026-07-10T09:00:00+03:00").document()]
+        activity = {
+            "semantic_reviewer_model": "deepseek-v4-flash:cloud",
+            "project_recommendation": {
+                "name": "Serenichron Level 2",
+                "prefix": "ES",
+                "tag_names": ["Processes"],
+            },
+        }
+        route, error = pipeline.resolve_route(activity, cited, routing)
+        self.assertIsNone(error)
+        self.assertEqual("SC", route["prefix"])
+
+    def test_semantic_review_taxonomy_contains_distinct_project_task_pairs(self):
+        routing = json.loads((ROOT / "routing.json").read_text())
+
+        taxonomy = pipeline._semantic_review_taxonomy(routing)
+
+        serenichron_l2 = {
+            tuple(row["tag_names"])
+            for row in taxonomy
+            if row["project_name"] == "Serenichron Level 2"
+        }
+        self.assertTrue({
+            ("Business development",),
+            ("Processes",),
+            ("System development",),
+        } <= serenichron_l2)
+        system_development = next(
+            row for row in taxonomy
+            if row["project_name"] == "Serenichron Level 2"
+            and row["prefix"] == "SC"
+            and row["tag_names"] == ["System development"]
+        )
+        self.assertIn("serenichron", system_development["selection_guidance"])
+
+    def test_semantic_route_hint_prefers_normalized_cwd_over_session_file_path(self):
+        routing = json.loads((ROOT / "routing.json").read_text())
+        event = evidence_ledger.evidence_event(
+            "codex_sessions_event",
+            {
+                "source_type": "codex_sessions",
+                "source_id": "session:event:1",
+                "machine": "macbook",
+                "session_id": "session",
+            },
+            observed_at="2026-07-10T09:00:00+03:00",
+            raw_source_span={
+                "timestamp": "2026-07-10T09:00:00+03:00",
+                "path": "/Users/blackthorne/.codex/sessions/rollout.jsonl",
+                "cwd": "/Users/blackthorne/Work/tstprep.com/site-codebase/site",
+            },
+            attributes={"role": "user", "kind": "message", "content": "Fix site"},
+        ).document()
+
+        hint = pipeline._semantic_route_hint(event, routing)
+
+        self.assertEqual("TST Prep Level 2", hint["project_name"])
+        self.assertEqual(["Technical development"], hint["tag_names"])
+
     def test_proposal_identity_ignores_placement_but_distinguishes_segments(self):
         activity = analysis_for(["ev-1"])["activities"][0]
         activity["activity_id"] = "act-stable"
@@ -507,6 +633,90 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             field_patch=field_patch,
         )
         review_corrections.append_decision(path, record, item=item)
+
+    def test_reviewed_description_bypasses_legacy_regex_in_full_pipeline(self):
+        first = session_event(
+            "session-1:event:review-1",
+            "2026-07-10T09:00:00+03:00",
+            "Hold brand strategy alignment meeting",
+        )
+        last = session_event(
+            "session-1:event:review-2",
+            "2026-07-10T10:00:00+03:00",
+            "Schedule Friday follow-up one-to-one",
+        )
+        analysis = analysis_for([first.evidence_id, last.evidence_id], recommended=30)
+        activity = analysis["activities"][0]
+        activity.update({
+            "action": "Held",
+            "object": "brand strategy alignment meeting",
+            "outcome": "scheduled Friday follow-up one-to-one",
+            "semantic_reviewer_model": "deepseek-v4-flash:0731-cloud",
+            "semantic_reviewer_revision": "a" * 64,
+            "review_prompt_version": "clockify-semantic-review-v5",
+        })
+
+        _, result = self.make_run([first, last], analysis)
+
+        self.assertEqual(1, len(result["proposals"]))
+        self.assertEqual(
+            "SC — Held brand strategy alignment meeting scheduled Friday follow-up one-to-one",
+            result["proposals"][0]["description"],
+        )
+        self.assertFalse(
+            any(
+                row.get("exception_kind") == "description_contract"
+                for row in result["ambiguous"]
+            )
+        )
+
+    def test_completed_analysis_fixture_preserves_replay_identity_metadata(self):
+        first = session_event("session-1:event:1", "2026-07-10T09:00:00+03:00")
+        analysis = analysis_for([first.evidence_id], recommended=30)
+        analysis["activities"][0].update({
+            "analyzer_model": "deepseek-v4-flash:0731-cloud",
+            "analyzer_tier": "primary_flash_review",
+            "analyzer_revision": "a" * 64,
+            "semantic_reviewer_model": "deepseek-v4-flash:0731-cloud",
+            "semantic_reviewer_revision": "a" * 64,
+            "review_prompt_version": "clockify-semantic-review-v6",
+        })
+        metadata = {
+            "review_prompt_version": "clockify-semantic-review-v6",
+            "evidence_bundle_schema_version": "clockify-semantic-evidence-bundle/v1",
+            "evidence_bundle_manifest": {
+                "schema_version": "clockify-semantic-evidence-bundle/v1",
+                "digest": "sebm-" + "b" * 64,
+                "bundles": [],
+            },
+            "ledger_event_count": 1,
+            "ledger_evidence_digest": "led-" + "c" * 64,
+            "analysis_chunks": [{"model": "deepseek-v4-flash:0731-cloud"}],
+            "analyzer_cache": {
+                "schema_version": "clockify-analyzer-cache/v2",
+                "records": [],
+            },
+        }
+        analysis.update(metadata)
+
+        run_dir, _ = self.make_run([first], analysis)
+        restored = json.loads(
+            (run_dir / "semantic-analysis.json").read_text(encoding="utf-8")
+        )
+
+        for key, value in metadata.items():
+            self.assertEqual(value, restored[key])
+        self.assertEqual(
+            {
+                "analyzer_model": "deepseek-v4-flash:0731-cloud",
+                "analyzer_tier": "primary_flash_review",
+                "analyzer_revision": "a" * 64,
+            },
+            {
+                key: restored["activities"][0][key]
+                for key in ("analyzer_model", "analyzer_tier", "analyzer_revision")
+            },
+        )
 
     def test_splits_effort_around_existing_block_without_overlap(self):
         first = session_event("session-1:event:1", "2026-07-10T09:00:00+03:00")
@@ -946,7 +1156,7 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             for row in result["ambiguous"]
         ))
 
-    def test_incomplete_source_inventory_blocks_semantic_accounting(self):
+    def test_incomplete_coordinator_source_blocks_semantic_accounting(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         run_dir = Path(temp.name) / "run-partial"
@@ -957,7 +1167,7 @@ class WorkAccountingPipelineTests(unittest.TestCase):
                 "clockify": {"status": "complete"},
                 "fathom": {"status": "complete"},
                 "sessions/macbook": {"status": "complete"},
-                "sessions/precision": {
+                "sessions/omarchy-precision": {
                     "status": "partial",
                     "reason": "legacy metadata fallback",
                 },
@@ -975,6 +1185,38 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         write_json(fixture, analysis_for([event.evidence_id]))
         with self.assertRaisesRegex(pipeline.WorkAccountingError, "incomplete"):
             pipeline.run_accounting(run_dir, root=ROOT, analysis_fixture=fixture)
+
+    def test_incomplete_peer_source_allows_available_evidence_accounting(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        run_dir = Path(temp.name) / "run-peer-partial"
+        event = session_event("session-1:event:1", "2026-07-10T09:00:00+03:00")
+        ledger = evidence_ledger.EvidenceLedger(
+            (event,),
+            {
+                "clockify": {"status": "complete"},
+                "fathom": {"status": "complete"},
+                "multica_issues": {"status": "complete"},
+                "sessions/omarchy-precision": {"status": "complete"},
+                "repositories/omarchy-precision": {"status": "complete"},
+                "sessions/macbook": {"status": "unavailable"},
+            },
+        )
+        write_json(
+            run_dir / "evidence" / "evidence-ledger.json",
+            {
+                "schema_version": ledger.manifest.schema_version,
+                "manifest": ledger.manifest.document(),
+                "events": [event.document()],
+            },
+        )
+        fixture = Path(temp.name) / "analysis.json"
+        write_json(fixture, analysis_for([event.evidence_id], recommended=10))
+
+        result = pipeline.run_accounting(run_dir, root=ROOT, analysis_fixture=fixture)
+
+        self.assertIn("semantic_analysis", result)
+        self.assertEqual("sessions/macbook", result["coverage_warnings"][0]["source"])
 
     def test_replay_is_byte_stable_for_unchanged_inputs_and_versions(self):
         first = session_event("session-1:event:1", "2026-07-10T09:00:00+03:00")

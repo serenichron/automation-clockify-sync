@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -30,6 +31,22 @@ def bundle_manifest() -> dict:
         "schema_version": "clockify-semantic-evidence-bundle/v1",
         "digest": review_run.semantic_analyzer.stable_digest("sebm-", [], length=64),
         "bundles": [],
+    }
+
+
+def accounting_result(*, proposal_id: str = "P001") -> dict:
+    return {
+        "schema_version": 1,
+        "allocation_mode": "non_overlapping_v1",
+        "ledger_manifest": {},
+        "semantic_analysis": {},
+        "proposals": [{"id": proposal_id}],
+        "ambiguous": [],
+        "skipped": [],
+        "allocation": {},
+        "fathom_reconciliation": [],
+        "correction_regression": {},
+        "external_writes": False,
     }
 
 
@@ -89,7 +106,7 @@ class ReviewRunResultTests(unittest.TestCase):
                 }],
             })
 
-    def test_immutable_replay_copies_only_ledger_and_binds_source_identity(self):
+    def test_immutable_replay_copies_ledger_and_sealed_analysis_fixture(self):
         with tempfile.TemporaryDirectory() as tmp:
             runs = Path(tmp) / "runs"
             source = runs / "source-run"
@@ -124,6 +141,9 @@ class ReviewRunResultTests(unittest.TestCase):
                 }) + "\n",
                 encoding="utf-8",
             )
+            (source / "work-accounting-result.json").write_text(
+                json.dumps(accounting_result(), sort_keys=True) + "\n", encoding="utf-8"
+            )
 
             with mock.patch.object(review_run, "RUNS", runs):
                 replay = review_run._prepare_replay_run(source)
@@ -136,7 +156,114 @@ class ReviewRunResultTests(unittest.TestCase):
             provenance = json.loads((replay / "replay-source.json").read_text(encoding="utf-8"))
             self.assertEqual("source-run", provenance["source_run_id"])
             self.assertEqual("elm-" + "a" * 64, provenance["source_manifest_id"])
+            self.assertIn("work_accounting_result_sha256", provenance)
+            fixture = replay / provenance["semantic_analysis_fixture"]
+            self.assertEqual(
+                (source / "semantic-analysis.json").read_bytes(),
+                fixture.read_bytes(),
+            )
+            self.assertEqual(
+                provenance["semantic_analysis_sha256"],
+                review_run.hashlib.sha256(fixture.read_bytes()).hexdigest(),
+            )
             self.assertFalse((replay / "semantic-analysis.json").exists())
+
+    def test_replay_fixture_drift_blocks_before_accounting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            source = runs / "source-run"
+            (source / "evidence").mkdir(parents=True)
+            ledger = {
+                "schema_version": "evidence-ledger/v1",
+                "manifest": {
+                    "manifest_id": "elm-" + "a" * 64,
+                    "events_digest": "b" * 64,
+                },
+                "events": [],
+            }
+            (source / "evidence" / "evidence-ledger.json").write_text(
+                json.dumps(ledger, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            (source / "run-report.json").write_text("{}\n", encoding="utf-8")
+            (source / "run-report.md").write_text("# source\n", encoding="utf-8")
+            (source / "semantic-analysis.json").write_text(
+                json.dumps({"schema_version": 1, "activities": []}) + "\n",
+                encoding="utf-8",
+            )
+            (source / "work-accounting-result.json").write_text(
+                json.dumps(accounting_result(), sort_keys=True) + "\n", encoding="utf-8"
+            )
+
+            with mock.patch.object(review_run, "RUNS", runs):
+                replay = review_run._prepare_replay_run(source)
+                provenance = json.loads((replay / "replay-source.json").read_text())
+                (replay / provenance["semantic_analysis_fixture"]).write_text(
+                    '{"tampered":true}\n', encoding="utf-8"
+                )
+                with self.assertRaisesRegex(ValueError, "differs from its immutable source"):
+                    review_run._replay_analysis_fixture(source, replay)
+
+    def test_replay_automatically_passes_sealed_fixture_without_analyzer_configuration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            source = runs / "source-run"
+            (source / "evidence").mkdir(parents=True)
+            ledger = {
+                "schema_version": "evidence-ledger/v1",
+                "manifest": {
+                    "manifest_id": "elm-" + "a" * 64,
+                    "events_digest": "b" * 64,
+                },
+                "events": [],
+            }
+            (source / "evidence" / "evidence-ledger.json").write_text(
+                json.dumps(ledger, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            (source / "run-report.json").write_text("{}\n", encoding="utf-8")
+            (source / "run-report.md").write_text("# source\n", encoding="utf-8")
+            (source / "semantic-analysis.json").write_text(
+                json.dumps({"schema_version": 1, "activities": []}) + "\n",
+                encoding="utf-8",
+            )
+            (source / "work-accounting-result.json").write_text(
+                json.dumps(accounting_result(), sort_keys=True) + "\n", encoding="utf-8"
+            )
+            blocked_after_command_capture = subprocess.CompletedProcess(
+                args=["accounting"], returncode=2, stdout="", stderr="fixture test stop"
+            )
+            with mock.patch.object(review_run, "RUNS", runs), mock.patch.dict(
+                os.environ,
+                {
+                    "CLOCKIFY_ANALYZER_PRIMARY_URL": "",
+                    "CLOCKIFY_ANALYZER_PRIMARY_MODEL": "",
+                    "CLOCKIFY_PRIVATE_TEXT_EGRESS_APPROVED": "",
+                },
+                clear=False,
+            ), mock.patch.object(
+                review_run, "_run", return_value=blocked_after_command_capture
+            ) as run:
+                code = review_run.main([
+                    "--replay-from", str(source),
+                    "--state", str(Path(tmp) / "state.json"),
+                    "--corrections", str(Path(tmp) / "corrections.jsonl"),
+                ])
+
+            self.assertEqual(2, code)
+            command = run.call_args.args[0]
+            self.assertIn("--analysis-fixture", command)
+            fixture = Path(command[command.index("--analysis-fixture") + 1])
+            self.assertTrue(fixture.is_file())
+            self.assertIn("replay-fixture", fixture.parts)
+
+    def test_replay_rejects_caller_supplied_fixture_before_any_process_runs(self):
+        with mock.patch.object(review_run, "_run") as run:
+            code = review_run.main([
+                "--replay-from", "/tmp/source",
+                "--analysis-fixture", "/tmp/unsealed.json",
+            ])
+
+        self.assertEqual(2, code)
+        run.assert_not_called()
 
     def test_replay_integrity_rejects_analyzer_version_drift(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -170,6 +297,9 @@ class ReviewRunResultTests(unittest.TestCase):
                         "analysis_chunks": [],
                     }) + "\n",
                     encoding="utf-8",
+                )
+                (run_dir / "work-accounting-result.json").write_text(
+                    json.dumps(accounting_result(), sort_keys=True) + "\n", encoding="utf-8"
                 )
 
             with mock.patch.object(review_run, "RUNS", runs):
@@ -218,10 +348,36 @@ class ReviewRunResultTests(unittest.TestCase):
                     }) + "\n",
                     encoding="utf-8",
                 )
+                (run_dir / "work-accounting-result.json").write_text(
+                    json.dumps(accounting_result(), sort_keys=True) + "\n", encoding="utf-8"
+                )
 
             with mock.patch.object(review_run, "RUNS", runs):
                 with self.assertRaisesRegex(ValueError, "cache decisions differ"):
                     review_run._verify_replay_integrity(source, replay)
+
+    def test_replay_integrity_rejects_accounting_result_drift(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            source, replay = runs / "source-run", runs / "replay-run"
+            ledger = {"schema_version": "evidence-ledger/v1", "manifest": {"manifest_id": "elm-" + "a" * 64, "events_digest": "b" * 64}, "events": []}
+            analysis = {
+                "schema_version": 1, "prompt_version": "prompt-v1",
+                "evidence_bundle_schema_version": "clockify-semantic-evidence-bundle/v1",
+                "evidence_bundle_manifest": bundle_manifest(),
+                "ledger_evidence_digest": "sha256:" + "c" * 64,
+                "activities": [{"analyzer_model": "model-a", "analyzer_tier": "primary"}],
+                "analysis_chunks": [],
+            }
+            for run_dir, proposal_id in ((source, "P001"), (replay, "P002")):
+                (run_dir / "evidence").mkdir(parents=True)
+                (run_dir / "evidence" / "evidence-ledger.json").write_text(json.dumps(ledger, sort_keys=True) + "\n")
+                (run_dir / "semantic-analysis.json").write_text(json.dumps(analysis, sort_keys=True) + "\n")
+                (run_dir / "work-accounting-result.json").write_text(json.dumps(accounting_result(proposal_id=proposal_id), sort_keys=True) + "\n")
+            with mock.patch.object(review_run, "RUNS", runs):
+                with self.assertRaisesRegex(ValueError, "work accounting result differs"):
+                    review_run._verify_replay_integrity(source, replay)
+            self.assertEqual("blocked", json.loads((replay / "replay-integrity.json").read_text())["status"])
 
     def test_replay_range_options_are_rejected_before_any_process_runs(self):
         with mock.patch.object(review_run, "_run") as run:

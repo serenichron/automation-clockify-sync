@@ -197,7 +197,7 @@ class QualityMatchingTests(unittest.TestCase):
         )
         self.assertEqual([{"left": "P001", "right": "existing-1"}], overlaps)
 
-    def test_semantic_proposal_must_pass_caveman_contract(self):
+    def test_flash_reviewed_semantic_proposal_gets_caveman_advisory(self):
         row = proposal(
             id="P001",
             candidate_key="wk-one",
@@ -218,13 +218,16 @@ class QualityMatchingTests(unittest.TestCase):
                     "source_type": "semantic_activity",
                     "source_session_id": "act-one",
                     "evidence_ids": ["ev-one"],
+                    "semantic_reviewer_model": "deepseek-v4-flash:0731-cloud",
                 },
             }
         )
         review = quality.review_proposal(row, {}, [])
-        self.assertTrue(review["has_issues"])
+        self.assertFalse(
+            any("Caveman description" in issue for issue in review["issues"])
+        )
         self.assertTrue(
-            any("Caveman description contract" in issue for issue in review["issues"])
+            any("Caveman description advisory" in item for item in review["suggestions"])
         )
 
     def test_semantic_proposal_requires_matching_structured_render(self):

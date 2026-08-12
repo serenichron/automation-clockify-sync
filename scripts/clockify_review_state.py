@@ -136,6 +136,9 @@ def _identity(record: dict[str, Any]) -> dict[str, Any]:
 
 def _keys(record: dict[str, Any]) -> dict[str, str]:
     identity = _identity(record)
+    fallback = {
+        key: value for key, value in identity["fallback"].items() if value
+    }
     return {
         "candidate_key": identity["provided_candidate_key"],
         "activity_key": identity["provided_activity_key"] or (
@@ -147,12 +150,12 @@ def _keys(record: dict[str, Any]) -> dict[str, str]:
                     "evidence_fingerprint": identity["evidence_fingerprint"],
                 },
             )
-            if identity["activity_id"] and identity["evidence_fingerprint"]
+            if identity["activity_id"]
             else ""
         ),
         "provenance_key": _digest("pv-", identity["provenance"]) if identity["provenance"] else "",
-        "anchor_key": _digest("sa-", identity["anchor"]),
-        "fallback_key": _digest("sf-", identity["fallback"]),
+        "anchor_key": _digest("sa-", identity["anchor"]) if identity["anchor"] else "",
+        "fallback_key": _digest("sf-", fallback) if fallback else "",
     }
 
 
@@ -489,7 +492,13 @@ def ingest_run(run_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
             excluded_ids={split_plan["parent"]["id"]} if split_plan is not None else None,
         )
         if item is None:
-            stable_key = keys["candidate_key"] or keys["provenance_key"] or keys["anchor_key"] or keys["fallback_key"]
+            stable_key = (
+                keys["activity_key"]
+                or keys["candidate_key"]
+                or keys["provenance_key"]
+                or keys["anchor_key"]
+                or keys["fallback_key"]
+            )
             item_id = _digest("rvi-", {"stable_key": stable_key})
             # Extremely unlikely hash collision; fail safely rather than merge records.
             if item_id in state["items"]:

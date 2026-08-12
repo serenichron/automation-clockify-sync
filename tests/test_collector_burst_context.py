@@ -863,32 +863,140 @@ class CollectorBurstContextTests(unittest.TestCase):
         self.assertEqual(1, run.call_count)
         self.assertIn("script digest mismatch", result["errors"][0])
 
-    def test_canonical_export_attestation_rejects_git_sha_or_dirty_worktree(self) -> None:
-        machine = {"name": "precision", "host": "precision.example.test", "collector_root": "/work/clockify"}
-        cases = [
-            ("other-sha", False, "Git SHA mismatch"),
-            ("coordinator-sha", True, "tracked Git worktree is dirty"),
+    def test_canonical_export_attestation_retries_allowlisted_exporter_digest(self) -> None:
+        machine = {
+            "name": "precision",
+            "host": "precision.example.test",
+            "collector_root": "/work/clockify",
+        }
+        compatible_digest = next(iter(
+            collector.COMPATIBLE_CANONICAL_EXPORT_DIGESTS
+        ))
+        mismatch = {
+            "machine": "precision",
+            "status": "unavailable",
+            "canonical_export_attestation": {
+                "collector_script_sha256": compatible_digest,
+                "runtime_identity": {
+                    "git_sha": "approved-remote-sha",
+                    "git_dirty": False,
+                },
+            },
+        }
+        exported = {
+            "machine": "precision",
+            "status": "ok",
+            "claude_bursts": [],
+            "hermes_sessions": [],
+            "hermes_db_sessions": [],
+            "codex_sessions": [],
+            "repository_events": [],
+            "repository_evidence_status": "complete",
+            "errors": [],
+            "canonical_export_attestation": mismatch[
+                "canonical_export_attestation"
+            ],
+        }
+        responses = [
+            collector.subprocess.CompletedProcess(
+                ["ssh"], 0, json.dumps(mismatch), ""
+            ),
+            collector.subprocess.CompletedProcess(
+                ["ssh"], 0, json.dumps(exported), ""
+            ),
         ]
-        for remote_sha, remote_dirty, expected_error in cases:
-            with self.subTest(remote_sha=remote_sha, remote_dirty=remote_dirty):
-                exported = {
-                    "machine": "precision", "canonical_export_attestation": {
-                        "collector_script_sha256": "expected-digest",
-                        "runtime_identity": {"git_sha": remote_sha, "git_dirty": remote_dirty},
-                    },
-                }
-                completed = collector.subprocess.CompletedProcess(["ssh"], 0, json.dumps(exported), "")
-                with (
-                    mock.patch.object(collector, "collector_script_sha256", return_value="expected-digest"),
-                    mock.patch.object(collector.subprocess, "run", return_value=completed) as run,
-                ):
-                    result = collector.collect_remote_sessions(
-                        machine, SINCE, UNTIL, [],
-                        coordinator_identity={"git_sha": "coordinator-sha", "git_dirty": False},
-                    )
-                self.assertEqual("unavailable", result["status"])
-                self.assertEqual(1, run.call_count)
-                self.assertIn(expected_error, result["errors"][0])
+        with (
+            mock.patch.object(
+                collector,
+                "collector_script_sha256",
+                return_value="new-coordinator-digest",
+            ),
+            mock.patch.object(
+                collector.subprocess, "run", side_effect=responses
+            ) as run,
+        ):
+            result = collector.collect_remote_sessions(
+                machine,
+                SINCE,
+                UNTIL,
+                [],
+                coordinator_identity={
+                    "git_sha": "coordinator-sha",
+                    "git_dirty": True,
+                },
+            )
+
+        self.assertEqual(2, run.call_count)
+        self.assertEqual("ok", result["status"])
+        self.assertEqual(
+            compatible_digest,
+            result["canonical_export"]["collector_script_sha256"],
+        )
+        self.assertFalse(
+            result["canonical_export"]["collector_digest_match"]
+        )
+        self.assertFalse(result["canonical_export"]["git_sha_match"])
+
+    def test_canonical_export_attestation_accepts_sha_drift_and_records_dirty_worktree(self) -> None:
+        machine = {"name": "precision", "host": "precision.example.test", "collector_root": "/work/clockify"}
+        clean_export = {
+            "machine": "precision", "status": "ok", "claude_bursts": [],
+            "hermes_sessions": [], "hermes_db_sessions": [], "codex_sessions": [],
+            "repository_events": [], "repository_evidence_status": "complete", "errors": [],
+            "canonical_export_attestation": {
+                "collector_script_sha256": "expected-digest",
+                "runtime_identity": {"git_sha": "other-sha", "git_dirty": False},
+            },
+        }
+        completed = collector.subprocess.CompletedProcess(
+            ["ssh"], 0, json.dumps(clean_export), ""
+        )
+        with (
+            mock.patch.object(
+                collector, "collector_script_sha256", return_value="expected-digest"
+            ),
+            mock.patch.object(collector.subprocess, "run", return_value=completed),
+        ):
+            result = collector.collect_remote_sessions(
+                machine, SINCE, UNTIL, [],
+                coordinator_identity={"git_sha": "coordinator-sha", "git_dirty": False},
+            )
+        self.assertEqual("ok", result["status"])
+        self.assertEqual(
+            "git_worktree_content_attested",
+            result["canonical_export"]["bundle_provenance"],
+        )
+        self.assertFalse(result["canonical_export"]["git_sha_match"])
+
+        dirty_export = {
+            "machine": "precision", "status": "ok", "claude_bursts": [],
+            "hermes_sessions": [], "hermes_db_sessions": [], "codex_sessions": [],
+            "repository_events": [], "repository_evidence_status": "complete", "errors": [],
+            "canonical_export_attestation": {
+                "collector_script_sha256": "expected-digest",
+                "runtime_identity": {"git_sha": "coordinator-sha", "git_dirty": True},
+            },
+        }
+        completed = collector.subprocess.CompletedProcess(
+            ["ssh"], 0, json.dumps(dirty_export), ""
+        )
+        with (
+            mock.patch.object(
+                collector, "collector_script_sha256", return_value="expected-digest"
+            ),
+            mock.patch.object(collector.subprocess, "run", return_value=completed) as run,
+        ):
+            result = collector.collect_remote_sessions(
+                machine, SINCE, UNTIL, [],
+                coordinator_identity={"git_sha": "coordinator-sha", "git_dirty": False},
+            )
+        self.assertEqual("ok", result["status"])
+        self.assertEqual(1, run.call_count)
+        self.assertEqual(
+            "git_worktree_content_attested_dirty",
+            result["canonical_export"]["bundle_provenance"],
+        )
+        self.assertTrue(result["canonical_export"]["remote_git_dirty"])
 
     def test_export_local_reports_its_digest_before_collecting_on_mismatch(self) -> None:
         machine = {"name": "desktop"}

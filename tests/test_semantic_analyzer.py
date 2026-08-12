@@ -105,6 +105,52 @@ def provider_response(payload: dict, members: list[dict] | None = None) -> dict:
     clear=False,
 )
 class SemanticAnalyzerTests(unittest.TestCase):
+    def test_primary_accepts_protected_openai_client_environment(self):
+        environment = {
+            "OPENAI_BASE_URL": "https://precision-llm.example/v1",
+            "OPENAI_API_KEY": "gateway-bearer",
+            "OPENAI_MODEL": "deepseek-v4-flash:cloud",
+            "CF_ACCESS_CLIENT_ID": "access-id",
+            "CF_ACCESS_CLIENT_SECRET": "access-secret",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            endpoint = semantic.AnalyzerEndpoint.from_env(
+                "CLOCKIFY_ANALYZER_PRIMARY",
+                default_model=semantic.DEFAULT_PRIMARY_MODEL,
+            )
+
+        self.assertIsNotNone(endpoint)
+        self.assertEqual(
+            "https://precision-llm.example/v1/chat/completions", endpoint.url
+        )
+        self.assertEqual("gateway-bearer", endpoint.api_key)
+        self.assertEqual("access-id", endpoint.cf_access_client_id)
+        self.assertEqual("access-secret", endpoint.cf_access_client_secret)
+
+    def test_http_transport_sends_protected_gateway_headers(self):
+        endpoint = semantic.AnalyzerEndpoint(
+            "primary",
+            "https://precision-llm.example/v1/chat/completions",
+            semantic.DEFAULT_PRIMARY_MODEL,
+            api_key="gateway-bearer",
+            cf_access_client_id="access-id",
+            cf_access_client_secret="access-secret",
+        )
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"ok":true}'
+        with mock.patch(
+            "scripts.semantic_analyzer.urllib.request.urlopen",
+            return_value=response,
+        ) as opened:
+            self.assertEqual(
+                {"ok": True}, semantic.http_transport(endpoint, {"messages": []})
+            )
+
+        request = opened.call_args.args[0]
+        self.assertEqual("Bearer gateway-bearer", request.get_header("Authorization"))
+        self.assertEqual("access-id", request.get_header("Cf-access-client-id"))
+        self.assertEqual("access-secret", request.get_header("Cf-access-client-secret"))
+
     def test_http_transport_separates_retryable_and_hard_http_failures(self):
         endpoint = semantic.AnalyzerEndpoint("primary", "http://primary", "qualified")
         body = {"model": "qualified", "messages": []}
@@ -137,7 +183,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
             private_text_approved=True,
         )[0]["content"]
 
-        self.assertEqual("clockify-semantic-v16", semantic.PROMPT_VERSION)
+        self.assertEqual("clockify-semantic-v17", semantic.PROMPT_VERSION)
         self.assertIn("MEETING SUFFICIENCY IS A HARD GATE", system)
         self.assertIn("MUST NOT produce an activity", system)
         self.assertIn("exactly one insufficient_evidence exception", system)
@@ -145,6 +191,376 @@ class SemanticAnalyzerTests(unittest.TestCase):
         self.assertIn("Do not mark timing low merely", system)
         self.assertIn("Preserve domain qualifiers that distinguish", system)
         self.assertIn("putting the qualifier only in workstream", system)
+        self.assertIn("Repository commits are corroboration only", system)
+
+    def test_independent_flash_review_corrects_extraction_semantics(self):
+        calls: list[str] = []
+        taxonomy = [{
+            "project_name": "Serenichron Level 2",
+            "prefix": "SC",
+            "tag_names": ["Processes"],
+            "billable": True,
+        }]
+
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            mode = payload.get("mode")
+            calls.append(mode)
+            response = provider_response(payload)
+            if mode == "extract":
+                response["activities"][0]["action"] = "Fixed and published"
+                return response
+            self.assertEqual("review", mode)
+            self.assertEqual(
+                "Fixed and published",
+                payload["candidate"]["activities"][0]["action"],
+            )
+            self.assertEqual(taxonomy, payload["clockify_taxonomy"])
+            response["activities"][0].update({
+                "action": "Published",
+                "object": "Clockify review descriptions",
+                "outcome": "removed transcript fragments",
+                "project_recommendation": {
+                    "name": "Serenichron Level 2",
+                    "prefix": "SC",
+                    "tag_names": ["Processes"],
+                },
+            })
+            return response
+
+        result = semantic.analyze_tiered(
+            [event("ev-1")],
+            primary=semantic.AnalyzerEndpoint(
+                "primary", "http://primary", "flash-review-test"
+            ),
+            transport=transport,
+            review_taxonomy=taxonomy,
+        )
+
+        self.assertEqual(["extract", "review"], calls)
+        activity = result["activities"][0]
+        self.assertEqual("Published", activity["action"])
+        self.assertEqual("flash-review-test", activity["semantic_reviewer_model"])
+        self.assertEqual(
+            semantic.REVIEW_PROMPT_VERSION,
+            activity["review_prompt_version"],
+        )
+
+    def test_flash_review_prompt_distinguishes_interactive_from_autonomous_work(self):
+        system = semantic._review_messages(
+            [event("ev-1")],
+            candidate={"activities": [], "exceptions": [], "omissions": []},
+            taxonomy=[],
+        )[0]["content"]
+
+        self.assertEqual("clockify-semantic-review-v6", semantic.REVIEW_PROMPT_VERSION)
+        self.assertIn("human instruction plus its resulting assistant/tool evidence", system)
+        self.assertIn("Do not omit an accomplishment", system)
+        self.assertIn("genuinely", system)
+        self.assertIn("autonomous background execution", system)
+        self.assertIn("Every omission requires lifecycle planned or noise", system)
+        self.assertIn("repository commits only to corroborate", system)
+        self.assertIn("plain Caveman wording", system)
+        self.assertIn("route_hint", system)
+        payload = json.loads(semantic._review_messages(
+            [event("ev-1")],
+            candidate={"activities": [], "exceptions": [], "omissions": []},
+            taxonomy=[],
+        )[1]["content"])
+        self.assertEqual(
+            [{"bundle_ref": "b-0001", "allowed_member_range": [1, 1]}],
+            payload["coverage_contract"],
+        )
+
+        hinted = event("ev-1")
+        hinted["semantic_route_hint"] = {
+            "action": "route",
+            "project_name": "Serenichron Level 2",
+            "prefix": "SC",
+            "tag_names": ["System development"],
+            "confidence": "high",
+        }
+        hinted_payload = json.loads(semantic._review_messages(
+            [hinted],
+            candidate={"activities": [], "exceptions": [], "omissions": []},
+            taxonomy=[],
+        )[1]["content"])
+        self.assertEqual(
+            hinted["semantic_route_hint"],
+            hinted_payload["bundles"][0]["members"][0]["route_hint"],
+        )
+
+    def test_portfolio_review_prompt_requires_invoice_worthy_consolidation(self):
+        messages = semantic._review_messages(
+            [event("ev-1")],
+            candidate={"activities": [], "exceptions": [], "omissions": []},
+            taxonomy=[],
+            review_scope="portfolio",
+            review_prompt_version=semantic.PORTFOLIO_REVIEW_PROMPT_VERSION,
+        )
+
+        self.assertIn("invoice-worthy accomplishments", messages[0]["content"])
+        self.assertIn("one row per message", messages[0]["content"])
+        self.assertIn("20–90 minute accomplishment", messages[0]["content"])
+        self.assertIn("search→recovery or transfer", messages[0]["content"])
+        self.assertIn("Never exceed 14 total words", messages[0]["content"])
+        payload = json.loads(messages[1]["content"])
+        self.assertEqual("portfolio", payload["review_scope"])
+        self.assertEqual(
+            semantic.PORTFOLIO_REVIEW_PROMPT_VERSION,
+            payload["review_prompt_version"],
+        )
+
+    def test_portfolio_validation_is_a_separate_semantic_contract(self):
+        messages = semantic._review_messages(
+            [event("ev-1")],
+            candidate={"activities": [], "exceptions": [], "omissions": []},
+            taxonomy=[],
+            review_scope="portfolio_validation",
+            review_prompt_version=semantic.PORTFOLIO_VALIDATION_PROMPT_VERSION,
+        )
+
+        self.assertIn("Independently compare the candidate", messages[0]["content"])
+        self.assertIn("client/project level", messages[0]["content"])
+        self.assertIn("Never exceed 14 total words", messages[0]["content"])
+        payload = json.loads(messages[1]["content"])
+        self.assertEqual("portfolio_validation", payload["review_scope"])
+        self.assertEqual(
+            semantic.PORTFOLIO_VALIDATION_PROMPT_VERSION,
+            payload["review_prompt_version"],
+        )
+
+    def test_single_activity_recovery_requires_exact_flash_citation_audit(self):
+        messages = semantic._review_messages(
+            [event("ev-1")],
+            candidate={"activities": [], "exceptions": [], "omissions": []},
+            taxonomy=[],
+            review_scope="portfolio_single_activity_recovery",
+            review_prompt_version="clockify-portfolio-single-activity-recovery-v2",
+        )
+
+        self.assertIn("one source candidate", messages[0]["content"])
+        self.assertIn("entire allowed_member_range", messages[0]["content"])
+        self.assertIn("every\ninteger member must occur exactly once", messages[0]["content"])
+        payload = json.loads(messages[1]["content"])
+        self.assertEqual(
+            "portfolio_single_activity_recovery", payload["review_scope"]
+        )
+
+    def test_flash_review_owns_wording_and_effort_without_python_rewrite(self):
+        taxonomy = [{
+            "project_name": "Serenichron Level 2",
+            "prefix": "SC",
+            "tag_names": ["Processes"],
+            "billable": True,
+        }]
+
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            response = provider_response(payload)
+            if payload.get("mode") == "review":
+                response["activities"][0].update({
+                    "action": "Fixed and verified",
+                    "object": "Clockify review output",
+                    "outcome": "scheduled Friday follow-up one-to-one",
+                    "effort": {
+                        "minimum_minutes": 60,
+                        "recommended_minutes": 120,
+                        "maximum_minutes": 180,
+                    },
+                    "project_recommendation": {
+                        "name": "Serenichron Level 2",
+                        "prefix": "SC",
+                        "tag_names": ["Processes"],
+                    },
+                })
+            return response
+
+        result = semantic.analyze_tiered(
+            [event("ev-1")],
+            primary=semantic.AnalyzerEndpoint(
+                "primary", "http://primary", "flash-review-test"
+            ),
+            transport=transport,
+            review_taxonomy=taxonomy,
+        )
+
+        activity = result["activities"][0]
+        self.assertEqual("Fixed and verified", activity["action"])
+        self.assertEqual(
+            "scheduled Friday follow-up one-to-one",
+            activity["outcome"],
+        )
+        self.assertEqual(120, activity["effort"]["recommended_minutes"])
+
+    def test_flash_review_structural_repair_exhaustion_does_not_retry_extractor(self):
+        calls: list[str] = []
+        taxonomy = [{
+            "project_name": "Serenichron Level 2",
+            "prefix": "SC",
+            "tag_names": ["Processes"],
+            "billable": True,
+        }]
+
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            calls.append(payload["mode"])
+            if payload["mode"] == "extract":
+                return provider_response(payload)
+            return {"activities": [], "exceptions": [], "omissions": []}
+
+        result = semantic.analyze_tiered(
+            [event("ev-1")],
+            primary=semantic.AnalyzerEndpoint(
+                "primary", "http://primary", "flash-review-test"
+            ),
+            transport=transport,
+            review_taxonomy=taxonomy,
+        )
+
+        self.assertEqual(["extract", "review", "review"], calls)
+        self.assertEqual([], result["activities"])
+        self.assertEqual("analyzer_review_failure", result["exceptions"][0]["kind"])
+        self.assertIn("structural repair", result["exceptions"][0]["reason"])
+
+    def test_flash_review_timeout_recovers_without_rerunning_extractor_and_replays(self):
+        taxonomy = [{
+            "project_name": "Serenichron Level 2",
+            "prefix": "SC",
+            "tag_names": ["Processes"],
+            "billable": True,
+        }]
+        calls: list[str] = []
+
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            calls.append(payload["mode"])
+            if payload["mode"] == "extract":
+                return provider_response(payload)
+            raise semantic.AnalyzerTimeoutError("review timed out")
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "analyzer-cache.jsonl"
+            first = semantic.analyze_tiered(
+                [event("ev-1")],
+                primary=semantic.AnalyzerEndpoint(
+                    "primary", "http://primary", "flash-review-test"
+                ),
+                transport=transport,
+                cache=semantic.AnalyzerResponseCache(path),
+                review_taxonomy=taxonomy,
+            )
+            second = semantic.analyze_tiered(
+                [event("ev-1")],
+                primary=semantic.AnalyzerEndpoint(
+                    "primary", "http://primary", "flash-review-test"
+                ),
+                transport=lambda *_: self.fail("sealed review replay called transport"),
+                cache=semantic.AnalyzerResponseCache(path),
+                review_taxonomy=taxonomy,
+            )
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+
+        self.assertEqual(1, calls.count("extract"))
+        self.assertEqual(4, calls.count("review"))
+        self.assertEqual(first["exceptions"], second["exceptions"])
+        self.assertEqual(1, sum(row["status"] == "accepted" for row in records))
+        self.assertEqual(4, sum(row["status"] == "rejected" for row in records))
+
+    def test_extractor_and_flash_reviewer_cache_identities_replay_independently(self):
+        taxonomy = [{
+            "project_name": "Serenichron Level 2",
+            "prefix": "SC",
+            "tag_names": ["Processes"],
+            "billable": True,
+        }]
+        calls: list[str] = []
+
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            calls.append(payload["mode"])
+            response = provider_response(payload)
+            if payload["mode"] == "review":
+                response["activities"][0]["project_recommendation"] = {
+                    "name": "Serenichron Level 2",
+                    "prefix": "SC",
+                    "tag_names": ["Processes"],
+                }
+            return response
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "analyzer-cache.jsonl"
+            first_cache = semantic.AnalyzerResponseCache(path)
+            first = semantic.analyze_tiered(
+                [event("ev-1")],
+                primary=semantic.AnalyzerEndpoint(
+                    "primary", "http://primary", "flash-review-test"
+                ),
+                transport=transport,
+                cache=first_cache,
+                review_taxonomy=taxonomy,
+            )
+            second_cache = semantic.AnalyzerResponseCache(path)
+            second = semantic.analyze_tiered(
+                [event("ev-1")],
+                primary=semantic.AnalyzerEndpoint(
+                    "primary", "http://primary", "flash-review-test"
+                ),
+                transport=lambda *_: self.fail("cache replay called transport"),
+                cache=second_cache,
+                review_taxonomy=taxonomy,
+            )
+
+        self.assertEqual(["extract", "review"], calls)
+        self.assertEqual(first["activities"], second["activities"])
+        self.assertEqual(2, first_cache.misses)
+        self.assertEqual(2, second_cache.hits)
+
+    def test_flash_review_rejects_project_and_task_outside_taxonomy(self):
+        calls: list[str] = []
+        taxonomy = [{
+            "project_name": "Serenichron Level 2",
+            "prefix": "SC",
+            "tag_names": ["Processes"],
+            "billable": True,
+        }]
+
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            calls.append(payload["mode"])
+            response = provider_response(payload)
+            if payload["mode"] == "review":
+                response["activities"][0]["project_recommendation"] = {
+                    "name": "Invented Client",
+                    "prefix": "XX",
+                    "tag_names": ["Invented Task"],
+                }
+            return response
+
+        result = semantic.analyze_tiered(
+            [event("ev-1")],
+            primary=semantic.AnalyzerEndpoint(
+                "primary", "http://primary", "flash-review-test"
+            ),
+            transport=transport,
+            review_taxonomy=taxonomy,
+        )
+
+        self.assertEqual(["extract", "review", "review"], calls)
+        self.assertEqual([], result["activities"])
+        self.assertEqual("analyzer_review_failure", result["exceptions"][0]["kind"])
 
     def test_production_primary_requires_flash_and_rejects_pro(self):
         base = {
@@ -153,7 +569,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
         }
         with mock.patch.dict(os.environ, base, clear=False):
             with self.assertRaisesRegex(
-                semantic.AnalyzerError, "primary analyzer must be deepseek-v4-flash"
+                semantic.AnalyzerError, "approved DeepSeek V4 Flash cloud alias"
             ):
                 semantic.AnalyzerEndpoint.from_env(
                     "CLOCKIFY_ANALYZER_PRIMARY",
@@ -164,14 +580,11 @@ class SemanticAnalyzerTests(unittest.TestCase):
             "CLOCKIFY_ANALYZER_PRIMARY_MODEL": "deepseek-v4-flash:cloud",
         }
         with mock.patch.dict(os.environ, preview_alias, clear=False):
-            with self.assertRaisesRegex(
-                semantic.AnalyzerError,
-                "primary analyzer must be deepseek-v4-flash:0731-cloud",
-            ):
-                semantic.AnalyzerEndpoint.from_env(
-                    "CLOCKIFY_ANALYZER_PRIMARY",
-                    default_model=semantic.DEFAULT_PRIMARY_MODEL,
-                )
+            endpoint = semantic.AnalyzerEndpoint.from_env(
+                "CLOCKIFY_ANALYZER_PRIMARY",
+                default_model=semantic.DEFAULT_PRIMARY_MODEL,
+            )
+        self.assertEqual("deepseek-v4-flash:cloud", endpoint.model)
         with self.assertRaisesRegex(semantic.AnalyzerError, "V4 Pro is not approved"):
             semantic.AnalyzerEndpoint(
                 "fallback", "http://analyzer.test", "deepseek-v4-pro:cloud"
@@ -322,6 +735,39 @@ class SemanticAnalyzerTests(unittest.TestCase):
                 provider_model="model-a",
                 analyzer_tier="primary",
             )
+
+    def test_exception_and_omission_require_structural_disposition_fields(self):
+        invalid = [
+            {
+                "activities": [],
+                "exceptions": [{
+                    "kind": "insufficient_evidence",
+                    "evidence_ids": ["ev-1"],
+                    "reason": "",
+                }],
+                "omissions": [],
+            },
+            {
+                "activities": [],
+                "exceptions": [],
+                "omissions": [{
+                    "evidence_ids": ["ev-1"],
+                    "reason": "autonomous execution",
+                }],
+            },
+        ]
+        for response in invalid:
+            with self.subTest(response=response), self.assertRaisesRegex(
+                semantic.AnalyzerError,
+                "nonempty reason|omission lifecycle",
+            ):
+                semantic.validate_result(
+                    response,
+                    known_evidence_ids={"ev-1"},
+                    provider_model="model-a",
+                    analyzer_tier="primary",
+                    semantic_validation=False,
+                )
 
     def test_rejects_invalid_effort_order(self):
         response = valid_response("ev-1")
@@ -1749,6 +2195,142 @@ class SemanticAnalyzerTests(unittest.TestCase):
         }
         self.assertEqual({item["evidence_id"] for item in events}, classified)
 
+    def test_concurrent_extraction_refills_after_each_successful_chunk(self):
+        slow_started = threading.Event()
+        refilled_started = threading.Event()
+        calls: list[int] = []
+        lock = threading.Lock()
+
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            member = provider_members(payload)[0]
+            day = int(member["time_span"]["start"][8:10])
+            with lock:
+                calls.append(day)
+            if day == 10:
+                self.assertTrue(slow_started.wait(timeout=1))
+            elif day == 11:
+                slow_started.set()
+                self.assertTrue(
+                    refilled_started.wait(timeout=1),
+                    "a successful peer did not refill the available worker slot",
+                )
+            elif day == 12:
+                refilled_started.set()
+            else:
+                self.fail(f"unexpected day {day}")
+            response = provider_response(payload)
+            response["activities"][0].update({
+                "object": f"Clockify item {day}",
+                "workstream": f"Clockify stream {day}",
+            })
+            return response
+
+        result = semantic.analyze_tiered(
+            [event(f"ev-{number}", f"2026-07-{10 + number:02d}") for number in range(3)],
+            primary=semantic.AnalyzerEndpoint("primary", "http://primary", "cheap"),
+            transport=transport,
+            max_events_per_chunk=1,
+            max_workers=2,
+        )
+
+        self.assertTrue(refilled_started.is_set())
+        self.assertEqual([10, 11, 12], sorted(calls))
+        self.assertEqual([1, 2, 3], [item["chunk"] for item in result["analysis_chunks"]])
+
+    def test_concurrent_extraction_never_exceeds_worker_limit_when_refilling(self):
+        active = 0
+        max_active = 0
+        lock = threading.Lock()
+
+        def transport(_endpoint, body):
+            nonlocal active, max_active
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.02)
+            finally:
+                with lock:
+                    active -= 1
+            member = provider_members(payload)[0]
+            response = provider_response(payload)
+            day = member["time_span"]["start"][8:10]
+            response["activities"][0].update({
+                "object": f"Clockify item {day}",
+                "workstream": f"Clockify stream {day}",
+            })
+            return response
+
+        semantic.analyze_tiered(
+            [event(f"ev-{number}", f"2026-07-{10 + number:02d}") for number in range(6)],
+            primary=semantic.AnalyzerEndpoint("primary", "http://primary", "cheap"),
+            transport=transport,
+            max_events_per_chunk=1,
+            max_workers=2,
+        )
+
+        self.assertLessEqual(max_active, 2)
+        self.assertEqual(2, max_active)
+
+    def test_concurrent_refill_keeps_ordered_cache_replay_identical(self):
+        calls: list[int] = []
+
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            member = provider_members(payload)[0]
+            day = int(member["time_span"]["start"][8:10])
+            calls.append(day)
+            # Deliberately complete in reverse order. The result and replay
+            # must stay in source chunk order rather than completion order.
+            time.sleep(0.01 * (20 - day))
+            response = provider_response(payload)
+            response["activities"][0].update({
+                "object": f"Clockify item {day}",
+                "workstream": f"Clockify stream {day}",
+            })
+            return response
+
+        events = [event(f"ev-{number}", f"2026-07-{10 + number:02d}") for number in range(4)]
+        endpoint = semantic.AnalyzerEndpoint("primary", "http://primary", "cheap")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "analyzer-cache.jsonl"
+            first = semantic.analyze_tiered(
+                events,
+                primary=endpoint,
+                transport=transport,
+                cache=semantic.AnalyzerResponseCache(path),
+                max_events_per_chunk=1,
+                max_workers=2,
+            )
+            second = semantic.analyze_tiered(
+                events,
+                primary=endpoint,
+                transport=lambda *_: self.fail("cache replay called transport"),
+                cache=semantic.AnalyzerResponseCache(path),
+                max_events_per_chunk=1,
+                max_workers=2,
+            )
+
+        self.assertEqual([10, 11, 12, 13], sorted(calls))
+        first_without_cache_summary = dict(first)
+        second_without_cache_summary = dict(second)
+        first_without_cache_summary.pop("analyzer_cache")
+        second_without_cache_summary.pop("analyzer_cache")
+        self.assertEqual(first_without_cache_summary, second_without_cache_summary)
+        self.assertEqual(
+            first["analyzer_cache"]["records"],
+            second["analyzer_cache"]["records"],
+        )
+        self.assertEqual([1, 2, 3, 4], [item["chunk"] for item in first["analysis_chunks"]])
+
     def test_concurrent_extraction_probes_each_route_once(self):
         calls: list[tuple[str, str]] = []
         lock = threading.Lock()
@@ -1906,6 +2488,122 @@ class SemanticAnalyzerTests(unittest.TestCase):
         self.assertEqual(["ev-a", "ev-b"], result["activities"][0]["evidence_ids"])
         self.assertEqual("primary", result["activities"][0]["analyzer_tier"])
         self.assertEqual("cheap", result["activities"][0]["analyzer_model"])
+
+    def test_post_synthesis_semantics_receive_independent_flash_review(self):
+        calls: list[str] = []
+        taxonomy = [
+            {
+                "project_name": "Serenichron Level 2",
+                "prefix": "SC",
+                "tag_names": ["Processes"],
+                "billable": True,
+            },
+            {
+                "project_name": "Internal Level 2",
+                "prefix": "INT",
+                "tag_names": ["Administration"],
+                "billable": False,
+            },
+        ]
+
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            mode = payload["mode"]
+            calls.append(mode)
+            if mode == "extract":
+                return provider_response(payload)
+            if mode == "synthesize":
+                provisional = payload["provisional_activities"]
+                response = valid_response(provisional[0]["evidence_ids"][0])
+                response["activities"][0].update({
+                    "action": "Copied",
+                    "object": "raw transcript fragments",
+                    "outcome": "into one timesheet line",
+                    "evidence_ids": sorted(
+                        evidence_id
+                        for activity in provisional
+                        for evidence_id in activity["evidence_ids"]
+                    ),
+                    "evidence_spans": [
+                        span
+                        for activity in provisional
+                        for span in activity["evidence_spans"]
+                    ],
+                    "project_recommendation": {
+                        "name": "Internal Level 2",
+                        "prefix": "INT",
+                        "tag_names": ["Administration"],
+                    },
+                    "merge_rationale": "same workstream across two days",
+                })
+                return response
+
+            self.assertEqual("review", mode)
+            members = provider_members(payload)
+            response = provider_response(payload, members)
+            if len(members) == 2:
+                candidate_text = json.dumps(payload["candidate"], sort_keys=True)
+                self.assertNotIn("ev-a", candidate_text)
+                self.assertNotIn("ev-b", candidate_text)
+                self.assertNotIn("activity_id", candidate_text)
+                self.assertNotIn("evidence_ids", candidate_text)
+                self.assertNotIn("evidence_partitions", candidate_text)
+                self.assertEqual(
+                    "Copied",
+                    payload["candidate"]["activities"][0]["action"],
+                )
+                response["activities"][0].update({
+                    "action": "Reconciled",
+                    "object": "July work evidence",
+                    "outcome": "produced one invoice-ready accomplishment",
+                    "project_recommendation": {
+                        "name": "Serenichron Level 2",
+                        "prefix": "SC",
+                        "tag_names": ["Processes"],
+                    },
+                    "merge_rationale": (
+                        "same accomplishment supported across two days"
+                    ),
+                })
+            else:
+                response["activities"][0]["project_recommendation"] = {
+                    "name": "Serenichron Level 2",
+                    "prefix": "SC",
+                    "tag_names": ["Processes"],
+                }
+            return response
+
+        result = semantic.analyze_tiered(
+            [event("ev-a", "2026-07-10"), event("ev-b", "2026-07-11")],
+            primary=semantic.AnalyzerEndpoint(
+                "primary", "http://primary", "flash-review-test"
+            ),
+            transport=transport,
+            review_taxonomy=taxonomy,
+            max_workers=1,
+        )
+
+        self.assertEqual(
+            ["extract", "review", "extract", "review", "synthesize", "review"],
+            calls,
+        )
+        self.assertEqual(1, len(result["activities"]))
+        activity = result["activities"][0]
+        self.assertEqual("Reconciled", activity["action"])
+        self.assertEqual(
+            "Serenichron Level 2",
+            activity["project_recommendation"]["name"],
+        )
+        self.assertEqual(
+            "primary_post_synthesis_flash_review",
+            activity["analyzer_tier"],
+        )
+        self.assertEqual(
+            semantic.REVIEW_PROMPT_VERSION,
+            activity["review_prompt_version"],
+        )
 
     def test_generic_workstream_with_different_objects_skips_synthesis(self):
         calls: list[str] = []

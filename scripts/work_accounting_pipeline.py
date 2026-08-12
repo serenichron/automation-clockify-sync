@@ -8,6 +8,7 @@ inside the selected local run directory.
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
 import datetime as dt
 import hashlib
@@ -250,17 +251,6 @@ def _analysis_events(events: Iterable[dict[str, Any]]) -> tuple[list[dict[str, A
         source_type = str(event.get("source_type") or "")
         if source_type == "clockify":
             continue
-        if source_type == "repository_events":
-            # Git history is immutable corroboration, not proof that Vlad
-            # performed each commit. Repositories observed from a session CWD
-            # may include fetched upstream, dependency-bot, or autonomous-agent
-            # commits. Keep every commit in the evidence ledger, but do not let
-            # an unbound commit become a standalone timesheet activity.
-            noise.append({
-                "evidence_id": str(event.get("evidence_id")),
-                "reason": "corroborative_repository_evidence",
-            })
-            continue
         if source_type == "fathom":
             eligible, exclusion = _meeting_is_eligible(event)
             semantic_status = str(_attributes(event).get("semantic_evidence_status") or "")
@@ -335,16 +325,63 @@ def analyze_ledger(
     analyzer_target_body_bytes: int | None = None,
     analyzer_max_events_per_chunk: int | None = None,
     analyzer_workers: int | None = None,
+    review_taxonomy: list[dict[str, Any]] | None = None,
+    review_routing: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     known = {str(event.get("evidence_id")) for event in events}
     if analysis_fixture:
         fixture = _read_json(analysis_fixture)
-        return semantic_analyzer.validate_result(
+        raw_activities = fixture.get("activities", [])
+        reviewed = bool(raw_activities) and all(
+            isinstance(activity, Mapping)
+            and activity.get("semantic_reviewer_model")
+            for activity in raw_activities
+        )
+        result = semantic_analyzer.validate_result(
             fixture,
             known_evidence_ids=known,
             provider_model="fixture",
             analyzer_tier="fixture",
+            semantic_validation=not reviewed,
         )
+        if reviewed:
+            semantic_analyzer._validate_review_taxonomy(
+                result,
+                review_taxonomy or [],
+            )
+            provenance = {
+                tuple(sorted(str(value) for value in activity.get("evidence_ids", []))): {
+                    key: activity.get(key)
+                    for key in (
+                        "analyzer_model",
+                        "analyzer_tier",
+                        "analyzer_revision",
+                        "semantic_reviewer_model",
+                        "semantic_reviewer_revision",
+                        "review_prompt_version",
+                    )
+                }
+                for activity in raw_activities
+            }
+            for activity in result["activities"]:
+                activity.update(
+                    provenance.get(tuple(activity["evidence_ids"]), {})
+                )
+        # A completed semantic run is also a valid offline fixture. Preserve
+        # its replay identity metadata after revalidating the semantic rows;
+        # validate_result intentionally returns only the provider contract.
+        for key in (
+            "review_prompt_version",
+            "evidence_bundle_schema_version",
+            "evidence_bundle_manifest",
+            "ledger_event_count",
+            "ledger_evidence_digest",
+            "analysis_chunks",
+            "analyzer_cache",
+        ):
+            if key in fixture:
+                result[key] = copy.deepcopy(fixture[key])
+        return result
     primary = semantic_analyzer.AnalyzerEndpoint.from_env(
         "CLOCKIFY_ANALYZER_PRIMARY",
         default_model=semantic_analyzer.DEFAULT_PRIMARY_MODEL,
@@ -368,13 +405,138 @@ def analyze_ledger(
         }.items()
         if value is not None
     }
+    routing = dict(review_routing or {"session_routes": [], "meeting_routes": []})
+    if review_routing is None:
+        for choice in review_taxonomy or []:
+            for pattern in choice.get("selection_guidance", []):
+                routing["session_routes"].append({
+                    "pattern": pattern,
+                    "project_name": choice.get("project_name"),
+                    "prefix": choice.get("prefix"),
+                    "tag_names": choice.get("tag_names", []),
+                    "confidence": "medium",
+                })
+    hinted_events = _with_semantic_route_hints(events, routing)
     return semantic_analyzer.analyze_tiered(
-        events,
+        hinted_events,
         primary=primary,
         fallback=fallback,
         corrections=corrections,
         cache=cache,
+        review_taxonomy=review_taxonomy,
         **tuning,
+    )
+
+
+def _semantic_review_taxonomy(routing: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Expose only valid Clockify project/task choices to semantic review."""
+    choices: dict[tuple[str, str, tuple[str, ...]], dict[str, Any]] = {}
+    for section in ("session_routes", "meeting_routes"):
+        for route in routing.get(section, []):
+            if not isinstance(route, Mapping) or not route.get("project_name"):
+                continue
+            tag_names = tuple(sorted(str(value) for value in route.get("tag_names", [])))
+            key = (
+                str(route.get("project_name") or ""),
+                str(route.get("prefix") or "SC"),
+                tag_names,
+            )
+            choice = choices.setdefault(key, {
+                "project_name": key[0],
+                "prefix": key[1],
+                "tag_names": list(tag_names),
+                "billable": bool(route.get("billable", True)),
+                "selection_guidance": [],
+            })
+            guidance = choice["selection_guidance"]
+            for field in ("pattern", "email_domain", "title_regex"):
+                value = str(route.get(field) or "").strip()
+                if value and value not in guidance:
+                    guidance.append(value)
+    # Prefix overrides are billing-identification aliases, not new Clockify
+    # projects.  Expose every existing task type for the matched project so the
+    # Flash reviewer can select both the correct task and the required prefix.
+    base_choices = list(choices.values())
+    for override in routing.get("prefix_overrides", []):
+        if not isinstance(override, Mapping):
+            continue
+        project_prefix = str(override.get("project_name_prefix") or "").casefold()
+        prefix = str(override.get("prefix") or "").strip()
+        patterns = [str(value) for value in override.get("patterns", []) if str(value)]
+        if not project_prefix or not prefix or not patterns:
+            continue
+        for base in base_choices:
+            if not str(base["project_name"]).casefold().startswith(project_prefix):
+                continue
+            key = (
+                str(base["project_name"]),
+                prefix,
+                tuple(base["tag_names"]),
+            )
+            choices.setdefault(key, {
+                **base,
+                "prefix": prefix,
+                "selection_guidance": patterns,
+            })
+    for choice in choices.values():
+        choice["selection_guidance"].sort()
+    return [choices[key] for key in sorted(choices)]
+
+
+def _semantic_route_hint(
+    event: Mapping[str, Any], routing: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    record = _event_record(event)
+    if event.get("source_type") == "fathom":
+        candidate = collector.route_meeting(record, dict(routing))
+    else:
+        candidate = _route_session_record(record, routing)
+    action = str(candidate.get("action") or "")
+    if action == "ambiguous":
+        return None
+    if action == "skip":
+        return {
+            "action": "skip",
+            "reason": str(candidate.get("reason") or "local route excludes source"),
+        }
+    project_name = str(candidate.get("project_name") or "")
+    if not project_name:
+        return None
+    candidate = _apply_prefix_override(candidate, [event], routing)
+    return {
+        "action": "route",
+        "project_name": project_name,
+        "prefix": str(candidate.get("prefix") or "SC"),
+        "tag_names": sorted(str(value) for value in candidate.get("tag_names", [])),
+        "confidence": str(candidate.get("confidence") or "low"),
+    }
+
+
+def _with_semantic_route_hints(
+    events: list[dict[str, Any]], routing: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    hinted: list[dict[str, Any]] = []
+    for event in events:
+        copied = dict(event)
+        if hint := _semantic_route_hint(event, routing):
+            copied["semantic_route_hint"] = hint
+        hinted.append(copied)
+    return hinted
+
+
+def _route_session_record(
+    record: Mapping[str, Any], routing: Mapping[str, Any]
+) -> dict[str, Any]:
+    context = str(record.get("cwd") or record.get("path") or "")
+    normalized_context = re.sub(r"[^a-z0-9]+", "-", context.casefold()).strip("-")
+    labels = [
+        str(record.get("label") or ""),
+        str(record.get("title") or ""),
+        normalized_context,
+    ]
+    return collector.route_session(
+        {"label": " ".join(value for value in labels if value), "path": context},
+        dict(routing),
     )
 
 
@@ -389,6 +551,68 @@ def _routes_by_name(routing: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
             continue
         result.setdefault(str(route["project_name"]).casefold(), route)
     return result
+
+
+def _routes_by_selection(
+    routing: Mapping[str, Any],
+) -> dict[tuple[str, str, tuple[str, ...]], dict[str, Any]]:
+    result: dict[tuple[str, str, tuple[str, ...]], dict[str, Any]] = {}
+    for section in ("session_routes", "meeting_routes"):
+        for route in routing.get(section, []):
+            if not isinstance(route, dict) or not route.get("project_name"):
+                continue
+            key = (
+                str(route["project_name"]).casefold(),
+                str(route.get("prefix") or "SC"),
+                tuple(sorted(str(value) for value in route.get("tag_names", []))),
+            )
+            result.setdefault(key, route)
+            for override in routing.get("prefix_overrides", []):
+                if not isinstance(override, Mapping):
+                    continue
+                project_prefix = str(
+                    override.get("project_name_prefix") or ""
+                ).casefold()
+                prefix = str(override.get("prefix") or "").strip()
+                if project_prefix and prefix and key[0].startswith(project_prefix):
+                    result.setdefault(
+                        (key[0], prefix, key[2]),
+                        {
+                            **route,
+                            "base_prefix": str(route.get("prefix") or "SC"),
+                            "prefix": prefix,
+                        },
+                    )
+    return result
+
+
+def _apply_prefix_override(
+    route: Mapping[str, Any],
+    cited_events: list[Mapping[str, Any]],
+    routing: Mapping[str, Any],
+) -> dict[str, Any]:
+    selected = dict(route)
+    selected["prefix"] = str(
+        selected.pop("base_prefix", None) or selected.get("prefix") or "SC"
+    )
+    project_name = str(selected.get("project_name") or "").casefold()
+    searchable = " ".join(
+        json.dumps(_event_record(event), ensure_ascii=False, sort_keys=True)
+        for event in cited_events
+    ).casefold()
+    for override in routing.get("prefix_overrides", []):
+        if not isinstance(override, Mapping):
+            continue
+        project_prefix = str(override.get("project_name_prefix") or "").casefold()
+        patterns = [str(value).casefold() for value in override.get("patterns", [])]
+        if (
+            project_prefix
+            and project_name.startswith(project_prefix)
+            and any(pattern and pattern in searchable for pattern in patterns)
+        ):
+            selected["prefix"] = str(override.get("prefix") or selected["prefix"])
+            break
+    return selected
 
 
 def _event_record(event: Mapping[str, Any]) -> dict[str, Any]:
@@ -418,13 +642,7 @@ def resolve_route(
         if event.get("source_type") == "fathom":
             candidate = collector.route_meeting(record, dict(routing))
         else:
-            candidate = collector.route_session(
-                {
-                    "label": record.get("label") or record.get("title") or "",
-                    "path": record.get("path") or record.get("cwd") or "",
-                },
-                dict(routing),
-            )
+            candidate = _route_session_record(record, routing)
         if candidate.get("action") == "skip":
             skipped_routes.append(str(candidate.get("reason") or "deterministic route excluded source"))
             continue
@@ -451,6 +669,17 @@ def resolve_route(
 
     recommended = activity.get("project_recommendation") or {}
     recommended_name = str(recommended.get("name") or "").casefold()
+    recommended_tags = tuple(
+        sorted(str(value) for value in recommended.get("tag_names", []))
+    )
+    if activity.get("semantic_reviewer_model") and recommended_name:
+        recommended_prefix = str(recommended.get("prefix") or "SC")
+        reviewed_route = _routes_by_selection(routing).get(
+            (recommended_name, recommended_prefix, recommended_tags)
+        )
+        if reviewed_route is None:
+            return None, "Flash review selected an unavailable Clockify project/task type"
+        return _apply_prefix_override(reviewed_route, cited_events, routing), None
     named = _routes_by_name(routing).get(recommended_name) if recommended_name else None
     route = deterministic or named
     if route is None:
@@ -462,7 +691,7 @@ def resolve_route(
                 f"semantic project recommendation conflicts with deterministic route: "
                 f"{recommended.get('name')} vs {deterministic.get('project_name')}"
             )
-    return dict(route), None
+    return _apply_prefix_override(route, cited_events, routing), None
 
 
 def _existing_blocks(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -669,6 +898,9 @@ def _proposal(
             "burst_end": _iso(end),
             "evidence_ids": evidence_ids,
             "analyzer_model": activity.get("analyzer_model"),
+            "semantic_reviewer_model": activity.get("semantic_reviewer_model"),
+            "semantic_reviewer_revision": activity.get("semantic_reviewer_revision"),
+            "review_prompt_version": activity.get("review_prompt_version"),
             "prompt_version": activity.get("prompt_version"),
             "schema_version": activity.get("schema_version"),
         },
@@ -689,12 +921,25 @@ def run_accounting(
     ledger_path = run_dir / "evidence" / "evidence-ledger.json"
     ledger, all_events = load_ledger(ledger_path)
     completeness = ledger.manifest.document().get("source_completeness", {})
-    if completeness.get("status") != "complete":
-        missing = ", ".join(completeness.get("incomplete_sources", [])) or "unknown"
+    incomplete = [str(value) for value in completeness.get("incomplete_sources", [])]
+    coordinator = os.environ.get(
+        "CLOCKIFY_AUTOPILOT_COORDINATOR", "omarchy-precision"
+    ).strip()
+    required = {"clockify", "fathom", "multica_issues"}
+    hard_missing = [
+        source
+        for source in incomplete
+        if source in required
+        or source in {f"sessions/{coordinator}", f"repositories/{coordinator}"}
+        or not source.startswith(("sessions/", "repositories/"))
+    ]
+    if hard_missing:
+        missing = ", ".join(hard_missing) or "unknown"
         raise WorkAccountingError(
-            f"evidence ledger is incomplete; semantic accounting is blocked: {missing}"
+            f"required evidence is incomplete; semantic accounting is blocked: {missing}"
         )
     analysis_events, noise = _analysis_events(all_events)
+    routing = _read_json(root / "routing.json")
     corrections = _load_corrections(corrections_path)
     regression_cases = _load_regression_cases(corrections_path)
     _write_json(run_dir / "review-learning-cases.json", corrections)
@@ -707,6 +952,8 @@ def run_accounting(
         analyzer_target_body_bytes=analyzer_target_body_bytes,
         analyzer_max_events_per_chunk=analyzer_max_events_per_chunk,
         analyzer_workers=analyzer_workers,
+        review_taxonomy=_semantic_review_taxonomy(routing),
+        review_routing=routing,
     )
     analysis.setdefault("ledger_event_count", len(analysis_events))
     analysis.setdefault("ledger_evidence_digest", semantic_analyzer.stable_digest(
@@ -723,7 +970,6 @@ def run_accounting(
     analysis["noise_classifications"] = noise
     _write_json(run_dir / "semantic-analysis.json", analysis)
 
-    routing = _read_json(root / "routing.json")
     events_by_id = {str(event["evidence_id"]): event for event in all_events}
     existing = _existing_blocks(all_events)
     fathom = _fathom_events(all_events)
@@ -845,23 +1091,35 @@ def run_accounting(
         if route_error or route is None:
             ambiguous.append({"id": activity_id, "reason": route_error, "exception_kind": "routing", "evidence_ids": evidence_ids})
             continue
-        rendered = caveman_renderer.try_render(
-            {
-                "prefix": str(route.get("prefix") or "SC"),
-                "action": activity.get("action"),
-                "object": activity.get("object"),
-                "outcome": activity.get("outcome"),
-            }
-        )
-        if not rendered.ok:
-            ambiguous.append({
-                "id": activity_id,
-                "reason": str(rendered.error),
-                "exception_kind": "description_contract",
-                "evidence_ids": evidence_ids,
-            })
-            continue
-        description = str(rendered.description)
+        if activity.get("semantic_reviewer_model"):
+            # The independent Flash reviewer owns semantic clarity and useful
+            # wording. Python only assembles its reviewed fields with the
+            # authoritative route prefix; it does not overrule the review with
+            # grammar heuristics.
+            description = (
+                f"{str(route.get('prefix') or 'SC')} — "
+                f"{str(activity.get('action') or '')} "
+                f"{str(activity.get('object') or '')} "
+                f"{str(activity.get('outcome') or '')}"
+            ).strip()
+        else:
+            rendered = caveman_renderer.try_render(
+                {
+                    "prefix": str(route.get("prefix") or "SC"),
+                    "action": activity.get("action"),
+                    "object": activity.get("object"),
+                    "outcome": activity.get("outcome"),
+                }
+            )
+            if not rendered.ok:
+                ambiguous.append({
+                    "id": activity_id,
+                    "reason": str(rendered.error),
+                    "exception_kind": "description_contract",
+                    "evidence_ids": evidence_ids,
+                })
+                continue
+            description = str(rendered.description)
         activity["rendered_description"] = description
         meeting_events = [event for event in cited if event.get("source_type") == "fathom"]
         if lifecycle == "meeting" or meeting_events:
@@ -1055,6 +1313,14 @@ def run_accounting(
         ],
         "correction_regression": correction_regression,
         "external_writes": False,
+        "coverage_warnings": [
+            {
+                "source": source,
+                "reason": "peer evidence unavailable; interval retained for later backfill",
+            }
+            for source in incomplete
+            if source not in hard_missing
+        ],
     }
     # The initial analyzer artifact is written before deterministic routing and
     # rendering so failures remain inspectable. Rewrite it with the final

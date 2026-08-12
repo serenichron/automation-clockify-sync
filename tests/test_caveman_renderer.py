@@ -15,6 +15,26 @@ SPEC.loader.exec_module(renderer)
 
 
 class CavemanRendererTests(unittest.TestCase):
+    def test_portfolio_mode_allows_named_technical_slashes_but_not_paths(self):
+        self.assertEqual(
+            "SC — Configured Sol/Terra routing for reliable delegated execution",
+            renderer.validate_description(
+                "SC — Configured Sol/Terra routing for reliable delegated execution",
+                allow_compact_technical_slashes=True,
+            ),
+        )
+        with self.assertRaisesRegex(renderer.CavemanValidationError, "path"):
+            renderer.validate_description(
+                "SC — Reviewed /Users/private/session output for invoice preparation",
+                allow_compact_technical_slashes=True,
+            )
+        self.assertEqual(
+            "SC — Fixed exec_command routing and prepared handoff prompt",
+            renderer.validate_description(
+                "SC — Fixed exec_command routing and prepared handoff prompt",
+                allow_compact_technical_underscores=True,
+            ),
+        )
     def test_representative_examples_follow_the_contract(self):
         cases = [
             (

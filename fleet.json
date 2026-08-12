@@ -1,5 +1,7 @@
 {
   "ssh_options": [
+    "-F",
+    "/dev/null",
     "-o",
     "ConnectTimeout=10",
     "-o",
@@ -29,7 +31,7 @@
       "hermes_sessions": "/home/blackthorne/.hermes/sessions",
       "hermes_db": "/home/blackthorne/.hermes/state.db",
       "codex_home": "/home/blackthorne/.codex",
-      "collector_root": "/home/blackthorne/Work/serenichron/automation/clockify-sync",
+      "collector_root": "/home/blackthorne/Work/automation-clockify-sync",
       "enabled": true
     },
     {
@@ -40,7 +42,7 @@
       "hermes_sessions": "/home/blackthorne/.hermes/sessions",
       "hermes_db": "/home/blackthorne/.hermes/state.db",
       "codex_home": "/home/blackthorne/.codex",
-      "collector_root": "/home/blackthorne/Work/serenichron/automation/clockify-sync",
+      "collector_root": "/home/blackthorne/Work/automation-clockify-sync",
       "enabled": true
     }
   ]

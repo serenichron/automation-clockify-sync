@@ -27,8 +27,9 @@ complete process:
 2. write and validate an immutable, content-addressed evidence ledger;
 3. classify noise and reconstruct atomic semantic accomplishments with a
    tiered analyzer;
-4. route projects deterministically and render Caveman descriptions targeting
-   8–14 words, with a five-word hard floor for complete atomic examples;
+4. use an independent Flash review to select a configured project/task and
+   render Caveman descriptions targeting 8–14 words, while local code verifies
+   taxonomy membership and structural safety;
 5. allocate active effort around fixed Clockify and Fathom blocks without
    overlap, gap filling, overnight bridging, or silent trimming;
 6. validate quality and ingest stable review identities; shadow evaluation
@@ -36,9 +37,50 @@ complete process:
    deltas. Exceptions-only operation is not activated until its measured gates
    pass.
 
+For month-scale recovery, `scripts/clockify_portfolio_review.py` adds a bounded
+second pass over already reviewed, successfully allocated activities. It groups
+only one project/day portfolio at a time and asks the pinned Flash model to turn
+message-level commands, checks, fixes, tests, and follow-ups into invoice-worthy
+accomplishments. A separate Flash call then validates client/project level, task
+type, effort, consolidation boundary, and Caveman wording against the same raw
+evidence. The stage retains the original non-overlapping allocation segments,
+never fills gaps, writes progress to `portfolio-status.json`, and stores both
+model decisions in an append-only cache. `scripts/clockify_portfolio_quality.py`
+performs only structural/integrity checks and identifies rows requiring another
+semantic repair; it does not replace the Flash validator with local semantics.
+
 It prints the absolute path to `autopilot-result.json`. Lower-level commands
 remain available for targeted diagnosis. Calendly is intentionally outside the
 current process.
+
+## Guarded Google Sheet publication
+
+Google Sheet publication is a separate post-review stage. It is never invoked
+by collection, analysis, quality checks, replay, or the scheduled service. Run
+it only after the source quality report and immutable replay both pass and a
+human board instruction explicitly authorizes the named workbook and interval:
+
+```bash
+python3 scripts/clockify_sheet_publish.py \
+  --spreadsheet-id <approved-spreadsheet-id> \
+  --sheet-title "August 2026 review" \
+  --template-title Proposals \
+  --proposals /absolute/path/to/source-run/proposals.json \
+  --quality-report /absolute/path/to/source-run/quality_report.json \
+  --replay-integrity /absolute/path/to/replay-run/replay-integrity.json \
+  --run-id <source-run-id> \
+  --enable-write
+```
+
+Without `--enable-write`, the command validates the artifacts and emits a
+no-write preview. The write path verifies the proposal count, quality status,
+replay status, replay/source identity, and unique stable activity-segment IDs.
+It creates the named month tab from the hidden `Proposals` template when
+needed, displays duration as integer minutes, and appends only new stable IDs.
+For existing IDs it updates machine-owned evidence fields while preserving the
+human-owned `Disposition`, `Review Status`, and `Review Notes` cells. It never
+calls Clockify. Later intervals in the same month use the same command and tab;
+already published stable IDs are not duplicated.
 
 Outputs:
 
@@ -69,6 +111,12 @@ Outputs:
 - `runs/<run-id>/autopilot-summary.md`: compact new/changed or coverage summary;
 - `runs/<run-id>/review-current.csv`: stable-ID export of the complete active
   review for local inspection or an explicitly approved Sheet patch;
+- `runs/<portfolio-run-id>/portfolio-review.csv`: locally consolidated,
+  invoice-reviewable activities with their original allocation segments;
+- `runs/<portfolio-run-id>/portfolio-status.json`: model/revision-bound progress
+  for resumable desktop execution;
+- `runs/<portfolio-run-id>/portfolio-quality.json`: overlap, provenance,
+  forbidden-content, duration, and semantic-repair findings;
 - `state/review-items.json`: mutable local review state, intentionally ignored
   by Git;
 - `state/review-corrections.jsonl`: immutable evidence-bound approve, skip, and
@@ -76,8 +124,11 @@ Outputs:
 - `state/review-acceptance.jsonl`: integrity-linked shadow/guarded period
   evidence controlling exceptions-only eligibility, intentionally ignored by Git.
 
-Models propose semantics only. Deterministic code owns evidence identity,
-project routing, descriptions, time allocation, review identity, and safety.
+Flash analysis and a separate Flash reviewer own semantic classification,
+project/task recommendations, consolidation boundaries, effort judgment, and
+human-readable wording. Deterministic code owns evidence identity, exact taxonomy
+membership, non-overlapping placement, review identity, integrity, and safety; it
+does not discard a plausible activity through a grammar-only semantic validator.
 Raw evidence may overlap; proposed and existing Clockify allocations may not.
 Each activity carries minimum, recommended, and maximum active-effort estimates,
 with the recommended estimate normalized to five-minute timesheet granularity.
@@ -131,13 +182,17 @@ partition recovery below even when the primary is the only qualified route. Conf
 low-confidence claims that remain unresolved become explicit exceptions, never
 proposals.
 
-The required primary is `deepseek-v4-flash:0731-cloud`, whose manifest must resolve
-to `remote_model: deepseek-v4-flash:0731`. The generic
-`deepseek-v4-flash:cloud` alias currently resolves to the older `:preview` model
-and is not approved. The pinned 0731 release must pass the v16 synthetic route gate. Every
-live cloud route must include the resolved 64-character model revision so the
+The required primary is the generic `deepseek-v4-flash:cloud` alias, which Ollama
+now defaults to the July 31 Flash release. Every live run must additionally pin
+the approved 64-character release revision
+`d3f1c87447216481a8001f48c517a51e13bfb141853a8df5e52f81bf765dabc3` so the
 scorecard, analyzer cache, semantic run, and replay cannot silently mix model
-releases. `deepseek-v4-pro:cloud` is not an approved route for this process.
+releases if the alias moves later. The equivalent explicit tag
+`deepseek-v4-flash:0731-cloud` remains accepted for old sealed decisions. The
+exact model tag is part of each cache route identity, so an in-progress sealed
+run must retain the tag it started with rather than migrating accepted decisions
+to an alias. The release must pass the v17 synthetic route gate.
+`deepseek-v4-pro:cloud` is not an approved route for this process.
 
 Analyzer requests retain the fail-closed 1,450,000-byte hard ceiling. Normal
 extraction uses a 250,000-byte and 250-event operational target with four
@@ -251,6 +306,15 @@ A currently running Clockify entry is represented as an existing fixed block
 only through the earlier of the collection snapshot and the requested end. Its
 temporary boundary remains explicit provenance. If any running entry cannot be
 bounded safely, Clockify coverage stays partial and accounting fails closed.
+
+`state/source-coverage.json` retains per-peer coverage debt. If MacBook or
+desktop collection is unavailable, the current run still analyzes complete
+Precision and central evidence, and records the missed interval instead of
+treating it as zero work. The next scheduled run expands its whole collection
+window to the earliest debt date, which also expands Clockify and Fathom fixed
+blocks for safe deduplication and allocation. Successful recollection clears a
+source only when the expanded window reaches that source's original debt date;
+retry exhaustion never erases debt.
 
 `review-snapshot.json` categorizes items as `new`, `changed`,
 `carried_pending`, or `resolved_disappeared`. A zero-candidate run never closes
@@ -400,40 +464,71 @@ still requires full-denominator human dispositions and the measured acceptance
 thresholds. Neither a probe nor a passing synthetic scorecard authorizes
 private-text egress.
 
-## Durable Precision execution
+## Durable host execution
 
-Month-scale accounting must run under the Precision user service, not an SSH
-foreground process. `scripts/clockify_accounting_runner.py` holds a nonblocking
+Month-scale accounting and scheduled reviews run under an available host user service, not an SSH
+foreground process or a Codex/terminal session.
+`scripts/clockify_accounting_runner.py` holds a nonblocking
 single-instance lock, resumes the append-only analyzer cache, and atomically
 writes `runner-status.json` with only lifecycle metadata. It never serializes
 the analyzer environment or credentials. Accounting artifacts are atomically
 published before the validated `work-accounting-result.json` completion marker;
 the runner trusts that marker only when the complete required artifact set is
 present. A completed result is idempotent and will not be recomputed.
+Before starting, the runner also requires the approved Flash model and release
+revision. A nonempty cache is sealed to exactly one model tag; changing an
+in-progress explicit-tag run to the generic alias, or presenting a mixed-model
+cache, fails closed before any provider request. The safe model and revision are
+recorded in lifecycle status so host drift can be audited without exposing a key.
 
-The reviewed unit is `ops/systemd/clockify-work-accounting.service`. Install it
+The reviewed unit is `ops/systemd/clockify-work-accounting.service`. Its
+`clockify_autopilot_runner.py` entrypoint runs the complete review process,
+writes compact durable status, and returns exit 75 only for incomplete source
+peer coverage. Complete Precision and central evidence still produces review
+proposals plus a `coverage_warning`. systemd then recollects after one hour, bounded by
+`CLOCKIFY_AUTOPILOT_MAX_COVERAGE_RETRIES`; configuration and integrity exit 2
+still fail closed without looping. After retry exhaustion, durable source debt
+remains and the next primary schedule tries the expanded interval again. Install it
 as `~/.config/systemd/user/clockify-work-accounting.service`, create the private
 mode-0600 environment file from
 `ops/systemd/clockify-work-accounting.env.example`, and enable user lingering on
-Precision so the unit survives SSH/Mac disconnection and Precision reboot. The
+Precision so the unit survives SSH/Mac/desktop disconnection and Precision
+reboot. The
 unit clears all inherited fallback-route variables so this validation can use
 only the approved pinned Flash route. It restarts unexpected crashes, but
 `RestartPreventExitStatus=2` prevents a known fail-closed configuration,
 authentication, integrity, or route error from looping indefinitely. Logs remain
 in the Precision user journal.
 
+When the desktop is unavailable, macOS can run the same guarded runner through
+`ops/launchd/com.serenichron.clockify-work-accounting.plist` and
+`ops/launchd/clockify-work-accounting.sh`. The wrapper reads the same private
+mode-0600 environment contract, clears every fallback route, restarts unexpected
+crashes, and maps the runner's intentional exit `2` to a clean launchd exit so a
+known authorization, integrity, configuration, or route block cannot create a
+restart loop. Install or load this agent only under separate approval; keeping
+the reviewed files in the repository does not activate it.
+
 ## Safety contract
 
 - Collector, quality, and review-state steps do not write to Clockify.
-- Missing analyzer configuration, incomplete canonical remote evidence, invalid
+- Missing analyzer configuration, incomplete required central or Precision
+  evidence, invalid
   correction logs, title-only meetings, and contract failures block or become
   explicit exceptions; they never become invented work.
+- Missing non-coordinator peer evidence becomes durable coverage debt and a
+  warning; it does not suppress proposals supported by complete sources.
+- EmblemStudio work uses the applicable Serenichron project and task type, with
+  `ES —` instead of the ordinary `SC —` description prefix.
 - Private semantic prose cannot reach a configured analyzer unless
   `CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED=approved` is explicitly present at
   runtime; route-probe success is not privacy approval.
 - A blocked accounting stage still writes its local action contract and exits
   nonzero so schedulers cannot mistake it for a healthy run.
 - The quality command never updates Google Sheets or any other external system.
+- The Sheet publisher requires an explicit `--enable-write`, a passing quality
+  report, a passing immutable replay for the same source run, and a separately
+  approved workbook/interval. It preserves human decision cells by stable ID.
 - Clockify posting requires an explicit board decision for each stable review
   item.
 - Sheet synchronization, Multica issue mutation, schedule changes, deployment,

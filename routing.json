@@ -2,6 +2,17 @@
   "timezone": "Europe/Bucharest",
   "clockify_user_id": "5f5b5121a551633f6dfa31e6",
   "default_since_policy": "one_day_before_latest_clockify_entry",
+  "prefix_overrides": [
+    {
+      "project_name_prefix": "Serenichron",
+      "patterns": [
+        "emblem-studio",
+        "emblemstudio",
+        "master-emblem-studio"
+      ],
+      "prefix": "ES"
+    }
+  ],
   "safety": {
     "post_clockify_unattended": false,
     "mutate_downstream_multica_issues_unattended": false,

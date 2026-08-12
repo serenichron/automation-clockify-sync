@@ -396,13 +396,35 @@ def _ledger_identity(run_dir: Path) -> dict[str, str]:
     }
 
 
+def _accounting_identity(run_dir: Path) -> dict[str, str]:
+    """Return the exact completion-marker identity used by immutable replay.
+
+    The accounting result is the deterministic allocation/reconciliation
+    outcome, not merely a convenient summary.  A replay which changes it must
+    fail even if the upstream ledger and cached model decisions agree.
+    """
+    path = run_dir / "work-accounting-result.json"
+    document = _read_json(path)
+    if not isinstance(document, dict) or document.get("schema_version") != 1:
+        raise ValueError(f"invalid work accounting result: {path}")
+    if document.get("allocation_mode") != "non_overlapping_v1":
+        raise ValueError(f"work accounting result has invalid allocation mode: {path}")
+    return {"file_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
 def _prepare_replay_run(source: Path) -> Path:
-    """Create a distinct run that reuses only one immutable collected ledger."""
+    """Create a distinct run with immutable ledger and semantic fixture copies."""
     source = _run_child(source, label="replay source")
-    for required in ("run-report.json", "run-report.md", "semantic-analysis.json"):
+    for required in (
+        "run-report.json", "run-report.md", "semantic-analysis.json",
+        "work-accounting-result.json",
+    ):
         if not (source / required).is_file():
             raise ValueError(f"replay source is incomplete; missing {source / required}")
     source_identity = _ledger_identity(source)
+    source_accounting_identity = _accounting_identity(source)
+    source_analysis_path = source / "semantic-analysis.json"
+    source_analysis_sha256 = hashlib.sha256(source_analysis_path.read_bytes()).hexdigest()
     stem = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ") + f"-replay-{source.name}"
     target = RUNS.resolve() / stem
     suffix = 1
@@ -415,6 +437,9 @@ def _prepare_replay_run(source: Path) -> Path:
             source / "evidence" / "evidence-ledger.json",
             target / "evidence" / "evidence-ledger.json",
         )
+        fixture_path = target / "replay-fixture" / "semantic-analysis.json"
+        fixture_path.parent.mkdir(parents=True)
+        shutil.copyfile(source_analysis_path, fixture_path)
         report = _read_json(source / "run-report.json")
         if not isinstance(report, dict):
             raise ValueError("replay source run report must be an object")
@@ -432,14 +457,44 @@ def _prepare_replay_run(source: Path) -> Path:
                 "source_manifest_id": source_identity["manifest_id"],
                 "source_events_digest": source_identity["events_digest"],
                 "ledger_file_sha256": source_identity["file_sha256"],
+                "semantic_analysis_sha256": source_analysis_sha256,
+                "semantic_analysis_fixture": str(fixture_path.relative_to(target)),
+                "work_accounting_result_sha256": source_accounting_identity["file_sha256"],
             },
         )
         if _ledger_identity(target) != source_identity:
             raise ValueError("replay ledger copy does not match its immutable source")
+        if hashlib.sha256(fixture_path.read_bytes()).hexdigest() != source_analysis_sha256:
+            raise ValueError("replay semantic analysis fixture copy does not match its immutable source")
         return target
     except Exception:
         shutil.rmtree(target, ignore_errors=True)
         raise
+
+
+def _replay_analysis_fixture(source: Path, replay: Path) -> Path:
+    """Resolve and verify the sealed offline analyzer fixture for a replay."""
+    source = _run_child(source, label="replay source")
+    replay = _run_child(replay, label="replay run")
+    provenance = _read_json(replay / "replay-source.json")
+    if not isinstance(provenance, dict):
+        raise ValueError("replay source provenance must be an object")
+    relative = str(provenance.get("semantic_analysis_fixture") or "")
+    expected = str(provenance.get("semantic_analysis_sha256") or "")
+    if not relative or len(expected) != 64:
+        raise ValueError("replay semantic analysis fixture identity is incomplete")
+    fixture = (replay / relative).resolve()
+    try:
+        fixture.relative_to(replay)
+    except ValueError as exc:
+        raise ValueError("replay semantic analysis fixture escapes the replay run") from exc
+    if not fixture.is_file():
+        raise ValueError("replay semantic analysis fixture is missing")
+    source_digest = hashlib.sha256((source / "semantic-analysis.json").read_bytes()).hexdigest()
+    fixture_digest = hashlib.sha256(fixture.read_bytes()).hexdigest()
+    if source_digest != expected or fixture_digest != expected:
+        raise ValueError("replay semantic analysis fixture differs from its immutable source")
+    return fixture
 
 
 def _analysis_versions(document: dict[str, Any]) -> list[str]:
@@ -571,6 +626,8 @@ def _verify_replay_integrity(source: Path, replay: Path) -> dict[str, Any]:
     replay = _run_child(replay, label="replay run")
     source_identity = _ledger_identity(source)
     replay_identity = _ledger_identity(replay)
+    source_accounting_identity = _accounting_identity(source)
+    replay_accounting_identity = _accounting_identity(replay)
     source_analysis = _read_json(source / "semantic-analysis.json")
     replay_analysis = _read_json(replay / "semantic-analysis.json")
     if not isinstance(source_analysis, dict) or not isinstance(replay_analysis, dict):
@@ -594,6 +651,8 @@ def _verify_replay_integrity(source: Path, replay: Path) -> dict[str, Any]:
         failures.append("validated analyzer cache decisions differ")
     if source_bundle_identity != replay_bundle_identity:
         failures.append("semantic evidence bundle manifest differs")
+    if source_accounting_identity != replay_accounting_identity:
+        failures.append("work accounting result differs")
     report: dict[str, Any] = {
         "schema_version": 1,
         "status": "pass" if not failures else "blocked",
@@ -604,6 +663,7 @@ def _verify_replay_integrity(source: Path, replay: Path) -> dict[str, Any]:
         "analyzer_versions": [json.loads(value) for value in replay_versions],
         "analyzer_cache_records": replay_cache_records,
         "evidence_bundle_manifest": replay_bundle_identity,
+        "work_accounting_result": replay_accounting_identity,
         "failures": failures,
     }
     report["integrity_digest"] = "sha256:" + hashlib.sha256(
@@ -656,9 +716,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    if args.replay_from and (args.since or args.until or args.no_enrich):
+    if args.replay_from and (
+        args.since or args.until or args.no_enrich or args.analysis_fixture
+    ):
         print(
-            "clockify review run: --replay-from cannot be combined with collection range/enrichment options",
+            "clockify review run: --replay-from cannot be combined with collection "
+            "range/enrichment options or --analysis-fixture",
             file=sys.stderr,
         )
         return 2
@@ -689,10 +752,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     replay_source: Path | None = None
+    replay_analysis_fixture: Path | None = None
     if args.replay_from:
         try:
             replay_source = _run_child(args.replay_from, label="replay source")
             run_dir = _prepare_replay_run(replay_source)
+            replay_analysis_fixture = _replay_analysis_fixture(replay_source, run_dir)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             print(f"clockify review run: cannot prepare immutable replay: {exc}", file=sys.stderr)
             return 2
@@ -729,8 +794,9 @@ def main(argv: list[str] | None = None) -> int:
         "--analyzer-cache",
         str(args.analyzer_cache or (args.state.parent / "analyzer-cache-v2.jsonl")),
     ]
-    if args.analysis_fixture:
-        accounting_command.extend(["--analysis-fixture", str(args.analysis_fixture)])
+    analysis_fixture = replay_analysis_fixture or args.analysis_fixture
+    if analysis_fixture:
+        accounting_command.extend(["--analysis-fixture", str(analysis_fixture)])
     for option, value in (
         ("--analyzer-target-body-bytes", args.analyzer_target_body_bytes),
         ("--analyzer-max-events-per-chunk", args.analyzer_max_events_per_chunk),

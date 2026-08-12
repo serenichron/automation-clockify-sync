@@ -20,6 +20,13 @@ from typing import Mapping
 
 SCHEMA_VERSION = "clockify-accounting-runner/v1"
 RESULT_SCHEMA_VERSION = 1
+APPROVED_FLASH_MODELS = {
+    "deepseek-v4-flash:cloud",
+    "deepseek-v4-flash:0731-cloud",
+}
+APPROVED_FLASH_REVISION = (
+    "d3f1c87447216481a8001f48c517a51e13bfb141853a8df5e52f81bf765dabc3"
+)
 REQUIRED_RESULT_ARTIFACTS = (
     "semantic-analysis.json",
     "allocation-report.json",
@@ -33,6 +40,44 @@ REQUIRED_RESULT_ARTIFACTS = (
 
 class RunnerConfigurationError(ValueError):
     """The runner environment is absent or unsafe."""
+
+
+def _validated_analyzer_route(
+    environment: Mapping[str, str], cache: Path
+) -> dict[str, str]:
+    """Return the approved route and reject model drift in a sealed cache."""
+    model = str(environment.get("CLOCKIFY_ANALYZER_PRIMARY_MODEL") or "").strip()
+    revision = str(
+        environment.get("CLOCKIFY_ANALYZER_PRIMARY_REVISION") or ""
+    ).strip()
+    if model not in APPROVED_FLASH_MODELS:
+        raise RunnerConfigurationError(
+            "CLOCKIFY_ANALYZER_PRIMARY_MODEL must be an approved Flash route"
+        )
+    if revision != APPROVED_FLASH_REVISION:
+        raise RunnerConfigurationError(
+            "CLOCKIFY_ANALYZER_PRIMARY_REVISION must match the approved Flash release"
+        )
+    if cache.is_file():
+        cached_models: set[str] = set()
+        try:
+            with cache.open(encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    record = json.loads(line)
+                    cached_model = str(record.get("model") or "").strip()
+                    if cached_model:
+                        cached_models.add(cached_model)
+        except (OSError, json.JSONDecodeError, AttributeError) as exc:
+            raise RunnerConfigurationError(
+                "CLOCKIFY_ACCOUNTING_CACHE metadata is invalid"
+            ) from exc
+        if cached_models and cached_models != {model}:
+            raise RunnerConfigurationError(
+                "CLOCKIFY_ACCOUNTING_CACHE is sealed to a different or mixed model tag"
+            )
+    return {"model": model, "revision": revision}
 
 
 def _iso_now() -> str:
@@ -83,6 +128,7 @@ def build_command(
     root = _required_path(environment, "CLOCKIFY_ACCOUNTING_ROOT")
     run_dir = _required_path(environment, "CLOCKIFY_ACCOUNTING_RUN_DIR")
     cache = _required_path(environment, "CLOCKIFY_ACCOUNTING_CACHE")
+    _validated_analyzer_route(environment, cache)
     status = _optional_absolute_path(
         environment,
         "CLOCKIFY_ACCOUNTING_STATUS",
@@ -164,6 +210,10 @@ def run(environment: Mapping[str, str] | None = None) -> int:
         "run_dir": str(run_dir),
         "cache": str(cache),
         "command_digest": _command_digest(command),
+        "analyzer_route": {
+            "model": str(environment["CLOCKIFY_ANALYZER_PRIMARY_MODEL"]),
+            "revision": str(environment["CLOCKIFY_ANALYZER_PRIMARY_REVISION"]),
+        },
     }
     if final_result := _complete_result(run_dir):
         _atomic_write(status, {

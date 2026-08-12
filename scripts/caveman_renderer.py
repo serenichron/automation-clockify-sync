@@ -40,7 +40,7 @@ _SHELL_COMMAND_RE = re.compile(
     re.I,
 )
 _PROMPT_OR_RULE_RE = re.compile(
-    r"\b(?:system|user|assistant)\s+(?:prompt|message)\b|\btool\s+call\b|\bprompt\b|\b(?:follow|obey)\s+(?:these\s+)?(?:rules?|instructions?)\b|\b(?:must|should)\s+(?:not\s+)?(?:always|never)\b",
+    r"\b(?:system|user|assistant)\s+(?:prompt|message)\b|\btool\s+call\b|\b(?:follow|obey)\s+(?:these\s+)?(?:rules?|instructions?)\b|\b(?:must|should)\s+(?:not\s+)?(?:always|never)\b",
     re.I,
 )
 _STATUS_DUMP_RE = re.compile(
@@ -52,6 +52,10 @@ _EVIDENCE_DUMP_RE = re.compile(
     r"trace\s+ids?|log\s+dump|artifact\s+(?:ids?|paths?)|source\s+ids?)\b",
     re.I,
 )
+_COMPACT_TECHNICAL_SLASH_RE = re.compile(
+    r"\b(?:[A-Za-z0-9][A-Za-z0-9_-]*)(?:/[A-Za-z0-9][A-Za-z0-9_-]*)+\b"
+)
+_COMPACT_TECHNICAL_UNDERSCORE_RE = re.compile(r"(?<=\w)_(?=\w)")
 
 _FORBIDDEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("NEEDS REVIEW marker", re.compile(r"\bneeds[\s\u00a0\u2000-\u200b\u202f\u205f\u3000_-]+review\b", re.I)),
@@ -91,7 +95,13 @@ def _parts(value: CavemanParts | Mapping[str, Any]) -> CavemanParts:
     )
 
 
-def validate_description(description: str) -> str:
+def validate_description(
+    description: str,
+    *,
+    max_words: int = 14,
+    allow_compact_technical_slashes: bool = False,
+    allow_compact_technical_underscores: bool = False,
+) -> str:
     """Validate an already-rendered description without rewriting it."""
     if not isinstance(description, str) or not description:
         raise CavemanValidationError("description must be a non-empty string")
@@ -105,25 +115,43 @@ def validate_description(description: str) -> str:
     if not body or not re.match(r"^[A-Z]", body):
         raise CavemanValidationError("body must begin with a capitalized verb")
     for label, pattern in _FORBIDDEN_PATTERNS:
-        if pattern.search(description):
+        inspected = (
+            _COMPACT_TECHNICAL_SLASH_RE.sub("TechnicalPair", description)
+            if label == "path" and allow_compact_technical_slashes
+            else _COMPACT_TECHNICAL_UNDERSCORE_RE.sub("", description)
+            if label == "Markdown" and allow_compact_technical_underscores
+            else description
+        )
+        if pattern.search(inspected):
             raise CavemanValidationError(f"description contains forbidden {label}")
     body_words = re.findall(r"\b[\w'-]+\b", body)
     if any(left.casefold() == right.casefold() for left, right in zip(body_words, body_words[1:])):
         raise CavemanValidationError("description contains adjacent repeated words")
     word_count = len(re.findall(r"\b[\w'-]+\b", description))
-    if not 5 <= word_count <= 14:
+    if not 5 <= word_count <= max_words:
         raise CavemanValidationError(
-            f"description has {word_count} words; expected hard bounds 5–14 "
-            "with an 8–14 word target"
+            f"description has {word_count} words; expected hard bounds 5–{max_words} "
+            f"with an 8–{max_words} word target"
         )
     return description
 
 
-def render_caveman_description(value: CavemanParts | Mapping[str, Any]) -> str:
+def render_caveman_description(
+    value: CavemanParts | Mapping[str, Any],
+    *,
+    max_words: int = 14,
+    allow_compact_technical_slashes: bool = False,
+    allow_compact_technical_underscores: bool = False,
+) -> str:
     """Render exact provided semantics or fail; never truncate or embellish them."""
     parts = _parts(value)
     description = f"{parts.prefix} — {parts.action} {parts.object} {parts.outcome}"
-    return validate_description(description)
+    return validate_description(
+        description,
+        max_words=max_words,
+        allow_compact_technical_slashes=allow_compact_technical_slashes,
+        allow_compact_technical_underscores=allow_compact_technical_underscores,
+    )
 
 
 def try_render_caveman_description(value: CavemanParts | Mapping[str, Any]) -> RenderResult:

@@ -23,6 +23,12 @@ runtime Git SHA. Never substitute host-specific paths.
 - Never mutate a Google Sheet from collection, analysis, quality, or scheduled
   runs. A Sheet patch is separate, stable-ID keyed, and must preserve Status and
   Notes.
+- After an explicit human board instruction naming the workbook and interval,
+  a passing source quality report plus its passing immutable replay may be
+  published with `scripts/clockify_sheet_publish.py --enable-write`. Use one
+  monthly review tab, append only new activity-segment IDs, preserve
+  Disposition/Review Status/Review Notes, and never couple this stage to a
+  Clockify write.
 - Never print secrets, tokens, environment values, raw credential files, or
   private session histories in Multica.
 - Never log autonomous agents, subagents, daemons, polling, heartbeats,
@@ -37,11 +43,35 @@ runtime Git SHA. Never substitute host-specific paths.
 
 ## Process contract
 
-Run:
+Long-running work belongs to Precision's persistent user service, not the
+Multica task process. On every scheduled wake:
 
 ```bash
-python3 <resolved-root>/scripts/clockify_review_run.py
+systemctl --user start clockify-work-accounting.service
 ```
+
+Read `<resolved-root>/state/autopilot-runner-status.json`. When it says
+`running` or `retry_scheduled`, end the wake without posting. The service keeps
+the analyzer cache and lock, survives the Multica task ending, and recollects
+after one hour when MacBook or desktop evidence is unavailable. Retries are
+bounded; exhausted missing-source coverage remains durable in
+`state/source-coverage.json` and is retried by the next primary schedule. Peer
+loss does not block proposals supported by complete Precision, Clockify,
+Fathom, and Multica evidence.
+
+When status says `complete` and has no `reported_at`, read only the result and
+summary paths named there, obey the action contract below, then mark that exact
+result reported:
+
+```bash
+python3 <resolved-root>/scripts/clockify_autopilot_runner.py \
+  --mark-reported <absolute-autopilot-result-path>
+```
+
+Never mark a result reported before its required Multica comment succeeds.
+When today's result is already reported, do not rerun it merely because a retry
+check trigger fired. The next primary daily trigger starts the next accounting
+window.
 
 The process, not the analyst, performs these stages:
 
@@ -54,11 +84,19 @@ The process, not the analyst, performs these stages:
    workstreams across sessions and machines.
 4. Split independent projects, objects, deliverables, and outcomes into atomic
    activities; merge duplicate evidence for the same accomplishment.
-5. Resolve project and tags deterministically. Model recommendations never
-   override conflicting routing evidence.
-6. Render `Prefix — action object outcome` descriptions, approximately 8–14
-   words. No `[NEEDS REVIEW]`, Markdown, ellipses, first person, URLs, paths,
-   hashes, emails, commands, prompts, agent status, or evidence dumps.
+5. Run an independent call to the same pinned Flash model as semantic reviewer.
+   It compares the proposed activity with cited evidence, chooses the correct
+   configured client/project and task type, checks the consolidation boundary
+   and effort, and rewrites the human-readable outcome when needed. Local code
+   verifies that the selection exists in the configured Clockify taxonomy; it
+   does not replace that judgment with regex routing.
+6. Have the Flash reviewer return `action object outcome` wording,
+   approximately 8–14 words. Local code adds the authoritative project prefix
+   and enforces structural safety. No `[NEEDS REVIEW]`, Markdown, ellipses,
+   first person, URLs, paths, hashes, emails, commands, prompts, agent status,
+   or evidence dumps.
+   EmblemStudio work uses a Serenichron project/task selection with prefix `ES`;
+   ordinary Serenichron work retains prefix `SC`.
 7. Allocate human effort inside observed spans of the cited semantic
    workstream. Unrelated evidence elsewhere that day cannot widen an activity's
    placement capacity. Meetings and existing entries remain fixed. Never fill
@@ -72,17 +110,20 @@ entry grouping, wall-clock gap filling, or manual overlap trimming.
 
 ## Evidence and model limits
 
-- `deepseek-v4-flash:0731-cloud` is the required primary analyzer. Its Ollama
-  manifest must resolve to `remote_model: deepseek-v4-flash:0731`; the generic
-  `deepseek-v4-flash:cloud` alias resolves to `:preview` and is not approved.
-  Resolve and pass the exact 64-character Ollama revision through
-  `CLOCKIFY_ANALYZER_PRIMARY_REVISION`; cloud tags without a release binding
-  fail closed. `deepseek-v4-pro:cloud` is not approved for this process.
-- The request ceiling is about 1.45 MB. The pipeline chunks complete normalized
-  events by day and rejects an individually oversized event instead of clipping
-  it. A timed-out extraction request is sealed locally and bisected only at a
-  safe context or complete-turn boundary; the identical parent request is never
-  retried. Other transport failures still block.
+- `deepseek-v4-flash:cloud` is the required primary analyzer. Ollama now
+  defaults this alias to the July 31 Flash release. Pin revision
+  `d3f1c87447216481a8001f48c517a51e13bfb141853a8df5e52f81bf765dabc3`
+  through `CLOCKIFY_ANALYZER_PRIMARY_REVISION` on every live run so later alias
+  drift cannot mix decisions. The equivalent explicit
+  `deepseek-v4-flash:0731-cloud` tag remains accepted for old sealed decisions.
+  `deepseek-v4-pro:cloud` is not approved for this process.
+- The protected Precision gateway has an observed response-time boundary near
+  125 seconds. Keep `CLOCKIFY_AUTOPILOT_ANALYZER_TARGET_BODY_BYTES=75000` so
+  normal requests begin below the reliable body-size range instead of paying
+  for oversized timeouts. The pipeline still rejects an individually oversized
+  event instead of clipping it. A timed-out extraction request is sealed locally
+  and bisected only at a safe context or complete-turn boundary; the identical
+  parent request is never retried. Other transport failures remain explicit.
 - The immutable raw ledger remains local. A route probe contains no evidence.
   Private semantic projection is denied unless the separately approved runtime
   explicitly sets `CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED=approved`. Probe
@@ -93,8 +134,11 @@ entry grouping, wall-clock gap filling, or manual overlap trimming.
 - Use the compact `autopilot-result.json` and `autopilot-summary.md` for normal
   operation. Inspect cited ledger events only for a named exception. Do not load
   entire raw evidence bundles into the agent conversation.
-- Models propose semantics. Deterministic code owns routing, Caveman rendering,
-  allocation, stable IDs, and safety.
+- Flash analysis and a separate Flash reviewer own semantic classification,
+  client/project and task selection, consolidation boundaries, effort judgment,
+  and human-readable wording. Deterministic code owns evidence identity, exact
+  taxonomy membership, prefix assembly, non-overlapping placement, stable IDs,
+  integrity, and safety.
 
 ## Fathom
 
@@ -125,7 +169,7 @@ entry grouping, wall-clock gap filling, or manual overlap trimming.
 
 ## Action contract
 
-Read `autopilot-result.json` and obey `action`:
+Read the `autopilot-result.json` named by persistent status and obey `action`:
 
 - `no_comment`: no Multica mutation. End the run.
 - `review_delta`: report only new and changed stable review items.

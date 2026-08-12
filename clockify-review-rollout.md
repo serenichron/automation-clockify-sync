@@ -1,8 +1,40 @@
 # Clockify review recovery rollout
 
-Status: superseded by the evidence-grounded accounting candidate; no guarded
-action in this document has been executed. The 2026-07-30 identifiers below are
-historical evidence and must be re-read before any rollout.
+## Live Precision coordinator — 2026-08-10
+
+The authoritative dry-run workflow now separates short Multica coordination
+from long-running accounting execution:
+
+- Precision service: `/home/blackthorne/.config/systemd/user/clockify-work-accounting.service`
+- Operational root: `/home/blackthorne/Work/automation-clockify-sync`
+- Protected analyzer: `https://precision-llm.serenichron.agency/v1`, model
+  `deepseek-v4-flash:cloud`; credentials remain in mode-0600 client files.
+- Specialist agent: `11af6181-aa36-4c10-9c55-71aee5b38e6b`
+  (`OPS-Clockify @prec`, Precision Codex Luna runtime).
+- Authoritative autopilot: `6e1bd5f6-06ee-4824-9dd0-d06147574a7a`, `run_only`.
+- Primary trigger: `5ca60571-6007-465a-bb8e-3c49cd3641e3`, weekdays 07:00.
+- Completion check: `99fe482d-bc90-4664-bc9f-661604cda623`, weekdays 09:30.
+- Final retry check: `80a51a27-8724-4222-be61-825c161bec53`, weekdays 12:30.
+
+`scripts/clockify_autopilot_runner.py` owns the single-instance job and compact
+status. Incomplete MacBook or desktop coverage no longer blocks accounting from
+complete Precision and central evidence. It emits proposals with a coverage
+warning, records per-source debt in `state/source-coverage.json`, and returns
+temporary exit 75 so systemd recollects after one hour, at most twice per
+scheduled job. Retry exhaustion preserves the debt; the next primary trigger
+expands collection back to its earliest missed date. Configuration, authentication,
+integrity, and semantic-accounting blocks still exit 2 without looping. The
+specialist consumes only a completed, unreported action contract and marks it
+reported after any required Multica comment succeeds. Google Sheets and
+Clockify remain no-write surfaces.
+
+EmblemStudio evidence is routed to the matching Serenichron project/task type
+and rendered with the `ES —` description prefix. Ordinary Serenichron work
+continues to use `SC —`.
+
+The remaining 2026-07-30 material is historical candidate evidence. Its old
+paths, run statuses, and proposed rollout steps are not a description of the
+live Precision coordinator above and must be re-read before reuse.
 
 ## Candidate status — 2026-08-03
 
@@ -217,7 +249,11 @@ approval is granted:
    unless the integrity-checked ledger reports eligible.
 9. Refresh any approved review surface by stable ID only after the shadow run
    passes. Preserve reviewer Status and Notes. Do not use a full-sheet overwrite
-   and do not publish transcript-derived legacy descriptions.
+   and do not publish transcript-derived legacy descriptions. Use the separate
+   `scripts/clockify_sheet_publish.py --enable-write` stage only after the
+   source quality report and immutable replay pass for the same run. Reuse one
+   monthly tab, append future intervals, and preserve Disposition, Review
+   Status, and Review Notes for every existing stable activity-segment ID.
 10. Trigger one manual authoritative canary. It must perform no Clockify or
    Google Sheet write. With unchanged evidence it must make no SER-651
    mutation.

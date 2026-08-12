@@ -333,12 +333,17 @@ def review_proposal(
     suggestions: list[str] = []
     improved_description = None
     description = str(proposal.get("description") or "")
+    flash_reviewed = bool(_provenance(proposal).get("semantic_reviewer_model"))
 
     if proposal.get("allocation_mode") == "non_overlapping_v1":
         try:
             caveman_renderer.validate_description(description)
         except caveman_renderer.CavemanValidationError as exc:
-            issues.append(f"Caveman description contract failed: {exc}")
+            message = f"Caveman description advisory: {exc}"
+            if flash_reviewed:
+                suggestions.append(message)
+            else:
+                issues.append(message)
         if not proposal.get("activity_id") or not proposal.get("workstream_id"):
             issues.append("Semantic proposal lacks stable activity/workstream identity")
         provenance_ids = (_provenance(proposal).get("evidence_ids") or [])
@@ -386,7 +391,10 @@ def review_proposal(
     if "\n" in description:
         issues.append("Description is not single-line")
     if len(description) > 180:
-        issues.append("Description exceeds 180 characters")
+        if flash_reviewed:
+            suggestions.append("Description exceeds 180 characters")
+        else:
+            issues.append("Description exceeds 180 characters")
     start = parse_timestamp(proposal.get("start"))
     end = parse_timestamp(proposal.get("end"))
     if not start or not end or end <= start:

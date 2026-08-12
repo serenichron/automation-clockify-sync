@@ -34,10 +34,17 @@ except ImportError:  # pragma: no cover - direct script execution fallback
 
 
 SCHEMA_VERSION = 1
-PROMPT_VERSION = "clockify-semantic-v16"
+PROMPT_VERSION = "clockify-semantic-v17"
+REVIEW_PROMPT_VERSION = "clockify-semantic-review-v6"
+PORTFOLIO_REVIEW_PROMPT_VERSION = "clockify-portfolio-review-v2"
+PORTFOLIO_VALIDATION_PROMPT_VERSION = "clockify-portfolio-validation-v1"
 ANALYZER_CACHE_SCHEMA_VERSION = "clockify-analyzer-cache/v2"
 EVIDENCE_BUNDLE_SCHEMA_VERSION = "clockify-semantic-evidence-bundle/v1"
-DEFAULT_PRIMARY_MODEL = "deepseek-v4-flash:0731-cloud"
+DEFAULT_PRIMARY_MODEL = "deepseek-v4-flash:cloud"
+APPROVED_PRIMARY_MODELS = frozenset({
+    DEFAULT_PRIMARY_MODEL,
+    "deepseek-v4-flash:0731-cloud",
+})
 FORBIDDEN_ANALYZER_MODEL_MARKERS = ("deepseek-v4-pro",)
 DEFAULT_MAX_BODY_BYTES = 1_450_000
 # Operational limits are deliberately well below the hard request ceiling.  The
@@ -228,6 +235,8 @@ _CONTRACT_FAILURE_PATTERNS: tuple[tuple[str, str], ...] = (
     ("invalid_evidence_ids", "evidence partition"),
     ("missing_activity_fields", "requires action, object, and outcome"),
     ("missing_workstream", "requires a workstream"),
+    ("missing_nonactivity_fields", "requires a nonempty reason"),
+    ("missing_nonactivity_fields", "omission lifecycle must be planned or noise"),
     ("invalid_effort", "effort"),
     ("invalid_effort", "must be positive"),
     ("invalid_project", "project_recommendation"),
@@ -295,6 +304,10 @@ def _repair_instruction(failure_code: str) -> str:
         "invalid_evidence_ids": "Use only supplied bundle refs and valid inclusive member ranges.",
         "missing_activity_fields": "Include lifecycle, action, object, outcome, evidence, spans, and effort.",
         "missing_workstream": "Give each reviewable activity a short stable workstream name.",
+        "missing_nonactivity_fields": (
+            "Give every exception a nonempty kind and reason, and every omission "
+            "a planned or noise lifecycle plus a nonempty reason."
+        ),
         "invalid_effort": "Use positive ordered effort minutes for every activity.",
         "invalid_project": "Use an object for project recommendation, with blank fields when unsupported.",
         "invalid_output_lists": "Return activities, exceptions, and omissions as JSON lists.",
@@ -1038,6 +1051,10 @@ User-role evidence is intent, not proof that requested work happened. Assistant-
 evidence alone is status or autonomous output, not proof of human-attention work.
 Except for meetings, a completed, advanced, investigated, or blocked accomplishment
 must cite both a user instruction and an assistant result from the same conversation.
+Repository commits are corroboration only. Never treat a commit, commit subject, or
+changed artifact as standalone proof of human-attention work. Cite repository evidence
+with the paired interactive-session accomplishment it supports, or classify it as noise
+when no such supported accomplishment is present.
 Do not invent projects, outcomes, evidence, effort, or meeting purpose.
 MEETING SUFFICIENCY IS A HARD GATE. A Fathom bundle containing only a title and
 timestamps, with no summary, action items, transcript, or other outcome-bearing
@@ -1192,6 +1209,332 @@ def _body_for(
             repair_attempt=repair_attempt,
             timeout_recovery_attempt=timeout_recovery_attempt,
             connection_recovery_attempt=connection_recovery_attempt,
+        ),
+    }
+
+
+def _semantic_review_candidate(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    """Project semantic hints without local identifiers or trusted citations.
+
+    The independent reviewer reconstructs evidence partitions from the supplied
+    bundles.  This projection works for both raw extraction responses and
+    restored post-synthesis analyses, so synthesis can never become the final
+    unreviewed semantic authority.
+    """
+    projected: dict[str, list[dict[str, Any]]] = {
+        "activities": [],
+        "exceptions": [],
+        "omissions": [],
+    }
+    for raw in candidate.get("activities", []):
+        if not isinstance(raw, Mapping):
+            continue
+        project = raw.get("project_recommendation")
+        effort = raw.get("effort")
+        projected["activities"].append({
+            "lifecycle": _safe_text(raw.get("lifecycle")),
+            "action": _safe_text(raw.get("action")),
+            "object": _safe_text(raw.get("object")),
+            "outcome": _safe_text(raw.get("outcome")),
+            "workstream": _safe_text(raw.get("workstream")),
+            "project_recommendation": (
+                {
+                    "name": _safe_text(project.get("name")),
+                    "prefix": _safe_text(project.get("prefix")),
+                    "tag_names": sorted(
+                        _safe_text(value)
+                        for value in project.get("tag_names", [])
+                        if _safe_text(value)
+                    ),
+                }
+                if isinstance(project, Mapping)
+                else {}
+            ),
+            "effort": (
+                {
+                    "minimum_minutes": effort.get("minimum_minutes"),
+                    "recommended_minutes": effort.get("recommended_minutes"),
+                    "maximum_minutes": effort.get("maximum_minutes"),
+                }
+                if isinstance(effort, Mapping)
+                else {}
+            ),
+            "semantic_confidence": _safe_text(raw.get("semantic_confidence")),
+            "timing_confidence": _safe_text(raw.get("timing_confidence")),
+            "split_rationale": _safe_text(raw.get("split_rationale")),
+            "merge_rationale": _safe_text(raw.get("merge_rationale")),
+            "omit_rationale": _safe_text(raw.get("omit_rationale")),
+        })
+    for raw in candidate.get("exceptions", []):
+        if isinstance(raw, Mapping):
+            projected["exceptions"].append({
+                "kind": _safe_text(raw.get("kind")),
+                "reason": _safe_text(raw.get("reason")),
+            })
+    for raw in candidate.get("omissions", []):
+        if isinstance(raw, Mapping):
+            projected["omissions"].append({
+                "lifecycle": _safe_text(raw.get("lifecycle")),
+                "reason": _safe_text(raw.get("reason")),
+            })
+    return projected
+
+def _review_messages(
+    events: list[dict[str, Any]],
+    *,
+    candidate: Mapping[str, Any],
+    taxonomy: list[dict[str, Any]],
+    repair_failure_code: str | None = None,
+    transport_recovery_attempt: int | None = None,
+    transport_failure_code: str | None = None,
+    review_scope: str = "extraction",
+    review_prompt_version: str = REVIEW_PROMPT_VERSION,
+) -> list[dict[str, str]]:
+    """Build an independent semantic-review request for one extraction."""
+    system = f"""You are the independent Clockify accounting reviewer.
+Use the evidence bundles as authority. The first-pass candidate is untrusted and
+may be accepted, corrected, split, merged, omitted, or replaced by an exception.
+
+Review semantically, not with brittle grammar rules. For every proposed activity:
+- verify that the cited evidence proves human-attention work and the stated outcome;
+- choose the correct client/project level and task type only from clockify_taxonomy;
+- judge whether effort is plausible human attention rather than process runtime;
+- produce one concise human-readable task/outcome description through action,
+  object, and outcome. The neutral render `Prefix — action object outcome` must be
+  a single line and normally 8-14 words. Use plain Caveman wording. Never include
+  NEEDS REVIEW markers, Markdown, URLs, domains, filesystem paths, commit hashes,
+  raw commands, prompt text, agent chatter, or copied session-message prose. Split
+  distinct accomplishments instead of cramming them into one long description;
+- keep one independently meaningful accomplishment per activity;
+- use meetings as fixed blocks and require outcome-bearing meeting evidence;
+- treat a human instruction plus its resulting assistant/tool evidence in the same
+  interactive session as supported human-directed work. Do not omit an accomplishment
+  merely because an assistant or tool delivered the result;
+- use repository commits only to corroborate a supported interactive-session
+  accomplishment. A commit, subject, or changed artifact alone never proves
+  human-attention work and must not become a standalone activity;
+- classify plans, waiting, polling, unsolicited status chatter, and genuinely
+  autonomous background execution without a paired human instruction as planned/noise.
+
+Return the extraction response shape with exactly these top-level lists:
+activities, exceptions, omissions. The candidate is only a semantic hint and its
+citations and local identifiers are intentionally absent. Reconstruct citations
+solely from the evidence bundles. Preserve provider field names and shape, but do
+not preserve candidate values that evidence or taxonomy shows are wrong.
+Use evidence_partitions with only supplied bundle_ref/member_ranges. Account for
+every supplied bundle member exactly once across the three lists. Never invent
+evidence, clients, projects, tags, outcomes, or effort. Project name, prefix, and
+tag_names must exactly match one clockify_taxonomy row, or all must be blank when
+the evidence is insufficient. A member route_hint is a privacy-safe local routing
+signal derived from source location or calendar metadata. Validate it against the
+semantic evidence; keep it when consistent, override it only with a better exact
+taxonomy choice, and split or raise an exception when one activity mixes conflicting
+client routes. Taxonomy selection_guidance is context, not an output field. Every
+exception requires a nonempty kind and reason.
+Every omission requires lifecycle planned or noise and a nonempty reason. Prefer a
+corrected evidence-supported activity over omission when the candidate merely chose
+an invalid project or task type. This review uses {review_prompt_version}."""
+    if review_scope == "portfolio":
+        system += """
+
+PORTFOLIO CONSOLIDATION: This is a second-pass review of already reviewed
+micro-activities from one bounded project/day portfolio. Reconstruct the
+invoice-worthy accomplishments proved by the complete evidence, rather than
+preserving one row per message, command, check, test, fix, or status update.
+Merge implementation, debugging, review, deployment, verification, and follow-up
+substeps when they jointly advanced the same bounded deliverable, incident,
+decision, or client outcome—even when the candidate used slightly different
+workstream or object wording. Keep genuinely independent deliverables separate.
+Do not merge unrelated work merely because it shared a day or project.
+
+Default to the smallest useful set of invoice rows. A candidate deserves its own
+row only when its outcome would make sense on an invoice without the neighboring
+candidate. Merge setup→execution, search→recovery or transfer, diagnosis→fix,
+implementation→test, review→decision, deployment→verification, and retry→success
+chains into the final delivered outcome. The enabling step is not an independent
+accomplishment merely because it used a different command, artifact, or verb.
+
+An activity under ten minutes should survive only when the evidence proves a
+genuinely isolated short deliverable or fixed meeting. Normally combine supported
+microsteps into a useful 20–90 minute accomplishment, and allow a larger bounded
+entry when one sustained workstream genuinely requires it. Estimate total human
+attention across the merged evidence; never use process runtime and never invent
+time. Prefer a small number of clear invoice-review rows over a transcript-like
+activity inventory. Each returned activity needs exactly one independently
+meaningful outcome and a complete Caveman description of 8–14 total words after
+adding the supplied prefix. Never exceed 14 total words; keep quantities only when
+they materially explain the delivered result.
+"""
+    elif review_scope == "portfolio_validation":
+        system += """
+
+FINAL PORTFOLIO VALIDATION: Independently compare the candidate with the complete
+evidence and accounting contract. Validate the client/project level, task type,
+human-attention effort, consolidation boundary, and human-readable task/outcome
+description. Correct plausible candidate rows instead of rejecting them for a
+wording defect. Preserve a merge when its evidence forms one setup→result or
+diagnosis→fix deliverable; split only genuinely independent invoice outcomes.
+Every accepted description must be complete Caveman wording of 8–14 total words
+after adding the supplied prefix. Never exceed 14 total words. Remove secondary
+details before sacrificing the core verb, object, or delivered result. Return the
+fully corrected replacement and account for every evidence member exactly once.
+"""
+    elif review_scope == "portfolio_single_activity_recovery":
+        system += """
+
+FAILED-LEAF PORTFOLIO RECOVERY: This request contains one source candidate that
+the earlier portfolio pass could not cite correctly. Independently validate its
+client, task type, outcome, human-attention effort, and Caveman wording against
+the complete evidence. Do not preserve it when the evidence shows it is wrong.
+
+Prefer exactly one corrected activity when the evidence forms one bounded
+diagnosis, fix, decision, or delivered outcome. Do not split commands, checks,
+observations, implementation steps, and verification from that same outcome into
+separate invoice rows. When every member of a supplied bundle supports that one
+outcome, cite the bundle's entire allowed_member_range as one inclusive range.
+Split only when the evidence proves genuinely independent invoice outcomes.
+
+Before returning JSON, audit the citations against coverage_contract: every
+integer member must occur exactly once across activities, exceptions, and
+omissions; no range may overlap, repeat, reverse, or exceed its allowed bounds.
+Return one fully corrected replacement with complete 8-14-word Caveman wording.
+"""
+    elif review_scope in {
+        "portfolio_wording_recovery",
+        "portfolio_wording_recovery_retry",
+    }:
+        system += """
+
+FINAL WORDING RECOVERY: Preserve the candidate's evidence classification,
+project route, task type, and bounded accomplishment unless the evidence proves
+them wrong. Rewrite the retained activity's action, object, and outcome as plain
+Caveman fields. The action, object, and outcome must never contain the project
+prefix, an em dash separator, Markdown, IDs, paths, URLs, hashes, prompt text,
+or copied status prose. Do not place `Prefix —` inside any field. Keep one verb
+in the action and one bounded delivered result in the outcome. The exact render
+`Prefix — action object outcome` must contain 8-14 total words. Preserve any
+evidence members already classified as noise or exception, and account for every
+bundle member exactly once.
+"""
+        if review_scope == "portfolio_wording_recovery_retry":
+            system += """
+
+WORDING RETRY: The prior Flash rewrite still failed the rendering contract.
+Simplify the wording materially. Use ordinary words and spaces only: no slash,
+backslash, colon, semicolon, hash, Markdown-like punctuation, version string,
+domain, path-shaped token, abbreviation chain, or embedded prefix. Count the
+complete `Prefix — action object outcome` render before returning it and keep it
+between 8 and 14 words.
+"""
+    elif review_scope != "extraction":
+        raise AnalyzerError("semantic review scope is invalid")
+    if repair_failure_code is not None:
+        system += (
+            "\n\nSTRUCTURAL REPAIR: The prior review could not be consumed under "
+            f"{repair_failure_code}. {_repair_instruction(repair_failure_code)} "
+            "Use coverage_contract as the exact citation ledger. Return one complete "
+            "schema-valid replacement. "
+            "Do not discuss the prior response."
+        )
+    if transport_recovery_attempt is not None:
+        if (
+            transport_failure_code not in {"transport_timeout", "transport_error"}
+            or isinstance(transport_recovery_attempt, bool)
+            or not isinstance(transport_recovery_attempt, int)
+            or not 1 <= transport_recovery_attempt <= MAX_TIMEOUT_RECOVERY_ATTEMPTS
+        ):
+            raise AnalyzerError("semantic review transport recovery is invalid")
+        system += (
+            "\n\nTRANSPORT RECOVERY: The prior independent review transport "
+            "returned no usable response. Review the complete supplied evidence "
+            "and candidate in this bounded attempt. Do not mention the prior call."
+        )
+    model_bundles, manifest = _semantic_evidence_bundles(events)
+    events_by_id = {
+        str(event.get("evidence_id")): event
+        for event in events
+        if isinstance(event, Mapping)
+    }
+    for bundle, local_manifest in zip(model_bundles, manifest, strict=True):
+        evidence_ids = local_manifest.get("evidence_ids", [])
+        members = bundle.get("members", [])
+        if len(evidence_ids) != len(members):
+            raise AnalyzerError("semantic route-hint member mapping is invalid")
+        for member, evidence_id in zip(members, evidence_ids, strict=True):
+            event = events_by_id.get(str(evidence_id), {})
+            hint = event.get("semantic_route_hint") if isinstance(event, Mapping) else None
+            if isinstance(hint, Mapping) and hint:
+                member["route_hint"] = copy.deepcopy(dict(hint))
+    payload = {
+        "mode": "review",
+        "schema_version": SCHEMA_VERSION,
+        "extractor_prompt_version": PROMPT_VERSION,
+        "review_prompt_version": review_prompt_version,
+        "bundles": model_bundles,
+        "coverage_contract": [
+            {
+                "bundle_ref": str(bundle["bundle_ref"]),
+                "allowed_member_range": [1, int(bundle["member_count"])],
+            }
+            for bundle in model_bundles
+        ],
+        "candidate": _semantic_review_candidate(candidate),
+        "clockify_taxonomy": copy.deepcopy(taxonomy),
+    }
+    if review_scope != "extraction":
+        payload["review_scope"] = review_scope
+    if repair_failure_code is not None:
+        payload["repair_feedback"] = {
+            "failure_code": repair_failure_code,
+            "instruction": _repair_instruction(repair_failure_code),
+            "coverage_rule": (
+                "Every supplied member integer must appear exactly once across "
+                "activities, exceptions, and omissions, and every range must stay "
+                "inside its bundle's allowed_member_range."
+            ),
+        }
+    if transport_recovery_attempt is not None:
+        payload["review_transport_recovery"] = {
+            "failure_code": transport_failure_code,
+            "attempt": transport_recovery_attempt,
+            "maximum_attempts": MAX_TIMEOUT_RECOVERY_ATTEMPTS,
+        }
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": canonical_json(payload)},
+    ]
+
+
+def _review_body(
+    events: list[dict[str, Any]],
+    *,
+    candidate: Mapping[str, Any],
+    taxonomy: list[dict[str, Any]],
+    model: str,
+    repair_failure_code: str | None = None,
+    transport_recovery_attempt: int | None = None,
+    transport_failure_code: str | None = None,
+    review_scope: str = "extraction",
+    review_prompt_version: str = REVIEW_PROMPT_VERSION,
+) -> dict[str, Any]:
+    return {
+        "model": model,
+        "temperature": 0,
+        "seed": (
+            4_000 + transport_recovery_attempt
+            if transport_recovery_attempt is not None
+            else 101 if repair_failure_code is None else 102
+        ),
+        "response_format": {"type": "json_object"},
+        "messages": _review_messages(
+            events,
+            candidate=candidate,
+            taxonomy=taxonomy,
+            repair_failure_code=repair_failure_code,
+            transport_recovery_attempt=transport_recovery_attempt,
+            transport_failure_code=transport_failure_code,
+            review_scope=review_scope,
+            review_prompt_version=review_prompt_version,
         ),
     }
 
@@ -1906,6 +2249,7 @@ def validate_result(
     provider_revision: str = "",
     evidence_time_spans: dict[str, dict[str, str]] | None = None,
     evidence_support: Mapping[str, Mapping[str, str]] | None = None,
+    semantic_validation: bool = True,
 ) -> dict[str, Any]:
     activities = result.get("activities", [])
     exceptions = result.get("exceptions", [])
@@ -1933,8 +2277,17 @@ def validate_result(
         if lifecycle not in LIFECYCLES:
             raise AnalyzerError(f"invalid lifecycle: {lifecycle!r}")
         evidence_ids = evidence_ids_for(raw.get("evidence_ids"), "activity")
-        _validate_human_accomplishment(lifecycle, evidence_ids, evidence_support)
-        action = _normalize_action(raw.get("action"))
+        if semantic_validation:
+            _validate_human_accomplishment(
+                lifecycle,
+                evidence_ids,
+                evidence_support,
+            )
+        action = (
+            _normalize_action(raw.get("action"))
+            if semantic_validation
+            else _one_line(raw.get("action"))
+        )
         obj = _one_line(raw.get("object"))
         outcome = _one_line(raw.get("outcome"))
         split_rationale = _one_line(raw.get("split_rationale"))
@@ -1943,7 +2296,7 @@ def validate_result(
             raise AnalyzerError("reviewable activity requires action, object, and outcome")
         if lifecycle not in {"planned", "noise"} and not workstream:
             raise AnalyzerError("reviewable activity requires a workstream")
-        if lifecycle not in {"planned", "noise"}:
+        if semantic_validation and lifecycle not in {"planned", "noise"}:
             _validate_atomic_parts(action, obj, outcome, split_rationale)
             try:
                 caveman_renderer.render(
@@ -1966,8 +2319,15 @@ def validate_result(
         raw_maximum = _positive_int(effort.get("maximum_minutes"), "maximum_minutes")
         if not raw_minimum <= raw_recommended <= raw_maximum:
             raise AnalyzerError("effort must satisfy minimum <= recommended <= maximum")
-        recommended = _five_minute_effort(raw_recommended)
-        minimum, maximum = _effort_band(recommended)
+        if semantic_validation:
+            recommended = _five_minute_effort(raw_recommended)
+            minimum, maximum = _effort_band(recommended)
+        else:
+            minimum, recommended, maximum = (
+                raw_minimum,
+                raw_recommended,
+                raw_maximum,
+            )
         model_timing_confidence = _confidence(
             raw.get("timing_confidence"), "timing_confidence"
         )
@@ -1990,7 +2350,7 @@ def validate_result(
         # Fully observed source intervals give a stable ceiling for attention.
         # They are intentionally not treated as all-active wall time: only the
         # largest conservative effort band that fits within the ceiling is used.
-        if lifecycle not in {"planned", "noise"}:
+        if semantic_validation and lifecycle not in {"planned", "noise"}:
             bounded_effort = _effort_from_bounded_capacity(
                 _bounded_evidence_capacity_minutes(evidence_ids, evidence_time_spans)
             )
@@ -2052,11 +2412,29 @@ def validate_result(
             if not isinstance(value, dict):
                 raise AnalyzerError(f"{kind} record must be an object")
             evidence_ids = evidence_ids_for(value.get("evidence_ids"), kind)
+            reason = _one_line(value.get("reason"))
+            if not reason:
+                raise AnalyzerError(f"{kind} requires a nonempty reason")
+            if kind == "exception":
+                record_kind = _one_line(value.get("kind"))
+                if not record_kind:
+                    raise AnalyzerError("exception requires a nonempty kind")
+            else:
+                lifecycle = str(value.get("lifecycle") or "").strip().lower()
+                if lifecycle not in {"planned", "noise"}:
+                    raise AnalyzerError(
+                        "omission lifecycle must be planned or noise"
+                    )
             output.append(
                 {
                     **value,
                     "evidence_ids": evidence_ids,
-                    "reason": _one_line(value.get("reason")),
+                    "reason": reason,
+                    **(
+                        {"kind": record_kind}
+                        if kind == "exception"
+                        else {"lifecycle": lifecycle}
+                    ),
                 }
             )
         return sorted(output, key=canonical_json)
@@ -2115,6 +2493,8 @@ class AnalyzerEndpoint:
     api_key: str = ""
     timeout_seconds: int = 120
     revision: str = ""
+    cf_access_client_id: str = ""
+    cf_access_client_secret: str = ""
 
     def __post_init__(self) -> None:
         normalized_model = self.model.strip().casefold()
@@ -2126,19 +2506,44 @@ class AnalyzerEndpoint:
     @classmethod
     def from_env(cls, prefix: str, *, default_model: str = "") -> "AnalyzerEndpoint | None":
         url = os.environ.get(f"{prefix}_URL", "").strip()
+        primary_openai_route = prefix == "CLOCKIFY_ANALYZER_PRIMARY"
+        if not url and primary_openai_route:
+            url = os.environ.get("OPENAI_BASE_URL", "").strip()
         if not url:
             return None
+        if url.rstrip("/").endswith("/v1"):
+            url = url.rstrip("/") + "/chat/completions"
         endpoint = cls(
             name=prefix.lower(),
             url=url,
-            model=os.environ.get(f"{prefix}_MODEL", default_model).strip(),
-            api_key=os.environ.get(f"{prefix}_API_KEY", "").strip(),
+            model=(
+                os.environ.get(f"{prefix}_MODEL")
+                or (os.environ.get("OPENAI_MODEL") if primary_openai_route else "")
+                or default_model
+            ).strip(),
+            api_key=(
+                os.environ.get(f"{prefix}_API_KEY")
+                or (os.environ.get("OPENAI_API_KEY") if primary_openai_route else "")
+                or ""
+            ).strip(),
             timeout_seconds=int(os.environ.get(f"{prefix}_TIMEOUT_SECONDS", "120")),
             revision=os.environ.get(f"{prefix}_REVISION", "").strip(),
+            cf_access_client_id=(
+                os.environ.get(f"{prefix}_CF_ACCESS_CLIENT_ID")
+                or (os.environ.get("CF_ACCESS_CLIENT_ID") if primary_openai_route else "")
+                or ""
+            ).strip(),
+            cf_access_client_secret=(
+                os.environ.get(f"{prefix}_CF_ACCESS_CLIENT_SECRET")
+                or (os.environ.get("CF_ACCESS_CLIENT_SECRET") if primary_openai_route else "")
+                or ""
+            ).strip(),
         )
-        if prefix == "CLOCKIFY_ANALYZER_PRIMARY" and endpoint.model != DEFAULT_PRIMARY_MODEL:
+        if bool(endpoint.cf_access_client_id) != bool(endpoint.cf_access_client_secret):
+            raise AnalyzerError("Cloudflare Access service credentials must be a complete pair")
+        if prefix == "CLOCKIFY_ANALYZER_PRIMARY" and endpoint.model not in APPROVED_PRIMARY_MODELS:
             raise AnalyzerError(
-                f"Clockify primary analyzer must be {DEFAULT_PRIMARY_MODEL}"
+                "Clockify primary analyzer must use the approved DeepSeek V4 Flash cloud alias"
             )
         return endpoint
 
@@ -2425,6 +2830,14 @@ def http_transport(endpoint: AnalyzerEndpoint, body: dict[str, Any]) -> dict[str
                 if endpoint.api_key
                 else {}
             ),
+            **(
+                {
+                    "CF-Access-Client-Id": endpoint.cf_access_client_id,
+                    "CF-Access-Client-Secret": endpoint.cf_access_client_secret,
+                }
+                if endpoint.cf_access_client_id
+                else {}
+            ),
         },
         method="POST",
     )
@@ -2491,6 +2904,247 @@ def probe_endpoint(endpoint: AnalyzerEndpoint, transport: Transport = http_trans
     }
 
 
+def _validate_review_taxonomy(
+    result: Mapping[str, Any],
+    taxonomy: list[dict[str, Any]],
+) -> None:
+    allowed = {
+        (
+            _one_line(row.get("project_name")),
+            _one_line(row.get("prefix")),
+            tuple(sorted(str(value) for value in row.get("tag_names", []))),
+        )
+        for row in taxonomy
+        if isinstance(row, Mapping) and row.get("project_name")
+    }
+    for activity in result.get("activities", []):
+        project = activity.get("project_recommendation") or {}
+        selection = (
+            _one_line(project.get("name")),
+            _one_line(project.get("prefix")),
+            tuple(sorted(str(value) for value in project.get("tag_names", []))),
+        )
+        if any(selection) and selection not in allowed:
+            raise AnalyzerError(
+                "semantic review selected a project or task type outside taxonomy"
+            )
+
+
+def _call_semantic_review_once(
+    endpoint: AnalyzerEndpoint,
+    events: list[dict[str, Any]],
+    *,
+    candidate: Mapping[str, Any],
+    taxonomy: list[dict[str, Any]],
+    tier: str,
+    transport: Transport,
+    known_evidence_ids: set[str],
+    evidence_time_spans: dict[str, dict[str, str]] | None,
+    cache: "AnalyzerResponseCache | None",
+    before_transport: Callable[[AnalyzerEndpoint], None] | None,
+    cancelled: Callable[[], bool] | None,
+    repair_failure_code: str | None = None,
+    transport_recovery_attempt: int | None = None,
+    transport_failure_code: str | None = None,
+    review_scope: str = "extraction",
+    review_prompt_version: str = REVIEW_PROMPT_VERSION,
+) -> dict[str, Any]:
+    body = _review_body(
+        events,
+        candidate=candidate,
+        taxonomy=taxonomy,
+        model=endpoint.model,
+        repair_failure_code=repair_failure_code,
+        transport_recovery_attempt=transport_recovery_attempt,
+        transport_failure_code=transport_failure_code,
+        review_scope=review_scope,
+        review_prompt_version=review_prompt_version,
+    )
+    if len(canonical_json(body).encode("utf-8")) > DEFAULT_MAX_BODY_BYTES:
+        raise AnalyzerError("semantic review body exceeds configured request ceiling")
+    _raise_if_cancelled(cancelled)
+    response = cache.lookup(endpoint, body) if cache is not None else None
+    cache_miss = response is None
+    if response is None:
+        if before_transport is not None:
+            before_transport(endpoint)
+        _raise_if_cancelled(cancelled)
+        try:
+            raw_response = transport(endpoint, body)
+        except AnalyzerTimeoutError:
+            _raise_if_cancelled(cancelled)
+            if cache is not None and cache_miss:
+                cache.store_rejected(
+                    endpoint,
+                    body,
+                    failure_code="transport_timeout",
+                )
+            raise
+        except AnalyzerTransportError:
+            _raise_if_cancelled(cancelled)
+            if cache is not None and cache_miss:
+                cache.store_rejected(
+                    endpoint,
+                    body,
+                    failure_code="transport_error",
+                )
+            raise
+        _raise_if_cancelled(cancelled)
+        try:
+            response = _json_object_from_response(raw_response)
+        except AnalyzerError as exc:
+            _raise_if_cancelled(cancelled)
+            if cache is not None and cache_miss:
+                cache.store_rejected(
+                    endpoint,
+                    body,
+                    failure_code=_contract_failure_code(exc),
+                )
+            raise AnalyzerContractError(str(exc)) from exc
+    try:
+        response = _normalize_provider_response(response, mode="extract")
+        _provider_response_cache_safe(
+            response,
+            original_evidence_ids=known_evidence_ids,
+        )
+        restored = _restore_extraction_partitions(response, events=events)
+        restored = bind_activity_evidence_spans(
+            restored,
+            evidence_time_spans=evidence_time_spans,
+        )
+        result = validate_result(
+            restored,
+            known_evidence_ids=known_evidence_ids,
+            provider_model=endpoint.model,
+            analyzer_tier=tier,
+            provider_revision=endpoint.revision,
+            evidence_time_spans=evidence_time_spans,
+            semantic_validation=False,
+        )
+        _validate_review_taxonomy(result, taxonomy)
+    except (AnalyzerTimeoutError, AnalyzerTransportError):
+        raise
+    except AnalyzerError as exc:
+        _raise_if_cancelled(cancelled)
+        if cache is not None and cache_miss:
+            cache.store_rejected(
+                endpoint,
+                body,
+                failure_code=_contract_failure_code(exc),
+            )
+        raise AnalyzerContractError(str(exc)) from exc
+    _raise_if_cancelled(cancelled)
+    if cache is not None and cache_miss:
+        cache.store_accepted(endpoint, body, response)
+    for activity in result["activities"]:
+        activity["extractor_model"] = endpoint.model
+        activity["semantic_reviewer_model"] = endpoint.model
+        activity["semantic_reviewer_revision"] = endpoint.revision
+        activity["review_prompt_version"] = review_prompt_version
+    return result
+
+
+def _call_semantic_review(
+    endpoint: AnalyzerEndpoint,
+    events: list[dict[str, Any]],
+    *,
+    candidate: Mapping[str, Any],
+    taxonomy: list[dict[str, Any]],
+    tier: str,
+    transport: Transport,
+    known_evidence_ids: set[str],
+    evidence_time_spans: dict[str, dict[str, str]] | None,
+    cache: "AnalyzerResponseCache | None",
+    before_transport: Callable[[AnalyzerEndpoint], None] | None,
+    cancelled: Callable[[], bool] | None,
+    review_scope: str = "extraction",
+    review_prompt_version: str = REVIEW_PROMPT_VERSION,
+) -> dict[str, Any]:
+    def failure(reason: str) -> dict[str, Any]:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "prompt_version": PROMPT_VERSION,
+            "activities": [],
+            "exceptions": [{
+                "kind": "analyzer_review_failure",
+                "evidence_ids": sorted(known_evidence_ids),
+                "reason": reason,
+            }],
+            "omissions": [],
+        }
+
+    def call_with_structural_repair(
+        *,
+        transport_recovery_attempt: int | None = None,
+        transport_failure_code: str | None = None,
+    ) -> dict[str, Any]:
+        try:
+            return _call_semantic_review_once(
+                endpoint,
+                events,
+                candidate=candidate,
+                taxonomy=taxonomy,
+                tier=tier,
+                transport=transport,
+                known_evidence_ids=known_evidence_ids,
+                evidence_time_spans=evidence_time_spans,
+                cache=cache,
+                before_transport=before_transport,
+                cancelled=cancelled,
+                transport_recovery_attempt=transport_recovery_attempt,
+                transport_failure_code=transport_failure_code,
+                review_scope=review_scope,
+                review_prompt_version=review_prompt_version,
+            )
+        except AnalyzerContractError as exc:
+            try:
+                return _call_semantic_review_once(
+                    endpoint,
+                    events,
+                    candidate=candidate,
+                    taxonomy=taxonomy,
+                    tier=tier,
+                    transport=transport,
+                    known_evidence_ids=known_evidence_ids,
+                    evidence_time_spans=evidence_time_spans,
+                    cache=cache,
+                    before_transport=before_transport,
+                    cancelled=cancelled,
+                    repair_failure_code=_contract_failure_code(exc),
+                    transport_recovery_attempt=transport_recovery_attempt,
+                    transport_failure_code=transport_failure_code,
+                    review_scope=review_scope,
+                    review_prompt_version=review_prompt_version,
+                )
+            except AnalyzerContractError:
+                return failure("Flash reviewer exhausted one structural repair")
+
+    try:
+        return call_with_structural_repair()
+    except (AnalyzerTimeoutError, AnalyzerTransportError) as exc:
+        failure_code = (
+            "transport_timeout"
+            if isinstance(exc, AnalyzerTimeoutError)
+            else "transport_error"
+        )
+        for attempt in range(1, MAX_TIMEOUT_RECOVERY_ATTEMPTS + 1):
+            try:
+                return call_with_structural_repair(
+                    transport_recovery_attempt=attempt,
+                    transport_failure_code=failure_code,
+                )
+            except (AnalyzerTimeoutError, AnalyzerTransportError) as recovery_error:
+                failure_code = (
+                    "transport_timeout"
+                    if isinstance(recovery_error, AnalyzerTimeoutError)
+                    else "transport_error"
+                )
+                continue
+        return failure(
+            "Flash reviewer exhausted bounded transport recovery without rerunning extraction"
+        )
+
+
 def _call_validated(
     endpoint: AnalyzerEndpoint,
     events: list[dict[str, Any]],
@@ -2508,6 +3162,7 @@ def _call_validated(
     repair_attempt: int | None = None,
     timeout_recovery_attempt: int | None = None,
     connection_recovery_attempt: int | None = None,
+    review_taxonomy: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     body = _body_for(
         events,
@@ -2571,6 +3226,30 @@ def _call_validated(
         _provider_response_cache_safe(
             response, original_evidence_ids=extraction_ids
         )
+        if review_taxonomy is not None:
+            # Preserve the first-pass reasoning independently. Semantic
+            # correctness is decided by a second Flash inference, not by the
+            # legacy Python grammar and human-work heuristics below.
+            if cache is not None and cache_miss:
+                cache.store_accepted(endpoint, body, response)
+                cache_miss = False
+            reviewed = _call_semantic_review(
+                endpoint,
+                events,
+                candidate=response,
+                taxonomy=review_taxonomy,
+                tier=f"{tier}_flash_review",
+                transport=transport,
+                known_evidence_ids=extraction_ids,
+                evidence_time_spans=evidence_time_spans,
+                cache=cache,
+                before_transport=before_transport,
+                cancelled=cancelled,
+            )
+            return _ValidatedAnalysis(
+                reviewed,
+                low_timing_evidence_ids=_low_model_timing_evidence_ids(reviewed),
+            )
         restored_response = _restore_extraction_partitions(
             response, events=events
         )
@@ -2587,6 +3266,8 @@ def _call_validated(
             evidence_time_spans=evidence_time_spans,
             evidence_support=_evidence_support(events),
         )
+    except (AnalyzerTimeoutError, AnalyzerTransportError):
+        raise
     except AnalyzerError as exc:
         _raise_if_cancelled(cancelled)
         if cache is not None and cache_miss:
@@ -2619,6 +3300,8 @@ def _call_synthesis_validated(
     repair_failure_code: str | None = None,
     repair_attempt: int | None = None,
     transport_recovery_attempt: int | None = None,
+    semantic_validation: bool = True,
+    review_taxonomy: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Synthesize one repeated workstream and reject any lost evidence."""
     body = _synthesis_body(
@@ -2680,7 +3363,13 @@ def _call_synthesis_validated(
             analyzer_tier=tier,
             provider_revision=endpoint.revision,
             evidence_time_spans=evidence_time_spans,
+            semantic_validation=semantic_validation,
         )
+        if review_taxonomy is not None:
+            # Taxonomy membership remains a structural safety boundary.  The
+            # synthesis response is not marked semantically reviewed; callers
+            # must pass it through an independent evidence-backed Flash review.
+            _validate_review_taxonomy(result, review_taxonomy)
         if result["exceptions"] or result["omissions"]:
             raise AnalyzerError("synthesis must preserve cited activities, not emit nonactivities")
         if len(result["activities"]) > len(activities):
@@ -2789,6 +3478,7 @@ def analyze_tiered(
     max_workers: int = DEFAULT_ANALYZER_WORKERS,
     private_text_approved: bool | None = None,
     cache: AnalyzerResponseCache | None = None,
+    review_taxonomy: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if max_workers <= 0:
         raise AnalyzerError("max_workers must be positive")
@@ -3002,6 +3692,7 @@ def analyze_tiered(
                 cache=cache,
                 before_transport=before_extraction_transport,
                 cancelled=cancellation.is_set,
+                review_taxonomy=review_taxonomy,
             )
         except AnalyzerContractError as initial_error:
             # A sealed contract rejection receives a small, deterministic
@@ -3026,6 +3717,7 @@ def analyze_tiered(
                         cancelled=cancellation.is_set,
                         repair_failure_code=repair_failure_code,
                         repair_attempt=repair_attempt,
+                        review_taxonomy=review_taxonomy,
                     )
                 except AnalyzerContractError as error:
                     repair_error = error
@@ -3093,6 +3785,7 @@ def analyze_tiered(
                                 before_transport=before_extraction_transport,
                                 cancelled=cancellation.is_set,
                                 timeout_recovery_attempt=timeout_attempt,
+                                review_taxonomy=review_taxonomy,
                             )
                         except AnalyzerTimeoutError:
                             continue
@@ -3164,6 +3857,7 @@ def analyze_tiered(
                                 before_transport=before_extraction_transport,
                                 cancelled=cancellation.is_set,
                                 connection_recovery_attempt=connection_attempt,
+                                review_taxonomy=review_taxonomy,
                             )
                         except AnalyzerTransportError:
                             continue
@@ -3275,6 +3969,7 @@ def analyze_tiered(
                             cancelled=cancellation.is_set,
                             repair_failure_code=fallback_feedback,
                             repair_attempt=(fallback_attempt or None),
+                            review_taxonomy=review_taxonomy,
                         )
                     except AnalyzerContractError as error:
                         fallback_error = error
@@ -3347,6 +4042,7 @@ def analyze_tiered(
                         cache=cache,
                         before_transport=before_extraction_transport,
                         cancelled=cancellation.is_set,
+                        review_taxonomy=review_taxonomy,
                     )
                 except AnalyzerContractError:
                     # A validated low-confidence primary decision is still useful
@@ -3434,6 +4130,9 @@ def analyze_tiered(
                     try:
                         outcomes[index] = future.result()
                     except BaseException as exc:
+                        # Preserve the first failure exactly.  It is the cause
+                        # callers need to diagnose, even if cancelled peers
+                        # subsequently report their own cancellation errors.
                         fatal_error = exc
                         break
                 if fatal_error is not None:
@@ -3441,17 +4140,17 @@ def analyze_tiered(
                     for future in pending:
                         future.cancel()
                     break
-                # Do not refill a partially completed batch.  A peer in this
-                # batch may still report a fatal failure; waiting to dispatch
-                # the next batch prevents any later chunk from reaching cache
-                # or transport before that failure is observed.
-                if not pending:
-                    while next_index < len(chunks):
-                        future = executor.submit(analyze_chunk, (next_index, chunks[next_index]))
-                        pending[future] = next_index
-                        next_index += 1
-                        if len(pending) >= max_workers:
-                            break
+                # Refill every slot that actually completed before waiting
+                # again.  This keeps the provider window full when one request
+                # is slow, while the bounded `pending` map and cancellation
+                # gate still prevent queued work from escaping after a fatal
+                # peer failure is observed.
+                for _index, _future in completed:
+                    if next_index >= len(chunks):
+                        break
+                    future = executor.submit(analyze_chunk, (next_index, chunks[next_index]))
+                    pending[future] = next_index
+                    next_index += 1
         except BaseException as exc:
             fatal_error = exc
         finally:
@@ -3505,6 +4204,8 @@ def analyze_tiered(
                 evidence_time_spans=synthesis_spans,
                 cache=cache,
                 before_transport=probe_once,
+                semantic_validation=review_taxonomy is None,
+                review_taxonomy=review_taxonomy,
             )
         except (AnalyzerTimeoutError, AnalyzerTransportError) as initial_error:
             last_error: AnalyzerError = initial_error
@@ -3524,6 +4225,8 @@ def analyze_tiered(
                     cache=cache,
                     before_transport=probe_once,
                     transport_recovery_attempt=attempt,
+                    semantic_validation=review_taxonomy is None,
+                    review_taxonomy=review_taxonomy,
                 )
             except (AnalyzerTimeoutError, AnalyzerTransportError) as error:
                 last_error = error
@@ -3531,6 +4234,7 @@ def analyze_tiered(
         raise last_error
 
     synthesis_exceptions: list[dict[str, Any]] = []
+    synthesis_omissions: list[dict[str, Any]] = []
     for candidate_key in sorted(grouped):
         provisional = sorted(grouped[candidate_key], key=lambda value: value["activity_id"])
         if len(provisional) < 2:
@@ -3574,6 +4278,8 @@ def analyze_tiered(
                         before_transport=probe_once,
                         repair_failure_code=repair_failure_code,
                         repair_attempt=repair_attempt,
+                        semantic_validation=review_taxonomy is None,
+                        review_taxonomy=review_taxonomy,
                     )
                 except AnalyzerContractError as error:
                     repair_error = error
@@ -3677,6 +4383,8 @@ def analyze_tiered(
                         before_transport=probe_once,
                         repair_failure_code=fallback_feedback,
                         repair_attempt=(fallback_attempt or None),
+                        semantic_validation=review_taxonomy is None,
+                        review_taxonomy=review_taxonomy,
                     )
                 except AnalyzerContractError as error:
                     fallback_error = error
@@ -3725,6 +4433,27 @@ def analyze_tiered(
                 continue
             used = fallback
             tier = "fallback"
+        if review_taxonomy is not None:
+            synthesis_events = [
+                event
+                for event in original_events
+                if str(event.get("evidence_id")) in synthesis_ids
+            ]
+            synthesized = _call_semantic_review(
+                used,
+                synthesis_events,
+                candidate=synthesized,
+                taxonomy=review_taxonomy,
+                tier=f"{tier}_post_synthesis_flash_review",
+                transport=transport,
+                known_evidence_ids=synthesis_ids,
+                evidence_time_spans=synthesis_spans,
+                cache=cache,
+                before_transport=probe_once,
+                cancelled=cancellation.is_set,
+            )
+            synthesis_exceptions.extend(synthesized["exceptions"])
+            synthesis_omissions.extend(synthesized["omissions"])
         for activity in provisional:
             del activities_by_id[activity["activity_id"]]
         for activity in synthesized["activities"]:
@@ -3734,9 +4463,13 @@ def analyze_tiered(
     exceptions = [value for result in results for value in result["exceptions"]]
     exceptions.extend(synthesis_exceptions)
     omissions = [value for result in results for value in result["omissions"]]
+    omissions.extend(synthesis_omissions)
     return {
         "schema_version": SCHEMA_VERSION,
         "prompt_version": PROMPT_VERSION,
+        "review_prompt_version": (
+            REVIEW_PROMPT_VERSION if review_taxonomy is not None else None
+        ),
         "evidence_bundle_schema_version": EVIDENCE_BUNDLE_SCHEMA_VERSION,
         "evidence_bundle_manifest": {
             "schema_version": EVIDENCE_BUNDLE_SCHEMA_VERSION,

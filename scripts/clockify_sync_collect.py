@@ -45,6 +45,11 @@ CANONICAL_EXPORT_TIMEOUT_SECONDS = 900
 CANONICAL_EXPORT_TIMEOUT_MIN_SECONDS = 60
 CANONICAL_EXPORT_TIMEOUT_MAX_SECONDS = 1800
 CANONICAL_EXPORT_ENVELOPE_PREFIX = "clockify-canonical-v1:"
+COMPATIBLE_CANONICAL_EXPORT_DIGESTS = frozenset({
+    # Approved 5d329568 / dd455bb fleet exporter. Later coordinator-only
+    # attestation changes do not alter its evidence-export contract.
+    "fd8d72d4f3469a91087568da1a953c1f8bb09a45bef572a0a4390476101053bb",
+})
 BUCHAREST = ZoneInfo("Europe/Bucharest")
 
 MULTICA_PROFILE = "desktop-api.multica.ai"
@@ -1432,30 +1437,36 @@ def collect_remote_sessions(
         coordinator = coordinator_identity or collector_runtime_identity()
         coordinator_git_sha = str(coordinator.get("git_sha") or "").strip()
         script = str(Path(collector_root) / "scripts" / "clockify_sync_collect.py")
-        remote_parts = [
-            "python3",
-            script,
-            "export-local",
-            "--machine-json",
-            json.dumps(machine, ensure_ascii=False, separators=(",", ":")),
-            "--since",
-            since.isoformat(),
-            "--until",
-            until.isoformat(),
-            "--expected-collector-sha256",
-            expected_script_digest,
-            "--encoded-output",
-        ]
-        if coordinator_git_sha:
-            remote_parts.extend(["--coordinator-git-sha", coordinator_git_sha])
-        canonical_command = " ".join(shlex.quote(part) for part in remote_parts)
-        try:
-            canonical = subprocess.run(
-                ["ssh", *ssh_options, host, canonical_command],
+        def canonical_command_for(expected_digest: str) -> str:
+            remote_parts = [
+                "python3",
+                script,
+                "export-local",
+                "--machine-json",
+                json.dumps(machine, ensure_ascii=False, separators=(",", ":")),
+                "--since",
+                since.isoformat(),
+                "--until",
+                until.isoformat(),
+                "--expected-collector-sha256",
+                expected_digest,
+                "--encoded-output",
+            ]
+            if coordinator_git_sha:
+                remote_parts.extend(["--coordinator-git-sha", coordinator_git_sha])
+            return " ".join(shlex.quote(part) for part in remote_parts)
+
+        def run_canonical(expected_digest: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["ssh", *ssh_options, host, canonical_command_for(expected_digest)],
                 capture_output=True,
                 text=True,
                 timeout=canonical_timeout,
             )
+
+        try:
+            negotiated_digest = expected_script_digest
+            canonical = run_canonical(negotiated_digest)
             if canonical.returncode == 0:
                 exported = canonical_export_payload(canonical.stdout, machine["name"])
                 if exported is None:
@@ -1477,7 +1488,40 @@ def collect_remote_sessions(
                         return result
                     remote_digest = str(attestation.get("collector_script_sha256") or "")
                     runtime = attestation.get("runtime_identity")
-                    if remote_digest != expected_script_digest:
+                    if (
+                        remote_digest != negotiated_digest
+                        and remote_digest in COMPATIBLE_CANONICAL_EXPORT_DIGESTS
+                    ):
+                        # The first request is an attestation-only handshake.
+                        # Rerun only an explicitly allowlisted exporter digest;
+                        # arbitrary remote code never receives evidence-export
+                        # authority from its self-reported checksum.
+                        negotiated_digest = remote_digest
+                        canonical = run_canonical(negotiated_digest)
+                        if canonical.returncode != 0:
+                            result["errors"].append(
+                                "compatible canonical remote evidence export unavailable; no legacy metadata fallback used"
+                            )
+                            return result
+                        exported = canonical_export_payload(
+                            canonical.stdout, machine["name"]
+                        )
+                        if not isinstance(exported, dict):
+                            result["errors"].append(
+                                "compatible canonical remote evidence export returned an invalid attestation payload; no legacy metadata fallback used"
+                            )
+                            return result
+                        attestation = exported.get("canonical_export_attestation")
+                        if not isinstance(attestation, dict):
+                            result["errors"].append(
+                                "compatible canonical remote evidence export missing code attestation; no legacy metadata fallback used"
+                            )
+                            return result
+                        remote_digest = str(
+                            attestation.get("collector_script_sha256") or ""
+                        )
+                        runtime = attestation.get("runtime_identity")
+                    if remote_digest != negotiated_digest:
                         result["errors"].append(
                             "canonical remote evidence export script digest mismatch; no legacy metadata fallback used"
                         )
@@ -1490,18 +1534,32 @@ def collect_remote_sessions(
                     remote_git_sha = str(runtime.get("git_sha") or "").strip()
                     remote_git_dirty = runtime.get("git_dirty")
                     if remote_git_sha:
-                        if not coordinator_git_sha or remote_git_sha != coordinator_git_sha:
+                        if not isinstance(remote_git_dirty, bool):
                             result["errors"].append(
-                                "canonical remote evidence export Git SHA mismatch; no legacy metadata fallback used"
+                                "canonical remote evidence export missing Git worktree state; no legacy metadata fallback used"
                             )
                             return result
-                        if remote_git_dirty is not False:
-                            result["errors"].append(
-                                "canonical remote evidence export tracked Git worktree is dirty; no legacy metadata fallback used"
+                        git_sha_match = bool(
+                            coordinator_git_sha
+                            and remote_git_sha == coordinator_git_sha
+                        )
+                        # The exporter is a standalone script. Its exact content
+                        # digest, not an unrelated repository commit, is the
+                        # executable compatibility boundary. This permits a
+                        # clean fleet host to lag on analyzer-only commits while
+                        # still failing closed on exporter drift.
+                        if remote_git_dirty:
+                            bundle_provenance = (
+                                "git_worktree_content_attested_dirty"
                             )
-                            return result
-                        bundle_provenance = "git_worktree"
+                        else:
+                            bundle_provenance = (
+                                "git_worktree"
+                                if git_sha_match
+                                else "git_worktree_content_attested"
+                            )
                     else:
+                        git_sha_match = None
                         bundle_provenance = "non_git_bundle"
                     exported["collector_contract"] = "canonical_export_v1"
                     exported["canonical_export"] = {
@@ -1509,8 +1567,14 @@ def collect_remote_sessions(
                         "provenance": "full_context_remote_export",
                         "bundle_provenance": bundle_provenance,
                         "collector_script_sha256": remote_digest,
+                        "coordinator_collector_script_sha256": expected_script_digest,
+                        "collector_digest_match": (
+                            remote_digest == expected_script_digest
+                        ),
                         "coordinator_git_sha": coordinator_git_sha or None,
                         "remote_git_sha": remote_git_sha or None,
+                        "remote_git_dirty": remote_git_dirty,
+                        "git_sha_match": git_sha_match,
                     }
                     return exported
             result["errors"].append(

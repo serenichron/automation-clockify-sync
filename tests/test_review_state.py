@@ -144,6 +144,35 @@ class ReviewStateTests(unittest.TestCase):
         self.assertEqual(list(state["items"]), [item_id])
         self.assertEqual(state["items"][item_id]["disposition"], "pending")
 
+    def test_evidence_backed_ambiguous_activities_do_not_collapse(self):
+        ambiguous = [
+            {
+                "id": "A001",
+                "activity_id": "act-one",
+                "exception_kind": "contested_time",
+                "reason": "recommended effort exceeds available observed capacity",
+            },
+            {
+                "id": "A002",
+                "activity_id": "act-two",
+                "exception_kind": "contested_time",
+                "reason": "recommended effort exceeds available observed capacity",
+            },
+        ]
+
+        state, snapshot, _ = ingest(self.tmp_path, "run-ambiguous", [], ambiguous)
+
+        self.assertEqual(2, len(state["items"]))
+        self.assertEqual(2, snapshot["summary"]["new"])
+        self.assertEqual(
+            {"act-one", "act-two"},
+            {item["activity_id"] for item in snapshot["categories"]["new"]},
+        )
+        self.assertEqual(
+            2,
+            len({item["candidate_key"] for item in snapshot["categories"]["new"]}),
+        )
+
     def test_dry_run_does_not_write_state_or_snapshot(self):
         run_dir = self.tmp_path / "run-one"
         write_json(run_dir / "proposals.json", [proposal()])
