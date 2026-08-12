@@ -182,16 +182,17 @@ partition recovery below even when the primary is the only qualified route. Conf
 low-confidence claims that remain unresolved become explicit exceptions, never
 proposals.
 
-The required primary is the generic `deepseek-v4-flash:cloud` alias, which Ollama
-now defaults to the July 31 Flash release. Every live run must additionally pin
-the approved 64-character release revision
-`d3f1c87447216481a8001f48c517a51e13bfb141853a8df5e52f81bf765dabc3` so the
-scorecard, analyzer cache, semantic run, and replay cannot silently mix model
-releases if the alias moves later. The equivalent explicit tag
-`deepseek-v4-flash:0731-cloud` remains accepted for old sealed decisions. The
-exact model tag is part of each cache route identity, so an in-progress sealed
-run must retain the tag it started with rather than migrating accepted decisions
-to an alias. The release must pass the v17 synthetic route gate.
+The required primary is the generic `deepseek-v4-flash:cloud` alias. Every live
+run must additionally pin the full revision reported by the host's current
+manifest so the scorecard, analyzer cache, semantic run, and replay cannot
+silently mix model releases if the alias moves later. The current Precision
+rollout binds revision
+`6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc`.
+The equivalent explicit tag `deepseek-v4-flash:0731-cloud` and its historical
+revision remain accepted only for already sealed decisions. The exact model tag
+is part of each cache route identity, so an in-progress sealed run must retain
+the tag it started with rather than migrating accepted decisions to an alias.
+The active release must pass the v17 synthetic route gate.
 `deepseek-v4-pro:cloud` is not an approved route for this process.
 
 Analyzer requests retain the fail-closed 1,450,000-byte hard ceiling. Normal

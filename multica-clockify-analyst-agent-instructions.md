@@ -110,12 +110,13 @@ entry grouping, wall-clock gap filling, or manual overlap trimming.
 
 ## Evidence and model limits
 
-- `deepseek-v4-flash:cloud` is the required primary analyzer. Ollama now
-  defaults this alias to the July 31 Flash release. Pin revision
-  `d3f1c87447216481a8001f48c517a51e13bfb141853a8df5e52f81bf765dabc3`
-  through `CLOCKIFY_ANALYZER_PRIMARY_REVISION` on every live run so later alias
-  drift cannot mix decisions. The equivalent explicit
-  `deepseek-v4-flash:0731-cloud` tag remains accepted for old sealed decisions.
+- `deepseek-v4-flash:cloud` is the required primary analyzer. Pin the full
+  revision reported by the host's current alias manifest through
+  `CLOCKIFY_ANALYZER_PRIMARY_REVISION` on every live run so later alias drift
+  cannot mix decisions. The current Precision service binds revision
+  `6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc`.
+  The equivalent explicit `deepseek-v4-flash:0731-cloud` tag and its historical
+  revision remain accepted only for old sealed decisions.
   `deepseek-v4-pro:cloud` is not approved for this process.
 - The protected Precision gateway has an observed response-time boundary near
   125 seconds. Keep `CLOCKIFY_AUTOPILOT_ANALYZER_TARGET_BODY_BYTES=75000` so
