@@ -286,6 +286,13 @@ def _reviewable_description_topic(description: str) -> str | None:
 def _route_for_proposal(
     proposal: dict[str, Any], routes: list[dict[str, Any]]
 ) -> dict[str, Any] | None:
+    matches = _routes_for_proposal(proposal, routes)
+    return matches[0] if matches else None
+
+
+def _routes_for_proposal(
+    proposal: dict[str, Any], routes: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
     label = str(proposal.get("source_label") or "").lower()
     project = str(proposal.get("client_project") or "").lower()
     project_suffix = str(proposal.get("clockify_project_suffix") or "")
@@ -294,33 +301,70 @@ def _route_for_proposal(
     # titles can mention Serenichron even when the routed Clockify project is a
     # client project (for example, "Serenichron × Lens of Alex").
     if project_suffix:
-        for route in routes:
-            if str(route.get("project_suffix") or "") == project_suffix:
-                return route
+        matched = [
+            route
+            for route in routes
+            if str(route.get("project_suffix") or "") == project_suffix
+        ]
+        if matched:
+            return matched
 
     if project:
-        for route in routes:
-            if str(route.get("project_name") or "").lower() == project:
-                return route
+        matched = [
+            route
+            for route in routes
+            if str(route.get("project_name") or "").lower() == project
+        ]
+        if matched:
+            return matched
 
-    for route in routes:
-        pattern = str(route.get("pattern") or "").lower()
-        if pattern and (pattern in label or pattern in project):
-            return route
-    return None
+    return [
+        route
+        for route in routes
+        if (pattern := str(route.get("pattern") or "").lower())
+        and (pattern in label or pattern in project)
+    ]
+
+
+def _quality_routes(routing: dict[str, Any]) -> list[dict[str, Any]]:
+    routes = [
+        *routing.get("session_routes", []),
+        *routing.get("meeting_routes", []),
+    ]
+    expanded = [dict(route) for route in routes if isinstance(route, dict)]
+    for override in routing.get("prefix_overrides", []):
+        if not isinstance(override, dict):
+            continue
+        project_prefix = str(override.get("project_name_prefix") or "").casefold()
+        alias = str(override.get("prefix") or "").strip()
+        if not project_prefix or not alias:
+            continue
+        for route in routes:
+            if not isinstance(route, dict):
+                continue
+            project = str(route.get("project_name") or "")
+            if project.casefold().startswith(project_prefix):
+                expanded.append({**route, "prefix": alias})
+    return expanded
 
 
 def check_prefix_match(
     proposal: dict[str, Any], routes: list[dict[str, Any]]
 ) -> str | None:
-    route = _route_for_proposal(proposal, routes)
-    if not route:
+    matched = _routes_for_proposal(proposal, routes)
+    if not matched:
         return None
-    expected = route.get("prefix", "SC")
+    expected = sorted({str(route.get("prefix") or "SC") for route in matched})
     description = str(proposal.get("description") or "")
-    if description and not description.startswith((expected, "[NEEDS REVIEW]")):
+    if description and not description.startswith("[NEEDS REVIEW]"):
         actual = description.split(" — ", 1)[0]
-        return f"Prefix mismatch: expected '{expected}', found '{actual}'"
+        if actual not in expected:
+            expectation = (
+                f"'{expected[0]}'"
+                if len(expected) == 1
+                else "one of " + ", ".join(f"'{prefix}'" for prefix in expected)
+            )
+            return f"Prefix mismatch: expected {expectation}, found '{actual}'"
     return None
 
 
@@ -614,10 +658,7 @@ def main(argv: list[str] | None = None) -> int:
     proposals = get_proposals(run_dir)
     enriched = get_enriched_context(run_dir)
     routing = get_routing(args.root)
-    routes = [
-        *routing.get("session_routes", []),
-        *routing.get("meeting_routes", []),
-    ]
+    routes = _quality_routes(routing)
     clockify_path = run_dir / "evidence" / "clockify-existing.json"
     existing_document = load_json(clockify_path) if clockify_path.exists() else {}
     existing = existing_document.get("entries", []) if isinstance(existing_document, dict) else []

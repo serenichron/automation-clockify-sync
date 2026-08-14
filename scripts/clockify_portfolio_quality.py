@@ -197,6 +197,16 @@ def _routing_taxonomy(routing: Mapping[str, Any] | None) -> dict[tuple[str, tupl
             if not tags:
                 continue
             result.setdefault((project, tags), set()).add(prefix)
+    for override in routing.get("prefix_overrides", []):
+        if not isinstance(override, Mapping):
+            raise ValueError("routing prefix override must be an object")
+        project_prefix = str(override.get("project_name_prefix") or "").casefold()
+        prefix = str(override.get("prefix") or "").strip()
+        if not project_prefix or not prefix:
+            continue
+        for (project, _tags), allowed in result.items():
+            if project.casefold().startswith(project_prefix):
+                allowed.add(prefix)
     if not result:
         raise ValueError("canonical routing taxonomy has no usable routes")
     return result

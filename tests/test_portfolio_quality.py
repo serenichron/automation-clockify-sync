@@ -100,6 +100,15 @@ def routing():
     }], "meeting_routes": []}
 
 
+def routing_with_emblem_alias():
+    return {
+        **routing(),
+        "prefix_overrides": [
+            {"project_name_prefix": "Serenichron", "prefix": "ES"}
+        ],
+    }
+
+
 class PortfolioQualityTests(unittest.TestCase):
     def audit(self, value, source=None, evidence=None):
         event = fathom_event()
@@ -125,6 +134,22 @@ class PortfolioQualityTests(unittest.TestCase):
         report = quality.audit(document(event), ledger(event), source_proposals=mixed, routing=routing())
         self.assertEqual("blocked", report["status"])
         self.assertTrue(any("mixed, missing, or unknown" in issue["reason"] for issue in report["structural_issues"]))
+
+    def test_canonical_routing_accepts_configured_project_prefix_alias(self):
+        event = fathom_event()
+        value = document(
+            event,
+            description="ES — Rebuilt EmblemStudio review into invoice-ready entries",
+        )
+
+        report = quality.audit(
+            value,
+            ledger(event),
+            source_proposals=proposals(),
+            routing=routing_with_emblem_alias(),
+        )
+
+        self.assertEqual("pass", report["status"])
 
     def test_cited_fathom_meeting_requires_its_full_interval_in_row_allocation(self):
         event = fathom_event()

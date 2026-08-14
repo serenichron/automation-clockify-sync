@@ -61,6 +61,31 @@ class QualityMatchingTests(unittest.TestCase):
 
         self.assertIsNone(quality.check_prefix_match(row, routes))
 
+    def test_configured_project_prefix_alias_is_accepted(self):
+        routing = {
+            "session_routes": [
+                {
+                    "pattern": "serenichron",
+                    "project_name": "Serenichron Level 2",
+                    "project_suffix": "775f9f",
+                    "prefix": "SC",
+                }
+            ],
+            "meeting_routes": [],
+            "prefix_overrides": [
+                {"project_name_prefix": "Serenichron", "prefix": "ES"}
+            ],
+        }
+        row = proposal(
+            client_project="Serenichron Level 2",
+            clockify_project_suffix="775f9f",
+            description="ES — Verified EmblemStudio release candidate",
+        )
+
+        self.assertIsNone(
+            quality.check_prefix_match(row, quality._quality_routes(routing))
+        )
+
     def test_exact_session_identity_wins_over_same_label(self):
         enriched = {
             "claude_contexts": [
