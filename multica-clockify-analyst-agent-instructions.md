@@ -118,6 +118,11 @@ entry grouping, wall-clock gap filling, or manual overlap trimming.
   The equivalent explicit `deepseek-v4-flash:0731-cloud` tag and its historical
   revision remain accepted only for old sealed decisions.
   `deepseek-v4-pro:cloud` is not approved for this process.
+- Set `CLOCKIFY_ANALYZER_PRIMARY_REASONING_EFFORT=none`. Ollama's default
+  reasoning stream can spend minutes on one contract-sized request. This keeps
+  the same Flash model making the semantic decision while suppressing that
+  unbounded stream. Accepted legacy decisions from the same model revision are
+  reusable; legacy rejections and timeouts are retried under the bounded route.
 - The protected Precision gateway has an observed response-time boundary near
   125 seconds. Keep `CLOCKIFY_AUTOPILOT_ANALYZER_TARGET_BODY_BYTES=75000` so
   normal requests begin below the reliable body-size range instead of paying

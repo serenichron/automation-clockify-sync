@@ -321,6 +321,7 @@ def capture_evaluation(
             ),
             "model": endpoint.model,
             "revision": endpoint.revision,
+            "reasoning_effort": endpoint.reasoning_effort,
             "tier": tier,
         },
         "prompt_version": semantic_analyzer.PROMPT_VERSION,

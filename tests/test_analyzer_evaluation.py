@@ -84,7 +84,7 @@ class AnalyzerEvaluationTests(unittest.TestCase):
     def test_produces_digest_bound_passing_scorecard(self) -> None:
         scorecard = evaluation.evaluate(document())
         self.assertTrue(scorecard["passed"])
-        self.assertEqual("clockify-analyzer-evaluator/v5", scorecard["evaluator_version"])
+        self.assertEqual("clockify-analyzer-evaluator/v6", scorecard["evaluator_version"])
         self.assertEqual("deepseek-v4-flash:0731-cloud", scorecard["route"]["model"])
         self.assertEqual(64, len(scorecard["input_corpus_digest"]))
         self.assertEqual(scorecard, evaluation.verify_scorecard(scorecard))

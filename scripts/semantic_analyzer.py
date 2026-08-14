@@ -2500,12 +2500,17 @@ class AnalyzerEndpoint:
     revision: str = ""
     cf_access_client_id: str = ""
     cf_access_client_secret: str = ""
+    reasoning_effort: str = ""
 
     def __post_init__(self) -> None:
         normalized_model = self.model.strip().casefold()
         if any(marker in normalized_model for marker in FORBIDDEN_ANALYZER_MODEL_MARKERS):
             raise AnalyzerError(
                 "DeepSeek V4 Pro is not approved for the Clockify accounting process"
+            )
+        if self.reasoning_effort not in {"", "none"}:
+            raise AnalyzerError(
+                "Clockify analyzer reasoning effort must be empty or none"
             )
 
     @classmethod
@@ -2543,6 +2548,9 @@ class AnalyzerEndpoint:
                 or (os.environ.get("CF_ACCESS_CLIENT_SECRET") if primary_openai_route else "")
                 or ""
             ).strip(),
+            reasoning_effort=os.environ.get(
+                f"{prefix}_REASONING_EFFORT", ""
+            ).strip().casefold(),
         )
         if bool(endpoint.cf_access_client_id) != bool(endpoint.cf_access_client_secret):
             raise AnalyzerError("Cloudflare Access service credentials must be a complete pair")
@@ -2574,17 +2582,23 @@ class AnalyzerResponseCache:
         self._load()
 
     @staticmethod
-    def _request_identity(endpoint: AnalyzerEndpoint, body: Mapping[str, Any]) -> dict[str, str]:
+    def _request_identity(
+        endpoint: AnalyzerEndpoint,
+        body: Mapping[str, Any],
+        *,
+        include_reasoning_effort: bool = True,
+    ) -> dict[str, str]:
         body_digest = hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
+        route = {
+            "name": endpoint.name,
+            "url": endpoint.url,
+            "model": endpoint.model,
+            "revision": endpoint.revision,
+        }
+        if include_reasoning_effort and endpoint.reasoning_effort:
+            route["reasoning_effort"] = endpoint.reasoning_effort
         route_digest = hashlib.sha256(
-            canonical_json(
-                {
-                    "name": endpoint.name,
-                    "url": endpoint.url,
-                    "model": endpoint.model,
-                    "revision": endpoint.revision,
-                }
-            ).encode("utf-8")
+            canonical_json(route).encode("utf-8")
         ).hexdigest()
         cache_key = stable_digest(
             "arc-",
@@ -2707,6 +2721,26 @@ class AnalyzerResponseCache:
                 # Another guarded run may have appended after this instance loaded.
                 self._load()
                 record = self._records.get(identity["cache_key"])
+            # A newly selected reasoning mode is part of the route identity for
+            # every new provider decision. Reuse already sealed decisions from
+            # the same model/revision's legacy route so an in-progress month is
+            # not recomputed merely to change future inference behavior.
+            if record is None and endpoint.reasoning_effort:
+                legacy_identity = self._request_identity(
+                    endpoint, body, include_reasoning_effort=False
+                )
+                record = self._records.get(legacy_identity["cache_key"])
+                if record is None and self.path.exists():
+                    self._load()
+                    record = self._records.get(legacy_identity["cache_key"])
+                # Preserve valid expensive decisions. A legacy rejection or
+                # timeout is deliberately not inherited: the bounded route is
+                # intended to retry exactly those failed requests under the new
+                # inference behavior.
+                if record is not None and record["status"] == "accepted":
+                    identity = legacy_identity
+                else:
+                    record = None
             if record is None:
                 self.misses += 1
                 return None
@@ -2824,7 +2858,10 @@ class AnalyzerResponseCache:
 
 
 def http_transport(endpoint: AnalyzerEndpoint, body: dict[str, Any]) -> dict[str, Any]:
-    encoded = canonical_json(body).encode("utf-8")
+    transport_body = dict(body)
+    if endpoint.reasoning_effort:
+        transport_body["reasoning_effort"] = endpoint.reasoning_effort
+    encoded = canonical_json(transport_body).encode("utf-8")
     request = urllib.request.Request(
         endpoint.url,
         data=encoded,

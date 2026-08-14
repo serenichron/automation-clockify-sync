@@ -456,7 +456,7 @@ evidence at the nearest context or complete conversation-turn boundary and
 analyzes each child through the same route set, cancellation gate, and sealed cache.
 It never retries the identical parent request.
 Recovery never separates user intent from its following assistant result. It is
-bounded at an indivisible turn, singleton evidence, or depth eight, records every
+bounded at an indivisible turn, singleton evidence, or depth four, records every
 child route decision, and cannot rejoin normal cross-chunk synthesis unless every
 evidence ID is classified exactly once.
 A passing synthetic
@@ -500,6 +500,12 @@ only the approved pinned Flash route. It restarts unexpected crashes, but
 `RestartPreventExitStatus=2` prevents a known fail-closed configuration,
 authentication, integrity, or route error from looping indefinitely. Logs remain
 in the Precision user journal.
+
+Set `CLOCKIFY_ANALYZER_PRIMARY_REASONING_EFFORT=none` for the current Flash
+alias. Ollama otherwise enables a reasoning stream that can spend minutes on a
+small contract request. The setting remains model inference, is bound to new
+cache route identities, reuses accepted legacy decisions from the same model
+revision, and deliberately retries legacy rejections and timeouts.
 
 When the desktop is unavailable, macOS can run the same guarded runner through
 `ops/launchd/com.serenichron.clockify-work-accounting.plist` and

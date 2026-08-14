@@ -24,11 +24,11 @@ except ModuleNotFoundError:
 
 INPUT_SCHEMA_VERSION = "clockify-analyzer-evaluation-input/v1"
 SCORECARD_SCHEMA_VERSION = "clockify-analyzer-evaluation-scorecard/v1"
-EVALUATOR_VERSION = "clockify-analyzer-evaluator/v5"
+EVALUATOR_VERSION = "clockify-analyzer-evaluator/v6"
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 _CASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _REQUIRED_ROUTE_FIELDS = frozenset({"route_id", "model", "tier"})
-_ROUTE_FIELDS = _REQUIRED_ROUTE_FIELDS | {"revision"}
+_ROUTE_FIELDS = _REQUIRED_ROUTE_FIELDS | {"revision", "reasoning_effort"}
 _RESPONSE_FIELDS = frozenset({"activities", "exceptions", "omissions"})
 
 
@@ -102,6 +102,8 @@ def _route(document: Mapping[str, Any]) -> dict[str, str]:
         r"[a-f0-9]{64}", route["revision"]
     ):
         raise EvaluationError("moving cloud model routes require a release revision")
+    if route["reasoning_effort"] not in {"", "none"}:
+        raise EvaluationError("route reasoning_effort must be empty or none")
     return route
 
 

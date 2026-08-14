@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import dataclasses
 import json
 import os
 from pathlib import Path
@@ -112,6 +113,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
             "OPENAI_MODEL": "deepseek-v4-flash:cloud",
             "CF_ACCESS_CLIENT_ID": "access-id",
             "CF_ACCESS_CLIENT_SECRET": "access-secret",
+            "CLOCKIFY_ANALYZER_PRIMARY_REASONING_EFFORT": "none",
         }
         with mock.patch.dict(os.environ, environment, clear=True):
             endpoint = semantic.AnalyzerEndpoint.from_env(
@@ -126,6 +128,16 @@ class SemanticAnalyzerTests(unittest.TestCase):
         self.assertEqual("gateway-bearer", endpoint.api_key)
         self.assertEqual("access-id", endpoint.cf_access_client_id)
         self.assertEqual("access-secret", endpoint.cf_access_client_secret)
+        self.assertEqual("none", endpoint.reasoning_effort)
+
+    def test_endpoint_rejects_unbounded_reasoning_effort_configuration(self):
+        with self.assertRaisesRegex(
+            semantic.AnalyzerError, "reasoning effort must be empty or none"
+        ):
+            semantic.AnalyzerEndpoint(
+                "primary", "http://primary", "qualified",
+                reasoning_effort="low",
+            )
 
     def test_http_transport_sends_protected_gateway_headers(self):
         endpoint = semantic.AnalyzerEndpoint(
@@ -135,6 +147,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
             api_key="gateway-bearer",
             cf_access_client_id="access-id",
             cf_access_client_secret="access-secret",
+            reasoning_effort="none",
         )
         response = mock.MagicMock()
         response.__enter__.return_value.read.return_value = b'{"ok":true}'
@@ -150,6 +163,9 @@ class SemanticAnalyzerTests(unittest.TestCase):
         self.assertEqual("Bearer gateway-bearer", request.get_header("Authorization"))
         self.assertEqual("access-id", request.get_header("Cf-access-client-id"))
         self.assertEqual("access-secret", request.get_header("Cf-access-client-secret"))
+        self.assertEqual(
+            "none", json.loads(request.data)["reasoning_effort"]
+        )
 
     def test_http_transport_separates_retryable_and_hard_http_failures(self):
         endpoint = semantic.AnalyzerEndpoint("primary", "http://primary", "qualified")
@@ -3719,6 +3735,56 @@ class SemanticAnalyzerTests(unittest.TestCase):
             semantic.AnalyzerResponseCache._request_identity(first, body)["cache_key"],
             semantic.AnalyzerResponseCache._request_identity(second, body)["cache_key"],
         )
+
+    def test_response_cache_reuses_legacy_decision_then_separates_new_reasoning_route(self):
+        body = {"model": semantic.DEFAULT_PRIMARY_MODEL, "messages": []}
+        legacy = semantic.AnalyzerEndpoint(
+            "primary", "http://primary", semantic.DEFAULT_PRIMARY_MODEL,
+            revision="a" * 64,
+        )
+        bounded = dataclasses.replace(legacy, reasoning_effort="none")
+        response = {"activities": [], "exceptions": [], "omissions": []}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "analyzer-cache.jsonl"
+            cache = semantic.AnalyzerResponseCache(path)
+            cache.store_accepted(legacy, body, response)
+
+            self.assertEqual(response, cache.lookup(bounded, body))
+            self.assertEqual(1, cache.hits)
+            self.assertEqual(0, cache.misses)
+            self.assertNotEqual(
+                semantic.AnalyzerResponseCache._request_identity(legacy, body)["cache_key"],
+                semantic.AnalyzerResponseCache._request_identity(bounded, body)["cache_key"],
+            )
+
+            new_body = {"model": semantic.DEFAULT_PRIMARY_MODEL, "messages": [{"role": "user"}]}
+            cache.store_accepted(bounded, new_body, response)
+            records = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(2, len(records))
+        self.assertNotEqual(records[0]["route_digest"], records[1]["route_digest"])
+
+    def test_response_cache_does_not_inherit_legacy_rejection_into_new_reasoning_route(self):
+        body = {"model": semantic.DEFAULT_PRIMARY_MODEL, "messages": []}
+        legacy = semantic.AnalyzerEndpoint(
+            "primary", "http://primary", semantic.DEFAULT_PRIMARY_MODEL,
+            revision="a" * 64,
+        )
+        bounded = dataclasses.replace(legacy, reasoning_effort="none")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "analyzer-cache.jsonl"
+            cache = semantic.AnalyzerResponseCache(path)
+            cache.store_rejected(
+                legacy, body, failure_code="transport_timeout"
+            )
+
+            self.assertIsNone(cache.lookup(bounded, body))
+
+        self.assertEqual(0, cache.hits)
+        self.assertEqual(1, cache.misses)
 
     def test_response_cache_retains_prior_prompt_records_without_reusing_them(self):
         endpoint = semantic.AnalyzerEndpoint("primary", "http://primary", "cheap")
