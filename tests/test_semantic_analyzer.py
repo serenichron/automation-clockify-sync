@@ -2062,6 +2062,43 @@ class SemanticAnalyzerTests(unittest.TestCase):
         self.assertEqual("exhausted", recovery["status"])
         self.assertLessEqual(recovery["max_depth"], semantic.MAX_PARTITION_RECOVERY_DEPTH)
 
+    def test_partition_recovery_caps_persistent_rejection_amplification(self):
+        extract_calls = 0
+
+        def transport(_endpoint, body):
+            nonlocal extract_calls
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            extract_calls += 1
+            return {"activities": [], "exceptions": [], "omissions": []}
+
+        events = [event(f"ev-{number:02d}") for number in range(64)]
+        result = semantic.analyze_tiered(
+            events,
+            primary=semantic.AnalyzerEndpoint(
+                "primary", "http://primary", "qualified"
+            ),
+            transport=transport,
+            max_events_per_chunk=len(events),
+        )
+
+        # A complete depth-four binary tree has 31 nodes. Each node receives
+        # one initial request plus the two existing sealed repair attempts.
+        self.assertEqual(31 * 3, extract_calls)
+        self.assertEqual(
+            [item["evidence_id"] for item in events],
+            sorted(
+                evidence_id
+                for exception in result["exceptions"]
+                for evidence_id in exception["evidence_ids"]
+            ),
+        )
+        self.assertEqual(
+            semantic.MAX_PARTITION_RECOVERY_DEPTH,
+            result["analysis_chunks"][0]["recovery"]["max_depth"],
+        )
+
     def test_partition_recovery_rejects_colliding_child_activity_identities(self):
         def fake_call(_endpoint, chunk, **_kwargs):
             if len(chunk) > 1:

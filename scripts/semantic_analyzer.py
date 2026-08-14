@@ -61,7 +61,12 @@ MAX_CONNECTION_RECOVERY_ATTEMPTS = 3
 # Recover only by deterministic bisection.  The default extraction limit is
 # 250 events, so eight splits reach singleton evidence without an unbounded
 # retry tree.
-MAX_PARTITION_RECOVERY_DEPTH = 8
+# Bound recursive recovery so one persistently malformed model response cannot
+# amplify a single 250-event chunk into hundreds of additional inference calls.
+# Four levels still reduce a worst-case chunk to roughly 16-event leaves while
+# capping the recovery tree at 31 logical nodes. Unresolved leaves remain
+# explicit analyzer_failure exceptions and the sealed cache stays replayable.
+MAX_PARTITION_RECOVERY_DEPTH = 4
 MIN_PARTITION_RECOVERY_EVENTS = 1
 PRIVATE_TEXT_APPROVAL_ENV = "CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED"
 LIFECYCLES = {
