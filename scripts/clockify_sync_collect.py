@@ -62,6 +62,7 @@ FATHOM_MAX_COLLECTION_RETRY_DELAY_SECONDS = 600
 FATHOM_COLLECTION_RETRY_DEADLINE_SECONDS = 1800
 CLOCKIFY_PAGE_SIZE = 200
 CLOCKIFY_CHECKPOINT_COMPATIBILITY_VERSION = "clockify-pagination/v1"
+FATHOM_CHECKPOINT_COMPATIBILITY_VERSION = "fathom-cursor-pagination/v1"
 CANONICAL_EXPORT_TIMEOUT_SECONDS = 900
 CANONICAL_EXPORT_TIMEOUT_MIN_SECONDS = 60
 CANONICAL_EXPORT_TIMEOUT_MAX_SECONDS = 1800
@@ -2435,6 +2436,99 @@ def _fathom_cursor_reference(cursor: str | None) -> str:
     return "sha256:" + hashlib.sha256(cursor.encode("utf-8")).hexdigest()[:12]
 
 
+def _fathom_page_response(data: Any) -> tuple[list[Mapping[str, Any]], str | None]:
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, Mapping)], None
+    if not isinstance(data, Mapping) or not isinstance(data.get("items"), (list, tuple)):
+        raise ValueError("Fathom meetings response did not contain a list")
+    next_cursor = (
+        data.get("next_cursor")
+        or data.get("nextCursor")
+        or data.get("next_page_token")
+        or (data.get("pagination") or {}).get("next_cursor")
+    )
+    return (
+        [item for item in data["items"] if isinstance(item, Mapping)],
+        str(next_cursor or "").strip() or None,
+    )
+
+
+def _fathom_page_signature(items: list[Mapping[str, Any]]) -> str:
+    canonical = json.dumps(
+        [str(item.get("recording_id") or item.get("id") or "") for item in items],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _fathom_checkpoint_identity(
+    since: dt.datetime,
+    until: dt.datetime,
+) -> CheckpointIdentity:
+    creation_search_start = since - FATHOM_CREATION_LOOKBACK
+    request_contract = {
+        "endpoint": "/meetings",
+        "query": {
+            "created_after": iso_utc(creation_search_start),
+            "created_before": iso_utc(until),
+            "limit": 50,
+            "include_summary": "true",
+            "include_action_items": "true",
+            "include_transcript": "true",
+        },
+        "occurrence_interval": {"since": iso_utc(since), "until": iso_utc(until)},
+        "creation_lookback_seconds": int(FATHOM_CREATION_LOOKBACK.total_seconds()),
+    }
+    request_fingerprint = "sha256:" + hashlib.sha256(
+        json.dumps(request_contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return CheckpointIdentity(
+        source="fathom",
+        since_utc=iso_utc(since),
+        until_utc=iso_utc(until),
+        request_fingerprint=request_fingerprint,
+        compatibility_version=FATHOM_CHECKPOINT_COMPATIBILITY_VERSION,
+    )
+
+
+def _fathom_checkpoint_items(
+    checkpoint_store: PageCheckpointStore,
+    state: CheckpointState,
+) -> tuple[list[Mapping[str, Any]], set[str], str | None]:
+    items: list[Mapping[str, Any]] = []
+    seen_cursors: set[str] = set()
+    cursor: str | None = None
+    for page_number, saved_page in enumerate(checkpoint_store.iter_pages(state), start=1):
+        page_items, next_cursor = _fathom_page_response(saved_page["payload"])
+        continuation = saved_page["continuation"]
+        if not isinstance(continuation, Mapping) or dict(continuation) != {
+            "cursor": next_cursor
+        }:
+            raise CheckpointError("checkpoint Fathom page continuation is invalid")
+        signature = saved_page["signature"]
+        if not isinstance(signature, str) or signature != _fathom_page_signature(page_items):
+            raise CheckpointError("checkpoint Fathom page signature is invalid")
+        if next_cursor:
+            if next_cursor in seen_cursors:
+                raise CheckpointError("checkpoint Fathom pagination cursor repeated")
+            seen_cursors.add(next_cursor)
+        elif page_number != len(state.pages):
+            raise CheckpointError("checkpoint Fathom terminal page has a successor")
+        items.extend(page_items)
+        cursor = next_cursor
+    expected_continuation: dict[str, str | None] = (
+        {} if not state.pages else {"cursor": cursor}
+    )
+    if dict(state.continuation) != expected_continuation:
+        raise CheckpointError("checkpoint Fathom continuation is invalid")
+    if state.complete and (not state.pages or cursor is not None):
+        raise CheckpointError("completed Fathom checkpoint has a continuation")
+    if not state.complete and state.pages and cursor is None:
+        raise CheckpointError("unfinished Fathom checkpoint has no continuation")
+    return items, seen_cursors, cursor
+
+
 def _fathom_failure(
     reason: str,
     *,
@@ -2457,7 +2551,13 @@ def _fathom_failure(
     }
 
 
-def fetch_fathom(fenv: dict[str, str], since: dt.datetime, until: dt.datetime) -> dict[str, Any]:
+def fetch_fathom(
+    fenv: dict[str, str],
+    since: dt.datetime,
+    until: dt.datetime,
+    *,
+    checkpoint_store: PageCheckpointStore | None = None,
+) -> dict[str, Any]:
     if fenv.get("_missing"):
         return {
             "status": "missing_credentials",
@@ -2466,14 +2566,23 @@ def fetch_fathom(fenv: dict[str, str], since: dt.datetime, until: dt.datetime) -
             "complete": False,
         }
     headers = {"X-Api-Key": fenv["FATHOM_API_KEY"]}
-    items: list[dict[str, Any]] = []
+    items: list[Mapping[str, Any]] = []
     cursor: str | None = None
     pages = 0
     retry_budget = FathomRetryBudget()
     creation_search_start = since - FATHOM_CREATION_LOOKBACK
     try:
         seen_cursors: set[str] = set()
-        while True:
+        checkpoint_state: CheckpointState | None = None
+        if checkpoint_store is not None:
+            checkpoint_state = checkpoint_store.open(_fathom_checkpoint_identity(since, until))
+            items, seen_cursors, cursor = _fathom_checkpoint_items(
+                checkpoint_store, checkpoint_state
+            )
+            pages = len(checkpoint_state.pages)
+        while checkpoint_state is None or not checkpoint_state.complete:
+            if pages >= FATHOM_MAX_PAGES:
+                raise ValueError("Fathom pagination exceeded safety limit")
             retry_budget.require_time_remaining()
             query = {
                 # Fathom recording records are created at or shortly after the
@@ -2496,30 +2605,26 @@ def fetch_fathom(fenv: dict[str, str], since: dt.datetime, until: dt.datetime) -
             data = fathom_http_json_with_retry(
                 f"{FATHOM_API}/meetings?{params}", headers, retry_budget
             )
-            if isinstance(data, list):
-                page_items = data
-            elif isinstance(data, dict) and isinstance(data.get("items"), list):
-                page_items = data["items"]
-            else:
-                raise ValueError("Fathom meetings response did not contain a list")
-            items.extend(item for item in page_items if isinstance(item, dict))
-            pages += 1
-            if isinstance(data, list):
-                break
-            next_cursor = (
-                data.get("next_cursor")
-                or data.get("nextCursor")
-                or data.get("next_page_token")
-                or (data.get("pagination") or {}).get("next_cursor")
-            )
-            cursor = str(next_cursor or "").strip() or None
-            if not cursor:
-                break
-            if pages >= FATHOM_MAX_PAGES:
-                raise ValueError("Fathom pagination exceeded safety limit")
-            if cursor in seen_cursors:
+            page_items, next_cursor = _fathom_page_response(data)
+            if next_cursor and next_cursor in seen_cursors:
                 raise ValueError("Fathom pagination cursor repeated")
-            seen_cursors.add(cursor)
+            if checkpoint_state is not None:
+                checkpoint_state = checkpoint_store.append_page(
+                    checkpoint_state,
+                    payload=data,
+                    continuation={"cursor": next_cursor},
+                    signature=_fathom_page_signature(page_items),
+                )
+            items.extend(page_items)
+            pages += 1
+            if next_cursor:
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+                continue
+            cursor = None
+            if checkpoint_state is not None:
+                checkpoint_state = checkpoint_store.mark_complete(checkpoint_state)
+            break
 
         meetings = []
         for m in items:
@@ -2602,7 +2707,10 @@ def fetch_fathom(fenv: dict[str, str], since: dt.datetime, until: dt.datetime) -
         )
     except Exception as e:
         return _fathom_failure(
-            str(e), page=pages + 1, cursor=cursor, retry_budget=retry_budget
+            str(e) if checkpoint_store is None else "Fathom checkpoint collection failed",
+            page=pages + 1,
+            cursor=cursor,
+            retry_budget=retry_budget,
         )
 
 

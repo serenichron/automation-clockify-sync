@@ -865,6 +865,170 @@ class CollectorBurstContextTests(unittest.TestCase):
         self.assertEqual(1, result["failure"]["retry_count"])
         self.assertEqual([1], result["failure"]["retry_delays_seconds"])
 
+    def test_fathom_retry_resumes_from_private_cursor(self) -> None:
+        first_page = {
+            "items": [{
+                "id": "first-meeting",
+                "recording_start_time": "2026-07-21T05:00:00Z",
+                "recording_end_time": "2026-07-21T05:30:00Z",
+            }],
+            "next_cursor": "private-next",
+        }
+        second_page = {
+            "items": [{
+                "id": "second-meeting",
+                "recording_start_time": "2026-07-21T06:00:00Z",
+                "recording_end_time": "2026-07-21T06:30:00Z",
+            }],
+        }
+        env = {"FATHOM_API_KEY": "not-logged"}
+
+        def interrupted_http(url, _headers):
+            cursor = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).get("cursor")
+            if cursor is None:
+                return first_page
+            self.assertEqual(["private-next"], cursor)
+            raise OSError("offline")
+
+        def resumed_http(url, _headers):
+            cursor = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).get("cursor")
+            self.assertEqual(["private-next"], cursor)
+            return second_page
+
+        def uninterrupted_http(url, _headers):
+            cursor = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).get("cursor")
+            return second_page if cursor else first_page
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = checkpoints.PageCheckpointStore(Path(directory))
+            with mock.patch.object(collector, "http_json", side_effect=interrupted_http):
+                interrupted = collector.fetch_fathom(
+                    env, SINCE, UNTIL, checkpoint_store=store
+                )
+
+            self.assertFalse(interrupted["complete"])
+            self.assertEqual([], interrupted["meetings"])
+            self.assertEqual(
+                collector._fathom_cursor_reference("private-next"),
+                interrupted["failure"]["cursor"],
+            )
+            self.assertNotIn("private-next", json.dumps(interrupted))
+
+            with mock.patch.object(collector, "http_json", side_effect=resumed_http):
+                resumed = collector.fetch_fathom(
+                    env, SINCE, UNTIL, checkpoint_store=store
+                )
+
+        with mock.patch.object(collector, "http_json", side_effect=uninterrupted_http):
+            uninterrupted = collector.fetch_fathom(env, SINCE, UNTIL)
+
+        self.assertTrue(resumed["complete"])
+        self.assertEqual(2, resumed["pages_fetched"])
+        self.assertEqual(["first-meeting", "second-meeting"], [
+            meeting["recording_id"] for meeting in resumed["meetings"]
+        ])
+        self.assertEqual(
+            json.dumps(uninterrupted, sort_keys=True, separators=(",", ":")).encode(),
+            json.dumps(resumed, sort_keys=True, separators=(",", ":")).encode(),
+        )
+
+    def test_fathom_complete_checkpoint_replay_skips_http(self) -> None:
+        page = {
+            "items": [{
+                "id": "completed-meeting",
+                "recording_start_time": "2026-07-21T05:00:00Z",
+                "recording_end_time": "2026-07-21T05:30:00Z",
+            }],
+        }
+        env = {"FATHOM_API_KEY": "not-logged"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = checkpoints.PageCheckpointStore(Path(directory))
+            with mock.patch.object(collector, "http_json", return_value=page):
+                collected = collector.fetch_fathom(
+                    env, SINCE, UNTIL, checkpoint_store=store
+                )
+            with mock.patch.object(collector, "http_json") as http:
+                replayed = collector.fetch_fathom(
+                    env, SINCE, UNTIL, checkpoint_store=store
+                )
+
+        self.assertEqual(collected, replayed)
+        http.assert_not_called()
+
+    def test_fathom_resume_rejects_repeated_private_cursor(self) -> None:
+        first_page = {"items": [], "next_cursor": "private-next"}
+        repeated_page = {"items": [], "next_cursor": "private-next"}
+        env = {"FATHOM_API_KEY": "not-logged"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = checkpoints.PageCheckpointStore(Path(directory))
+            with mock.patch.object(
+                collector, "http_json", side_effect=[first_page, OSError("offline")]
+            ):
+                collector.fetch_fathom(env, SINCE, UNTIL, checkpoint_store=store)
+            with mock.patch.object(collector, "http_json", return_value=repeated_page):
+                resumed = collector.fetch_fathom(
+                    env, SINCE, UNTIL, checkpoint_store=store
+                )
+
+        self.assertEqual("error", resumed["status"])
+        self.assertFalse(resumed["complete"])
+        self.assertEqual([], resumed["meetings"])
+        self.assertEqual(
+            collector._fathom_cursor_reference("private-next"),
+            resumed["failure"]["cursor"],
+        )
+        self.assertNotIn("private-next", json.dumps(resumed))
+
+    def test_fathom_corrupt_checkpoint_fails_closed_before_http(self) -> None:
+        page = {"items": []}
+        env = {"FATHOM_API_KEY": "not-logged"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = checkpoints.PageCheckpointStore(root)
+            with mock.patch.object(collector, "http_json", return_value=page):
+                collector.fetch_fathom(env, SINCE, UNTIL, checkpoint_store=store)
+            page_path = next(root.iterdir()) / "pages" / "000001.json"
+            saved_page = json.loads(page_path.read_text())
+            saved_page["payload"] = {"items": [{"id": "tampered"}]}
+            page_path.write_text(json.dumps(saved_page))
+
+            with mock.patch.object(collector, "http_json") as http:
+                corrupted = collector.fetch_fathom(
+                    env, SINCE, UNTIL, checkpoint_store=store
+                )
+
+        self.assertEqual("error", corrupted["status"])
+        self.assertFalse(corrupted["complete"])
+        self.assertEqual([], corrupted["meetings"])
+        http.assert_not_called()
+
+    def test_fathom_unfinished_terminal_checkpoint_fails_closed_before_http(self) -> None:
+        page = {"items": []}
+        env = {"FATHOM_API_KEY": "not-logged"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = checkpoints.PageCheckpointStore(Path(directory))
+            state = store.open(collector._fathom_checkpoint_identity(SINCE, UNTIL))
+            store.append_page(
+                state,
+                payload=page,
+                continuation={"cursor": None},
+                signature=collector._fathom_page_signature([]),
+            )
+
+            with mock.patch.object(collector, "http_json") as http:
+                corrupted = collector.fetch_fathom(
+                    env, SINCE, UNTIL, checkpoint_store=store
+                )
+
+        self.assertEqual("error", corrupted["status"])
+        self.assertFalse(corrupted["complete"])
+        self.assertEqual([], corrupted["meetings"])
+        http.assert_not_called()
+
     def test_fathom_retry_deadline_fails_closed_before_sleep(self) -> None:
         rate_limit = urllib.error.HTTPError(
             "https://fathom.example.test/meetings", 429, "rate limited",
