@@ -53,6 +53,54 @@ def accounting_result(*, proposal_id: str = "P001") -> dict:
 
 
 class ReviewRunResultTests(unittest.TestCase):
+    def test_collector_run_dirs_rejects_incomplete_report_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            run_dir = runs / "20260816T120000Z"
+            report_path = run_dir / "run-report.md"
+            report_path.parent.mkdir(parents=True)
+            report_path.write_text("# receipt\n", encoding="utf-8")
+            (run_dir / "run-report.json").write_text(json.dumps({
+                "evidence_ledger": {
+                    "source_completeness": {"status": "incomplete"},
+                },
+            }) + "\n", encoding="utf-8")
+            ledger_path = run_dir / "evidence" / "evidence-ledger.json"
+            ledger_path.parent.mkdir()
+            ledger_path.write_text(json.dumps({
+                "manifest": {
+                    "source_completeness": {"status": "complete"},
+                },
+            }) + "\n", encoding="utf-8")
+
+            with mock.patch.object(review_run, "RUNS", runs):
+                with self.assertRaisesRegex(ValueError, "not complete"):
+                    review_run._collector_run_dirs(str(report_path))
+
+    def test_collector_run_dirs_rejects_incomplete_ledger_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            run_dir = runs / "20260816T120000Z"
+            report_path = run_dir / "run-report.md"
+            report_path.parent.mkdir(parents=True)
+            report_path.write_text("# receipt\n", encoding="utf-8")
+            (run_dir / "run-report.json").write_text(json.dumps({
+                "evidence_ledger": {
+                    "source_completeness": {"status": "complete"},
+                },
+            }) + "\n", encoding="utf-8")
+            ledger_path = run_dir / "evidence" / "evidence-ledger.json"
+            ledger_path.parent.mkdir()
+            ledger_path.write_text(json.dumps({
+                "manifest": {
+                    "source_completeness": {"status": "incomplete"},
+                },
+            }) + "\n", encoding="utf-8")
+
+            with mock.patch.object(review_run, "RUNS", runs):
+                with self.assertRaisesRegex(ValueError, "not complete"):
+                    review_run._collector_run_dirs(str(report_path))
+
     def test_completed_slices_are_processed_before_later_collection_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             runs = Path(tmp) / "runs"
@@ -60,8 +108,19 @@ class ReviewRunResultTests(unittest.TestCase):
             second = runs / "20260816T130000Z"
             for run_dir in (first, second):
                 run_dir.mkdir(parents=True)
-                (run_dir / "run-report.json").write_text("{}\n", encoding="utf-8")
+                (run_dir / "run-report.json").write_text(json.dumps({
+                    "evidence_ledger": {
+                        "source_completeness": {"status": "complete"},
+                    },
+                }) + "\n", encoding="utf-8")
                 (run_dir / "run-report.md").write_text("# receipt\n", encoding="utf-8")
+                ledger_path = run_dir / "evidence" / "evidence-ledger.json"
+                ledger_path.parent.mkdir()
+                ledger_path.write_text(json.dumps({
+                    "manifest": {
+                        "source_completeness": {"status": "complete"},
+                    },
+                }) + "\n", encoding="utf-8")
             first_result = first / "autopilot-result.json"
             second_result = second / "autopilot-result.json"
             collected = subprocess.CompletedProcess(
@@ -602,8 +661,19 @@ class ReviewRunResultTests(unittest.TestCase):
             runs = Path(tmp) / "runs"
             run_dir = runs / "run-blocked"
             run_dir.mkdir(parents=True)
-            (run_dir / "run-report.json").write_text("{}\n", encoding="utf-8")
+            (run_dir / "run-report.json").write_text(json.dumps({
+                "evidence_ledger": {
+                    "source_completeness": {"status": "complete"},
+                },
+            }) + "\n", encoding="utf-8")
             (run_dir / "run-report.md").write_text("# fixture\n", encoding="utf-8")
+            ledger_path = run_dir / "evidence" / "evidence-ledger.json"
+            ledger_path.parent.mkdir()
+            ledger_path.write_text(json.dumps({
+                "manifest": {
+                    "source_completeness": {"status": "complete"},
+                },
+            }) + "\n", encoding="utf-8")
             collected = subprocess.CompletedProcess(
                 args=["collector"], returncode=0,
                 stdout=str(run_dir / "run-report.md") + "\n", stderr="",

@@ -368,13 +368,38 @@ def _collector_run_dirs(stdout: str) -> tuple[Path, ...]:
     seen: set[Path] = set()
     for report in reports:
         run_dir = report.parent
+        report_json = run_dir / "run-report.json"
+        ledger_json = run_dir / "evidence" / "evidence-ledger.json"
         if (
             report.name != "run-report.md"
             or run_dir.parent != RUNS.resolve()
             or not report.is_file()
-            or not (run_dir / "run-report.json").is_file()
+            or not report_json.is_file()
+            or not ledger_json.is_file()
         ):
             raise ValueError(f"Collector emitted an invalid run directory: {run_dir}")
+        try:
+            receipt = _read_json(report_json)
+            ledger = _read_json(ledger_json)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Collector emitted an invalid run receipt: {run_dir}") from exc
+        reported_ledger = receipt.get("evidence_ledger") if isinstance(receipt, dict) else None
+        manifest = ledger.get("manifest") if isinstance(ledger, dict) else None
+        reported_completeness = (
+            reported_ledger.get("source_completeness")
+            if isinstance(reported_ledger, dict)
+            else None
+        )
+        ledger_completeness = (
+            manifest.get("source_completeness") if isinstance(manifest, dict) else None
+        )
+        if (
+            not isinstance(reported_completeness, dict)
+            or reported_completeness.get("status") != "complete"
+            or not isinstance(ledger_completeness, dict)
+            or ledger_completeness.get("status") != "complete"
+        ):
+            raise ValueError(f"Collector emitted a run receipt that is not complete: {run_dir}")
         if run_dir in seen:
             raise ValueError(f"Collector emitted duplicate run directory: {run_dir}")
         seen.add(run_dir)
