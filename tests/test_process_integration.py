@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -73,6 +75,7 @@ class ProcessIntegrationTests(unittest.TestCase):
     def test_collector_run_emits_a_manifest_valid_evidence_ledger(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runs = Path(tmp) / "runs"
+            checkpoint_root = Path(tmp) / "checkpoints"
             machine_result = {
                 "machine": "macbook",
                 "status": "ok",
@@ -94,7 +97,10 @@ class ProcessIntegrationTests(unittest.TestCase):
                     return {"skip_rules": {}, "session_routes": [], "meeting_routes": []}
                 return {"machines": [{"name": "macbook", "enabled": True}], "ssh_options": []}
 
-            with mock.patch.object(collector, "RUNS", runs), mock.patch.object(
+            with mock.patch.object(collector, "RUNS", runs), mock.patch.dict(
+                collector.os.environ,
+                {"CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT": str(checkpoint_root)},
+            ), mock.patch.object(
                 collector, "load_json", side_effect=config
             ), mock.patch.object(
                 collector, "load_env_file", return_value={"_missing": True}
@@ -141,6 +147,352 @@ class ProcessIntegrationTests(unittest.TestCase):
                 "[NEEDS REVIEW] copied status",
                 (run_dir / "run-report.md").read_text(),
             )
+
+    def test_collector_emits_each_completed_backlog_slice(self) -> None:
+        """A long recovery interval creates one independently reviewable bundle per slice."""
+        seven_days_later = SINCE + dt.timedelta(days=7)
+
+        def dated_result(
+            source: str, since: dt.datetime, until: dt.datetime
+        ) -> dict[str, object]:
+            day = since.date().isoformat()
+            if source == "clockify":
+                return {
+                    "status": "ok",
+                    "complete": True,
+                    "entries": [{"id": f"clockify-{day}", "start": since.isoformat()}],
+                }
+            if source == "fathom":
+                return {
+                    "status": "ok",
+                    "complete": True,
+                    "meetings": [
+                        {
+                            "recording_id": f"fathom-{day}",
+                            "start": since.isoformat(),
+                            "end": until.isoformat(),
+                        }
+                    ],
+                }
+            return {
+                "status": "ok",
+                "complete": True,
+                "issues": [{"id": f"multica-{day}", "updated_at": since.isoformat()}],
+            }
+
+        def session_result(
+            machine: dict[str, object], since: dt.datetime, until: dt.datetime, *args: object, **kwargs: object
+        ) -> dict[str, object]:
+            day = since.date().isoformat()
+            return {
+                "machine": machine["name"],
+                "status": "ok",
+                "collector_contract": "canonical_export_v1",
+                "claude_bursts": [
+                    {"session_id": f"{machine['name']}-{day}", "start": since.isoformat(), "end": until.isoformat()}
+                ],
+                "hermes_sessions": [],
+                "hermes_db_sessions": [],
+                "codex_sessions": [],
+                "repository_events": [],
+                "repository_evidence_status": "complete",
+                "errors": [],
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            checkpoint_root = Path(tmp) / "checkpoints"
+            output = io.StringIO()
+            args = argparse.Namespace(since="2026-07-01", until="2026-07-07", enrich=False)
+
+            def config(path: Path):
+                if path.name == "routing.json":
+                    return {"skip_rules": {}, "session_routes": [], "meeting_routes": []}
+                return {
+                    "machines": [
+                        {"name": "macbook", "enabled": True},
+                        {"name": "remote", "enabled": True, "kind": "ssh"},
+                    ],
+                    "ssh_options": [],
+                }
+
+            with (
+                mock.patch.object(collector, "RUNS", runs),
+                mock.patch.dict(
+                    collector.os.environ,
+                    {"CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT": str(checkpoint_root)},
+                ),
+                mock.patch.object(collector, "load_json", side_effect=config),
+                mock.patch.object(collector, "load_env_file", return_value={"_missing": True}),
+                mock.patch.object(
+                    collector,
+                    "compute_range",
+                    return_value=(SINCE, seven_days_later, "fixture"),
+                ),
+                mock.patch.object(
+                    collector,
+                    "fetch_clockify",
+                    side_effect=lambda cenv, routing, since, until, **kwargs: dated_result(
+                        "clockify", since, until
+                    ),
+                ),
+                mock.patch.object(
+                    collector,
+                    "fetch_fathom",
+                    side_effect=lambda fenv, since, until, **kwargs: dated_result(
+                        "fathom", since, until
+                    ),
+                ),
+                mock.patch.object(
+                    collector,
+                    "fetch_multica_issues",
+                    side_effect=lambda since, until, **kwargs: dated_result(
+                        "multica", since, until
+                    ),
+                ),
+                mock.patch.object(
+                    collector,
+                    "machine_is_local",
+                    side_effect=lambda machine: machine["name"] == "macbook",
+                ),
+                mock.patch.object(collector, "collect_local_sessions", side_effect=session_result),
+                mock.patch.object(collector, "collect_remote_sessions", side_effect=session_result),
+                mock.patch.object(
+                    collector,
+                    "collector_runtime_identity",
+                    return_value={"collector_path": "/repo/collector.py", "git_sha": "fixture"},
+                ),
+                contextlib.redirect_stdout(output),
+            ):
+                self.assertEqual(0, collector.run(args))
+
+            reports = [Path(value) for value in output.getvalue().splitlines() if value]
+            run_dirs = sorted(runs.iterdir())
+            self.assertEqual(4, len(run_dirs))
+            self.assertEqual([run_dir / "run-report.md" for run_dir in run_dirs], reports)
+            self.assertEqual(4, len(set(run_dirs)))
+
+            previous_until = None
+            for run_dir, report_path in zip(run_dirs, reports):
+                report = json.loads((run_dir / "run-report.json").read_text())
+                evidence = json.loads(
+                    (run_dir / "evidence" / "evidence-ledger.json").read_text()
+                )
+                since = dt.datetime.strptime(
+                    report["date_range"]["since"], "%Y-%m-%d %H:%M"
+                ).replace(tzinfo=TZ)
+                until = dt.datetime.strptime(
+                    report["date_range"]["until"], "%Y-%m-%d %H:%M"
+                ).replace(tzinfo=TZ)
+                if previous_until is not None:
+                    self.assertEqual(previous_until, since)
+                previous_until = until
+                day = since.date().isoformat()
+                self.assertEqual("complete", evidence["manifest"]["source_completeness"]["status"])
+                self.assertEqual(
+                    {f"clockify-{day}", f"fathom-{day}", f"multica-{day}", f"macbook-{day}", f"remote-{day}"},
+                    {event["source_ref"]["source_id"] for event in evidence["events"]},
+                )
+                self.assertEqual(run_dir / "run-report.md", report_path)
+
+            self.assertEqual(seven_days_later, previous_until)
+
+    def test_collect_slice_rejects_an_interval_that_requires_multiple_slices(self) -> None:
+        """The extracted helper cannot accidentally rebuild a whole-range bundle."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "runs" / "bundle"
+            checkpoint_store = collector.PageCheckpointStore(Path(tmp) / "checkpoints")
+            complete = {"status": "ok", "complete": True}
+            with (
+                mock.patch.object(
+                    collector,
+                    "fetch_clockify",
+                    return_value={**complete, "entries": []},
+                ),
+                mock.patch.object(
+                    collector,
+                    "fetch_fathom",
+                    return_value={**complete, "meetings": []},
+                ),
+                mock.patch.object(
+                    collector,
+                    "fetch_multica_issues",
+                    return_value={**complete, "issues": []},
+                ),
+            ):
+                with self.assertRaises(ValueError):
+                    collector._collect_slice(
+                        argparse.Namespace(enrich=False),
+                        {"skip_rules": {}, "session_routes": [], "meeting_routes": []},
+                        {"machines": [], "ssh_options": []},
+                        {"_missing": True},
+                        {"_missing": True},
+                        SINCE,
+                        SINCE + dt.timedelta(days=3),
+                        "fixture",
+                        checkpoint_store,
+                        run_dir,
+                    )
+            self.assertFalse(run_dir.exists())
+
+    def test_collect_slice_rejects_a_malformed_existing_bundle_without_overwriting_it(self) -> None:
+        """A deterministic bundle collision is verified, never silently replaced."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "runs" / "bundle"
+            ledger_path = run_dir / "evidence" / "evidence-ledger.json"
+            ledger_path.parent.mkdir(parents=True)
+            (run_dir / "run-report.md").write_text("diagnostic\n")
+            (run_dir / "run-report.json").write_text(
+                json.dumps({"run_id": run_dir.name, "date_range": []})
+            )
+            ledger_path.write_text(json.dumps({"manifest": {}}))
+
+            with self.assertRaises(collector.BacklogError):
+                collector._collect_slice(
+                    argparse.Namespace(enrich=False),
+                    {"skip_rules": {}, "session_routes": [], "meeting_routes": []},
+                    {"machines": [], "ssh_options": []},
+                    {"_missing": True},
+                    {"_missing": True},
+                    SINCE,
+                    UNTIL,
+                    "fixture",
+                    collector.PageCheckpointStore(Path(tmp) / "checkpoints"),
+                    run_dir,
+                )
+            self.assertEqual("diagnostic\n", (run_dir / "run-report.md").read_text())
+
+    def test_collector_stops_at_an_incomplete_slice_and_retries_from_it(self) -> None:
+        """A later source failure preserves earlier receipts and never skips its retry."""
+        seven_days_later = SINCE + dt.timedelta(days=7)
+        routing = {"skip_rules": {}, "session_routes": [], "meeting_routes": []}
+        fleet = {"machines": [{"name": "macbook", "enabled": True}], "ssh_options": []}
+        failure_enabled = [True]
+        clockify_attempts: list[dt.datetime] = []
+
+        def clockify(
+            cenv: dict[str, str], routing: dict[str, object], since: dt.datetime, until: dt.datetime, **kwargs: object
+        ) -> dict[str, object]:
+            clockify_attempts.append(since)
+            return {
+                "status": "ok",
+                "complete": True,
+                "entries": [{"id": f"clockify-{since.date().isoformat()}", "start": since.isoformat()}],
+            }
+
+        def fathom(
+            fenv: dict[str, str], since: dt.datetime, until: dt.datetime, **kwargs: object
+        ) -> dict[str, object]:
+            if failure_enabled[0] and since == SINCE + dt.timedelta(days=2):
+                return {"status": "error", "complete": False, "meetings": []}
+            return {
+                "status": "ok",
+                "complete": True,
+                "meetings": [
+                    {
+                        "recording_id": f"fathom-{since.date().isoformat()}",
+                        "start": since.isoformat(),
+                        "end": until.isoformat(),
+                    }
+                ],
+            }
+
+        def multica(
+            since: dt.datetime, until: dt.datetime, **kwargs: object
+        ) -> dict[str, object]:
+            return {
+                "status": "ok",
+                "complete": True,
+                "issues": [{"id": f"multica-{since.date().isoformat()}", "updated_at": since.isoformat()}],
+            }
+
+        def sessions(
+            machine: dict[str, object], since: dt.datetime, until: dt.datetime, *args: object, **kwargs: object
+        ) -> dict[str, object]:
+            return {
+                "machine": machine["name"],
+                "status": "ok",
+                "collector_contract": "canonical_export_v1",
+                "claude_bursts": [
+                    {
+                        "session_id": f"{machine['name']}-{since.date().isoformat()}",
+                        "start": since.isoformat(),
+                        "end": until.isoformat(),
+                    }
+                ],
+                "hermes_sessions": [],
+                "hermes_db_sessions": [],
+                "codex_sessions": [],
+                "repository_events": [],
+                "repository_evidence_status": "complete",
+                "errors": [],
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            checkpoint_root = Path(tmp) / "checkpoints"
+            args = argparse.Namespace(since="2026-07-01", until="2026-07-07", enrich=False)
+
+            def config(path: Path):
+                return routing if path.name == "routing.json" else fleet
+
+            with (
+                mock.patch.object(collector, "RUNS", runs),
+                mock.patch.dict(
+                    collector.os.environ,
+                    {"CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT": str(checkpoint_root)},
+                ),
+                mock.patch.object(collector, "load_json", side_effect=config),
+                mock.patch.object(collector, "load_env_file", return_value={"_missing": True}),
+                mock.patch.object(
+                    collector,
+                    "compute_range",
+                    return_value=(SINCE, seven_days_later, "fixture"),
+                ),
+                mock.patch.object(collector, "fetch_clockify", side_effect=clockify),
+                mock.patch.object(collector, "fetch_fathom", side_effect=fathom),
+                mock.patch.object(collector, "fetch_multica_issues", side_effect=multica),
+                mock.patch.object(collector, "machine_is_local", return_value=True),
+                mock.patch.object(collector, "collect_local_sessions", side_effect=sessions),
+                mock.patch.object(
+                    collector,
+                    "collector_runtime_identity",
+                    return_value={"collector_path": "/repo/collector.py", "git_sha": "fixture"},
+                ),
+            ):
+                first_output = io.StringIO()
+                with contextlib.redirect_stdout(first_output):
+                    self.assertEqual(2, collector.run(args))
+
+                first_reports = [Path(value) for value in first_output.getvalue().splitlines() if value]
+                self.assertEqual(1, len(first_reports))
+                self.assertEqual(
+                    [SINCE, SINCE + dt.timedelta(days=2)], clockify_attempts
+                )
+                self.assertTrue(first_reports[0].is_file())
+
+                slices = collector.plan_slices(SINCE, seven_days_later, zone=collector.BUCHAREST)
+                identity = collector.BacklogIdentity(
+                    since_utc=collector.iso_utc(SINCE),
+                    until_utc=collector.iso_utc(seven_days_later),
+                    timezone=collector.BUCHAREST.key,
+                    max_days=2,
+                    compatibility_version=collector._backlog_compatibility_version(routing, fleet),
+                )
+                backlog = collector.BacklogStore(checkpoint_root).open(identity, slices)
+                self.assertEqual(1, len(backlog.completed))
+                self.assertEqual(first_reports[0], backlog.completed[0].result_path)
+
+                failure_enabled[0] = False
+                clockify_attempts.clear()
+                retry_output = io.StringIO()
+                with contextlib.redirect_stdout(retry_output):
+                    self.assertEqual(0, collector.run(args))
+
+            retry_reports = [Path(value) for value in retry_output.getvalue().splitlines() if value]
+            self.assertEqual(first_reports[0], retry_reports[0])
+            self.assertEqual(4, len(retry_reports))
+            self.assertEqual([slice_.since for slice_ in slices[1:]], clockify_attempts)
 
     def test_canonical_remote_export_is_preferred_without_legacy_execution(self) -> None:
         machine = {

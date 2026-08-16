@@ -37,12 +37,26 @@ try:
         CheckpointState,
         PageCheckpointStore,
     )
+    from scripts.collector_slices import (
+        BacklogError,
+        BacklogIdentity,
+        BacklogStore,
+        CollectionSlice,
+        plan_slices,
+    )
 except ModuleNotFoundError:  # Support direct execution from this directory.
     from collector_checkpoints import (  # type: ignore[no-redef]
         CheckpointError,
         CheckpointIdentity,
         CheckpointState,
         PageCheckpointStore,
+    )
+    from collector_slices import (  # type: ignore[no-redef]
+        BacklogError,
+        BacklogIdentity,
+        BacklogStore,
+        CollectionSlice,
+        plan_slices,
     )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -65,6 +79,7 @@ CLOCKIFY_CHECKPOINT_COMPATIBILITY_VERSION = "clockify-pagination/v1"
 FATHOM_CHECKPOINT_COMPATIBILITY_VERSION = "fathom-cursor-pagination/v2"
 MULTICA_PAGE_SIZE = 100
 MULTICA_CHECKPOINT_COMPATIBILITY_VERSION = "multica-offset-pagination/v1"
+BACKLOG_COMPATIBILITY_VERSION = "collector-slice-bundles/v1"
 CANONICAL_EXPORT_TIMEOUT_SECONDS = 900
 CANONICAL_EXPORT_TIMEOUT_MIN_SECONDS = 60
 CANONICAL_EXPORT_TIMEOUT_MAX_SECONDS = 1800
@@ -3499,21 +3514,120 @@ def write_markdown(run_dir: Path, report: dict[str, Any]) -> None:
     (run_dir / "run-report.md").write_text("\n".join(lines) + "\n")
 
 
-def run(args: argparse.Namespace) -> int:
-    routing = load_json(ROOT / "routing.json")
-    fleet = load_json(ROOT / "fleet.json")
-    cenv = load_env_file(clockify_env_candidates(), ["CLOCKIFY_API_KEY", "CLOCKIFY_WORKSPACE_ID"])
-    fenv = load_env_file(fathom_env_candidates(), ["FATHOM_API_KEY"])
-    since, until, reason = compute_range(args, routing, cenv)
+def collector_checkpoint_root() -> Path:
+    configured = os.environ.get("CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return ROOT / "state" / "collector-checkpoints"
+
+
+def _backlog_compatibility_version(
+    routing: Mapping[str, Any], fleet: Mapping[str, Any]
+) -> str:
+    payload = {
+        "contract": BACKLOG_COMPATIBILITY_VERSION,
+        "collector_sha256": collector_script_sha256(),
+        "routing": routing,
+        "fleet": fleet,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return f"{BACKLOG_COMPATIBILITY_VERSION}:{hashlib.sha256(encoded.encode()).hexdigest()}"
+
+
+def _slice_run_dir(slice_: CollectionSlice) -> Path:
+    since = slice_.since.astimezone(BUCHAREST).strftime("%Y%m%d")
+    until = slice_.until.astimezone(BUCHAREST).strftime("%Y%m%d")
+    return RUNS / f"{since}-{until}-{slice_.slice_id[7:]}"
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(65536), b""):
+            digest.update(block)
+    return "sha256:" + digest.hexdigest()
+
+
+def _verified_existing_slice_bundle(
+    run_dir: Path, since: dt.datetime, until: dt.datetime, reason: str
+) -> tuple[Path, dict[str, object]]:
+    report_path = run_dir / "run-report.md"
+    report_json_path = run_dir / "run-report.json"
+    ledger_path = run_dir / "evidence" / "evidence-ledger.json"
+    if (
+        run_dir.is_symlink()
+        or not run_dir.is_dir()
+        or any(path.is_symlink() or not path.is_file() for path in (report_path, report_json_path, ledger_path))
+    ):
+        raise BacklogError("existing slice bundle is missing required immutable artifacts")
+    try:
+        report = json.loads(report_json_path.read_text())
+        ledger = json.loads(ledger_path.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise BacklogError("existing slice bundle is invalid") from error
+    if not isinstance(report, dict) or not isinstance(ledger, dict):
+        raise BacklogError("existing slice bundle document is invalid")
+    if report.get("run_id") != run_dir.name or report.get("date_range") != {
+        "since": local_dt_string(since),
+        "until": local_dt_string(until),
+        "reason": reason,
+    }:
+        raise BacklogError("existing slice bundle identity does not match")
+    manifest = ledger.get("manifest")
+    completeness = manifest.get("source_completeness") if isinstance(manifest, dict) else None
+    if not isinstance(completeness, Mapping) or completeness.get("status") != "complete":
+        raise BacklogError("existing slice bundle is not complete")
+    return report_path, report
+
+
+def _slice_is_complete(report: Mapping[str, object]) -> bool:
+    ledger = report.get("evidence_ledger")
+    if not isinstance(ledger, Mapping):
+        return False
+    completeness = ledger.get("source_completeness")
+    return isinstance(completeness, Mapping) and completeness.get("status") == "complete"
+
+
+def _preserve_incomplete_run(run_dir: Path) -> None:
+    if not run_dir.exists() or run_dir.is_symlink() or not run_dir.is_dir():
+        return
+    candidate = run_dir.with_name(f"{run_dir.name}-incomplete")
+    suffix = 1
+    while candidate.exists():
+        candidate = run_dir.with_name(f"{run_dir.name}-incomplete-{suffix}")
+        suffix += 1
+    os.replace(run_dir, candidate)
+
+
+def _collect_slice(
+    args: argparse.Namespace,
+    routing: dict[str, Any],
+    fleet: dict[str, Any],
+    cenv: dict[str, str],
+    fenv: dict[str, str],
+    since: dt.datetime,
+    until: dt.datetime,
+    reason: str,
+    checkpoint_store: PageCheckpointStore,
+    run_dir: Path,
+) -> tuple[Path, dict[str, object]]:
+    requested_slices = plan_slices(since, until, zone=BUCHAREST)
+    if len(requested_slices) != 1:
+        raise ValueError("_collect_slice requires one bounded collection slice")
+    if run_dir.exists():
+        return _verified_existing_slice_bundle(run_dir, since, until, reason)
+    run_dir.mkdir(parents=True)
     runtime_identity = collector_runtime_identity()
-    run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    run_dir = RUNS / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_id = run_dir.name
 
     evidence = {
-        "clockify": fetch_clockify(cenv, routing, since, until),
-        "fathom": fetch_fathom(fenv, since, until),
-        "multica_issues": fetch_multica_issues(since, until),
+        "clockify": fetch_clockify(
+            cenv, routing, since, until, checkpoint_store=checkpoint_store
+        ),
+        "fathom": fetch_fathom(fenv, since, until, checkpoint_store=checkpoint_store),
+        "multica_issues": fetch_multica_issues(
+            since, until, checkpoint_store=checkpoint_store
+        ),
         "sessions": [],
     }
     for m in fleet.get("machines", []):
@@ -3669,7 +3783,68 @@ def run(args: argparse.Namespace) -> int:
     }
     write_json(run_dir / "run-report.json", compact)
     write_markdown(run_dir, report)
-    print(str(run_dir / "run-report.md"))
+    return run_dir / "run-report.md", report
+
+
+def run(args: argparse.Namespace) -> int:
+    routing = load_json(ROOT / "routing.json")
+    fleet = load_json(ROOT / "fleet.json")
+    cenv = load_env_file(clockify_env_candidates(), ["CLOCKIFY_API_KEY", "CLOCKIFY_WORKSPACE_ID"])
+    fenv = load_env_file(fathom_env_candidates(), ["FATHOM_API_KEY"])
+    since, until, reason = compute_range(args, routing, cenv)
+    slices = plan_slices(since, until, zone=BUCHAREST)
+    identity = BacklogIdentity(
+        since_utc=iso_utc(since),
+        until_utc=iso_utc(until),
+        timezone=BUCHAREST.key,
+        max_days=2,
+        compatibility_version=_backlog_compatibility_version(routing, fleet),
+    )
+    backlog_store = BacklogStore(collector_checkpoint_root())
+    try:
+        backlog = backlog_store.open(identity, slices)
+    except BacklogError:
+        print("collector backlog state is not safe to resume", file=sys.stderr)
+        return 2
+    checkpoint_store = PageCheckpointStore(backlog.directory / "source-checkpoints")
+    receipts = {receipt.slice_id: receipt for receipt in backlog.completed}
+
+    for slice_ in backlog.slices:
+        receipt = receipts.get(slice_.slice_id)
+        if receipt is not None:
+            print(str(receipt.result_path), flush=True)
+            continue
+        run_dir = _slice_run_dir(slice_)
+        try:
+            report_path, report = _collect_slice(
+                args,
+                routing,
+                fleet,
+                cenv,
+                fenv,
+                slice_.since,
+                slice_.until,
+                reason,
+                checkpoint_store,
+                run_dir,
+            )
+        except (BacklogError, CheckpointError, OSError, ValueError):
+            _preserve_incomplete_run(run_dir)
+            print("collector slice did not complete safely", file=sys.stderr)
+            return 2
+        if not _slice_is_complete(report):
+            _preserve_incomplete_run(run_dir)
+            return 2
+        try:
+            backlog = backlog_store.record_complete(
+                backlog, slice_.slice_id, report_path, _file_digest(report_path)
+            )
+        except (BacklogError, OSError):
+            print("collector slice receipt could not be recorded safely", file=sys.stderr)
+            return 2
+        receipts = {receipt.slice_id: receipt for receipt in backlog.completed}
+        print(str(report_path), flush=True)
+        del report
     return 0
 
 
