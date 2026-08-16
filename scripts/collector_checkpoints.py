@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import shutil
 from datetime import datetime, timezone
+from types import MappingProxyType
 from typing import Mapping
 
 
@@ -236,7 +237,7 @@ class PageCheckpointStore:
         pages = manifest["pages"]
         if not isinstance(pages, list):
             raise CheckpointError("manifest pages must be a list")
-        page_documents: list[Mapping[str, object]] = []
+        page_references: list[Mapping[str, object]] = []
         for expected_index, reference_value in enumerate(pages, start=1):
             reference = _mapping(reference_value, "page reference")
             if set(reference) != {"index", "path", "payload_digest", "page_digest"}:
@@ -274,7 +275,7 @@ class PageCheckpointStore:
                 raise CheckpointError("manifest payload digest does not match page")
             if _digest(page) != reference["page_digest"]:
                 raise CheckpointError("manifest page digest does not match page")
-            page_documents.append(page)
+            page_references.append(MappingProxyType(reference))
         if complete:
             if manifest["pages_digest"] != _digest(pages):
                 raise CheckpointError("completed page digest does not match")
@@ -282,7 +283,7 @@ class PageCheckpointStore:
         return CheckpointState(
             identity=identity,
             directory=directory,
-            pages=tuple(page_documents),
+            pages=tuple(page_references),
             continuation=continuation,
             metadata=metadata,
             complete=complete,

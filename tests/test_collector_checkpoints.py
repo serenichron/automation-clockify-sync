@@ -95,6 +95,29 @@ class PageCheckpointStoreTests(unittest.TestCase):
 
             self.assertEqual(1, len(reopened.pages))
 
+    def test_open_validates_pages_without_retaining_payload_bodies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = checkpoints.PageCheckpointStore(Path(directory))
+            state = store.append_page(
+                store.open(self.identity()),
+                payload=[{"id": "one", "detail": "must not remain in state"}],
+                continuation={},
+                signature="sha256:page-one",
+            )
+
+            reopened = store.open(self.identity())
+
+            self.assertEqual(
+                {"index", "path", "payload_digest", "page_digest"},
+                set(reopened.pages[0]),
+            )
+            page_path = state.directory / "pages/000001.json"
+            page = json.loads(page_path.read_text())
+            page["payload"] = [{"id": "changed"}]
+            page_path.write_text(json.dumps(page))
+            with self.assertRaises(checkpoints.CheckpointError):
+                store.open(self.identity())
+
     def test_open_rejects_manifest_for_a_different_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             store = checkpoints.PageCheckpointStore(Path(directory))
