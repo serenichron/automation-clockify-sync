@@ -636,6 +636,77 @@ class CollectorBurstContextTests(unittest.TestCase):
         self.assertEqual([], corrupted["entries"])
         clockify_get.assert_not_called()
 
+    def test_clockify_checkpoint_with_skipped_continuation_fails_closed(self) -> None:
+        env = {"CLOCKIFY_WORKSPACE_ID": "workspace", "CLOCKIFY_API_KEY": "not-logged"}
+        routing = {"clockify_user_id": "user"}
+        page = [{"id": "first-entry"}]
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = checkpoints.PageCheckpointStore(Path(directory))
+            identity = collector._clockify_checkpoint_identity(
+                "workspace", "user", SINCE, UNTIL
+            )
+            state = store.open(
+                identity,
+                initial_metadata={"snapshot_at": "2026-07-21T05:15:00Z"},
+            )
+            store.append_page(
+                state,
+                payload=page,
+                continuation={"page": 3},
+                signature=collector._clockify_page_signature(page),
+            )
+
+            with mock.patch.object(collector, "clockify_get") as clockify_get:
+                corrupted = collector.fetch_clockify(
+                    env,
+                    routing,
+                    SINCE,
+                    UNTIL,
+                    checkpoint_store=store,
+                )
+
+        self.assertEqual("error", corrupted["status"])
+        self.assertFalse(corrupted["complete"])
+        self.assertEqual([], corrupted["entries"])
+        clockify_get.assert_not_called()
+
+    def test_clockify_completed_checkpoint_with_full_final_page_fails_closed(self) -> None:
+        env = {"CLOCKIFY_WORKSPACE_ID": "workspace", "CLOCKIFY_API_KEY": "not-logged"}
+        routing = {"clockify_user_id": "user"}
+        full_page = [{"id": f"entry-{index:03d}"} for index in range(200)]
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = checkpoints.PageCheckpointStore(Path(directory))
+            identity = collector._clockify_checkpoint_identity(
+                "workspace", "user", SINCE, UNTIL
+            )
+            state = store.open(
+                identity,
+                initial_metadata={"snapshot_at": "2026-07-21T05:15:00Z"},
+            )
+            state = store.append_page(
+                state,
+                payload=full_page,
+                continuation={"page": 2},
+                signature=collector._clockify_page_signature(full_page),
+            )
+            store.mark_complete(state)
+
+            with mock.patch.object(collector, "clockify_get") as clockify_get:
+                corrupted = collector.fetch_clockify(
+                    env,
+                    routing,
+                    SINCE,
+                    UNTIL,
+                    checkpoint_store=store,
+                )
+
+        self.assertEqual("error", corrupted["status"])
+        self.assertFalse(corrupted["complete"])
+        self.assertEqual([], corrupted["entries"])
+        clockify_get.assert_not_called()
+
     def test_clockify_pagination_failure_marks_source_incomplete(self) -> None:
         with mock.patch.object(collector, "clockify_get", side_effect=OSError("offline")):
             result = collector.fetch_clockify(

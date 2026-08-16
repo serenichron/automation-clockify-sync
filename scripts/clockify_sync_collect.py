@@ -2244,11 +2244,17 @@ def _clockify_checkpoint_entries(
 ) -> tuple[list[Mapping[str, Any]], set[str]]:
     entries: list[Mapping[str, Any]] = []
     seen_pages: set[str] = set()
-    for saved_page in checkpoint_store.iter_pages(state):
+    final_page_size: int | None = None
+    for page_number, saved_page in enumerate(checkpoint_store.iter_pages(state), start=1):
         payload = saved_page["payload"]
         if not isinstance(payload, tuple):
             raise CheckpointError("checkpoint Clockify page payload is invalid")
         rows = [entry for entry in payload if isinstance(entry, Mapping)]
+        continuation = saved_page["continuation"]
+        if not isinstance(continuation, Mapping) or dict(continuation) != {
+            "page": page_number + 1
+        }:
+            raise CheckpointError("checkpoint Clockify page continuation is invalid")
         signature = saved_page["signature"]
         if not isinstance(signature, str) or signature != _clockify_page_signature(rows):
             raise CheckpointError("checkpoint Clockify page signature is invalid")
@@ -2256,12 +2262,18 @@ def _clockify_checkpoint_entries(
             raise CheckpointError("checkpoint Clockify pagination repeated a page")
         seen_pages.add(signature)
         entries.extend(rows)
+        final_page_size = len(rows)
+    if state.complete and (
+        final_page_size is None or final_page_size >= CLOCKIFY_PAGE_SIZE
+    ):
+        raise CheckpointError("completed Clockify checkpoint has no short final page")
     return entries, seen_pages
 
 
 def _clockify_checkpoint_page(state: CheckpointState) -> int:
-    page = state.continuation.get("page", 1)
-    if not isinstance(page, int) or isinstance(page, bool) or page < 1:
+    page = len(state.pages) + 1
+    expected_continuation: dict[str, int] = {} if page == 1 else {"page": page}
+    if dict(state.continuation) != expected_continuation:
         raise CheckpointError("checkpoint Clockify continuation page is invalid")
     return page
 
