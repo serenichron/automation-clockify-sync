@@ -30,6 +30,21 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Mapping
 
+try:
+    from scripts.collector_checkpoints import (
+        CheckpointError,
+        CheckpointIdentity,
+        CheckpointState,
+        PageCheckpointStore,
+    )
+except ModuleNotFoundError:  # Support direct execution from this directory.
+    from collector_checkpoints import (  # type: ignore[no-redef]
+        CheckpointError,
+        CheckpointIdentity,
+        CheckpointState,
+        PageCheckpointStore,
+    )
+
 ROOT = Path(__file__).resolve().parents[1]
 RUNS = ROOT / "runs"
 CLOCKIFY_API = "https://api.clockify.me/api/v1"
@@ -45,6 +60,8 @@ FATHOM_MAX_RETRY_DELAY_SECONDS = 60
 FATHOM_MAX_COLLECTION_RETRIES = 12
 FATHOM_MAX_COLLECTION_RETRY_DELAY_SECONDS = 600
 FATHOM_COLLECTION_RETRY_DEADLINE_SECONDS = 1800
+CLOCKIFY_PAGE_SIZE = 200
+CLOCKIFY_CHECKPOINT_COMPATIBILITY_VERSION = "clockify-pagination/v1"
 CANONICAL_EXPORT_TIMEOUT_SECONDS = 900
 CANONICAL_EXPORT_TIMEOUT_MIN_SECONDS = 60
 CANONICAL_EXPORT_TIMEOUT_MAX_SECONDS = 1800
@@ -2177,6 +2194,78 @@ def extract_hermes_db_context(db_path: str, since: dt.datetime, until: dt.dateti
 
 
 
+def _clockify_page_signature(entries: list[Mapping[str, Any]]) -> str:
+    canonical = json.dumps(
+        [str(entry.get("id") or "") for entry in entries],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _clockify_checkpoint_identity(
+    workspace_id: str,
+    user_id: str,
+    since: dt.datetime,
+    until: dt.datetime,
+) -> CheckpointIdentity:
+    request_contract = {
+        "endpoint": "/workspaces/{workspace_id}/user/{user_id}/time-entries",
+        "workspace_id": workspace_id,
+        "user_id": user_id,
+        "page_size": CLOCKIFY_PAGE_SIZE,
+        "query": {"start": iso_utc(since), "end": iso_utc(until)},
+    }
+    request_fingerprint = "sha256:" + hashlib.sha256(
+        json.dumps(request_contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return CheckpointIdentity(
+        source="clockify",
+        since_utc=iso_utc(since),
+        until_utc=iso_utc(until),
+        request_fingerprint=request_fingerprint,
+        compatibility_version=CLOCKIFY_CHECKPOINT_COMPATIBILITY_VERSION,
+    )
+
+
+def _clockify_checkpoint_snapshot(state: CheckpointState) -> dt.datetime:
+    snapshot_at = state.metadata.get("snapshot_at")
+    if not isinstance(snapshot_at, str):
+        raise CheckpointError("checkpoint snapshot_at is invalid")
+    observed_at = parse_dt(snapshot_at)
+    if observed_at is None:
+        raise CheckpointError("checkpoint snapshot_at is invalid")
+    return observed_at
+
+
+def _clockify_checkpoint_entries(
+    checkpoint_store: PageCheckpointStore,
+    state: CheckpointState,
+) -> tuple[list[Mapping[str, Any]], set[str]]:
+    entries: list[Mapping[str, Any]] = []
+    seen_pages: set[str] = set()
+    for saved_page in checkpoint_store.iter_pages(state):
+        payload = saved_page["payload"]
+        if not isinstance(payload, tuple):
+            raise CheckpointError("checkpoint Clockify page payload is invalid")
+        rows = [entry for entry in payload if isinstance(entry, Mapping)]
+        signature = saved_page["signature"]
+        if not isinstance(signature, str) or signature != _clockify_page_signature(rows):
+            raise CheckpointError("checkpoint Clockify page signature is invalid")
+        if rows and signature in seen_pages:
+            raise CheckpointError("checkpoint Clockify pagination repeated a page")
+        seen_pages.add(signature)
+        entries.extend(rows)
+    return entries, seen_pages
+
+
+def _clockify_checkpoint_page(state: CheckpointState) -> int:
+    page = state.continuation.get("page", 1)
+    if not isinstance(page, int) or isinstance(page, bool) or page < 1:
+        raise CheckpointError("checkpoint Clockify continuation page is invalid")
+    return page
+
+
 def fetch_clockify(
     cenv: dict[str, str],
     routing: dict[str, Any],
@@ -2184,6 +2273,7 @@ def fetch_clockify(
     until: dt.datetime,
     *,
     snapshot_at: dt.datetime | None = None,
+    checkpoint_store: PageCheckpointStore | None = None,
 ) -> dict[str, Any]:
     if cenv.get("_missing"):
         return {
@@ -2198,30 +2288,71 @@ def fetch_clockify(
     observed_at = snapshot_at or dt.datetime.now(dt.timezone.utc)
     if observed_at.tzinfo is None:
         observed_at = observed_at.replace(tzinfo=dt.timezone.utc)
-    snapshot_boundary = min(until, observed_at)
     try:
-        entries: list[dict[str, Any]] = []
-        seen_pages: set[tuple[str, ...]] = set()
-        page = 1
-        while True:
-            page_entries = clockify_get(
-                f"/workspaces/{ws}/user/{user}/time-entries?"
-                f"start={iso_utc(since)}&end={iso_utc(until)}&page={page}&page-size=200",
-                cenv,
+        if checkpoint_store is None:
+            entries: list[Mapping[str, Any]] = []
+            seen_pages: set[tuple[str, ...]] = set()
+            page = 1
+            while True:
+                page_entries = clockify_get(
+                    f"/workspaces/{ws}/user/{user}/time-entries?"
+                    f"start={iso_utc(since)}&end={iso_utc(until)}&page={page}&page-size={CLOCKIFY_PAGE_SIZE}",
+                    cenv,
+                )
+                if not isinstance(page_entries, list):
+                    raise ValueError("Clockify time-entry response did not contain a list")
+                rows = [entry for entry in page_entries if isinstance(entry, dict)]
+                signature = tuple(str(entry.get("id") or "") for entry in rows)
+                if rows and signature in seen_pages:
+                    raise ValueError("Clockify pagination repeated a page")
+                seen_pages.add(signature)
+                entries.extend(rows)
+                if len(rows) < CLOCKIFY_PAGE_SIZE:
+                    break
+                page += 1
+                if page > 100:
+                    raise ValueError("Clockify pagination exceeded safety limit")
+            pages_fetched = page
+        else:
+            identity = _clockify_checkpoint_identity(ws, user, since, until)
+            checkpoint_state = checkpoint_store.open(
+                identity,
+                initial_metadata={"snapshot_at": iso_utc(observed_at)},
             )
-            if not isinstance(page_entries, list):
-                raise ValueError("Clockify time-entry response did not contain a list")
-            rows = [entry for entry in page_entries if isinstance(entry, dict)]
-            signature = tuple(str(entry.get("id") or "") for entry in rows)
-            if rows and signature in seen_pages:
-                raise ValueError("Clockify pagination repeated a page")
-            seen_pages.add(signature)
-            entries.extend(rows)
-            if len(rows) < 200:
-                break
-            page += 1
-            if page > 100:
-                raise ValueError("Clockify pagination exceeded safety limit")
+            observed_at = _clockify_checkpoint_snapshot(checkpoint_state)
+            entries, seen_pages = _clockify_checkpoint_entries(
+                checkpoint_store, checkpoint_state
+            )
+            page = _clockify_checkpoint_page(checkpoint_state)
+            pages_fetched = len(checkpoint_state.pages)
+            while not checkpoint_state.complete:
+                if page > 100:
+                    raise ValueError("Clockify pagination exceeded safety limit")
+                page_entries = clockify_get(
+                    f"/workspaces/{ws}/user/{user}/time-entries?"
+                    f"start={iso_utc(since)}&end={iso_utc(until)}&page={page}&page-size={CLOCKIFY_PAGE_SIZE}",
+                    cenv,
+                )
+                if not isinstance(page_entries, list):
+                    raise ValueError("Clockify time-entry response did not contain a list")
+                rows = [entry for entry in page_entries if isinstance(entry, Mapping)]
+                signature = _clockify_page_signature(rows)
+                if rows and signature in seen_pages:
+                    raise ValueError("Clockify pagination repeated a page")
+                seen_pages.add(signature)
+                checkpoint_state = checkpoint_store.append_page(
+                    checkpoint_state,
+                    payload=page_entries,
+                    continuation={"page": page + 1},
+                    signature=signature,
+                )
+                entries.extend(rows)
+                pages_fetched += 1
+                if len(rows) < CLOCKIFY_PAGE_SIZE:
+                    checkpoint_state = checkpoint_store.mark_complete(checkpoint_state)
+                    break
+                page += 1
+        snapshot_boundary = min(until, observed_at)
         sanitized = []
         running_entry_count = 0
         running_snapshot_count = 0
@@ -2266,7 +2397,7 @@ def fetch_clockify(
                 "ok" if running_snapshot_count == running_entry_count else "partial"
             ),
             "entries": sanitized,
-            "pages_fetched": page,
+            "pages_fetched": pages_fetched,
             "running_entry_count": running_entry_count,
             "running_entry_snapshot_count": running_snapshot_count,
             "collection_snapshot": {
@@ -2279,7 +2410,7 @@ def fetch_clockify(
     except Exception as e:
         return {
             "status": "error",
-            "error": str(e),
+            "error": str(e) if checkpoint_store is None else "Clockify checkpoint collection failed",
             "entries": [],
             "running_entry_count": 0,
             "complete": False,

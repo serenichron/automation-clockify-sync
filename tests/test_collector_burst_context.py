@@ -13,6 +13,8 @@ import urllib.error
 from pathlib import Path
 from unittest import mock
 
+from scripts import collector_checkpoints as checkpoints
+
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "clockify_sync_collect.py"
 SPEC = importlib.util.spec_from_file_location("clockify_sync_collect", SCRIPT)
@@ -473,6 +475,166 @@ class CollectorBurstContextTests(unittest.TestCase):
         self.assertEqual(2, result["pages_fetched"])
         self.assertEqual(201, len(result["entries"]))
         self.assertTrue(any("page=2&" in call for call in calls))
+
+    def test_clockify_retry_resumes_after_persisted_page(self) -> None:
+        first_page = [
+            {
+                "id": f"clockify-{index:03d}",
+                "timeInterval": {
+                    "start": "2026-07-21T07:00:00Z",
+                    "end": "2026-07-21T07:05:00Z",
+                },
+            }
+            for index in range(200)
+        ]
+        second_page = [{
+            "id": "clockify-200",
+            "timeInterval": {
+                "start": "2026-07-21T08:00:00Z",
+                "end": "2026-07-21T08:05:00Z",
+            },
+        }]
+        env = {"CLOCKIFY_WORKSPACE_ID": "workspace", "CLOCKIFY_API_KEY": "not-logged"}
+        routing = {"clockify_user_id": "user"}
+        observed_at = dt.datetime(2026, 7, 21, 8, 15, tzinfo=TZ)
+
+        def interrupted_get(path, _env):
+            if "page=1&" in path:
+                return first_page
+            if "page=2&" in path:
+                raise OSError("offline")
+            raise AssertionError(path)
+
+        def resumed_get(path, _env):
+            if "page=1&" in path:
+                raise AssertionError("resume requested an already persisted page")
+            if "page=2&" in path:
+                return second_page
+            raise AssertionError(path)
+
+        def uninterrupted_get(path, _env):
+            if "page=1&" in path:
+                return first_page
+            if "page=2&" in path:
+                return second_page
+            raise AssertionError(path)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = checkpoints.PageCheckpointStore(Path(directory))
+            with mock.patch.object(collector, "clockify_get", side_effect=interrupted_get):
+                interrupted = collector.fetch_clockify(
+                    env,
+                    routing,
+                    SINCE,
+                    UNTIL,
+                    snapshot_at=observed_at,
+                    checkpoint_store=store,
+                )
+            self.assertFalse(interrupted["complete"])
+            self.assertEqual([], interrupted["entries"])
+
+            with mock.patch.object(collector, "clockify_get", side_effect=resumed_get):
+                resumed = collector.fetch_clockify(
+                    env,
+                    routing,
+                    SINCE,
+                    UNTIL,
+                    checkpoint_store=store,
+                )
+
+        with mock.patch.object(collector, "clockify_get", side_effect=uninterrupted_get):
+            uninterrupted = collector.fetch_clockify(
+                env,
+                routing,
+                SINCE,
+                UNTIL,
+                snapshot_at=observed_at,
+            )
+
+        self.assertTrue(resumed["complete"])
+        self.assertEqual(201, len(resumed["entries"]))
+        self.assertEqual(2, resumed["pages_fetched"])
+        self.assertEqual(
+            json.dumps(resumed, sort_keys=True, separators=(",", ":")).encode(),
+            json.dumps(uninterrupted, sort_keys=True, separators=(",", ":")).encode(),
+        )
+
+    def test_clockify_complete_checkpoint_replay_skips_http(self) -> None:
+        entry = [{
+            "id": "completed-entry",
+            "timeInterval": {
+                "start": "2026-07-21T07:00:00Z",
+                "end": "2026-07-21T07:05:00Z",
+            },
+        }]
+        env = {"CLOCKIFY_WORKSPACE_ID": "workspace", "CLOCKIFY_API_KEY": "not-logged"}
+        routing = {"clockify_user_id": "user"}
+        observed_at = dt.datetime(2026, 7, 21, 8, 15, tzinfo=TZ)
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = checkpoints.PageCheckpointStore(Path(directory))
+            with mock.patch.object(collector, "clockify_get", return_value=entry):
+                collected = collector.fetch_clockify(
+                    env,
+                    routing,
+                    SINCE,
+                    UNTIL,
+                    snapshot_at=observed_at,
+                    checkpoint_store=store,
+                )
+
+            with mock.patch.object(collector, "clockify_get") as clockify_get:
+                replayed = collector.fetch_clockify(
+                    env,
+                    routing,
+                    SINCE,
+                    UNTIL,
+                    checkpoint_store=store,
+                )
+
+        self.assertTrue(collected["complete"])
+        self.assertEqual(collected, replayed)
+        clockify_get.assert_not_called()
+
+    def test_clockify_corrupt_checkpoint_fails_closed_before_http(self) -> None:
+        entry = [{
+            "id": "completed-entry",
+            "timeInterval": {
+                "start": "2026-07-21T07:00:00Z",
+                "end": "2026-07-21T07:05:00Z",
+            },
+        }]
+        env = {"CLOCKIFY_WORKSPACE_ID": "workspace", "CLOCKIFY_API_KEY": "not-logged"}
+        routing = {"clockify_user_id": "user"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = checkpoints.PageCheckpointStore(root)
+            with mock.patch.object(collector, "clockify_get", return_value=entry):
+                collector.fetch_clockify(
+                    env,
+                    routing,
+                    SINCE,
+                    UNTIL,
+                    checkpoint_store=store,
+                )
+            page_path = next(root.iterdir()) / "pages" / "000001.json"
+            page = json.loads(page_path.read_text())
+            page["payload"] = [{"id": "tampered"}]
+            page_path.write_text(json.dumps(page))
+
+            with mock.patch.object(collector, "clockify_get") as clockify_get:
+                corrupted = collector.fetch_clockify(
+                    env,
+                    routing,
+                    SINCE,
+                    UNTIL,
+                    checkpoint_store=store,
+                )
+
+        self.assertFalse(corrupted["complete"])
+        self.assertEqual([], corrupted["entries"])
+        clockify_get.assert_not_called()
 
     def test_clockify_pagination_failure_marks_source_incomplete(self) -> None:
         with mock.patch.object(collector, "clockify_get", side_effect=OSError("offline")):
