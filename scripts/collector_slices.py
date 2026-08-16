@@ -67,11 +67,15 @@ def plan_slices(
     local_until = until.astimezone(zone)
     slices: list[CollectionSlice] = []
     cursor = local_since
-    while cursor < local_until:
+    while _utc_instant(cursor) < _utc_instant(local_until):
         boundary = datetime.combine(
             cursor.date() + timedelta(days=max_days), time.min, tzinfo=zone
         )
-        end = min(boundary, local_until)
+        end = (
+            boundary
+            if _utc_instant(boundary) < _utc_instant(local_until)
+            else local_until
+        )
         slices.append(CollectionSlice(cursor, end, _slice_id(cursor, end, zone)))
         cursor = end
     return tuple(slices)
@@ -87,7 +91,7 @@ def _validate_interval(
     for value, name in ((since, "since"), (until, "until")):
         if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
             raise BacklogError(f"{name} must be timezone-aware")
-    if since >= until:
+    if _utc_instant(since) >= _utc_instant(until):
         raise BacklogError("since must be before until")
 
 
@@ -102,7 +106,11 @@ def _slice_id(since: datetime, until: datetime, zone: ZoneInfo) -> str:
 
 
 def _utc_string(value: datetime) -> str:
-    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    return _utc_instant(value).isoformat().replace("+00:00", "Z")
+
+
+def _utc_instant(value: datetime) -> datetime:
+    return value.astimezone(timezone.utc)
 
 
 class BacklogStore:

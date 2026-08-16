@@ -46,6 +46,20 @@ class SlicePlanningTests(unittest.TestCase):
         self.assertEqual(dt.time.min, slices[0].until.astimezone(BUCHAREST).time())
         self.assertEqual(dt.datetime(2026, 10, 26, tzinfo=BUCHAREST), slices[0].until)
 
+    def test_repeated_fall_back_hour_preserves_utc_interval(self) -> None:
+        since = dt.datetime(2026, 10, 25, 0, 30, tzinfo=dt.timezone.utc)
+        until = dt.datetime(2026, 10, 25, 1, 15, tzinfo=dt.timezone.utc)
+
+        slices = collector_slices.plan_slices(since, until, zone=BUCHAREST)
+
+        self.assertEqual(1, len(slices))
+        self.assertLess(
+            slices[0].since.astimezone(dt.timezone.utc),
+            slices[0].until.astimezone(dt.timezone.utc),
+        )
+        self.assertEqual(since, slices[0].since.astimezone(dt.timezone.utc))
+        self.assertEqual(until, slices[0].until.astimezone(dt.timezone.utc))
+
     def test_preserves_partial_endpoints(self) -> None:
         since = dt.datetime(2026, 8, 1, 13, 45, tzinfo=BUCHAREST)
         until = dt.datetime(2026, 8, 5, 9, 15, tzinfo=BUCHAREST)
