@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as dt
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -493,6 +494,240 @@ class ProcessIntegrationTests(unittest.TestCase):
             self.assertEqual(first_reports[0], retry_reports[0])
             self.assertEqual(4, len(retry_reports))
             self.assertEqual([slice_.since for slice_ in slices[1:]], clockify_attempts)
+
+    def test_collector_rejects_a_tampered_ledger_before_receipt_reuse(self) -> None:
+        """A completed-report digest alone cannot authorize replay after ledger tampering."""
+        routing = {"skip_rules": {}, "session_routes": [], "meeting_routes": []}
+        fleet = {"machines": [], "ssh_options": []}
+        calls: list[str] = []
+
+        def clockify(*args: object, **kwargs: object) -> dict[str, object]:
+            calls.append("clockify")
+            return {"status": "ok", "complete": True, "entries": []}
+
+        def fathom(*args: object, **kwargs: object) -> dict[str, object]:
+            calls.append("fathom")
+            return {"status": "ok", "complete": True, "meetings": []}
+
+        def multica(*args: object, **kwargs: object) -> dict[str, object]:
+            calls.append("multica")
+            return {"status": "ok", "complete": True, "issues": []}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            checkpoints = Path(tmp) / "checkpoints"
+            args = argparse.Namespace(since="2026-07-01", until="2026-07-01", enrich=False)
+
+            def config(path: Path):
+                return routing if path.name == "routing.json" else fleet
+
+            with (
+                mock.patch.object(collector, "RUNS", runs),
+                mock.patch.dict(
+                    collector.os.environ,
+                    {"CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT": str(checkpoints)},
+                ),
+                mock.patch.object(collector, "load_json", side_effect=config),
+                mock.patch.object(collector, "load_env_file", return_value={"_missing": True}),
+                mock.patch.object(
+                    collector, "compute_range", return_value=(SINCE, UNTIL, "fixture")
+                ),
+                mock.patch.object(collector, "fetch_clockify", side_effect=clockify),
+                mock.patch.object(collector, "fetch_fathom", side_effect=fathom),
+                mock.patch.object(collector, "fetch_multica_issues", side_effect=multica),
+                mock.patch.object(
+                    collector,
+                    "collector_runtime_identity",
+                    return_value={"collector_path": "/repo/collector.py", "git_sha": "fixture"},
+                ),
+            ):
+                initial_output = io.StringIO()
+                with contextlib.redirect_stdout(initial_output):
+                    self.assertEqual(0, collector.run(args))
+                report_path = Path(initial_output.getvalue().strip())
+                ledger_path = report_path.parent / "evidence" / "evidence-ledger.json"
+                ledger = json.loads(ledger_path.read_text())
+                ledger["manifest"]["source_completeness"]["status"] = "incomplete"
+                ledger["manifest"]["source_completeness"]["incomplete_sources"] = ["fathom"]
+                ledger_path.write_text(json.dumps(ledger))
+
+                calls.clear()
+                replay_output = io.StringIO()
+                with contextlib.redirect_stdout(replay_output):
+                    self.assertEqual(2, collector.run(args))
+
+            self.assertEqual([], calls)
+            self.assertEqual("", replay_output.getvalue())
+
+    def test_collector_rejects_a_rewritten_mutable_ledger_receipt(self) -> None:
+        """The immutable Markdown receipt binds the ledger digest, not mutable JSON alone."""
+        routing = {"skip_rules": {}, "session_routes": [], "meeting_routes": []}
+        fleet = {"machines": [], "ssh_options": []}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            checkpoints = Path(tmp) / "checkpoints"
+            args = argparse.Namespace(since="2026-07-01", until="2026-07-01", enrich=False)
+
+            def config(path: Path):
+                return routing if path.name == "routing.json" else fleet
+
+            with (
+                mock.patch.object(collector, "RUNS", runs),
+                mock.patch.dict(
+                    collector.os.environ,
+                    {"CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT": str(checkpoints)},
+                ),
+                mock.patch.object(collector, "load_json", side_effect=config),
+                mock.patch.object(collector, "load_env_file", return_value={"_missing": True}),
+                mock.patch.object(
+                    collector, "compute_range", return_value=(SINCE, UNTIL, "fixture")
+                ),
+                mock.patch.object(
+                    collector,
+                    "fetch_clockify",
+                    return_value={"status": "ok", "complete": True, "entries": []},
+                ),
+                mock.patch.object(
+                    collector,
+                    "fetch_fathom",
+                    return_value={"status": "ok", "complete": True, "meetings": []},
+                ),
+                mock.patch.object(
+                    collector,
+                    "fetch_multica_issues",
+                    return_value={"status": "ok", "complete": True, "issues": []},
+                ),
+                mock.patch.object(
+                    collector,
+                    "collector_runtime_identity",
+                    return_value={"collector_path": "/repo/collector.py", "git_sha": "fixture"},
+                ),
+            ):
+                initial_output = io.StringIO()
+                with contextlib.redirect_stdout(initial_output):
+                    self.assertEqual(0, collector.run(args))
+                report_path = Path(initial_output.getvalue().strip())
+                ledger_path = report_path.parent / "evidence" / "evidence-ledger.json"
+                ledger_path.write_text(ledger_path.read_text() + "\n")
+                report_json_path = report_path.parent / "run-report.json"
+                report = json.loads(report_json_path.read_text())
+                report["evidence_ledger"]["ledger_digest"] = "sha256:" + hashlib.sha256(
+                    ledger_path.read_bytes()
+                ).hexdigest()
+                report_json_path.write_text(json.dumps(report))
+
+                replay_output = io.StringIO()
+                with contextlib.redirect_stdout(replay_output):
+                    self.assertEqual(2, collector.run(args))
+
+            self.assertEqual("", replay_output.getvalue())
+
+    def test_collector_recollects_into_a_distinct_bundle_when_routing_changes(self) -> None:
+        """A routing compatibility change cannot reuse a prior deterministic run ID."""
+        routing = [
+            {"skip_rules": {}, "session_routes": [], "meeting_routes": []}
+        ]
+        fleet = {"machines": [], "ssh_options": []}
+        calls: list[str] = []
+
+        def clockify(*args: object, **kwargs: object) -> dict[str, object]:
+            calls.append("clockify")
+            return {"status": "ok", "complete": True, "entries": []}
+
+        def fathom(*args: object, **kwargs: object) -> dict[str, object]:
+            calls.append("fathom")
+            return {"status": "ok", "complete": True, "meetings": []}
+
+        def multica(*args: object, **kwargs: object) -> dict[str, object]:
+            calls.append("multica")
+            return {"status": "ok", "complete": True, "issues": []}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            checkpoints = Path(tmp) / "checkpoints"
+            args = argparse.Namespace(since="2026-07-01", until="2026-07-01", enrich=False)
+
+            def config(path: Path):
+                return routing[0] if path.name == "routing.json" else fleet
+
+            with (
+                mock.patch.object(collector, "RUNS", runs),
+                mock.patch.dict(
+                    collector.os.environ,
+                    {"CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT": str(checkpoints)},
+                ),
+                mock.patch.object(collector, "load_json", side_effect=config),
+                mock.patch.object(collector, "load_env_file", return_value={"_missing": True}),
+                mock.patch.object(
+                    collector, "compute_range", return_value=(SINCE, UNTIL, "fixture")
+                ),
+                mock.patch.object(collector, "fetch_clockify", side_effect=clockify),
+                mock.patch.object(collector, "fetch_fathom", side_effect=fathom),
+                mock.patch.object(collector, "fetch_multica_issues", side_effect=multica),
+                mock.patch.object(
+                    collector,
+                    "collector_runtime_identity",
+                    return_value={"collector_path": "/repo/collector.py", "git_sha": "fixture"},
+                ),
+            ):
+                first_output = io.StringIO()
+                with contextlib.redirect_stdout(first_output):
+                    self.assertEqual(0, collector.run(args))
+                first_report = Path(first_output.getvalue().strip())
+
+                calls.clear()
+                routing[0] = {
+                    "skip_rules": {"changed": "compatibility"},
+                    "session_routes": [],
+                    "meeting_routes": [],
+                }
+                second_output = io.StringIO()
+                with contextlib.redirect_stdout(second_output):
+                    self.assertEqual(0, collector.run(args))
+
+            second_report = Path(second_output.getvalue().strip())
+            self.assertEqual(["clockify", "fathom", "multica"], calls)
+            self.assertNotEqual(first_report, second_report)
+            self.assertEqual(2, len([path for path in runs.iterdir() if path.is_dir()]))
+
+    def test_collector_never_renames_a_peer_directory_after_a_claim_collision(self) -> None:
+        """A peer-owned incomplete directory is not converted into this run's diagnostic."""
+        routing = {"skip_rules": {}, "session_routes": [], "meeting_routes": []}
+        fleet = {"machines": [], "ssh_options": []}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            peer_run_dir = runs / "peer-bundle"
+            peer_run_dir.mkdir(parents=True)
+            marker = peer_run_dir / "peer-claim"
+            marker.write_text("peer-owned\n")
+            args = argparse.Namespace(since="2026-07-01", until="2026-07-01", enrich=False)
+
+            def config(path: Path):
+                return routing if path.name == "routing.json" else fleet
+
+            with (
+                mock.patch.object(collector, "RUNS", runs),
+                mock.patch.dict(
+                    collector.os.environ,
+                    {"CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT": str(Path(tmp) / "checkpoints")},
+                ),
+                mock.patch.object(collector, "load_json", side_effect=config),
+                mock.patch.object(collector, "load_env_file", return_value={"_missing": True}),
+                mock.patch.object(
+                    collector, "compute_range", return_value=(SINCE, UNTIL, "fixture")
+                ),
+                mock.patch.object(collector, "_slice_run_dir", return_value=peer_run_dir),
+                mock.patch.object(
+                    collector, "fetch_clockify", side_effect=AssertionError("must not collect")
+                ),
+            ):
+                self.assertEqual(2, collector.run(args))
+
+            self.assertTrue(peer_run_dir.is_dir())
+            self.assertEqual("peer-owned\n", marker.read_text())
+            self.assertFalse((runs / "peer-bundle-incomplete").exists())
 
     def test_canonical_remote_export_is_preferred_without_legacy_execution(self) -> None:
         machine = {

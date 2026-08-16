@@ -3483,6 +3483,9 @@ def write_markdown(run_dir: Path, report: dict[str, Any]) -> None:
     )
     lines.append("")
     lines.append("## Evidence status")
+    ledger_receipt = report.get("evidence_ledger", {})
+    if isinstance(ledger_receipt, Mapping) and ledger_receipt.get("ledger_digest"):
+        lines.append(f"- Evidence ledger receipt: {ledger_receipt['ledger_digest']}")
     lines.append(f"- Clockify: {report['evidence']['clockify']['status']} ({len(report['evidence']['clockify'].get('entries', []))} existing entries)")
     lines.append(f"- Fathom: {report['evidence']['fathom']['status']} ({len(report['evidence']['fathom'].get('meetings', []))} meetings)")
     lines.append(f"- Multica issues: {report['evidence']['multica_issues']['status']} ({len(report['evidence']['multica_issues'].get('issues', []))} issues)")
@@ -3534,10 +3537,11 @@ def _backlog_compatibility_version(
     return f"{BACKLOG_COMPATIBILITY_VERSION}:{hashlib.sha256(encoded.encode()).hexdigest()}"
 
 
-def _slice_run_dir(slice_: CollectionSlice) -> Path:
+def _slice_run_dir(slice_: CollectionSlice, compatibility_version: str) -> Path:
     since = slice_.since.astimezone(BUCHAREST).strftime("%Y%m%d")
     until = slice_.until.astimezone(BUCHAREST).strftime("%Y%m%d")
-    return RUNS / f"{since}-{until}-{slice_.slice_id[7:]}"
+    compatibility_digest = hashlib.sha256(compatibility_version.encode()).hexdigest()
+    return RUNS / f"{since}-{until}-{slice_.slice_id[7:]}-{compatibility_digest}"
 
 
 def _file_digest(path: Path) -> str:
@@ -3561,6 +3565,7 @@ def _verified_existing_slice_bundle(
     ):
         raise BacklogError("existing slice bundle is missing required immutable artifacts")
     try:
+        markdown = report_path.read_text()
         report = json.loads(report_json_path.read_text())
         ledger = json.loads(ledger_path.read_text())
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -3577,6 +3582,20 @@ def _verified_existing_slice_bundle(
     completeness = manifest.get("source_completeness") if isinstance(manifest, dict) else None
     if not isinstance(completeness, Mapping) or completeness.get("status") != "complete":
         raise BacklogError("existing slice bundle is not complete")
+    reported_ledger = report.get("evidence_ledger")
+    if not isinstance(reported_ledger, Mapping):
+        raise BacklogError("existing slice bundle has no ledger receipt")
+    expected_ledger = {
+        "manifest_id": manifest.get("manifest_id"),
+        "event_count": manifest.get("event_count"),
+        "events_digest": manifest.get("events_digest"),
+        "source_completeness": completeness,
+        "ledger_digest": _file_digest(ledger_path),
+    }
+    if any(reported_ledger.get(key) != value for key, value in expected_ledger.items()):
+        raise BacklogError("existing slice bundle ledger receipt does not match")
+    if f"- Evidence ledger receipt: {expected_ledger['ledger_digest']}\n" not in markdown:
+        raise BacklogError("existing slice bundle Markdown receipt does not bind its ledger")
     return report_path, report
 
 
@@ -3588,8 +3607,24 @@ def _slice_is_complete(report: Mapping[str, object]) -> bool:
     return isinstance(completeness, Mapping) and completeness.get("status") == "complete"
 
 
-def _preserve_incomplete_run(run_dir: Path) -> None:
-    if not run_dir.exists() or run_dir.is_symlink() or not run_dir.is_dir():
+def _claim_slice_run_dir(run_dir: Path) -> bool:
+    run_dir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        run_dir.mkdir()
+    except FileExistsError:
+        return False
+    return True
+
+
+def _preserve_incomplete_run(
+    run_dir: Path, *, owned_by_current_invocation: bool
+) -> None:
+    if (
+        not owned_by_current_invocation
+        or not run_dir.exists()
+        or run_dir.is_symlink()
+        or not run_dir.is_dir()
+    ):
         return
     candidate = run_dir.with_name(f"{run_dir.name}-incomplete")
     suffix = 1
@@ -3614,9 +3649,9 @@ def _collect_slice(
     requested_slices = plan_slices(since, until, zone=BUCHAREST)
     if len(requested_slices) != 1:
         raise ValueError("_collect_slice requires one bounded collection slice")
-    if run_dir.exists():
+    claimed_run_dir = _claim_slice_run_dir(run_dir)
+    if not claimed_run_dir:
         return _verified_existing_slice_bundle(run_dir, since, until, reason)
-    run_dir.mkdir(parents=True)
     runtime_identity = collector_runtime_identity()
     run_id = run_dir.name
 
@@ -3727,6 +3762,7 @@ def _collect_slice(
         "event_count": ledger.manifest.event_count,
         "events_digest": ledger.manifest.events_digest,
         "source_completeness": ledger.manifest.document()["source_completeness"],
+        "ledger_digest": _file_digest(ledger_path),
     }
     write_json(run_dir / "legacy-proposals.json", proposals)
     write_json(run_dir / "legacy-ambiguous.json", ambiguous)
@@ -3783,6 +3819,7 @@ def _collect_slice(
     }
     write_json(run_dir / "run-report.json", compact)
     write_markdown(run_dir, report)
+    report["_collector_owned_run_dir"] = True
     return run_dir / "run-report.md", report
 
 
@@ -3812,9 +3849,29 @@ def run(args: argparse.Namespace) -> int:
     for slice_ in backlog.slices:
         receipt = receipts.get(slice_.slice_id)
         if receipt is not None:
-            print(str(receipt.result_path), flush=True)
+            expected_report_path = (
+                _slice_run_dir(slice_, identity.compatibility_version) / "run-report.md"
+            )
+            if receipt.result_path != expected_report_path:
+                print("collector slice receipt is not safe to reuse", file=sys.stderr)
+                return 2
+            try:
+                report_path, report = _verified_existing_slice_bundle(
+                    receipt.result_path.parent,
+                    slice_.since,
+                    slice_.until,
+                    reason,
+                )
+            except (BacklogError, OSError, ValueError):
+                print("collector slice receipt is not safe to reuse", file=sys.stderr)
+                return 2
+            if report_path != expected_report_path or not _slice_is_complete(report):
+                print("collector slice receipt is not safe to reuse", file=sys.stderr)
+                return 2
+            print(str(report_path), flush=True)
+            del report
             continue
-        run_dir = _slice_run_dir(slice_)
+        run_dir = _slice_run_dir(slice_, identity.compatibility_version)
         try:
             report_path, report = _collect_slice(
                 args,
@@ -3829,11 +3886,15 @@ def run(args: argparse.Namespace) -> int:
                 run_dir,
             )
         except (BacklogError, CheckpointError, OSError, ValueError):
-            _preserve_incomplete_run(run_dir)
             print("collector slice did not complete safely", file=sys.stderr)
             return 2
         if not _slice_is_complete(report):
-            _preserve_incomplete_run(run_dir)
+            _preserve_incomplete_run(
+                run_dir,
+                owned_by_current_invocation=bool(
+                    report.pop("_collector_owned_run_dir", False)
+                ),
+            )
             return 2
         try:
             backlog = backlog_store.record_complete(
