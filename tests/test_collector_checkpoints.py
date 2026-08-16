@@ -118,6 +118,105 @@ class PageCheckpointStoreTests(unittest.TestCase):
             with self.assertRaises(checkpoints.CheckpointError):
                 store.open(self.identity())
 
+    def test_iter_pages_reconstructs_pages_in_manifest_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = checkpoints.PageCheckpointStore(Path(directory))
+            state = store.append_page(
+                store.open(self.identity()),
+                payload=[{"id": "one"}],
+                continuation={"page": 2},
+                signature="sha256:page-one",
+                metadata={"sequence": 1},
+            )
+            state = store.append_page(
+                state,
+                payload=[{"id": "two"}],
+                continuation={},
+                signature="sha256:page-two",
+                metadata={"sequence": 2},
+            )
+
+            pages = list(store.iter_pages(store.open(self.identity())))
+
+            self.assertEqual(
+                [({"id": "one"},), ({"id": "two"},)],
+                [page["payload"] for page in pages],
+            )
+            self.assertEqual(
+                [{"page": 2}, {}], [page["continuation"] for page in pages]
+            )
+            self.assertEqual(
+                ["sha256:page-one", "sha256:page-two"],
+                [page["signature"] for page in pages],
+            )
+            self.assertEqual(
+                [{"sequence": 1}, {"sequence": 2}],
+                [page["metadata"] for page in pages],
+            )
+
+    def test_iter_pages_yields_immutable_page_documents(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = checkpoints.PageCheckpointStore(Path(directory))
+            state = store.append_page(
+                store.open(self.identity()),
+                payload=[{"id": "one"}],
+                continuation={"page": 2},
+                signature="sha256:page-one",
+                metadata={"sequence": 1},
+            )
+
+            page = next(store.iter_pages(state))
+
+            with self.assertRaises(TypeError):
+                page["signature"] = "changed"
+            with self.assertRaises(AttributeError):
+                page["payload"].append({"id": "changed"})
+            with self.assertRaises(TypeError):
+                page["continuation"]["page"] = 3
+
+    def test_iter_pages_rejects_tampering_after_open_before_iteration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = checkpoints.PageCheckpointStore(Path(directory))
+            state = store.append_page(
+                store.open(self.identity()),
+                payload=[{"id": "one"}],
+                continuation={},
+                signature="sha256:page-one",
+            )
+            reopened = store.open(self.identity())
+            page_path = state.directory / "pages/000001.json"
+            page = json.loads(page_path.read_text())
+            page["payload"] = [{"id": "changed"}]
+            page_path.write_text(json.dumps(page))
+
+            with self.assertRaises(checkpoints.CheckpointError):
+                next(store.iter_pages(reopened))
+
+    def test_iter_pages_reads_each_later_page_at_its_yield_point(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = checkpoints.PageCheckpointStore(Path(directory))
+            state = store.append_page(
+                store.open(self.identity()),
+                payload=[{"id": "one"}],
+                continuation={"page": 2},
+                signature="sha256:page-one",
+            )
+            state = store.append_page(
+                state,
+                payload=[{"id": "two"}],
+                continuation={},
+                signature="sha256:page-two",
+            )
+            stream = store.iter_pages(store.open(self.identity()))
+
+            self.assertEqual(({"id": "one"},), next(stream)["payload"])
+            page_path = state.directory / "pages/000002.json"
+            page = json.loads(page_path.read_text())
+            page["payload"] = [{"id": "changed"}]
+            page_path.write_text(json.dumps(page))
+            with self.assertRaises(checkpoints.CheckpointError):
+                next(stream)
+
     def test_open_rejects_manifest_for_a_different_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             store = checkpoints.PageCheckpointStore(Path(directory))

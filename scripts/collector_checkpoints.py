@@ -10,7 +10,7 @@ from pathlib import Path
 import shutil
 from datetime import datetime, timezone
 from types import MappingProxyType
-from typing import Mapping
+from typing import Iterator, Mapping
 
 
 SCHEMA_VERSION = "collector-page-checkpoint/v1"
@@ -188,6 +188,17 @@ class PageCheckpointStore:
                 removed.append(directory)
         return tuple(removed)
 
+    def iter_pages(self, state: CheckpointState) -> Iterator[Mapping[str, object]]:
+        if not isinstance(state, CheckpointState):
+            raise CheckpointError("state must be a CheckpointState")
+        if state.directory != self._directory_for(state.identity):
+            raise CheckpointError("state directory does not match identity")
+        for expected_index, reference in enumerate(state.pages, start=1):
+            _, page = self._validate_page(reference, expected_index, state.directory)
+            yield MappingProxyType(
+                {key: _immutable_value(value) for key, value in page.items()}
+            )
+
     def _directory_for(self, identity: CheckpointIdentity) -> Path:
         return self.root / _digest(identity.document())[7:]
 
@@ -239,42 +250,9 @@ class PageCheckpointStore:
             raise CheckpointError("manifest pages must be a list")
         page_references: list[Mapping[str, object]] = []
         for expected_index, reference_value in enumerate(pages, start=1):
-            reference = _mapping(reference_value, "page reference")
-            if set(reference) != {"index", "path", "payload_digest", "page_digest"}:
-                raise CheckpointError("page reference schema is invalid")
-            path = f"pages/{expected_index:06d}.json"
-            if (
-                not _is_page_index(reference["index"], expected_index)
-                or reference["path"] != path
-            ):
-                raise CheckpointError("page reference index or path is invalid")
-            if not _is_digest(reference["payload_digest"]) or not _is_digest(
-                reference["page_digest"]
-            ):
-                raise CheckpointError("page reference digest is invalid")
-            page_path = directory / path
-            page = self._read_page(page_path)
-            if set(page) != {
-                "index",
-                "payload",
-                "payload_digest",
-                "continuation",
-                "signature",
-                "metadata",
-            }:
-                raise CheckpointError("page schema is invalid")
-            if not _is_page_index(page["index"], expected_index):
-                raise CheckpointError("page index is invalid")
-            if not isinstance(page["signature"], str):
-                raise CheckpointError("page signature is invalid")
-            _mapping(page["continuation"], "page continuation")
-            _mapping(page["metadata"], "page metadata")
-            if page["payload_digest"] != _digest(page["payload"]):
-                raise CheckpointError("page payload digest does not match")
-            if page["payload_digest"] != reference["payload_digest"]:
-                raise CheckpointError("manifest payload digest does not match page")
-            if _digest(page) != reference["page_digest"]:
-                raise CheckpointError("manifest page digest does not match page")
+            reference, _ = self._validate_page(
+                reference_value, expected_index, directory
+            )
             page_references.append(MappingProxyType(reference))
         if complete:
             if manifest["pages_digest"] != _digest(pages):
@@ -298,6 +276,49 @@ class PageCheckpointStore:
             raise CheckpointError("referenced page is not valid JSON") from error
         return _mapping(value, "page")
 
+    def _validate_page(
+        self,
+        reference_value: Mapping[str, object],
+        expected_index: int,
+        directory: Path,
+    ) -> tuple[Mapping[str, object], Mapping[str, object]]:
+        reference = _mapping(reference_value, "page reference")
+        if set(reference) != {"index", "path", "payload_digest", "page_digest"}:
+            raise CheckpointError("page reference schema is invalid")
+        path = f"pages/{expected_index:06d}.json"
+        if (
+            not _is_page_index(reference["index"], expected_index)
+            or reference["path"] != path
+        ):
+            raise CheckpointError("page reference index or path is invalid")
+        if not _is_digest(reference["payload_digest"]) or not _is_digest(
+            reference["page_digest"]
+        ):
+            raise CheckpointError("page reference digest is invalid")
+        page = self._read_page(directory / path)
+        if set(page) != {
+            "index",
+            "payload",
+            "payload_digest",
+            "continuation",
+            "signature",
+            "metadata",
+        }:
+            raise CheckpointError("page schema is invalid")
+        if not _is_page_index(page["index"], expected_index):
+            raise CheckpointError("page index is invalid")
+        if not isinstance(page["signature"], str):
+            raise CheckpointError("page signature is invalid")
+        _mapping(page["continuation"], "page continuation")
+        _mapping(page["metadata"], "page metadata")
+        if page["payload_digest"] != _digest(page["payload"]):
+            raise CheckpointError("page payload digest does not match")
+        if page["payload_digest"] != reference["payload_digest"]:
+            raise CheckpointError("manifest payload digest does not match page")
+        if _digest(page) != reference["page_digest"]:
+            raise CheckpointError("manifest page digest does not match page")
+        return reference, page
+
 
 def _mapping(value: object, name: str) -> dict[str, object]:
     if not isinstance(value, Mapping):
@@ -309,6 +330,16 @@ def _optional_mapping(value: object, name: str) -> dict[str, object]:
     if value is None:
         return {}
     return _mapping(value, name)
+
+
+def _immutable_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _immutable_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return tuple(_immutable_value(item) for item in value)
+    return value
 
 
 def _identity_from_document(value: object) -> CheckpointIdentity:
