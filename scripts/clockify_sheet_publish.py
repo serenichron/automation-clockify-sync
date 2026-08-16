@@ -11,8 +11,14 @@ import argparse
 import datetime as dt
 import json
 from pathlib import Path
+import re
 import subprocess
 from typing import Any, Mapping, Protocol, Sequence
+
+try:
+    from scripts import clockify_portfolio_replay as portfolio_replay
+except ImportError:  # pragma: no cover - direct script execution fallback
+    import clockify_portfolio_replay as portfolio_replay  # type: ignore[no-redef]
 
 
 HEADER = [
@@ -215,6 +221,46 @@ def proposal_row(proposal: Mapping[str, Any], run_id: str) -> list[Any]:
     ]
 
 
+def portfolio_row(activity: Mapping[str, Any], run_id: str) -> list[Any]:
+    review_id = str(activity.get("review_id") or "").strip()
+    if not re.fullmatch(r"pvi-[a-f0-9]{24}", review_id):
+        raise PublicationError("portfolio activity lacks a stable review ID")
+    tags = activity.get("tag_names")
+    sources = activity.get("source_activity_ids")
+    if (
+        not isinstance(tags, list)
+        or not tags
+        or any(not isinstance(value, str) or not value.strip() for value in tags)
+    ):
+        raise PublicationError("portfolio activity tags are invalid")
+    if (
+        not isinstance(sources, list)
+        or not sources
+        or any(not isinstance(value, str) or not value.strip() for value in sources)
+    ):
+        raise PublicationError("portfolio activity sources are invalid")
+    duration = int(activity.get("duration_minutes") or 0)
+    if duration <= 0:
+        raise PublicationError("portfolio activity duration is invalid")
+    return [
+        review_id,
+        _timestamp(activity.get("start")),
+        _timestamp(activity.get("end")),
+        duration,
+        str(activity.get("client_project") or ""),
+        ", ".join(tags),
+        ", ".join(sources),
+        str(activity.get("confidence") or ""),
+        str(activity.get("description") or ""),
+        "pending",
+        1,
+        run_id,
+        str(activity.get("validation_status") or ""),
+        "pending",
+        "",
+    ]
+
+
 def verify_gates(
     proposals: Sequence[Mapping[str, Any]],
     quality: Mapping[str, Any],
@@ -230,6 +276,51 @@ def verify_gates(
         raise PublicationError("immutable replay has not passed cleanly")
     if str(replay.get("source_run_id") or "") != run_id:
         raise PublicationError("immutable replay does not belong to this source run")
+
+
+def verify_portfolio_gates(
+    portfolio: Mapping[str, Any],
+    quality: Mapping[str, Any],
+    replay: Mapping[str, Any],
+    run_id: str,
+) -> None:
+    activities = portfolio.get("activities")
+    repair = portfolio.get("repair")
+    if not isinstance(activities, list) or not all(
+        isinstance(row, Mapping) for row in activities
+    ):
+        raise PublicationError("portfolio repair activities are invalid")
+    if (
+        not isinstance(repair, Mapping)
+        or repair.get("status") not in {"complete", "pass"}
+        or repair.get("unresolved_wording") != []
+    ):
+        raise PublicationError("portfolio repair has not completed cleanly")
+    if any(row.get("validation_status") != "flash_validated" for row in activities):
+        raise PublicationError(
+            "portfolio activity lacks successful Flash portfolio validation"
+        )
+    source_run = Path(str(portfolio.get("source_run") or "")).name
+    if source_run != run_id:
+        raise PublicationError("portfolio repair does not belong to this source run")
+    if quality.get("status") != "pass":
+        raise PublicationError("portfolio quality report has not passed")
+    fragmentation = quality.get("fragmentation")
+    total_minutes = sum(int(row.get("duration_minutes") or 0) for row in activities)
+    if (
+        not isinstance(fragmentation, Mapping)
+        or int(fragmentation.get("row_count") or -1) != len(activities)
+        or int(fragmentation.get("total_minutes") or -1) != total_minutes
+    ):
+        raise PublicationError("portfolio quality totals do not match the repair")
+    identity = replay.get("identity")
+    artifacts = identity.get("artifacts") if isinstance(identity, Mapping) else None
+    if replay.get("status") != "pass" or not isinstance(artifacts, Mapping):
+        raise PublicationError("portfolio immutable replay has not passed cleanly")
+    if artifacts.get("repair") != portfolio_replay._digest(portfolio):
+        raise PublicationError("portfolio replay is not bound to the repair")
+    if artifacts.get("quality") != portfolio_replay._digest(quality):
+        raise PublicationError("portfolio replay is not bound to the quality report")
 
 
 def _sheet_map(metadata: Mapping[str, Any]) -> dict[str, int]:
@@ -331,20 +422,31 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--spreadsheet-id", required=True)
     parser.add_argument("--sheet-title", required=True)
     parser.add_argument("--template-title", default="Proposals")
-    parser.add_argument("--proposals", type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--proposals", type=Path)
+    source.add_argument("--portfolio-repair", type=Path)
     parser.add_argument("--quality-report", type=Path, required=True)
     parser.add_argument("--replay-integrity", type=Path, required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--enable-write", action="store_true")
     args = parser.parse_args(argv)
 
-    proposals = _json(args.proposals)
     quality = _json(args.quality_report)
     replay = _json(args.replay_integrity)
-    if not isinstance(proposals, list) or not all(isinstance(row, dict) for row in proposals):
-        raise PublicationError("proposals input must be a JSON array of objects")
-    verify_gates(proposals, quality, replay, args.run_id)
-    rows = [proposal_row(proposal, args.run_id) for proposal in proposals]
+    if args.portfolio_repair is not None:
+        portfolio = _json(args.portfolio_repair)
+        if not isinstance(portfolio, Mapping):
+            raise PublicationError("portfolio repair input must be a JSON object")
+        verify_portfolio_gates(portfolio, quality, replay, args.run_id)
+        rows = [portfolio_row(row, args.run_id) for row in portfolio["activities"]]
+    else:
+        proposals = _json(args.proposals)
+        if not isinstance(proposals, list) or not all(
+            isinstance(row, dict) for row in proposals
+        ):
+            raise PublicationError("proposals input must be a JSON array of objects")
+        verify_gates(proposals, quality, replay, args.run_id)
+        rows = [proposal_row(proposal, args.run_id) for proposal in proposals]
     if not args.enable_write:
         print(json.dumps({
             "status": "dry_run",

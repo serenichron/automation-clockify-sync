@@ -26,14 +26,43 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.clockify_sync_collect import clockify_env_candidates, load_env_file
+from scripts import clockify_portfolio_replay as portfolio_replay
 
 
 API = "https://api.clockify.me/api/v1"
 SCHEMA_VERSION = "clockify-approved-portfolio-post/v1"
+POST_HTTP_TIMEOUT_NAME = "CLOCKIFY_POST_HTTP_TIMEOUT_SECONDS"
+POST_HTTP_TIMEOUT_DEFAULT_SECONDS = 45
+POST_HTTP_TIMEOUT_MIN_SECONDS = 5
+POST_HTTP_TIMEOUT_MAX_SECONDS = 120
 
 
 class PortfolioPostError(ValueError):
     pass
+
+
+def post_http_timeout_seconds(environment: Mapping[str, Any]) -> int:
+    """Return the validated approval-gated Clockify request timeout."""
+    raw = (
+        environment[POST_HTTP_TIMEOUT_NAME]
+        if POST_HTTP_TIMEOUT_NAME in environment
+        else os.environ.get(POST_HTTP_TIMEOUT_NAME)
+    )
+    if raw is None:
+        return POST_HTTP_TIMEOUT_DEFAULT_SECONDS
+    text = str(raw)
+    if not text.isascii() or not text.isdecimal():
+        raise PortfolioPostError(
+            f"{POST_HTTP_TIMEOUT_NAME} must be an integer from "
+            f"{POST_HTTP_TIMEOUT_MIN_SECONDS} through {POST_HTTP_TIMEOUT_MAX_SECONDS}"
+        )
+    value = int(text)
+    if not POST_HTTP_TIMEOUT_MIN_SECONDS <= value <= POST_HTTP_TIMEOUT_MAX_SECONDS:
+        raise PortfolioPostError(
+            f"{POST_HTTP_TIMEOUT_NAME} must be an integer from "
+            f"{POST_HTTP_TIMEOUT_MIN_SECONDS} through {POST_HTTP_TIMEOUT_MAX_SECONDS}"
+        )
+    return value
 
 
 def _read(path: Path) -> Any:
@@ -72,6 +101,7 @@ def _request(
     *,
     method: str = "GET",
     payload: Mapping[str, Any] | None = None,
+    timeout_seconds: int = POST_HTTP_TIMEOUT_DEFAULT_SECONDS,
 ) -> Any:
     data = None
     headers = {"X-Api-Key": api_key}
@@ -81,14 +111,23 @@ def _request(
     request = urllib.request.Request(API + path, data=data, headers=headers, method=method)
     for attempt in range(4):
         try:
-            with urllib.request.urlopen(request, timeout=45) as response:
+            with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
                 body = response.read()
                 return json.loads(body) if body else None
         except urllib.error.HTTPError as exc:
-            if exc.code != 429 and not 500 <= exc.code < 600:
-                raise PortfolioPostError(f"Clockify HTTP {exc.code}") from exc
-            if attempt == 3:
-                raise PortfolioPostError(f"Clockify HTTP {exc.code} after retries") from exc
+            try:
+                if exc.code != 429 and not 500 <= exc.code < 600:
+                    raise PortfolioPostError(f"Clockify HTTP {exc.code}") from exc
+                if method != "GET" and 500 <= exc.code < 600:
+                    raise PortfolioPostError(
+                        f"Clockify HTTP {exc.code} requires write readback"
+                    ) from exc
+                if attempt == 3:
+                    raise PortfolioPostError(
+                        f"Clockify HTTP {exc.code} after retries"
+                    ) from exc
+            finally:
+                exc.close()
         except (TimeoutError, urllib.error.URLError) as exc:
             if method != "GET" or attempt == 3:
                 raise PortfolioPostError("Clockify transport failed") from exc
@@ -96,11 +135,15 @@ def _request(
     raise AssertionError("unreachable retry state")
 
 
-def _paged(path: str, api_key: str) -> list[dict[str, Any]]:
+def _paged(path: str, api_key: str, *, timeout_seconds: int) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     separator = "&" if "?" in path else "?"
     for page in range(1, 101):
-        value = _request(f"{path}{separator}page={page}&page-size=200", api_key)
+        value = _request(
+            f"{path}{separator}page={page}&page-size=200",
+            api_key,
+            timeout_seconds=timeout_seconds,
+        )
         if not isinstance(value, list):
             raise PortfolioPostError("Clockify list response is invalid")
         batch = [item for item in value if isinstance(item, dict)]
@@ -342,9 +385,28 @@ def _align_subminute_boundaries(
     return adjusted, changes
 
 
-def _live_entries(workspace: str, user: str, api_key: str) -> list[dict[str, Any]]:
-    query = urllib.parse.urlencode({"start": "2026-07-01T00:00:00Z", "end": "2026-08-01T21:00:00Z"})
-    rows = _paged(f"/workspaces/{workspace}/user/{user}/time-entries?{query}", api_key)
+def _live_entries(
+    workspace: str,
+    user: str,
+    api_key: str,
+    plans: Iterable[Mapping[str, Any]],
+    *,
+    timeout_seconds: int,
+) -> list[dict[str, Any]]:
+    windows = [(str(plan["start"]), str(plan["end"])) for plan in plans]
+    if not windows:
+        raise PortfolioPostError("approved portfolio contains no posting windows")
+    start = min(_parse(value) for value, _end in windows) - dt.timedelta(days=1)
+    end = max(_parse(value) for _start, value in windows) + dt.timedelta(days=1)
+    query = urllib.parse.urlencode({
+        "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "end": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    })
+    rows = _paged(
+        f"/workspaces/{workspace}/user/{user}/time-entries?{query}",
+        api_key,
+        timeout_seconds=timeout_seconds,
+    )
     return [value for row in rows if (value := _live_entry(row)) is not None]
 
 
@@ -396,6 +458,42 @@ def _apply_prior_receipt(
     ]
 
 
+def _verify_approved_artifacts(
+    portfolio: Mapping[str, Any],
+    quality: Mapping[str, Any],
+    replay: Mapping[str, Any],
+) -> None:
+    """Require one clean, Flash-validated, replay-bound posting package."""
+    activities = portfolio.get("activities")
+    repair = portfolio.get("repair")
+    if portfolio.get("external_writes") is not False:
+        raise PortfolioPostError("portfolio safety contract is invalid")
+    if not isinstance(activities, list) or not all(
+        isinstance(row, Mapping) for row in activities
+    ):
+        raise PortfolioPostError("portfolio activities are invalid")
+    if (
+        not isinstance(repair, Mapping)
+        or repair.get("status") not in {"complete", "pass"}
+        or repair.get("unresolved_wording") != []
+    ):
+        raise PortfolioPostError("portfolio repair has not cleanly completed")
+    if any(row.get("validation_status") != "flash_validated" for row in activities):
+        raise PortfolioPostError(
+            "portfolio activity lacks successful Flash portfolio validation"
+        )
+    if quality.get("status") != "pass":
+        raise PortfolioPostError("portfolio quality report is not passing")
+    identity = replay.get("identity")
+    artifacts = identity.get("artifacts") if isinstance(identity, Mapping) else None
+    if replay.get("status") != "pass" or not isinstance(artifacts, Mapping):
+        raise PortfolioPostError("portfolio immutable replay is not passing")
+    if artifacts.get("repair") != portfolio_replay._digest(portfolio):
+        raise PortfolioPostError("portfolio replay is not bound to the repair")
+    if artifacts.get("quality") != portfolio_replay._digest(quality):
+        raise PortfolioPostError("portfolio replay is not bound to the quality report")
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     portfolio_path = args.portfolio.resolve()
     quality_path = args.quality_report.resolve()
@@ -403,16 +501,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if portfolio_sha != args.expected_portfolio_sha256:
         raise PortfolioPostError("approved portfolio digest does not match")
     quality = _read(quality_path)
-    if not isinstance(quality, Mapping) or quality.get("status") != "pass":
-        raise PortfolioPostError("portfolio quality report is not passing")
     portfolio = _read(portfolio_path)
-    if not isinstance(portfolio, Mapping) or portfolio.get("external_writes") is not False:
-        raise PortfolioPostError("portfolio safety contract is invalid")
+    replay = _read(args.replay_integrity.resolve())
+    if not all(isinstance(value, Mapping) for value in (portfolio, quality, replay)):
+        raise PortfolioPostError("approved posting artifacts are invalid")
+    _verify_approved_artifacts(portfolio, quality, replay)
     environment = load_env_file(
         clockify_env_candidates(), ["CLOCKIFY_API_KEY", "CLOCKIFY_WORKSPACE_ID"]
     )
     if environment.get("_missing"):
         raise PortfolioPostError("Clockify credentials are unavailable")
+    timeout_seconds = post_http_timeout_seconds(environment)
     api_key = str(environment["CLOCKIFY_API_KEY"])
     workspace = str(environment["CLOCKIFY_WORKSPACE_ID"])
     routing = _read(args.routing.resolve())
@@ -421,9 +520,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise PortfolioPostError("Clockify user ID is missing from routing")
 
     project_ids = _unique_by_suffix(
-        _paged(f"/workspaces/{workspace}/projects?archived=false", api_key), "project"
+        _paged(
+            f"/workspaces/{workspace}/projects?archived=false",
+            api_key,
+            timeout_seconds=timeout_seconds,
+        ),
+        "project",
     )
-    tag_ids = _unique_by_suffix(_paged(f"/workspaces/{workspace}/tags", api_key), "tag")
+    tag_ids = _unique_by_suffix(
+        _paged(
+            f"/workspaces/{workspace}/tags",
+            api_key,
+            timeout_seconds=timeout_seconds,
+        ),
+        "tag",
+    )
     plans = _plans(portfolio, _resolved_routes(routing, project_ids, tag_ids))
     prior_path = args.prior_receipt
     if prior_path is None and args.receipt.exists():
@@ -433,7 +544,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         plans, prior_adjustments = _apply_prior_receipt(
             plans, prior_path.resolve(), portfolio_sha
         )
-    live = _live_entries(workspace, user, api_key)
+    live = _live_entries(
+        workspace, user, api_key, plans, timeout_seconds=timeout_seconds
+    )
     exact: dict[tuple[str, int], dict[str, Any]] = {}
     for plan in plans:
         matches = [entry for entry in live if _exact(plan, entry)]
@@ -489,6 +602,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "portfolio": str(portfolio_path),
         "portfolio_sha256": portfolio_sha,
         "quality_sha256": _sha256(quality_path),
+        "replay_sha256": _sha256(args.replay_integrity.resolve()),
         "review_rows": len(portfolio["activities"]),
         "planned_blocks": len(plans),
         "planned_minutes": sum(plan["duration_minutes"] for plan in plans),
@@ -524,9 +638,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 api_key,
                 method="POST",
                 payload=payload,
+                timeout_seconds=timeout_seconds,
             )
         except PortfolioPostError:
-            refreshed = _live_entries(workspace, user, api_key)
+            refreshed = _live_entries(
+                workspace, user, api_key, plans, timeout_seconds=timeout_seconds
+            )
             recovered = next((entry for entry in refreshed if _exact(plan, entry)), None)
             if recovered is None:
                 receipt["status"] = "interrupted"
@@ -550,6 +667,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("portfolio", type=Path)
     parser.add_argument("--quality-report", type=Path, required=True)
+    parser.add_argument("--replay-integrity", type=Path, required=True)
     parser.add_argument("--routing", type=Path, default=Path("routing.json"))
     parser.add_argument("--receipt", type=Path, required=True)
     parser.add_argument("--prior-receipt", type=Path)

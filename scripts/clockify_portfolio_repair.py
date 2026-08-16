@@ -30,17 +30,27 @@ except ImportError:  # pragma: no cover - direct script execution fallback
 
 
 REPAIR_SCHEMA_VERSION = 1
-APPROVED_FLASH_REVISION = "d3f1c87447216481a8001f48c517a51e13bfb141853a8df5e52f81bf765dabc3"
+APPROVED_FLASH_REVISION = "6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc"
 DEFAULT_WORKERS = 4
 MAX_WORKERS = 4
 SINGLE_ACTIVITY_REPAIR_PROMPT_VERSION = (
     "clockify-portfolio-repair-single-activity-v1"
 )
 WORDING_RECOVERY_PROMPT_VERSION = "clockify-portfolio-wording-recovery-v1"
+WORDING_DECISION_PROMPT_VERSION = "clockify-portfolio-wording-decision-v3"
+WORDING_FIELDS_REPAIR_PROMPT_VERSION = "clockify-portfolio-wording-fields-repair-v1"
 MAX_WORDING_RECOVERY_ATTEMPTS = 2
 PORTFOLIO_DESCRIPTION_MAX_WORDS = 24
 _PREFIX_RE = re.compile(r"^([A-Za-z][A-Za-z0-9 &-]{0,24}) — (.+)$")
 _WORD_RE = re.compile(r"\b[\w'-]+\b")
+CAVEMAN_WORDING_FAILURE_CODES = frozenset({
+    "forbidden_hash",
+    "forbidden_agent_status",
+    "adjacent_repeated_words",
+    "forbidden_markdown",
+    "forbidden_domain",
+    "invalid_caveman_contract",
+})
 
 
 class PortfolioRepairError(RuntimeError):
@@ -284,6 +294,561 @@ def _locked_taxonomy(row: Mapping[str, Any], *, prefix: str) -> list[dict[str, A
     }]
 
 
+def _analyzer_review_failed(result: Mapping[str, Any]) -> bool:
+    return (
+        result.get("activities") == []
+        and result.get("omissions") == []
+        and isinstance(result.get("exceptions"), list)
+        and bool(result["exceptions"])
+        and all(
+            isinstance(item, Mapping)
+            and str(item.get("kind") or "") == "analyzer_review_failure"
+            for item in result["exceptions"]
+        )
+    )
+
+
+def _wording_repair_instruction(failure_code: str) -> str:
+    repair_category = re.sub(r"_[2-9][0-9]*$", "", failure_code)
+    return {
+        "forbidden_hash": (
+            "Rewrite without commit hashes, hexadecimal identifiers, process IDs, "
+            "or other long numeric identifiers."
+        ),
+        "forbidden_agent_status": (
+            "Rewrite as the completed human-attention accomplishment only; remove "
+            "blocked, pending, waiting, approval, and agent-status prose."
+        ),
+        "adjacent_repeated_words": (
+            "Rewrite action, object, and outcome without repeated adjacent words or "
+            "duplicated phrases."
+        ),
+        "forbidden_markdown": (
+            "Rewrite as plain text without Markdown markers, links, or code formatting."
+        ),
+        "forbidden_domain": (
+            "Rewrite without domain names or URLs; describe the business object plainly."
+        ),
+    }.get(
+        repair_category,
+        "Correct the reported contract class while preserving the evidence-backed accomplishment.",
+    )
+
+
+def _wording_decision_body(
+    events: list[dict[str, Any]],
+    *,
+    candidate: Mapping[str, Any],
+    taxonomy: list[dict[str, Any]],
+    endpoint: semantic_analyzer.AnalyzerEndpoint,
+    stage: str,
+    prior_decision: Mapping[str, Any] | None = None,
+    repair_failure_code: str | None = None,
+    review_prompt_version: str | None = None,
+) -> dict[str, Any]:
+    """Build a citation-free decision request over opaque evidence bundles."""
+    if stage not in {"draft", "validation"}:
+        raise PortfolioRepairError("wording decision stage is invalid")
+    base = semantic_analyzer._review_body(
+        events,
+        candidate=candidate,
+        taxonomy=taxonomy,
+        model=endpoint.model,
+        review_scope="portfolio_wording_recovery",
+        review_prompt_version=(
+            review_prompt_version or WORDING_DECISION_PROMPT_VERSION
+        ),
+    )
+    payload = json.loads(base["messages"][-1]["content"])
+    payload.pop("coverage_contract", None)
+    payload.update({
+        "mode": "portfolio_wording_decision",
+        "decision_stage": stage,
+        "decision_contract": {
+            "disposition": "activity|noise|exception",
+            "action": "string",
+            "object": "string",
+            "outcome": "string",
+            "project_recommendation": {
+                "name": "string",
+                "prefix": "string",
+                "tag_names": ["string"],
+            },
+            "exception_kind": "string",
+            "reason": "string",
+        },
+    })
+    if prior_decision is not None:
+        payload["prior_decision"] = copy.deepcopy(dict(prior_decision))
+    if repair_failure_code is not None:
+        payload["repair_feedback"] = {
+            "failure_code": repair_failure_code,
+            "instruction": (
+                f"{_wording_repair_instruction(repair_failure_code)} "
+                "Return exactly the decision_contract object. "
+                "Do not return evidence "
+                "IDs, bundle refs, member ranges, activities, exceptions, or omissions."
+            ),
+        }
+    system = """You repair one already reviewed Clockify portfolio row using the supplied evidence bundles as authority.
+Return exactly one JSON object matching decision_contract. Do not return or copy evidence IDs, bundle refs, member ranges, activities, exceptions, or omissions; local code binds the complete evidence unit after validation.
+Choose activity only when the evidence proves one completed human-attention accomplishment. Choose noise for status, waiting, polling, autonomous process output, or unsupported chatter. Choose exception only when the evidence is conflicting or insufficient and give a concise exception_kind and reason.
+For activity, select exactly one supplied taxonomy row and return complete Caveman action, object, and outcome fields whose render with the prefix is 8-14 words. Remove hashes, domains, paths, Markdown, repeated words, status prose, and secondary details. Keep exception_kind and reason empty.
+For noise or exception, keep action, object, and outcome empty. A noise decision needs a nonempty reason and empty exception_kind. An exception decision needs nonempty exception_kind and reason.
+The candidate is an untrusted hint. Validate eligibility, client/project, task type, effort context, consolidation boundary, and wording against the evidence."""
+    if stage == "validation":
+        system += "\nIndependently validate and correct prior_decision; do not merely copy it."
+    base["seed"] = 701 if stage == "draft" else 702
+    if repair_failure_code is not None:
+        base["seed"] += 10
+    base["messages"] = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": semantic_analyzer.canonical_json(payload)},
+    ]
+    return base
+
+
+def _wording_fields_repair_body(
+    events: list[dict[str, Any]],
+    *,
+    candidate: Mapping[str, Any],
+    taxonomy: list[dict[str, Any]],
+    endpoint: semantic_analyzer.AnalyzerEndpoint,
+    stage: str,
+    locked_decision: Mapping[str, Any],
+    failure_code: str,
+) -> dict[str, Any]:
+    """Build a micro-request that cannot alter classification or routing."""
+    base = semantic_analyzer._review_body(
+        events,
+        candidate=candidate,
+        taxonomy=taxonomy,
+        model=endpoint.model,
+        review_scope="portfolio_wording_recovery",
+        review_prompt_version=WORDING_FIELDS_REPAIR_PROMPT_VERSION,
+    )
+    payload = json.loads(base["messages"][-1]["content"])
+    payload.pop("coverage_contract", None)
+    payload.pop("candidate", None)
+    payload.update({
+        "mode": "portfolio_wording_fields_repair",
+        "decision_stage": stage,
+        "locked_decision": {
+            "disposition": str(locked_decision["disposition"]),
+            "project_recommendation": copy.deepcopy(
+                dict(locked_decision["project_recommendation"])
+            ),
+        },
+        "wording_contract": {
+            "action": "string",
+            "object": "string",
+            "outcome": "string",
+        },
+        "repair_feedback": {
+            "failure_code": failure_code,
+            "instruction": _wording_repair_instruction(failure_code),
+        },
+    })
+    base["seed"] = 801 if stage == "draft" else 802
+    base["messages"] = [
+        {
+            "role": "system",
+            "content": (
+                "Rewrite only action, object, and outcome for one locked activity. "
+                "Return exactly the three-field wording_contract object. Classification, "
+                "project, prefix, tags, evidence, effort, and accounting are immutable and "
+                "must not be returned. Use the evidence bundles as authority. The exact "
+                "render 'Prefix — action object outcome' must be 8-14 words and contain no "
+                "hashes, domains, paths, Markdown, adjacent repetition, status/waiting prose, "
+                "or autonomous-process narration."
+            ),
+        },
+        {"role": "user", "content": semantic_analyzer.canonical_json(payload)},
+    ]
+    return base
+
+
+def _validate_wording_decision(
+    value: Mapping[str, Any],
+    *,
+    taxonomy: list[dict[str, Any]],
+    enforce_caveman: bool = True,
+) -> dict[str, Any]:
+    required = {
+        "disposition", "action", "object", "outcome", "project_recommendation",
+        "exception_kind", "reason",
+    }
+    if set(value) != required:
+        raise semantic_analyzer.AnalyzerContractError(
+            "wording decision has unsupported fields"
+        )
+    decision = copy.deepcopy(dict(value))
+    disposition = str(decision.get("disposition") or "")
+    if disposition not in {"activity", "noise", "exception"}:
+        raise semantic_analyzer.AnalyzerContractError(
+            "wording decision has invalid lifecycle"
+        )
+    project = decision.get("project_recommendation")
+    if not isinstance(project, Mapping) or set(project) != {"name", "prefix", "tag_names"}:
+        raise semantic_analyzer.AnalyzerContractError(
+            "wording decision project_recommendation is invalid"
+        )
+    tags = project.get("tag_names")
+    if not isinstance(tags, list) or any(not isinstance(tag, str) for tag in tags):
+        raise semantic_analyzer.AnalyzerContractError(
+            "wording decision project_recommendation is invalid"
+        )
+    selection = (
+        str(project.get("name") or ""),
+        str(project.get("prefix") or ""),
+        tuple(sorted(tags)),
+    )
+    allowed = {
+        (
+            str(row.get("project_name") or ""),
+            str(row.get("prefix") or ""),
+            tuple(sorted(str(tag) for tag in row.get("tag_names", []))),
+        )
+        for row in taxonomy
+    }
+    action = str(decision.get("action") or "").strip()
+    object_ = str(decision.get("object") or "").strip()
+    outcome = str(decision.get("outcome") or "").strip()
+    kind = str(decision.get("exception_kind") or "").strip()
+    reason = str(decision.get("reason") or "").strip()
+    if disposition == "activity":
+        if selection not in allowed or not action or not object_ or not outcome or kind:
+            raise semantic_analyzer.AnalyzerContractError(
+                "wording decision activity is outside the required project contract"
+            )
+        decision["reason"] = ""
+        if not enforce_caveman:
+            return decision
+        try:
+            rendered = caveman_renderer.render(
+                {
+                    "prefix": str(project.get("prefix") or ""),
+                    "action": action,
+                    "object": object_,
+                    "outcome": outcome,
+                },
+                max_words=PORTFOLIO_DESCRIPTION_MAX_WORDS,
+                allow_compact_technical_slashes=True,
+                allow_compact_technical_underscores=True,
+            )
+        except caveman_renderer.CavemanValidationError as exc:
+            raise semantic_analyzer.AnalyzerContractError(
+                f"wording decision violates Caveman contract: {exc}"
+            ) from exc
+        if not 8 <= _word_count(rendered) <= PORTFOLIO_DESCRIPTION_MAX_WORDS:
+            raise semantic_analyzer.AnalyzerContractError(
+                "wording decision violates Caveman contract: invalid word count"
+            )
+    else:
+        decision["action"] = ""
+        decision["object"] = ""
+        decision["outcome"] = ""
+        decision["project_recommendation"] = {
+            "name": "", "prefix": "", "tag_names": [],
+        }
+        if disposition == "noise" and (kind or not reason):
+            raise semantic_analyzer.AnalyzerContractError(
+                "wording decision noise requires a reason"
+            )
+        if disposition == "exception" and (not kind or not reason):
+            raise semantic_analyzer.AnalyzerContractError(
+                "wording decision exception requires kind and reason"
+            )
+    return decision
+
+
+def _validate_wording_fields(value: Mapping[str, Any]) -> dict[str, str]:
+    required = {"action", "object", "outcome"}
+    if set(value) != required:
+        raise semantic_analyzer.AnalyzerContractError(
+            "wording fields repair has unsupported fields"
+        )
+    result = {name: str(value.get(name) or "").strip() for name in sorted(required)}
+    if any(not result[name] for name in required):
+        raise semantic_analyzer.AnalyzerContractError(
+            "wording fields repair requires action, object, and outcome"
+        )
+    result["action"] = result["action"][:1].upper() + result["action"][1:]
+    return result
+
+
+def _wording_failure_code(error: BaseException) -> str:
+    """Return actionable, privacy-safe feedback for one decision retry."""
+    generic = semantic_analyzer._contract_failure_code(error)
+    if generic != "contract_rejected_other":
+        return generic
+    message = str(error).casefold()
+    if message == "analyzer cache records contract_rejected_other":
+        return "cached_unknown_contract_shape"
+    for marker, code in (
+        ("forbidden hash", "forbidden_hash"),
+        ("forbidden agent status", "forbidden_agent_status"),
+        ("adjacent repeated words", "adjacent_repeated_words"),
+        ("forbidden markdown", "forbidden_markdown"),
+        ("forbidden domain", "forbidden_domain"),
+    ):
+        if marker in message:
+            return code
+    for marker, code in (
+        ("unsupported fields", "unsupported_fields"),
+        ("project_recommendation is invalid", "invalid_project_recommendation"),
+        ("activity is outside the required project contract", "invalid_activity_contract"),
+        ("nonactivity contains activity fields", "invalid_nonactivity_contract"),
+        ("noise requires a reason", "invalid_noise_contract"),
+        ("exception requires kind and reason", "invalid_exception_contract"),
+        ("violates caveman contract", "invalid_caveman_contract"),
+        ("lacks json message content", "invalid_provider_envelope"),
+        ("returned invalid json", "invalid_json"),
+        ("json must be an object", "invalid_json_object"),
+    ):
+        if marker in message:
+            return code
+    return generic
+
+
+def _call_wording_fields_repair(
+    endpoint: semantic_analyzer.AnalyzerEndpoint,
+    events: list[dict[str, Any]],
+    *,
+    candidate: Mapping[str, Any],
+    taxonomy: list[dict[str, Any]],
+    stage: str,
+    locked_decision: Mapping[str, Any],
+    failure_code: str,
+    cache: semantic_analyzer.AnalyzerResponseCache,
+    transport: Transport,
+    probe_once: Callable[[semantic_analyzer.AnalyzerEndpoint], None],
+) -> dict[str, Any]:
+    """Repair only wording fields with at most two live provider attempts."""
+    live_attempts = 0
+    cached_rejections = 0
+    current_failure = failure_code
+    while live_attempts < 2 and cached_rejections < 4:
+        body = _wording_fields_repair_body(
+            events,
+            candidate=candidate,
+            taxonomy=taxonomy,
+            endpoint=endpoint,
+            stage=stage,
+            locked_decision=locked_decision,
+            failure_code=current_failure,
+        )
+        response = None
+        cache_miss = False
+        try:
+            response = cache.lookup(endpoint, body)
+            cache_miss = response is None
+            if response is None:
+                live_attempts += 1
+                probe_once(endpoint)
+                raw = transport(endpoint, body)
+                try:
+                    response = semantic_analyzer._json_object_from_response(raw)
+                except semantic_analyzer.AnalyzerError as exc:
+                    raise semantic_analyzer.AnalyzerContractError(str(exc)) from exc
+            fields = _validate_wording_fields(response)
+            repaired = copy.deepcopy(dict(locked_decision))
+            repaired.update(fields)
+            repaired = _validate_wording_decision(repaired, taxonomy=taxonomy)
+        except semantic_analyzer.AnalyzerContractError as exc:
+            current_failure = _wording_failure_code(exc)
+            if cache_miss:
+                cache.store_rejected(
+                    endpoint,
+                    body,
+                    failure_code=semantic_analyzer._contract_failure_code(exc),
+                )
+            else:
+                cached_rejections += 1
+                if cached_rejections > 1:
+                    current_failure = f"{current_failure}_{cached_rejections}"
+            continue
+        if cache_miss:
+            cache.store_accepted(endpoint, body, response)
+        return repaired
+    raise PortfolioRepairError(
+        f"Flash {stage} wording fields repair exhausted one structural repair"
+    )
+
+
+def _call_wording_decision(
+    endpoint: semantic_analyzer.AnalyzerEndpoint,
+    events: list[dict[str, Any]],
+    *,
+    candidate: Mapping[str, Any],
+    taxonomy: list[dict[str, Any]],
+    stage: str,
+    cache: semantic_analyzer.AnalyzerResponseCache,
+    transport: Transport,
+    probe_once: Callable[[semantic_analyzer.AnalyzerEndpoint], None],
+    prior_decision: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Call one bounded wording decision with at most one structural repair."""
+    failure_code: str | None = None
+    live_attempts = 0
+    cached_rejections = 0
+    while live_attempts < 2 and cached_rejections < 4:
+        body = _wording_decision_body(
+            events,
+            candidate=candidate,
+            taxonomy=taxonomy,
+            endpoint=endpoint,
+            stage=stage,
+            prior_decision=prior_decision,
+            repair_failure_code=failure_code,
+        )
+        response = None
+        cache_miss = False
+        try:
+            response = cache.lookup(endpoint, body)
+            cache_miss = response is None
+            if response is None:
+                for legacy_version in (
+                    "clockify-portfolio-wording-decision-v2",
+                    "clockify-portfolio-wording-decision-v1",
+                ):
+                    if legacy_version == WORDING_DECISION_PROMPT_VERSION:
+                        continue
+                    legacy_body = _wording_decision_body(
+                        events,
+                        candidate=candidate,
+                        taxonomy=taxonomy,
+                        endpoint=endpoint,
+                        stage=stage,
+                        prior_decision=prior_decision,
+                        repair_failure_code=failure_code,
+                        review_prompt_version=legacy_version,
+                    )
+                    try:
+                        legacy_response = cache.lookup(endpoint, legacy_body)
+                    except semantic_analyzer.AnalyzerContractError:
+                        continue
+                    if legacy_response is not None:
+                        body = legacy_body
+                        response = legacy_response
+                        cache_miss = False
+                        break
+            if response is None:
+                live_attempts += 1
+                probe_once(endpoint)
+                raw = transport(endpoint, body)
+                try:
+                    response = semantic_analyzer._json_object_from_response(raw)
+                except semantic_analyzer.AnalyzerError as exc:
+                    raise semantic_analyzer.AnalyzerContractError(str(exc)) from exc
+            decision = _validate_wording_decision(response, taxonomy=taxonomy)
+        except semantic_analyzer.AnalyzerContractError as exc:
+            failure_code = _wording_failure_code(exc)
+            if (
+                response is not None
+                and re.sub(r"_[2-9][0-9]*$", "", failure_code)
+                in CAVEMAN_WORDING_FAILURE_CODES
+            ):
+                locked_decision = _validate_wording_decision(
+                    response,
+                    taxonomy=taxonomy,
+                    enforce_caveman=False,
+                )
+                repaired = _call_wording_fields_repair(
+                    endpoint,
+                    events,
+                    candidate=candidate,
+                    taxonomy=taxonomy,
+                    stage=stage,
+                    locked_decision=locked_decision,
+                    failure_code=failure_code,
+                    cache=cache,
+                    transport=transport,
+                    probe_once=probe_once,
+                )
+                if cache_miss:
+                    cache.store_accepted(endpoint, body, repaired)
+                return repaired
+            if cache_miss:
+                cache.store_rejected(
+                    endpoint,
+                    body,
+                    failure_code=semantic_analyzer._contract_failure_code(exc),
+                )
+            else:
+                cached_rejections += 1
+                if cached_rejections > 1:
+                    failure_code = f"{failure_code}_{cached_rejections}"
+            continue
+        if cache_miss:
+            cache.store_accepted(endpoint, body, response)
+        return decision
+    raise PortfolioRepairError(
+        f"Flash {stage} wording decision exhausted one structural repair"
+    )
+
+
+def _replacement_from_wording_decision(
+    decision: Mapping[str, Any], *, evidence_ids: set[str]
+) -> dict[str, Any]:
+    disposition = str(decision["disposition"])
+    if disposition == "activity":
+        project = decision["project_recommendation"]
+        return {
+            "disposition": "activity",
+            "description_fields": {
+                "action": str(decision["action"]),
+                "object": str(decision["object"]),
+                "outcome": str(decision["outcome"]),
+            },
+            "client_project": str(project["name"]),
+            "tag_names": list(project["tag_names"]),
+            "evidence_ids": sorted(evidence_ids),
+            "exceptions": [],
+            "omissions": [],
+        }
+    classified = {
+        "evidence_ids": sorted(evidence_ids),
+        "reason": str(decision["reason"]),
+    }
+    if disposition == "noise":
+        classified["lifecycle"] = "noise"
+        return {
+            "disposition": "excluded", "exceptions": [],
+            "omissions": [classified],
+        }
+    classified["kind"] = str(decision["exception_kind"])
+    return {
+        "disposition": "excluded", "exceptions": [classified], "omissions": [],
+    }
+
+
+def _render_wording_decision(
+    decision: Mapping[str, Any], *, prefix: str
+) -> str:
+    try:
+        rendered = caveman_renderer.render(
+            {
+                "prefix": prefix,
+                "action": decision.get("action"),
+                "object": decision.get("object"),
+                "outcome": decision.get("outcome"),
+            },
+            max_words=PORTFOLIO_DESCRIPTION_MAX_WORDS,
+            allow_compact_technical_slashes=True,
+            allow_compact_technical_underscores=True,
+        )
+    except caveman_renderer.CavemanValidationError as exc:
+        raise PortfolioRepairError(
+            "Flash wording decision remained outside Caveman contract"
+        ) from exc
+    if not 8 <= _word_count(rendered) <= PORTFOLIO_DESCRIPTION_MAX_WORDS:
+        raise PortfolioRepairError(
+            "Flash wording decision remained outside Caveman contract"
+        )
+    return rendered
+
+
 def _review_replacement(
     row: Mapping[str, Any],
     *,
@@ -330,6 +895,38 @@ def _review_replacement(
         review_scope="portfolio",
         review_prompt_version=semantic_analyzer.PORTFOLIO_REVIEW_PROMPT_VERSION,
     )
+    if _analyzer_review_failed(reviewed):
+        draft = _call_wording_decision(
+            endpoint,
+            events,
+            candidate={"activities": [candidate], "exceptions": [], "omissions": []},
+            taxonomy=taxonomy,
+            stage="draft",
+            cache=cache,
+            transport=transport,
+            probe_once=probe_once,
+        )
+        validated_decision = _call_wording_decision(
+            endpoint,
+            events,
+            candidate={"activities": [candidate], "exceptions": [], "omissions": []},
+            taxonomy=taxonomy,
+            stage="validation",
+            cache=cache,
+            transport=transport,
+            probe_once=probe_once,
+            prior_decision=draft,
+        )
+        replacement = _replacement_from_wording_decision(
+            validated_decision, evidence_ids=evidence_ids
+        )
+        if replacement["disposition"] == "activity":
+            decision_project = validated_decision["project_recommendation"]
+            replacement["description"] = _render_wording_decision(
+                validated_decision, prefix=str(decision_project["prefix"])
+            )
+            replacement.pop("description_fields", None)
+        return replacement
     validated = semantic_analyzer._call_semantic_review(
         endpoint,
         events,
@@ -529,6 +1126,7 @@ def repair_document(
             "external_writes": False,
             "candidate_rows": [],
             "repaired_review_ids": [],
+            "unresolved_wording": [],
             "cache": cache.summary(),
             "carried_fathom_exception_ids": carried_fathom_ids,
         }
@@ -612,7 +1210,25 @@ def repair_document(
                 review_id, replacement = future.result()
             except (PortfolioRepairError, semantic_analyzer.AnalyzerError) as exc:
                 if item["repair_route"]:
-                    raise
+                    review_id = str(item["review_id"])
+                    row = rows_by_id[review_id]
+                    route = item["source_route"]
+                    replacements[review_id] = {
+                        "disposition": "activity",
+                        "description": str(row.get("description") or ""),
+                        "client_project": str(route["project_name"]),
+                        "tag_names": list(route["tag_names"]),
+                        "evidence_ids": sorted(
+                            str(value) for value in row.get("evidence_ids", [])
+                        ),
+                        "exceptions": [],
+                        "omissions": [],
+                    }
+                    unresolved[review_id] = (
+                        "Flash route repair failed; carried exact source proposal "
+                        f"route: {exc}"
+                    )
+                    continue
                 unresolved[str(item["review_id"])] = str(exc)
                 continue
             replacements[review_id] = replacement

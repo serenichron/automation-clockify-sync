@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import copy
 import csv
 import datetime as dt
 import json
@@ -390,6 +391,9 @@ def _review_with_bisection(
     single_activity_reviewer: Callable[
         [list[dict[str, Any]]], dict[str, Any]
     ] | None = None,
+    single_activity_fallback: Callable[
+        [list[dict[str, Any]]], dict[str, Any]
+    ] | None = None,
 ) -> list[tuple[tuple[int, ...], list[dict[str, Any]], dict[str, Any]]]:
     """Retry only analyzer failures on deterministic smaller source partitions."""
     ordered = sorted(source_activities, key=lambda row: _sort_activity(row, events_by_id))
@@ -405,6 +409,10 @@ def _review_with_bisection(
                 recovered = single_activity_reviewer(activities)
                 if not _is_analyzer_review_failure(recovered):
                     return [(path, activities, recovered)]
+            if single_activity_fallback is not None:
+                fallback = single_activity_fallback(activities)
+                if not _is_analyzer_review_failure(fallback):
+                    return [(path, activities, fallback)]
             activity_id = str(activities[0].get("activity_id") or "")
             raise PortfolioReviewError(
                 "analyzer review failed for single source activity "
@@ -465,6 +473,8 @@ def _package_review(
             "review_prompt_version": activity.get("review_prompt_version"),
             "semantic_reviewer_model": activity.get("semantic_reviewer_model"),
             "semantic_reviewer_revision": activity.get("semantic_reviewer_revision"),
+            "validation_status": activity.get("portfolio_validation_status")
+            or "flash_validated",
         })
     return packaged, list(reviewed["exceptions"]), list(reviewed["omissions"])
 
@@ -473,6 +483,7 @@ def _write_csv(path: Path, rows: Iterable[dict[str, Any]]) -> None:
     fields = [
         "Review ID", "Segments", "Start", "End", "Duration (min)", "Project",
         "Tags", "Confidence", "Description", "Disposition", "Source Activities",
+        "Validation",
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -494,6 +505,7 @@ def _write_csv(path: Path, rows: Iterable[dict[str, Any]]) -> None:
                 "Description": row["description"],
                 "Disposition": row["disposition"],
                 "Source Activities": ", ".join(row["source_activity_ids"]),
+                "Validation": row["validation_status"],
             })
     temporary.replace(path)
 
@@ -668,6 +680,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             ),
         )
 
+    def carry_single_source_activity(
+        source_activities: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Keep an already reviewed activity after bounded portfolio failures.
+
+        Base analysis has already passed a Flash reviewer. Portfolio review is
+        an optional packaging layer, so repeated opaque-ID copy errors must not
+        discard an evidence-backed accomplishment or abort the whole interval.
+        The marker keeps this explicit in JSON, CSV, and quality reporting.
+        """
+        if len(source_activities) != 1:
+            raise PortfolioReviewError(
+                "single-activity fallback received multiple activities"
+            )
+        carried = copy.deepcopy(source_activities[0])
+        carried["portfolio_validation_status"] = (
+            "source_semantic_review_carried_after_flash_contract_failure"
+        )
+        return {"activities": [carried], "exceptions": [], "omissions": []}
+
     def review_task(
         task: tuple[tuple[str, str, tuple[str, ...]], int, list[dict[str, Any]]]
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -681,6 +713,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             review_source_group,
             events_by_id=events_by_id,
             single_activity_reviewer=recover_single_source_activity,
+            single_activity_fallback=carry_single_source_activity,
         )
         for retry_partition, leaf_activities, reviewed in reviewed_partitions:
             evidence_ids = {
@@ -713,6 +746,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "omissions": len(group_omissions),
                 "evidence_count": len(evidence_ids),
                 "review_ids": sorted(row["review_id"] for row in packaged),
+                "validation_fallbacks": sum(
+                    row["validation_status"] != "flash_validated"
+                    for row in packaged
+                ),
                 **accounting,
             }
             if retry_partition:

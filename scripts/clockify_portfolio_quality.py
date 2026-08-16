@@ -28,7 +28,7 @@ REQUIRED_MODELS = frozenset({
     "deepseek-v4-flash:0731-cloud",
 })
 REQUIRED_MODEL = "deepseek-v4-flash:cloud"
-REQUIRED_REVISION = "d3f1c87447216481a8001f48c517a51e13bfb141853a8df5e52f81bf765dabc3"
+REQUIRED_REVISION = "6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc"
 _PREFIX_RE = re.compile(r"^([A-Za-z][A-Za-z0-9 &-]{0,24}) — ")
 
 
@@ -521,6 +521,11 @@ def audit(
             structural.append({"review_id": review_id, "reason": "row model is not the required Flash model"})
         if row.get("semantic_reviewer_revision") != REQUIRED_REVISION:
             structural.append({"review_id": review_id, "reason": "row revision is not the required Flash revision"})
+        if row.get("validation_status") != "flash_validated":
+            structural.append({
+                "review_id": review_id,
+                "reason": "row lacks successful Flash portfolio validation",
+            })
         description = row.get("description")
         try:
             caveman_renderer.validate_description(

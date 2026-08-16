@@ -213,6 +213,37 @@ class PortfolioReviewTests(unittest.TestCase):
         self.assertEqual([("act-one",)], recovery_calls)
         self.assertEqual(recovered, partitions[0][2])
 
+    def test_single_activity_failure_can_carry_reviewed_source_after_recovery(self):
+        failure = {
+            "activities": [],
+            "exceptions": [{
+                "kind": "analyzer_review_failure",
+                "evidence_ids": ["ev-one"],
+                "reason": "opaque evidence IDs were copied incorrectly",
+            }],
+            "omissions": [],
+        }
+
+        partitions = portfolio._review_with_bisection(
+            [{"activity_id": "act-one", "evidence_ids": ["ev-one"]}],
+            lambda group: failure,
+            events_by_id={},
+            single_activity_reviewer=lambda group: failure,
+            single_activity_fallback=lambda group: {
+                "activities": [{
+                    **group[0],
+                    "portfolio_validation_status": "source_review_carried",
+                }],
+                "exceptions": [],
+                "omissions": [],
+            },
+        )
+
+        self.assertEqual(
+            "source_review_carried",
+            partitions[0][2]["activities"][0]["portfolio_validation_status"],
+        )
+
     def test_portfolio_accounting_requires_top_level_equation(self):
         portfolio._portfolio_accounting(60, 45, 15)
 

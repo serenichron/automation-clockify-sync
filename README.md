@@ -82,6 +82,29 @@ human-owned `Disposition`, `Review Status`, and `Review Notes` cells. It never
 calls Clockify. Later intervals in the same month use the same command and tab;
 already published stable IDs are not duplicated.
 
+## Guarded Clockify portfolio posting
+
+The scheduled autopilot does not invoke the production poster. After a board-
+approved portfolio has a clean repair, passing quality report, and passing
+immutable replay, an operator can validate or execute that exact digest:
+
+```bash
+python3 scripts/clockify_post_approved_portfolio.py \
+  /absolute/path/to/portfolio-repair.json \
+  --quality-report /absolute/path/to/portfolio-quality.json \
+  --replay-integrity /absolute/path/to/replay-integrity.json \
+  --routing /absolute/path/to/routing.json \
+  --receipt /absolute/path/to/private-receipt.json \
+  --expected-portfolio-sha256 <approved-sha256> \
+  --execute
+```
+
+Omit `--execute` for a no-create preflight. The poster rejects warning-bearing
+repairs, rows without successful Flash portfolio validation, replay or quality
+drift, non-identical live overlaps, and portfolio digest mismatches. A failed or
+ambiguous POST is reconciled through a fresh exact live readback before the run
+can continue; it is never blindly retried after a server-side 5xx response.
+
 Outputs:
 
 - `runs/<run-id>/evidence/evidence-ledger.json`: immutable evidence and
@@ -507,6 +530,13 @@ small contract request. The setting remains model inference, is bound to new
 cache route identities, reuses accepted legacy decisions from the same model
 revision, and deliberately retries legacy rejections and timeouts.
 
+Set `CLOCKIFY_HTTP_TIMEOUT_SECONDS` to control only read-only Clockify
+collection requests. It defaults to `30` seconds and accepts base-10 integers
+from `5` through `120`, inclusive. Empty, non-integer, or out-of-range values
+fail before a Clockify request; Fathom, SSH, canonical-export, and analyzer
+timeouts are unaffected. The systemd and launchd environment examples set the
+documented default explicitly.
+
 When the desktop is unavailable, macOS can run the same guarded runner through
 `ops/launchd/com.serenichron.clockify-work-accounting.plist` and
 `ops/launchd/clockify-work-accounting.sh`. The wrapper reads the same private
@@ -538,6 +568,12 @@ the reviewed files in the repository does not activate it.
   approved workbook/interval. It preserves human decision cells by stable ID.
 - Clockify posting requires an explicit board decision for each stable review
   item.
+- Approval-gated portfolio posting uses `CLOCKIFY_POST_HTTP_TIMEOUT_SECONDS`,
+  which defaults to `45` seconds and accepts the same inclusive `5` through
+  `120` base-10 integer range. Invalid values fail before Clockify access. The
+  setting changes only request waiting time: it does not authorize `--execute`,
+  select a portfolio, or weaken digest, quality, idempotency, reconciliation,
+  or receipt gates.
 - Sheet synchronization, Multica issue mutation, schedule changes, deployment,
   and fleet rollout are separate guarded actions.
 - Do not claim a fix is live until the runtime path and Git SHA are read back on

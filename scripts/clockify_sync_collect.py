@@ -28,11 +28,15 @@ import urllib.parse
 import urllib.request
 from zoneinfo import ZoneInfo
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNS = ROOT / "runs"
 CLOCKIFY_API = "https://api.clockify.me/api/v1"
+CLOCKIFY_HTTP_TIMEOUT_NAME = "CLOCKIFY_HTTP_TIMEOUT_SECONDS"
+CLOCKIFY_HTTP_TIMEOUT_DEFAULT_SECONDS = 30
+CLOCKIFY_HTTP_TIMEOUT_MIN_SECONDS = 5
+CLOCKIFY_HTTP_TIMEOUT_MAX_SECONDS = 120
 FATHOM_API = "https://api.fathom.ai/external/v1"
 FATHOM_CREATION_LOOKBACK = dt.timedelta(days=1)
 FATHOM_MAX_PAGES = 1000
@@ -195,9 +199,14 @@ def local_dt_string(d: dt.datetime | None) -> str | None:
     return d.astimezone(BUCHAREST).strftime("%Y-%m-%d %H:%M")
 
 
-def http_json(url: str, headers: dict[str, str]) -> Any:
+def http_json(
+    url: str,
+    headers: dict[str, str],
+    *,
+    timeout_seconds: int = CLOCKIFY_HTTP_TIMEOUT_DEFAULT_SECONDS,
+) -> Any:
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=30) as r:
+    with urllib.request.urlopen(req, timeout=timeout_seconds) as r:
         return json.loads(r.read())
 
 
@@ -315,8 +324,37 @@ def canonical_export_payload(stdout: str, machine_name: str) -> dict[str, Any] |
     return None
 
 
+def clockify_http_timeout_seconds(cenv: Mapping[str, str]) -> int:
+    """Return the validated read-only Clockify request timeout."""
+    raw = (
+        cenv[CLOCKIFY_HTTP_TIMEOUT_NAME]
+        if CLOCKIFY_HTTP_TIMEOUT_NAME in cenv
+        else os.environ.get(CLOCKIFY_HTTP_TIMEOUT_NAME)
+    )
+    if raw is None:
+        return CLOCKIFY_HTTP_TIMEOUT_DEFAULT_SECONDS
+    if not re.fullmatch(r"[0-9]+", raw):
+        raise ValueError(
+            f"{CLOCKIFY_HTTP_TIMEOUT_NAME} must be an integer from "
+            f"{CLOCKIFY_HTTP_TIMEOUT_MIN_SECONDS} through "
+            f"{CLOCKIFY_HTTP_TIMEOUT_MAX_SECONDS}"
+        )
+    value = int(raw)
+    if not CLOCKIFY_HTTP_TIMEOUT_MIN_SECONDS <= value <= CLOCKIFY_HTTP_TIMEOUT_MAX_SECONDS:
+        raise ValueError(
+            f"{CLOCKIFY_HTTP_TIMEOUT_NAME} must be an integer from "
+            f"{CLOCKIFY_HTTP_TIMEOUT_MIN_SECONDS} through "
+            f"{CLOCKIFY_HTTP_TIMEOUT_MAX_SECONDS}"
+        )
+    return value
+
+
 def clockify_get(path: str, cenv: dict[str, str]) -> Any:
-    return http_json(CLOCKIFY_API + path, {"X-Api-Key": cenv["CLOCKIFY_API_KEY"]})
+    return http_json(
+        CLOCKIFY_API + path,
+        {"X-Api-Key": cenv["CLOCKIFY_API_KEY"]},
+        timeout_seconds=clockify_http_timeout_seconds(cenv),
+    )
 
 
 def latest_clockify_entry(cenv: dict[str, str], user_id: str) -> dt.datetime | None:

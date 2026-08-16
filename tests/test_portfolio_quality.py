@@ -68,6 +68,7 @@ def document(event, description="SC — Rebuilt Clockify review into invoice-rea
             "tag_names": ["System development"],
             "semantic_reviewer_model": quality.REQUIRED_MODEL,
             "semantic_reviewer_revision": quality.REQUIRED_REVISION,
+            "validation_status": "flash_validated",
         }],
         "exceptions": [],
         "omissions": [],
@@ -310,6 +311,28 @@ class PortfolioQualityTests(unittest.TestCase):
         report = quality.audit(value, ledger(event), source_proposals=proposals())
         self.assertEqual("blocked", report["status"])
         self.assertGreaterEqual(len(report["structural_issues"]), 3)
+
+    def test_carried_source_review_cannot_pass_portfolio_quality(self):
+        event = fathom_event()
+        value = document(event)
+        value["activities"][0]["validation_status"] = (
+            "source_semantic_review_carried_after_flash_contract_failure"
+        )
+
+        report = quality.audit(
+            value,
+            ledger(event),
+            source_proposals=proposals(),
+            routing=routing(),
+        )
+
+        self.assertEqual("blocked", report["status"])
+        self.assertTrue(
+            any(
+                "Flash portfolio validation" in issue["reason"]
+                for issue in report["structural_issues"]
+            )
+        )
 
     def test_caveman_wording_is_a_repair_candidate_not_a_rewrite(self):
         event = fathom_event()

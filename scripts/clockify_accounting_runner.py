@@ -25,7 +25,7 @@ APPROVED_FLASH_MODELS = {
     "deepseek-v4-flash:0731-cloud",
 }
 APPROVED_FLASH_REVISION = (
-    "d3f1c87447216481a8001f48c517a51e13bfb141853a8df5e52f81bf765dabc3"
+    "6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc"
 )
 REQUIRED_RESULT_ARTIFACTS = (
     "semantic-analysis.json",

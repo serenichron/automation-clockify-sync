@@ -60,6 +60,28 @@ def proposal(segment=1):
     }
 
 
+def portfolio_document():
+    return {
+        "source_run": "/private/runs/run-1",
+        "activities": [{
+            "review_id": "pvi-1234567890abcdef12345678",
+            "start": "2026-08-01T10:00+03:00",
+            "end": "2026-08-01T10:10+03:00",
+            "duration_minutes": 10,
+            "client_project": "Serenichron Level 2",
+            "tag_names": ["System development"],
+            "source_activity_ids": ["act-123", "act-456"],
+            "confidence": "high",
+            "description": "SC — Verified guarded Sheet publication with stable review identities",
+            "validation_status": "flash_validated",
+        }],
+        "repair": {
+            "status": "complete",
+            "unresolved_wording": [],
+        },
+    }
+
+
 class SheetPublicationTests(unittest.TestCase):
     def test_row_uses_stable_segment_identity_and_pending_review_fields(self):
         row = publisher.proposal_row(proposal(2), "run-1")
@@ -67,6 +89,56 @@ class SheetPublicationTests(unittest.TestCase):
         self.assertEqual("pending", row[9])
         self.assertEqual("pending", row[13])
         self.assertEqual("", row[14])
+
+    def test_portfolio_row_uses_consolidated_identity_and_sources(self):
+        row = publisher.portfolio_row(portfolio_document()["activities"][0], "run-1")
+        self.assertEqual("pvi-1234567890abcdef12345678", row[0])
+        self.assertEqual("act-123, act-456", row[6])
+        self.assertEqual("flash_validated", row[12])
+        self.assertEqual("pending", row[9])
+        self.assertEqual("pending", row[13])
+
+    def test_portfolio_gates_bind_repair_quality_and_replay(self):
+        portfolio = portfolio_document()
+        quality = {
+            "status": "pass",
+            "fragmentation": {"row_count": 1, "total_minutes": 10},
+        }
+        replay = {
+            "status": "pass",
+            "identity": {"artifacts": {
+                "repair": publisher.portfolio_replay._digest(portfolio),
+                "quality": publisher.portfolio_replay._digest(quality),
+            }},
+        }
+
+        publisher.verify_portfolio_gates(portfolio, quality, replay, "run-1")
+
+        replay["identity"]["artifacts"]["repair"] = "sha256:" + "0" * 64
+        with self.assertRaises(publisher.PublicationError):
+            publisher.verify_portfolio_gates(portfolio, quality, replay, "run-1")
+
+    def test_portfolio_gate_rejects_carried_source_review(self):
+        portfolio = portfolio_document()
+        portfolio["activities"][0]["validation_status"] = (
+            "source_semantic_review_carried_after_flash_contract_failure"
+        )
+        quality = {
+            "status": "pass",
+            "fragmentation": {"row_count": 1, "total_minutes": 10},
+        }
+        replay = {
+            "status": "pass",
+            "identity": {"artifacts": {
+                "repair": publisher.portfolio_replay._digest(portfolio),
+                "quality": publisher.portfolio_replay._digest(quality),
+            }},
+        }
+
+        with self.assertRaisesRegex(
+            publisher.PublicationError, "Flash portfolio validation"
+        ):
+            publisher.verify_portfolio_gates(portfolio, quality, replay, "run-1")
 
     def test_new_month_tab_copies_template_clears_and_writes_rows(self):
         gateway = FakeGateway()
@@ -184,6 +256,39 @@ class SheetPublicationTests(unittest.TestCase):
                 ])
         self.assertEqual(0, result)
         self.assertFalse(json.loads(output.getvalue())["external_writes"])
+
+    def test_portfolio_cli_dry_run_never_constructs_gateway(self):
+        portfolio = portfolio_document()
+        quality = {
+            "status": "pass",
+            "fragmentation": {"row_count": 1, "total_minutes": 10},
+        }
+        replay = {
+            "status": "pass",
+            "identity": {"artifacts": {
+                "repair": publisher.portfolio_replay._digest(portfolio),
+                "quality": publisher.portfolio_replay._digest(quality),
+            }},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "portfolio.json").write_text(json.dumps(portfolio))
+            (root / "quality.json").write_text(json.dumps(quality))
+            (root / "replay.json").write_text(json.dumps(replay))
+            output = io.StringIO()
+            with mock.patch.object(
+                publisher, "GwsSheetsGateway", side_effect=AssertionError("write gateway used")
+            ), contextlib.redirect_stdout(output):
+                result = publisher.main([
+                    "--spreadsheet-id", "sheet",
+                    "--sheet-title", "August 2026 portfolio review",
+                    "--portfolio-repair", str(root / "portfolio.json"),
+                    "--quality-report", str(root / "quality.json"),
+                    "--replay-integrity", str(root / "replay.json"),
+                    "--run-id", "run-1",
+                ])
+        self.assertEqual(0, result)
+        self.assertEqual(1, json.loads(output.getvalue())["rows"])
 
 
 if __name__ == "__main__":

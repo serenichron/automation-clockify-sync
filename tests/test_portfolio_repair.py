@@ -150,6 +150,22 @@ class PortfolioRepairTests(unittest.TestCase):
         self.assertTrue(any("8-24" in reason for reason in reasons))
         self.assertTrue(any("forbidden" in reason for reason in reasons))
 
+    def test_clean_no_repair_result_declares_no_unresolved_wording(self):
+        source = source_document(
+            "SC — Rebuilt Clockify review into invoice-ready July entries"
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = repair.repair_document(
+                source,
+                ledger(),
+                endpoint=None,
+                cache=semantic.AnalyzerResponseCache(Path(directory) / "cache.jsonl"),
+            )
+
+        self.assertEqual("pass", result["repair"]["status"])
+        self.assertEqual([], result["repair"]["unresolved_wording"])
+
     def test_flash_repair_runs_structured_and_separate_validation_and_preserves_rows(self):
         source = source_document(
             "SC — Rebuilt Clockify review into a complete invoice-ready July package with too many secondary details across every client workstream and meeting across all three machines"
@@ -179,7 +195,615 @@ class PortfolioRepairTests(unittest.TestCase):
             {key: value for key, value in before.items() if key != "description"},
             {key: value for key, value in after.items() if key != "description"},
         )
+
+    def test_contract_failed_review_switches_to_bounded_wording_decision(self):
+        source = source_document("SC — Reviewed NEEDS REVIEW status for July package")
+        analyzer_failure = {
+            "activities": [],
+            "exceptions": [{
+                "kind": "analyzer_review_failure",
+                "evidence_ids": ["ev-one"],
+                "reason": "Flash reviewer exhausted one structural repair",
+            }],
+            "omissions": [],
+        }
+        stages: list[str] = []
+
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            self.assertEqual("portfolio_wording_decision", payload["mode"])
+            stages.append(payload["decision_stage"])
+            decision = {
+                "disposition": "activity",
+                "action": "Prepared",
+                "object": "July portfolio review package",
+                "outcome": "for invoice-ready client approval",
+                "project_recommendation": {
+                    "name": "Serenichron Level 2",
+                    "prefix": "SC",
+                    "tag_names": ["Processes"],
+                },
+                "exception_kind": "",
+                "reason": "",
+            }
+            return {"choices": [{"message": {"content": json.dumps(decision)}}]}
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            semantic, "_call_semantic_review", return_value=analyzer_failure
+        ) as full_review:
+            result = repair.repair_document(
+                source,
+                ledger(),
+                endpoint=self.endpoint(),
+                cache=semantic.AnalyzerResponseCache(Path(directory) / "cache.jsonl"),
+                transport=transport,
+            )
+
+        self.assertEqual(["draft", "validation"], stages)
+        self.assertEqual(1, full_review.call_count)
+        self.assertEqual(
+            "SC — Prepared July portfolio review package for invoice-ready client approval",
+            result["activities"][0]["description"],
+        )
+        self.assertEqual(["ev-one"], result["activities"][0]["evidence_ids"])
         self.assertEqual(["pvi-one"], result["repair"]["repaired_review_ids"])
+
+    def test_wording_decision_repairs_one_malformed_provider_envelope(self):
+        source = source_document("SC — Reviewed NEEDS REVIEW status for July package")
+        analyzer_failure = {
+            "activities": [],
+            "exceptions": [{
+                "kind": "analyzer_review_failure",
+                "evidence_ids": ["ev-one"],
+                "reason": "Flash reviewer exhausted one structural repair",
+            }],
+            "omissions": [],
+        }
+        stages: list[str] = []
+        valid = {
+            "disposition": "activity",
+            "action": "Prepared",
+            "object": "July portfolio review package",
+            "outcome": "for invoice-ready client approval",
+            "project_recommendation": {
+                "name": "Serenichron Level 2",
+                "prefix": "SC",
+                "tag_names": ["Processes"],
+            },
+            "exception_kind": "",
+            "reason": "",
+        }
+
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            stages.append(payload["decision_stage"])
+            if len(stages) == 1:
+                return {"choices": []}
+            return {"choices": [{"message": {"content": json.dumps(valid)}}]}
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            semantic, "_call_semantic_review", return_value=analyzer_failure
+        ):
+            result = repair.repair_document(
+                source,
+                ledger(),
+                endpoint=self.endpoint(),
+                cache=semantic.AnalyzerResponseCache(Path(directory) / "cache.jsonl"),
+                transport=transport,
+            )
+
+        self.assertEqual(["draft", "draft", "validation"], stages)
+        self.assertEqual(
+            "SC — Prepared July portfolio review package for invoice-ready client approval",
+            result["activities"][0]["description"],
+        )
+
+    def test_wording_decision_retry_receives_specific_contract_feedback(self):
+        source = source_document("SC — Reviewed NEEDS REVIEW status for July package")
+        analyzer_failure = {
+            "activities": [],
+            "exceptions": [{
+                "kind": "analyzer_review_failure",
+                "evidence_ids": ["ev-one"],
+                "reason": "Flash reviewer exhausted one structural repair",
+            }],
+            "omissions": [],
+        }
+        valid = {
+            "disposition": "activity",
+            "action": "Prepared",
+            "object": "July portfolio review package",
+            "outcome": "for invoice-ready client approval",
+            "project_recommendation": {
+                "name": "Serenichron Level 2",
+                "prefix": "SC",
+                "tag_names": ["Processes"],
+            },
+            "exception_kind": "",
+            "reason": "",
+        }
+        repair_feedback: list[str] = []
+
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            feedback = payload.get("repair_feedback")
+            if feedback is None:
+                malformed = (
+                    {**valid, "confidence": "high"}
+                    if payload["decision_stage"] == "draft"
+                    else {**valid, "disposition": "completed"}
+                )
+                return {"choices": [{"message": {"content": json.dumps(malformed)}}]}
+            repair_feedback.append(feedback["failure_code"])
+            return {"choices": [{"message": {"content": json.dumps(valid)}}]}
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            semantic, "_call_semantic_review", return_value=analyzer_failure
+        ):
+            result = repair.repair_document(
+                source,
+                ledger(),
+                endpoint=self.endpoint(),
+                cache=semantic.AnalyzerResponseCache(Path(directory) / "cache.jsonl"),
+                transport=transport,
+            )
+
+        self.assertEqual(
+            ["unsupported_fields", "contract_rejected_invalid_lifecycle"],
+            repair_feedback,
+        )
+        self.assertEqual(
+            "SC — Prepared July portfolio review package for invoice-ready client approval",
+            result["activities"][0]["description"],
+        )
+
+    def test_cached_generic_rejection_uses_distinct_structural_repair_identity(self):
+        valid = {
+            "disposition": "activity",
+            "action": "Prepared",
+            "object": "July portfolio review package",
+            "outcome": "for invoice-ready client approval",
+            "project_recommendation": {
+                "name": "Serenichron Level 2",
+                "prefix": "SC",
+                "tag_names": ["Processes"],
+            },
+            "exception_kind": "",
+            "reason": "",
+        }
+        feedback: list[str] = []
+
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            feedback.append(payload["repair_feedback"]["failure_code"])
+            return {"choices": [{"message": {"content": json.dumps(valid)}}]}
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = semantic.AnalyzerResponseCache(Path(directory) / "cache.jsonl")
+            original = repair._wording_decision_body(
+                ledger()["events"],
+                candidate=source_document("ignored")["activities"][0],
+                taxonomy=routing()["session_routes"],
+                endpoint=self.endpoint(),
+                stage="draft",
+            )
+            cache.store_rejected(
+                self.endpoint(), original, failure_code="contract_rejected_other"
+            )
+
+            decision = repair._call_wording_decision(
+                self.endpoint(),
+                ledger()["events"],
+                candidate=source_document("ignored")["activities"][0],
+                taxonomy=routing()["session_routes"],
+                stage="draft",
+                cache=cache,
+                transport=transport,
+                probe_once=lambda _endpoint: None,
+            )
+
+        self.assertEqual(["cached_unknown_contract_shape"], feedback)
+        self.assertEqual(valid, decision)
+
+    def test_two_cached_generic_rejections_do_not_consume_live_repair_budget(self):
+        valid = {
+            "disposition": "activity",
+            "action": "Prepared",
+            "object": "July portfolio review package",
+            "outcome": "for invoice-ready client approval",
+            "project_recommendation": {
+                "name": "Serenichron Level 2",
+                "prefix": "SC",
+                "tag_names": ["Processes"],
+            },
+            "exception_kind": "",
+            "reason": "",
+        }
+        feedback: list[str] = []
+
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            feedback.append(payload["repair_feedback"]["failure_code"])
+            return {"choices": [{"message": {"content": json.dumps(valid)}}]}
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = semantic.AnalyzerResponseCache(Path(directory) / "cache.jsonl")
+            common = {
+                "events": ledger()["events"],
+                "candidate": source_document("ignored")["activities"][0],
+                "taxonomy": routing()["session_routes"],
+                "endpoint": self.endpoint(),
+                "stage": "draft",
+            }
+            original = repair._wording_decision_body(**common)
+            first_repair = repair._wording_decision_body(
+                **common, repair_failure_code="cached_unknown_contract_shape"
+            )
+            cache.store_rejected(
+                self.endpoint(), original, failure_code="contract_rejected_other"
+            )
+            cache.store_rejected(
+                self.endpoint(), first_repair, failure_code="contract_rejected_other"
+            )
+
+            decision = repair._call_wording_decision(
+                self.endpoint(),
+                ledger()["events"],
+                candidate=source_document("ignored")["activities"][0],
+                taxonomy=routing()["session_routes"],
+                stage="draft",
+                cache=cache,
+                transport=transport,
+                probe_once=lambda _endpoint: None,
+            )
+
+        self.assertEqual(["cached_unknown_contract_shape_2"], feedback)
+        self.assertEqual(valid, decision)
+
+    def test_current_wording_contract_does_not_replay_legacy_rejections(self):
+        valid = {
+            "disposition": "activity",
+            "action": "Prepared",
+            "object": "July portfolio review package",
+            "outcome": "for invoice-ready client approval",
+            "project_recommendation": {
+                "name": "Serenichron Level 2",
+                "prefix": "SC",
+                "tag_names": ["Processes"],
+            },
+            "exception_kind": "",
+            "reason": "",
+        }
+        for legacy_version in (
+            "clockify-portfolio-wording-decision-v1",
+            "clockify-portfolio-wording-decision-v2",
+        ):
+            with self.subTest(legacy_version=legacy_version):
+                feedback_present: list[bool] = []
+
+                def transport(_endpoint, body):
+                    payload = json.loads(body["messages"][-1]["content"])
+                    feedback_present.append("repair_feedback" in payload)
+                    return {"choices": [{"message": {"content": json.dumps(valid)}}]}
+
+                with tempfile.TemporaryDirectory() as directory:
+                    cache = semantic.AnalyzerResponseCache(Path(directory) / "cache.jsonl")
+                    with mock.patch.object(
+                        repair, "WORDING_DECISION_PROMPT_VERSION", legacy_version
+                    ):
+                        legacy = repair._wording_decision_body(
+                            ledger()["events"],
+                            candidate=source_document("ignored")["activities"][0],
+                            taxonomy=routing()["session_routes"],
+                            endpoint=self.endpoint(),
+                            stage="draft",
+                        )
+                    cache.store_rejected(
+                        self.endpoint(), legacy, failure_code="contract_rejected_other"
+                    )
+
+                    decision = repair._call_wording_decision(
+                        self.endpoint(),
+                        ledger()["events"],
+                        candidate=source_document("ignored")["activities"][0],
+                        taxonomy=routing()["session_routes"],
+                        stage="draft",
+                        cache=cache,
+                        transport=transport,
+                        probe_once=lambda _endpoint: None,
+                    )
+
+                self.assertEqual([False], feedback_present)
+                self.assertEqual(valid, decision)
+
+    def test_current_wording_contract_reuses_valid_v1_decision(self):
+        valid = {
+            "disposition": "activity",
+            "action": "Prepared",
+            "object": "July portfolio review package",
+            "outcome": "for invoice-ready client approval",
+            "project_recommendation": {
+                "name": "Serenichron Level 2",
+                "prefix": "SC",
+                "tag_names": ["Processes"],
+            },
+            "exception_kind": "",
+            "reason": "",
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = semantic.AnalyzerResponseCache(Path(directory) / "cache.jsonl")
+            with mock.patch.object(
+                repair,
+                "WORDING_DECISION_PROMPT_VERSION",
+                "clockify-portfolio-wording-decision-v1",
+            ):
+                legacy = repair._wording_decision_body(
+                    ledger()["events"],
+                    candidate=source_document("ignored")["activities"][0],
+                    taxonomy=routing()["session_routes"],
+                    endpoint=self.endpoint(),
+                    stage="draft",
+                )
+            cache.store_accepted(self.endpoint(), legacy, valid)
+
+            decision = repair._call_wording_decision(
+                self.endpoint(),
+                ledger()["events"],
+                candidate=source_document("ignored")["activities"][0],
+                taxonomy=routing()["session_routes"],
+                stage="draft",
+                cache=cache,
+                transport=lambda *_: self.fail("valid v1 decision must be reused"),
+                probe_once=lambda _endpoint: None,
+            )
+
+        self.assertEqual(valid, decision)
+
+    def test_activity_wording_decision_discards_unused_reason_prose(self):
+        decision = {
+            "disposition": "activity",
+            "action": "Prepared",
+            "object": "July portfolio review package",
+            "outcome": "for invoice-ready client approval",
+            "project_recommendation": {
+                "name": "Serenichron Level 2",
+                "prefix": "SC",
+                "tag_names": ["Processes"],
+            },
+            "exception_kind": "",
+            "reason": "The evidence supports this completed activity.",
+        }
+
+        normalized = repair._validate_wording_decision(
+            decision, taxonomy=routing()["session_routes"]
+        )
+
+        self.assertEqual("", normalized["reason"])
+
+    def test_nonactivity_wording_decision_discards_unused_activity_fields(self):
+        decision = {
+            "disposition": "noise",
+            "action": "Observed",
+            "object": "agent status",
+            "outcome": "while awaiting approval",
+            "project_recommendation": {
+                "name": "Serenichron Level 2",
+                "prefix": "SC",
+                "tag_names": ["Processes"],
+            },
+            "exception_kind": "",
+            "reason": "Status-only evidence is not a completed accomplishment.",
+        }
+
+        normalized = repair._validate_wording_decision(
+            decision, taxonomy=routing()["session_routes"]
+        )
+
+        self.assertEqual("", normalized["action"])
+        self.assertEqual("", normalized["object"])
+        self.assertEqual("", normalized["outcome"])
+        self.assertEqual(
+            {"name": "", "prefix": "", "tag_names": []},
+            normalized["project_recommendation"],
+        )
+
+    def test_wording_decision_retries_caveman_unsafe_activity_fields(self):
+        unsafe = {
+            "disposition": "activity",
+            "action": "Prepared",
+            "object": "portfolio commit 0123456789abcdef0123456789abcdef",
+            "outcome": "for client approval",
+            "project_recommendation": {
+                "name": "Serenichron Level 2",
+                "prefix": "SC",
+                "tag_names": ["Processes"],
+            },
+            "exception_kind": "",
+            "reason": "",
+        }
+        valid = {
+            **unsafe,
+            "object": "July portfolio review package",
+            "outcome": "for invoice-ready client approval",
+        }
+        feedback: list[str] = []
+
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            repair_feedback = payload.get("repair_feedback")
+            if repair_feedback is None:
+                response = unsafe
+            else:
+                feedback.append(repair_feedback["failure_code"])
+                response = (
+                    {key: valid[key] for key in ("action", "object", "outcome")}
+                    if payload["mode"] == "portfolio_wording_fields_repair"
+                    else valid
+                )
+            return {"choices": [{"message": {"content": json.dumps(response)}}]}
+
+        with tempfile.TemporaryDirectory() as directory:
+            decision = repair._call_wording_decision(
+                self.endpoint(),
+                ledger()["events"],
+                candidate=source_document("ignored")["activities"][0],
+                taxonomy=routing()["session_routes"],
+                stage="draft",
+                cache=semantic.AnalyzerResponseCache(Path(directory) / "cache.jsonl"),
+                transport=transport,
+                probe_once=lambda _endpoint: None,
+            )
+
+        self.assertEqual(["forbidden_hash"], feedback)
+        self.assertEqual(valid, decision)
+
+    def test_caveman_retry_feedback_names_the_rejected_wording_class(self):
+        error = semantic.AnalyzerContractError(
+            "wording decision violates Caveman contract: description contains forbidden hash"
+        )
+
+        failure_code = repair._wording_failure_code(error)
+        request = repair._wording_decision_body(
+            ledger()["events"],
+            candidate=source_document("ignored")["activities"][0],
+            taxonomy=routing()["session_routes"],
+            endpoint=self.endpoint(),
+            stage="draft",
+            repair_failure_code=failure_code,
+        )
+        payload = json.loads(request["messages"][-1]["content"])
+
+        self.assertEqual("forbidden_hash", failure_code)
+        self.assertIn("commit hashes", payload["repair_feedback"]["instruction"])
+
+    def test_caveman_rejection_uses_locked_wording_fields_repair(self):
+        unsafe = {
+            "disposition": "activity",
+            "action": "Prepared",
+            "object": "portfolio commit 0123456789abcdef0123456789abcdef",
+            "outcome": "for client approval",
+            "project_recommendation": {
+                "name": "Serenichron Level 2",
+                "prefix": "SC",
+                "tag_names": ["Processes"],
+            },
+            "exception_kind": "",
+            "reason": "",
+        }
+        valid_full = {
+            **unsafe,
+            "object": "July portfolio review package",
+            "outcome": "for invoice-ready client approval",
+        }
+        modes: list[str] = []
+        micro_payloads: list[dict] = []
+
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            modes.append(payload["mode"])
+            if len(modes) == 1:
+                response = unsafe
+            elif payload["mode"] == "portfolio_wording_fields_repair":
+                micro_payloads.append(payload)
+                response = {
+                    "action": "prepared",
+                    "object": "July portfolio review package",
+                    "outcome": "for invoice-ready client approval",
+                }
+            else:
+                response = valid_full
+            return {"choices": [{"message": {"content": json.dumps(response)}}]}
+
+        with tempfile.TemporaryDirectory() as directory:
+            decision = repair._call_wording_decision(
+                self.endpoint(),
+                ledger()["events"],
+                candidate=source_document("ignored")["activities"][0],
+                taxonomy=routing()["session_routes"],
+                stage="draft",
+                cache=semantic.AnalyzerResponseCache(Path(directory) / "cache.jsonl"),
+                transport=transport,
+                probe_once=lambda _endpoint: None,
+            )
+
+        self.assertEqual(
+            ["portfolio_wording_decision", "portfolio_wording_fields_repair"], modes
+        )
+        self.assertEqual(unsafe["disposition"], decision["disposition"])
+        self.assertEqual(
+            unsafe["project_recommendation"], decision["project_recommendation"]
+        )
+        self.assertEqual("Prepared", decision["action"])
+        self.assertEqual("July portfolio review package", decision["object"])
+        self.assertNotIn("candidate", micro_payloads[0])
+        self.assertEqual(
+            {"disposition", "project_recommendation"},
+            set(micro_payloads[0]["locked_decision"]),
+        )
+
+    def test_wording_decision_applies_flash_validated_taxonomy_route(self):
+        source = source_document("SC — Reviewed NEEDS REVIEW status for July package")
+        source["activities"][0].update({
+            "client_project": "",
+            "tag_names": [],
+            "source_activity_ids": ["act-source1"],
+        })
+        analyzer_failure = {
+            "activities": [],
+            "exceptions": [{
+                "kind": "analyzer_review_failure",
+                "evidence_ids": ["ev-one"],
+                "reason": "Flash reviewer exhausted one structural repair",
+            }],
+            "omissions": [],
+        }
+        decision = {
+            "disposition": "activity",
+            "action": "Prepared",
+            "object": "July portfolio review package",
+            "outcome": "for approved test-prep operations",
+            "project_recommendation": {
+                "name": "TST Prep Level 2",
+                "prefix": "TSTP",
+                "tag_names": ["Technical development"],
+            },
+            "exception_kind": "",
+            "reason": "",
+        }
+
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            return {"choices": [{"message": {"content": json.dumps(decision)}}]}
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            semantic, "_call_semantic_review", return_value=analyzer_failure
+        ):
+            result = repair.repair_document(
+                source,
+                ledger(),
+                endpoint=self.endpoint(),
+                cache=semantic.AnalyzerResponseCache(Path(directory) / "cache.jsonl"),
+                transport=transport,
+                routing=routing(),
+                source_proposals=proposals(("Serenichron Level 2", ["Processes"])),
+            )
+
+        row = result["activities"][0]
+        self.assertEqual("TST Prep Level 2", row["client_project"])
+        self.assertEqual(["Technical development"], row["tag_names"])
+        self.assertEqual(
+            "TSTP — Prepared July portfolio review package for approved test-prep operations",
+            row["description"],
+        )
 
     def test_cache_resume_does_not_call_transport_again(self):
         source = source_document(
@@ -204,7 +828,7 @@ class PortfolioRepairTests(unittest.TestCase):
 
         self.assertEqual(first["activities"], second["activities"])
 
-    def test_analyzer_failure_uses_single_activity_flash_recovery(self):
+    def test_validation_failure_uses_single_activity_flash_recovery(self):
         source = source_document(
             "SC — Rebuilt Clockify review into a complete invoice-ready July package with too many secondary details across every client workstream and meeting across all three machines"
         )
@@ -237,7 +861,10 @@ class PortfolioRepairTests(unittest.TestCase):
 
         def semantic_call(*_args, **kwargs):
             scopes.append(kwargs["review_scope"])
-            if kwargs["review_scope"] == "portfolio_single_activity_recovery":
+            if kwargs["review_scope"] in {
+                "portfolio",
+                "portfolio_single_activity_recovery",
+            }:
                 return replacement
             return failure
 
