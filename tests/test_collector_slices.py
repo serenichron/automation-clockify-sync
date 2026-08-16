@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -69,6 +70,16 @@ class SlicePlanningTests(unittest.TestCase):
         self.assertEqual(since, slices[0].since)
         self.assertEqual(dt.datetime(2026, 8, 3, tzinfo=BUCHAREST), slices[0].until)
         self.assertEqual(until, slices[-1].until)
+
+    def test_max_adjacent_interval_clamps_to_final_partial_slice(self) -> None:
+        since = dt.datetime(9999, 12, 30, 12, tzinfo=BUCHAREST)
+        until = dt.datetime(9999, 12, 31, 23, 59, tzinfo=BUCHAREST)
+
+        slices = collector_slices.plan_slices(since, until, zone=BUCHAREST)
+
+        self.assertEqual(1, len(slices))
+        self.assertEqual(since, slices[0].since)
+        self.assertEqual(until, slices[0].until)
 
     def test_rejects_naive_reversed_or_too_wide_intervals(self) -> None:
         aware = dt.datetime(2026, 8, 1, tzinfo=BUCHAREST)
@@ -170,6 +181,40 @@ class BacklogReceiptTests(unittest.TestCase):
             store = collector_slices.BacklogStore(Path(directory))
             state = store.open(self.identity, self.slices)
             (state.directory / "backlog-manifest.json").unlink()
+
+            with self.assertRaises(collector_slices.BacklogError):
+                store.open(self.identity, self.slices)
+
+    def test_record_complete_rejects_a_non_prefix_slice(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = collector_slices.BacklogStore(Path(directory))
+            artifact = Path(directory) / "later-result.json"
+            artifact.write_bytes(b'{"slice":"later"}\n')
+
+            with self.assertRaises(collector_slices.BacklogError):
+                store.record_complete(
+                    store.open(self.identity, self.slices),
+                    self.slices[1].slice_id,
+                    artifact,
+                    self._digest(artifact),
+                )
+
+    def test_manifest_rejects_receipts_that_are_not_a_chronological_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = collector_slices.BacklogStore(Path(directory))
+            state = store.open(self.identity, self.slices)
+            second = Path(directory) / "second-result.json"
+            second.write_bytes(b'{"slice":"second"}\n')
+            manifest_path = state.directory / "backlog-manifest.json"
+            manifest = json.loads(manifest_path.read_text())
+            manifest["completed"] = [
+                {
+                    "slice_id": self.slices[1].slice_id,
+                    "result_path": str(second),
+                    "result_digest": self._digest(second),
+                }
+            ]
+            manifest_path.write_text(json.dumps(manifest) + "\n")
 
             with self.assertRaises(collector_slices.BacklogError):
                 store.open(self.identity, self.slices)

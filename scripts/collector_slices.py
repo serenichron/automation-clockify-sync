@@ -68,14 +68,18 @@ def plan_slices(
     slices: list[CollectionSlice] = []
     cursor = local_since
     while _utc_instant(cursor) < _utc_instant(local_until):
-        boundary = datetime.combine(
-            cursor.date() + timedelta(days=max_days), time.min, tzinfo=zone
-        )
-        end = (
-            boundary
-            if _utc_instant(boundary) < _utc_instant(local_until)
-            else local_until
-        )
+        try:
+            boundary = datetime.combine(
+                cursor.date() + timedelta(days=max_days), time.min, tzinfo=zone
+            )
+        except OverflowError:
+            end = local_until
+        else:
+            end = (
+                boundary
+                if _utc_instant(boundary) < _utc_instant(local_until)
+                else local_until
+            )
         slices.append(CollectionSlice(cursor, end, _slice_id(cursor, end, zone)))
         cursor = end
     return tuple(slices)
@@ -152,6 +156,8 @@ class BacklogStore:
             raise BacklogError("receipt references an unknown slice")
         if slice_id in {receipt.slice_id for receipt in current.completed}:
             raise BacklogError("slice receipt is immutable")
+        if slice_id != current.slices[len(current.completed)].slice_id:
+            raise BacklogError("receipt must complete the next chronological slice")
 
         artifact = _verified_artifact(result_path, result_digest)
         receipt = {
@@ -217,6 +223,9 @@ class BacklogStore:
             raise BacklogError("backlog contains duplicate receipts")
         if any(receipt.slice_id not in valid_ids for receipt in receipts):
             raise BacklogError("backlog receipt references an unknown slice")
+        expected_receipt_ids = [slice_.slice_id for slice_ in slices[:len(receipts)]]
+        if [receipt.slice_id for receipt in receipts] != expected_receipt_ids:
+            raise BacklogError("backlog receipts must be a chronological prefix")
         for receipt in receipts:
             _verified_artifact(receipt.result_path, receipt.result_digest)
         complete = len(receipts) == len(slices)

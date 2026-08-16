@@ -81,20 +81,22 @@ class CollectorEntrypointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "checkpoints"
             root.mkdir()
+            source_root = root / ("b" * 64) / "source-checkpoints"
+            source_root.mkdir(parents=True)
             old = self._write_checkpoint(
-                root,
+                source_root,
                 "old",
                 complete=True,
                 completed_at="2026-08-01T23:59:59Z",
             )
             recent = self._write_checkpoint(
-                root,
+                source_root,
                 "recent",
                 complete=True,
                 completed_at="2026-08-02T00:00:00Z",
             )
-            incomplete = self._write_checkpoint(root, "incomplete", complete=False)
-            corrupt = root / ("c" * 64)
+            incomplete = self._write_checkpoint(source_root, "incomplete", complete=False)
+            corrupt = source_root / ("c" * 64)
             corrupt.mkdir()
             (corrupt / "manifest.json").write_text(
                 '{"credential":"credential-secret","cursor":"cursor-secret"}\n'
@@ -124,8 +126,10 @@ class CollectorEntrypointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "checkpoints"
             root.mkdir()
+            source_root = root / ("b" * 64) / "source-checkpoints"
+            source_root.mkdir(parents=True)
             old = self._write_checkpoint(
-                root,
+                source_root,
                 "old",
                 complete=True,
                 completed_at="2026-08-01T23:59:59Z",
@@ -154,14 +158,16 @@ class CollectorEntrypointTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "checkpoints"
             root.mkdir()
+            source_root = root / ("b" * 64) / "source-checkpoints"
+            source_root.mkdir(parents=True)
             boundary = self._write_checkpoint(
-                root,
+                source_root,
                 "boundary",
                 complete=True,
                 completed_at="2026-08-02T00:00:00Z",
             )
             before_boundary = self._write_checkpoint(
-                root,
+                source_root,
                 "before",
                 complete=True,
                 completed_at="2026-08-01T23:59:59Z",
@@ -179,6 +185,33 @@ class CollectorEntrypointTests(unittest.TestCase):
             self.assertIn("removed=1 preserved=1", stdout)
             self.assertTrue(boundary.exists())
             self.assertFalse(before_boundary.exists())
+
+    def test_cleanup_does_not_follow_a_symlinked_backlog_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "checkpoints"
+            root.mkdir()
+            outside_source_root = base / "outside" / "source-checkpoints"
+            outside_source_root.mkdir(parents=True)
+            old = self._write_checkpoint(
+                outside_source_root,
+                "old",
+                complete=True,
+                completed_at="2026-08-01T23:59:59Z",
+            )
+            (root / "linked-backlog").symlink_to(base / "outside", target_is_directory=True)
+
+            code, stdout, stderr = self._invoke_main(
+                "cleanup-checkpoints",
+                "--completed-before",
+                "2026-08-02",
+                "--checkpoint-root",
+                str(root),
+            )
+
+            self.assertEqual(0, code, stderr)
+            self.assertIn("removed=0 preserved=0", stdout)
+            self.assertTrue(old.exists())
 
 
 if __name__ == "__main__":

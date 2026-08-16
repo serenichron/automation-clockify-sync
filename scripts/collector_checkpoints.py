@@ -165,11 +165,13 @@ class PageCheckpointStore:
     def remove_completed_before(self, cutoff: datetime) -> tuple[Path, ...]:
         if cutoff.tzinfo is None:
             raise CheckpointError("cutoff must be timezone-aware")
+        if self.root.is_symlink():
+            raise CheckpointError("checkpoint root is unsafe")
         if not self.root.exists():
             return ()
         removed: list[Path] = []
         for directory in self.root.iterdir():
-            if not directory.is_dir() or directory.is_symlink():
+            if directory.is_symlink() or not directory.is_dir():
                 continue
             manifest_path = directory / "manifest.json"
             try:
@@ -210,7 +212,7 @@ class PageCheckpointStore:
         return self.open(state.identity)
 
     def _read_manifest(self, path: Path) -> Mapping[str, object]:
-        if not path.is_file() or path.is_symlink():
+        if path.is_symlink() or not path.is_file():
             raise CheckpointError("manifest is missing or unsafe")
         try:
             value = json.loads(path.read_text())
@@ -268,7 +270,7 @@ class PageCheckpointStore:
         )
 
     def _read_page(self, path: Path) -> Mapping[str, object]:
-        if not path.is_file() or path.is_symlink():
+        if path.is_symlink() or not path.is_file():
             raise CheckpointError("referenced page is missing or unsafe")
         try:
             value = json.loads(path.read_text())

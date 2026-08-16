@@ -2546,8 +2546,6 @@ def _fathom_checkpoint_items(
         raise CheckpointError("checkpoint Fathom continuation is invalid")
     if state.complete and (not state.pages or cursor is not None):
         raise CheckpointError("completed Fathom checkpoint has a continuation")
-    if not state.complete and state.pages and cursor is None:
-        raise CheckpointError("unfinished Fathom checkpoint has no continuation")
     return items, seen_cursors, cursor
 
 
@@ -2602,6 +2600,8 @@ def fetch_fathom(
                 checkpoint_store, checkpoint_state
             )
             pages = len(checkpoint_state.pages)
+            if checkpoint_state.pages and cursor is None and not checkpoint_state.complete:
+                checkpoint_state = checkpoint_store.mark_complete(checkpoint_state)
         while checkpoint_state is None or not checkpoint_state.complete:
             if pages >= FATHOM_MAX_PAGES:
                 raise ValueError("Fathom pagination exceeded safety limit")
@@ -2772,7 +2772,12 @@ def _multica_server_origin(server: str) -> str:
 
 def _multica_page_rows(data: Any) -> list[Mapping[str, Any]]:
     if isinstance(data, Mapping):
-        items = data.get("issues") or data.get("items") or []
+        if "issues" in data:
+            items = data["issues"]
+        elif "items" in data:
+            items = data["items"]
+        else:
+            raise ValueError("Multica issues response did not contain a list")
     elif isinstance(data, list):
         items = data
     else:
@@ -2824,7 +2829,7 @@ def _multica_checkpoint_rows(
     checkpoint_store: PageCheckpointStore,
     state: CheckpointState,
     endpoint_path: str,
-) -> tuple[list[Mapping[str, Any]], set[str], int]:
+) -> tuple[list[Mapping[str, Any]], set[str], int, bool]:
     if dict(state.metadata) != {"endpoint_path": endpoint_path}:
         raise CheckpointError("checkpoint Multica endpoint path is invalid")
     rows: list[Mapping[str, Any]] = []
@@ -2863,9 +2868,8 @@ def _multica_checkpoint_rows(
         final_page_size is None or final_page_size >= MULTICA_PAGE_SIZE
     ):
         raise CheckpointError("completed Multica checkpoint has no short final page")
-    if not state.complete and final_page_size is not None and final_page_size < MULTICA_PAGE_SIZE:
-        raise CheckpointError("unfinished Multica checkpoint has a terminal page")
-    return rows, seen_pages, offset
+    terminal_ready = final_page_size is not None and final_page_size < MULTICA_PAGE_SIZE
+    return rows, seen_pages, offset, terminal_ready
 
 
 def _multica_sanitized_issues(
@@ -2970,10 +2974,12 @@ def fetch_multica_issues(
                 raise CheckpointError("multiple Multica endpoints have committed checkpoints")
             candidates = committed or states
             for path, checkpoint_state in candidates:
-                rows, seen_pages, offset = _multica_checkpoint_rows(
+                rows, seen_pages, offset, terminal_ready = _multica_checkpoint_rows(
                     checkpoint_store, checkpoint_state, path
                 )
                 pages = len(checkpoint_state.pages)
+                if terminal_ready and not checkpoint_state.complete:
+                    checkpoint_state = checkpoint_store.mark_complete(checkpoint_state)
                 try:
                     while not checkpoint_state.complete:
                         if pages >= 100:
@@ -3550,12 +3556,25 @@ def cleanup_checkpoints(args: argparse.Namespace) -> int:
         return 2
 
     try:
-        before = tuple(
-            path
-            for path in root.iterdir()
-            if path.is_dir() and not path.is_symlink()
+        checkpoint_roots = tuple(
+            backlog / "source-checkpoints"
+            for backlog in root.iterdir()
+            if not backlog.is_symlink()
+            and backlog.is_dir()
+            and not (backlog / "source-checkpoints").is_symlink()
+            and (backlog / "source-checkpoints").is_dir()
         )
-        removed = PageCheckpointStore(root).remove_completed_before(cutoff)
+        before = tuple(
+            checkpoint
+            for checkpoint_root in checkpoint_roots
+            for checkpoint in checkpoint_root.iterdir()
+            if not checkpoint.is_symlink() and checkpoint.is_dir()
+        )
+        removed = tuple(
+            checkpoint
+            for checkpoint_root in checkpoint_roots
+            for checkpoint in PageCheckpointStore(checkpoint_root).remove_completed_before(cutoff)
+        )
     except (CheckpointError, OSError, ValueError):
         print("checkpoint cleanup failed safely", file=sys.stderr)
         return 2
