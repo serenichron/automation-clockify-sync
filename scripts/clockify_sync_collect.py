@@ -3524,6 +3524,54 @@ def collector_checkpoint_root() -> Path:
     return ROOT / "state" / "collector-checkpoints"
 
 
+def _cleanup_checkpoint_identity_digest(path: Path) -> str | None:
+    digest = path.name
+    if len(digest) == 64 and all(character in "0123456789abcdef" for character in digest):
+        return digest
+    return None
+
+
+def cleanup_checkpoints(args: argparse.Namespace) -> int:
+    root = Path(args.checkpoint_root)
+    if not root.is_absolute() or root.is_symlink() or not root.is_dir():
+        print("checkpoint root must be an existing absolute directory", file=sys.stderr)
+        return 2
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.completed_before):
+        print("completed-before must be YYYY-MM-DD", file=sys.stderr)
+        return 2
+    try:
+        cutoff = dt.datetime.combine(
+            dt.date.fromisoformat(args.completed_before),
+            dt.time.min,
+            tzinfo=dt.timezone.utc,
+        )
+    except ValueError:
+        print("completed-before must be a valid UTC date", file=sys.stderr)
+        return 2
+
+    try:
+        before = tuple(
+            path
+            for path in root.iterdir()
+            if path.is_dir() and not path.is_symlink()
+        )
+        removed = PageCheckpointStore(root).remove_completed_before(cutoff)
+    except (CheckpointError, OSError, ValueError):
+        print("checkpoint cleanup failed safely", file=sys.stderr)
+        return 2
+    removed_set = set(removed)
+    digests = sorted(
+        digest
+        for path in removed_set
+        if (digest := _cleanup_checkpoint_identity_digest(path)) is not None
+    )
+    print(
+        f"removed={len(removed_set)} preserved={len(before) - len(removed_set)} "
+        f"removed_identity_digests={','.join(digests) or 'none'}"
+    )
+    return 0
+
+
 def _backlog_compatibility_version(
     routing: Mapping[str, Any], fleet: Mapping[str, Any]
 ) -> str:
@@ -3932,9 +3980,14 @@ def main() -> int:
     export.add_argument("--expected-collector-sha256", required=True)
     export.add_argument("--coordinator-git-sha")
     export.add_argument("--encoded-output", action="store_true")
+    cleanup = sub.add_parser("cleanup-checkpoints")
+    cleanup.add_argument("--completed-before", required=True, help="UTC date boundary YYYY-MM-DD")
+    cleanup.add_argument("--checkpoint-root", required=True, help="existing absolute checkpoint root")
     args = ap.parse_args()
     if args.cmd == "run":
         return run(args)
+    if args.cmd == "cleanup-checkpoints":
+        return cleanup_checkpoints(args)
     if args.cmd == "export-local":
         machine = json.loads(args.machine_json)
         if not isinstance(machine, dict) or not machine.get("name"):

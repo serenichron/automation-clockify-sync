@@ -331,6 +331,40 @@ only through the earlier of the collection snapshot and the requested end. Its
 temporary boundary remains explicit provenance. If any running entry cannot be
 bounded safely, Clockify coverage stays partial and accounting fails closed.
 
+### Recovery-only collector checkpoints
+
+The collector keeps private, local checkpoints for paginated source responses
+so an interrupted recovery can resume without repeating already committed
+pages. The default root is the private repository state directory
+`state/collector-checkpoints`. A service may set an explicit private root with
+`CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT=/absolute/private/state/collector-checkpoints`.
+Keep the live directory private and mode-restricted; checkpoint contents are
+recovery evidence, not review artifacts, and must not be shared with an
+analyzer or client.
+
+Collection windows are split oldest-first into slices of at most two local
+calendar days. Each completed slice is recorded independently, so its
+validated report is immediately available for review even if a later slice
+fails. A subsequent run retries the oldest incomplete slice first. A source or
+slice failure preserves its incomplete checkpoint and fails closed: it never
+deletes recovery state, fabricates a result, or marks an incomplete slice as
+complete. Cleanup is never automatic during collection.
+
+After review, an operator may remove only completed checkpoints older than a
+UTC date boundary by passing an explicit absolute root:
+
+```bash
+python3 scripts/clockify_sync_collect.py cleanup-checkpoints \
+  --completed-before YYYY-MM-DD \
+  --checkpoint-root /absolute/private/state/collector-checkpoints
+```
+
+The command refuses relative, missing, or non-directory roots, and reports
+aggregate counts plus checkpoint identity digests only. It never prints page
+filenames, payloads, cursors, or credentials. Incomplete and corrupt
+checkpoints are preserved for fail-closed recovery and are not removed by this
+command.
+
 `state/source-coverage.json` retains per-peer coverage debt. If MacBook or
 desktop collection is unavailable, the current run still analyzes complete
 Precision and central evidence, and records the missed interval instead of
