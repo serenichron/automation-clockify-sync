@@ -1029,6 +1029,40 @@ class CollectorBurstContextTests(unittest.TestCase):
         self.assertEqual([], corrupted["meetings"])
         http.assert_not_called()
 
+    def test_fathom_checkpoint_rejects_out_of_sequence_request_cursor_before_http(self) -> None:
+        first_page = {"items": [], "next_cursor": "private-first-next"}
+        second_page = {"items": [], "next_cursor": "private-second-next"}
+        env = {"FATHOM_API_KEY": "not-logged"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = checkpoints.PageCheckpointStore(Path(directory))
+            state = store.open(collector._fathom_checkpoint_identity(SINCE, UNTIL))
+            state = store.append_page(
+                state,
+                payload=first_page,
+                continuation={"cursor": "private-first-next"},
+                signature=collector._fathom_page_signature([]),
+                metadata={"request_cursor": None},
+            )
+            store.append_page(
+                state,
+                payload=second_page,
+                continuation={"cursor": "private-second-next"},
+                signature=collector._fathom_page_signature([]),
+                metadata={"request_cursor": "private-out-of-sequence"},
+            )
+
+            with mock.patch.object(collector, "http_json") as http:
+                corrupted = collector.fetch_fathom(
+                    env, SINCE, UNTIL, checkpoint_store=store
+                )
+
+        self.assertEqual("error", corrupted["status"])
+        self.assertFalse(corrupted["complete"])
+        self.assertEqual([], corrupted["meetings"])
+        self.assertNotIn("private-out-of-sequence", json.dumps(corrupted))
+        http.assert_not_called()
+
     def test_fathom_retry_deadline_fails_closed_before_sleep(self) -> None:
         rate_limit = urllib.error.HTTPError(
             "https://fathom.example.test/meetings", 429, "rate limited",

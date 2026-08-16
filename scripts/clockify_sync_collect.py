@@ -62,7 +62,7 @@ FATHOM_MAX_COLLECTION_RETRY_DELAY_SECONDS = 600
 FATHOM_COLLECTION_RETRY_DEADLINE_SECONDS = 1800
 CLOCKIFY_PAGE_SIZE = 200
 CLOCKIFY_CHECKPOINT_COMPATIBILITY_VERSION = "clockify-pagination/v1"
-FATHOM_CHECKPOINT_COMPATIBILITY_VERSION = "fathom-cursor-pagination/v1"
+FATHOM_CHECKPOINT_COMPATIBILITY_VERSION = "fathom-cursor-pagination/v2"
 CANONICAL_EXPORT_TIMEOUT_SECONDS = 900
 CANONICAL_EXPORT_TIMEOUT_MIN_SECONDS = 60
 CANONICAL_EXPORT_TIMEOUT_MAX_SECONDS = 1800
@@ -2501,6 +2501,11 @@ def _fathom_checkpoint_items(
     cursor: str | None = None
     for page_number, saved_page in enumerate(checkpoint_store.iter_pages(state), start=1):
         page_items, next_cursor = _fathom_page_response(saved_page["payload"])
+        metadata = saved_page["metadata"]
+        if not isinstance(metadata, Mapping) or dict(metadata) != {
+            "request_cursor": cursor
+        }:
+            raise CheckpointError("checkpoint Fathom request cursor is invalid")
         continuation = saved_page["continuation"]
         if not isinstance(continuation, Mapping) or dict(continuation) != {
             "cursor": next_cursor
@@ -2614,6 +2619,7 @@ def fetch_fathom(
                     payload=data,
                     continuation={"cursor": next_cursor},
                     signature=_fathom_page_signature(page_items),
+                    metadata={"request_cursor": cursor},
                 )
             items.extend(page_items)
             pages += 1
