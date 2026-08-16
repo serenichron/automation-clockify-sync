@@ -2761,7 +2761,7 @@ def _multica_page_rows(data: Any) -> list[Mapping[str, Any]]:
     elif isinstance(data, list):
         items = data
     else:
-        items = []
+        raise ValueError("Multica issues response did not contain a list")
     if not isinstance(items, (list, tuple)):
         raise ValueError("Multica issues response did not contain a list")
     return [item for item in items if isinstance(item, Mapping)]

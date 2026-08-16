@@ -526,6 +526,33 @@ class CollectorBurstContextTests(unittest.TestCase):
         self.assertNotIn("private-user", serialized)
         self.assertNotIn("private-password", serialized)
 
+    def test_multica_rejects_invalid_top_level_payload_without_completion(self) -> None:
+        env = {
+            "MULTICA_TOKEN": "test-token",
+            "MULTICA_SERVER_URL": "https://multica.example.test",
+            "MULTICA_WORKSPACE_ID": "workspace-id",
+        }
+        with mock.patch.dict(collector.os.environ, env, clear=True), mock.patch.object(
+            collector, "_home_candidates", side_effect=AssertionError("profile lookup must not run")
+        ), mock.patch.object(collector, "http_json", return_value=None):
+            without_checkpoint = collector.fetch_multica_issues()
+
+            with tempfile.TemporaryDirectory() as directory:
+                store = checkpoints.PageCheckpointStore(Path(directory))
+                with_checkpoint = collector.fetch_multica_issues(checkpoint_store=store)
+                api_state = store.open(
+                    collector._multica_checkpoint_identity(
+                        "https://multica.example.test", "workspace-id", None, None, "/api/issues"
+                    )
+                )
+
+        for result in (without_checkpoint, with_checkpoint):
+            self.assertEqual("error", result["status"])
+            self.assertFalse(result["complete"])
+            self.assertEqual([], result["issues"])
+        self.assertFalse(api_state.complete)
+        self.assertEqual(0, len(api_state.pages))
+
     def test_multica_corrupt_checkpoint_fails_closed_before_http(self) -> None:
         env = {
             "MULTICA_TOKEN": "test-token",
