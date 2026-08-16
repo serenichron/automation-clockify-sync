@@ -3645,6 +3645,7 @@ def _collect_slice(
     reason: str,
     checkpoint_store: PageCheckpointStore,
     run_dir: Path,
+    owned_run_dirs: set[Path] | None = None,
 ) -> tuple[Path, dict[str, object]]:
     requested_slices = plan_slices(since, until, zone=BUCHAREST)
     if len(requested_slices) != 1:
@@ -3652,6 +3653,8 @@ def _collect_slice(
     claimed_run_dir = _claim_slice_run_dir(run_dir)
     if not claimed_run_dir:
         return _verified_existing_slice_bundle(run_dir, since, until, reason)
+    if owned_run_dirs is not None:
+        owned_run_dirs.add(run_dir)
     runtime_identity = collector_runtime_identity()
     run_id = run_dir.name
 
@@ -3819,7 +3822,6 @@ def _collect_slice(
     }
     write_json(run_dir / "run-report.json", compact)
     write_markdown(run_dir, report)
-    report["_collector_owned_run_dir"] = True
     return run_dir / "run-report.md", report
 
 
@@ -3872,6 +3874,7 @@ def run(args: argparse.Namespace) -> int:
             del report
             continue
         run_dir = _slice_run_dir(slice_, identity.compatibility_version)
+        owned_run_dirs: set[Path] = set()
         try:
             report_path, report = _collect_slice(
                 args,
@@ -3884,16 +3887,19 @@ def run(args: argparse.Namespace) -> int:
                 reason,
                 checkpoint_store,
                 run_dir,
+                owned_run_dirs,
             )
         except (BacklogError, CheckpointError, OSError, ValueError):
+            _preserve_incomplete_run(
+                run_dir,
+                owned_by_current_invocation=run_dir in owned_run_dirs,
+            )
             print("collector slice did not complete safely", file=sys.stderr)
             return 2
         if not _slice_is_complete(report):
             _preserve_incomplete_run(
                 run_dir,
-                owned_by_current_invocation=bool(
-                    report.pop("_collector_owned_run_dir", False)
-                ),
+                owned_by_current_invocation=run_dir in owned_run_dirs,
             )
             return 2
         try:

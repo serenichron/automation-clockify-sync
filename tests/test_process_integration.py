@@ -691,6 +691,78 @@ class ProcessIntegrationTests(unittest.TestCase):
             self.assertNotEqual(first_report, second_report)
             self.assertEqual(2, len([path for path in runs.iterdir() if path.is_dir()]))
 
+    def test_collector_retries_after_an_owned_claimed_directory_raises(self) -> None:
+        """A collection exception relocates only this invocation's claimed directory."""
+        routing = {"skip_rules": {}, "session_routes": [], "meeting_routes": []}
+        fleet = {"machines": [], "ssh_options": []}
+        clockify_attempts: list[str] = []
+
+        def clockify(*args: object, **kwargs: object) -> dict[str, object]:
+            clockify_attempts.append("clockify")
+            if len(clockify_attempts) == 1:
+                raise OSError("fixture collection failure")
+            return {"status": "ok", "complete": True, "entries": []}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            checkpoint_root = Path(tmp) / "checkpoints"
+            args = argparse.Namespace(since="2026-07-01", until="2026-07-01", enrich=False)
+
+            def config(path: Path):
+                return routing if path.name == "routing.json" else fleet
+
+            with (
+                mock.patch.object(collector, "RUNS", runs),
+                mock.patch.dict(
+                    collector.os.environ,
+                    {"CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT": str(checkpoint_root)},
+                ),
+                mock.patch.object(collector, "load_json", side_effect=config),
+                mock.patch.object(collector, "load_env_file", return_value={"_missing": True}),
+                mock.patch.object(
+                    collector, "compute_range", return_value=(SINCE, UNTIL, "fixture")
+                ),
+                mock.patch.object(collector, "fetch_clockify", side_effect=clockify),
+                mock.patch.object(
+                    collector,
+                    "fetch_fathom",
+                    return_value={"status": "ok", "complete": True, "meetings": []},
+                ),
+                mock.patch.object(
+                    collector,
+                    "fetch_multica_issues",
+                    return_value={"status": "ok", "complete": True, "issues": []},
+                ),
+                mock.patch.object(
+                    collector,
+                    "collector_runtime_identity",
+                    return_value={"collector_path": "/repo/collector.py", "git_sha": "fixture"},
+                ),
+            ):
+                slice_ = collector.plan_slices(SINCE, UNTIL, zone=collector.BUCHAREST)[0]
+                compatibility = collector._backlog_compatibility_version(routing, fleet)
+                run_dir = collector._slice_run_dir(slice_, compatibility)
+
+                first_output = io.StringIO()
+                with contextlib.redirect_stdout(first_output):
+                    self.assertEqual(2, collector.run(args))
+
+                diagnostics = list(runs.glob(f"{run_dir.name}-incomplete*"))
+                self.assertFalse(run_dir.exists())
+                self.assertEqual(1, len(diagnostics))
+                self.assertTrue(diagnostics[0].is_dir())
+                self.assertEqual("", first_output.getvalue())
+
+                retry_output = io.StringIO()
+                with contextlib.redirect_stdout(retry_output):
+                    self.assertEqual(0, collector.run(args))
+
+            report_path = Path(retry_output.getvalue().strip())
+            self.assertEqual(["clockify", "clockify"], clockify_attempts)
+            self.assertEqual(run_dir / "run-report.md", report_path)
+            self.assertTrue(report_path.is_file())
+            self.assertTrue(diagnostics[0].is_dir())
+
     def test_collector_never_renames_a_peer_directory_after_a_claim_collision(self) -> None:
         """A peer-owned incomplete directory is not converted into this run's diagnostic."""
         routing = {"skip_rules": {}, "session_routes": [], "meeting_routes": []}
