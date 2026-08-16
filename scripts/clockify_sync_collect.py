@@ -63,6 +63,8 @@ FATHOM_COLLECTION_RETRY_DEADLINE_SECONDS = 1800
 CLOCKIFY_PAGE_SIZE = 200
 CLOCKIFY_CHECKPOINT_COMPATIBILITY_VERSION = "clockify-pagination/v1"
 FATHOM_CHECKPOINT_COMPATIBILITY_VERSION = "fathom-cursor-pagination/v2"
+MULTICA_PAGE_SIZE = 100
+MULTICA_CHECKPOINT_COMPATIBILITY_VERSION = "multica-offset-pagination/v1"
 CANONICAL_EXPORT_TIMEOUT_SECONDS = 900
 CANONICAL_EXPORT_TIMEOUT_MIN_SECONDS = 60
 CANONICAL_EXPORT_TIMEOUT_MAX_SECONDS = 1800
@@ -2739,9 +2741,185 @@ def multica_profile_config() -> dict[str, Any] | None:
     return None
 
 
+def _multica_server_origin(server: str) -> str:
+    parsed = urllib.parse.urlsplit(server)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Multica server URL has no valid HTTP origin")
+    host = parsed.hostname.lower()
+    if ":" in host:
+        host = f"[{host}]"
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("Multica server URL has an invalid port") from error
+    return f"{parsed.scheme.lower()}://{host}{f':{port}' if port else ''}"
+
+
+def _multica_page_rows(data: Any) -> list[Mapping[str, Any]]:
+    if isinstance(data, Mapping):
+        items = data.get("issues") or data.get("items") or []
+    elif isinstance(data, list):
+        items = data
+    else:
+        items = []
+    if not isinstance(items, (list, tuple)):
+        raise ValueError("Multica issues response did not contain a list")
+    return [item for item in items if isinstance(item, Mapping)]
+
+
+def _multica_page_signature(rows: list[Mapping[str, Any]]) -> str:
+    canonical = json.dumps(
+        [str(row.get("id") or row.get("key") or row.get("identifier") or "") for row in rows],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _multica_checkpoint_identity(
+    server_origin: str,
+    workspace_id: str,
+    since: dt.datetime | None,
+    until: dt.datetime | None,
+    endpoint_path: str,
+) -> CheckpointIdentity:
+    since_utc = iso_utc(since) if since is not None else ""
+    until_utc = iso_utc(until) if until is not None else ""
+    request_contract = {
+        "server_origin": server_origin,
+        "workspace_id": workspace_id,
+        "endpoint_path": endpoint_path,
+        "page_size": MULTICA_PAGE_SIZE,
+        "api_contract": "multica-issues-offset-limit/v1",
+        "activity_interval": {"since": since_utc, "until": until_utc},
+    }
+    request_fingerprint = "sha256:" + hashlib.sha256(
+        json.dumps(request_contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return CheckpointIdentity(
+        source="multica_issues",
+        since_utc=since_utc,
+        until_utc=until_utc,
+        request_fingerprint=request_fingerprint,
+        compatibility_version=MULTICA_CHECKPOINT_COMPATIBILITY_VERSION,
+    )
+
+
+def _multica_checkpoint_rows(
+    checkpoint_store: PageCheckpointStore,
+    state: CheckpointState,
+    endpoint_path: str,
+) -> tuple[list[Mapping[str, Any]], set[str], int]:
+    if dict(state.metadata) != {"endpoint_path": endpoint_path}:
+        raise CheckpointError("checkpoint Multica endpoint path is invalid")
+    rows: list[Mapping[str, Any]] = []
+    seen_pages: set[str] = set()
+    offset = 0
+    final_page_size: int | None = None
+    for page_number, saved_page in enumerate(checkpoint_store.iter_pages(state), start=1):
+        page_rows = _multica_page_rows(saved_page["payload"])
+        metadata = saved_page["metadata"]
+        if not isinstance(metadata, Mapping) or dict(metadata) != {
+            "endpoint_path": endpoint_path,
+            "request_offset": offset,
+        }:
+            raise CheckpointError("checkpoint Multica request path or offset is invalid")
+        continuation = saved_page["continuation"]
+        next_offset = offset + len(page_rows)
+        if not isinstance(continuation, Mapping) or dict(continuation) != {
+            "offset": next_offset
+        }:
+            raise CheckpointError("checkpoint Multica page continuation is invalid")
+        signature = saved_page["signature"]
+        if not isinstance(signature, str) or signature != _multica_page_signature(page_rows):
+            raise CheckpointError("checkpoint Multica page signature is invalid")
+        if page_rows and signature in seen_pages:
+            raise CheckpointError("checkpoint Multica pagination repeated a page")
+        if len(page_rows) < MULTICA_PAGE_SIZE and page_number != len(state.pages):
+            raise CheckpointError("checkpoint Multica terminal page has a successor")
+        seen_pages.add(signature)
+        rows.extend(page_rows)
+        offset = next_offset
+        final_page_size = len(page_rows)
+    expected_continuation: dict[str, int] = {} if not state.pages else {"offset": offset}
+    if dict(state.continuation) != expected_continuation:
+        raise CheckpointError("checkpoint Multica continuation offset is invalid")
+    if state.complete and (
+        final_page_size is None or final_page_size >= MULTICA_PAGE_SIZE
+    ):
+        raise CheckpointError("completed Multica checkpoint has no short final page")
+    if not state.complete and final_page_size is not None and final_page_size < MULTICA_PAGE_SIZE:
+        raise CheckpointError("unfinished Multica checkpoint has a terminal page")
+    return rows, seen_pages, offset
+
+
+def _multica_sanitized_issues(
+    rows: list[Mapping[str, Any]],
+    since: dt.datetime | None,
+    until: dt.datetime | None,
+) -> list[dict[str, Any]]:
+    issues: list[dict[str, Any]] = []
+    for row in rows:
+        issue = {
+            "id": row.get("id"),
+            "key": row.get("key") or row.get("identifier"),
+            "title": row.get("title"),
+            "description": row.get("description"),
+            "status": row.get("status"),
+            "project_id": row.get("project_id") or row.get("projectId"),
+            "created_at": row.get("created_at") or row.get("createdAt"),
+            "updated_at": row.get("updated_at") or row.get("updatedAt"),
+            "completed_at": row.get("completed_at") or row.get("completedAt"),
+            "labels": row.get("labels") or [],
+        }
+        if since is not None and until is not None:
+            activity_times = [
+                parse_dt(issue.get(field))
+                for field in ("created_at", "updated_at", "completed_at")
+            ]
+            if not any(
+                value is not None
+                and since <= value.astimezone(since.tzinfo or BUCHAREST) < until
+                for value in activity_times
+            ):
+                continue
+        issues.append(issue)
+    return issues
+
+
+def _multica_result(
+    rows: list[Mapping[str, Any]],
+    pages: int,
+    since: dt.datetime | None,
+    until: dt.datetime | None,
+) -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "issues": _multica_sanitized_issues(rows, since, until),
+        "pages_fetched": pages,
+        "complete": True,
+        "activity_window": (
+            {"since": since.isoformat(), "until": until.isoformat()}
+            if since is not None and until is not None
+            else None
+        ),
+    }
+
+
+def _multica_failure() -> dict[str, Any]:
+    return {
+        "status": "error",
+        "issues": [],
+        "complete": False,
+        "note": "Unable to fetch issues with known API paths; autopilot can use CLI/API fallback.",
+    }
+
+
 def fetch_multica_issues(
     since: dt.datetime | None = None,
     until: dt.datetime | None = None,
+    *,
+    checkpoint_store: PageCheckpointStore | None = None,
 ) -> dict[str, Any]:
     cfg = multica_profile_config()
     if not cfg:
@@ -2757,21 +2935,83 @@ def fetch_multica_issues(
     # via the repeated-page guard instead of silently reporting 100 as complete.
     paths = ["/api/issues", "/issues"]
     headers = {"Authorization": f"Bearer {token}", "X-Workspace-ID": workspace_id}
+    if checkpoint_store is not None:
+        try:
+            server_origin = _multica_server_origin(server)
+            states = [
+                (
+                    path,
+                    checkpoint_store.open(
+                        _multica_checkpoint_identity(
+                            server_origin, workspace_id, since, until, path
+                        ),
+                        initial_metadata={"endpoint_path": path},
+                    ),
+                )
+                for path in paths
+            ]
+            committed = [(path, state) for path, state in states if state.pages]
+            if len(committed) > 1:
+                raise CheckpointError("multiple Multica endpoints have committed checkpoints")
+            candidates = committed or states
+            for path, checkpoint_state in candidates:
+                rows, seen_pages, offset = _multica_checkpoint_rows(
+                    checkpoint_store, checkpoint_state, path
+                )
+                pages = len(checkpoint_state.pages)
+                try:
+                    while not checkpoint_state.complete:
+                        if pages >= 100:
+                            raise ValueError("Multica issues pagination exceeded safety limit")
+                        data = http_json(
+                            server.rstrip("/")
+                            + f"{path}?limit={MULTICA_PAGE_SIZE}&offset={offset}",
+                            headers,
+                        )
+                        page_rows = _multica_page_rows(data)
+                        signature = _multica_page_signature(page_rows)
+                        if page_rows and signature in seen_pages:
+                            raise ValueError("Multica issues pagination repeated a page")
+                        checkpoint_state = checkpoint_store.append_page(
+                            checkpoint_state,
+                            payload=data,
+                            continuation={"offset": offset + len(page_rows)},
+                            signature=signature,
+                            metadata={
+                                "endpoint_path": path,
+                                "request_offset": offset,
+                            },
+                        )
+                        rows.extend(page_rows)
+                        seen_pages.add(signature)
+                        pages += 1
+                        offset += len(page_rows)
+                        if len(page_rows) < MULTICA_PAGE_SIZE:
+                            checkpoint_state = checkpoint_store.mark_complete(checkpoint_state)
+                            break
+                    return _multica_result(rows, pages, since, until)
+                except CheckpointError:
+                    raise
+                except Exception:
+                    if checkpoint_state.pages:
+                        raise
+                    # A path is only interchangeable before a page is committed.
+                    continue
+        except Exception:
+            return _multica_failure()
+        return _multica_failure()
     for path in paths:
         try:
-            issues: list[dict[str, Any]] = []
             seen_pages: set[tuple[str, ...]] = set()
             offset = 0
             pages = 0
+            rows: list[Mapping[str, Any]] = []
             while True:
                 data = http_json(
-                    server.rstrip("/") + f"{path}?limit=100&offset={offset}",
+                    server.rstrip("/") + f"{path}?limit={MULTICA_PAGE_SIZE}&offset={offset}",
                     headers,
                 )
-                items = data.get("issues") or data.get("items") or (data if isinstance(data, list) else [])
-                if not isinstance(items, list):
-                    raise ValueError("Multica issues response did not contain a list")
-                page = [item for item in items if isinstance(item, dict)]
+                page = _multica_page_rows(data)
                 signature = tuple(
                     str(item.get("id") or item.get("key") or item.get("identifier") or "")
                     for item in page
@@ -2780,58 +3020,16 @@ def fetch_multica_issues(
                     raise ValueError("Multica issues pagination repeated a page")
                 seen_pages.add(signature)
                 pages += 1
-                for it in page:
-                    issue = {
-                        "id": it.get("id"),
-                        "key": it.get("key") or it.get("identifier"),
-                        "title": it.get("title"),
-                        "description": it.get("description"),
-                        "status": it.get("status"),
-                        "project_id": it.get("project_id") or it.get("projectId"),
-                        "created_at": it.get("created_at") or it.get("createdAt"),
-                        "updated_at": it.get("updated_at") or it.get("updatedAt"),
-                        "completed_at": it.get("completed_at") or it.get("completedAt"),
-                        "labels": it.get("labels") or [],
-                    }
-                    if since is not None and until is not None:
-                        activity_times = [
-                            parse_dt(issue.get(field))
-                            for field in ("created_at", "updated_at", "completed_at")
-                        ]
-                        if not any(
-                            value is not None
-                            and since <= value.astimezone(since.tzinfo or BUCHAREST) < until
-                            for value in activity_times
-                        ):
-                            continue
-                    issues.append(issue)
-                if len(page) < 100:
+                rows.extend(page)
+                if len(page) < MULTICA_PAGE_SIZE:
                     break
                 offset += len(page)
                 if pages >= 100:
                     raise ValueError("Multica issues pagination exceeded safety limit")
-            return {
-                "status": "ok",
-                "issues": issues,
-                "pages_fetched": pages,
-                "complete": True,
-                "activity_window": (
-                    {
-                        "since": since.isoformat(),
-                        "until": until.isoformat(),
-                    }
-                    if since is not None and until is not None
-                    else None
-                ),
-            }
+            return _multica_result(rows, pages, since, until)
         except Exception:
             continue
-    return {
-        "status": "error",
-        "issues": [],
-        "complete": False,
-        "note": "Unable to fetch issues with known API paths; autopilot can use CLI/API fallback.",
-    }
+    return _multica_failure()
 
 
 def route_session(burst: dict[str, Any], routing: dict[str, Any]) -> dict[str, Any]:

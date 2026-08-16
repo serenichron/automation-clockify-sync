@@ -412,6 +412,154 @@ class CollectorBurstContextTests(unittest.TestCase):
         self.assertTrue(result["complete"])
         self.assertTrue(any("offset=100" in call for call in calls))
 
+    def test_multica_retry_resumes_bound_endpoint_and_offset(self) -> None:
+        env = {
+            "MULTICA_TOKEN": "test-token",
+            "MULTICA_SERVER_URL": "https://multica.example.test",
+            "MULTICA_WORKSPACE_ID": "workspace-id",
+        }
+        first_page = {"issues": [{"id": f"issue-{index}"} for index in range(100)]}
+        final_page = {"issues": [{"id": "issue-100"}]}
+        resumed_calls: list[str] = []
+
+        def interrupted_http(url: str, _headers: dict[str, str]) -> dict[str, list[dict[str, str]]]:
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+            self.assertIn("/api/issues", url)
+            if query["offset"] == ["0"]:
+                return first_page
+            self.assertEqual(["100"], query["offset"])
+            raise OSError("offline")
+
+        def resumed_http(url: str, _headers: dict[str, str]) -> dict[str, list[dict[str, str]]]:
+            resumed_calls.append(url)
+            self.assertEqual("/api/issues", urllib.parse.urlsplit(url).path)
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+            self.assertEqual(["100"], query["offset"])
+            return final_page
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            collector.os.environ, env, clear=True
+        ), mock.patch.object(
+            collector, "_home_candidates", side_effect=AssertionError("profile lookup must not run")
+        ):
+            store = checkpoints.PageCheckpointStore(Path(directory))
+            with mock.patch.object(collector, "http_json", side_effect=interrupted_http):
+                interrupted = collector.fetch_multica_issues(checkpoint_store=store)
+            self.assertFalse(interrupted["complete"])
+            self.assertEqual([], interrupted["issues"])
+
+            with mock.patch.object(collector, "http_json", side_effect=resumed_http):
+                resumed = collector.fetch_multica_issues(checkpoint_store=store)
+
+        self.assertTrue(resumed["complete"])
+        self.assertEqual(2, resumed["pages_fetched"])
+        self.assertEqual([f"issue-{index}" for index in range(101)], [
+            issue["id"] for issue in resumed["issues"]
+        ])
+        self.assertEqual(1, len(resumed_calls))
+        self.assertIn("offset=100", resumed_calls[0])
+
+    def test_multica_complete_checkpoint_replay_skips_http(self) -> None:
+        env = {
+            "MULTICA_TOKEN": "test-token",
+            "MULTICA_SERVER_URL": "https://multica.example.test",
+            "MULTICA_WORKSPACE_ID": "workspace-id",
+        }
+        page = {"issues": [{"id": "completed-issue"}]}
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            collector.os.environ, env, clear=True
+        ), mock.patch.object(
+            collector, "_home_candidates", side_effect=AssertionError("profile lookup must not run")
+        ):
+            store = checkpoints.PageCheckpointStore(Path(directory))
+            with mock.patch.object(collector, "http_json", return_value=page):
+                collected = collector.fetch_multica_issues(checkpoint_store=store)
+            with mock.patch.object(collector, "http_json") as http:
+                replayed = collector.fetch_multica_issues(checkpoint_store=store)
+
+        self.assertEqual(collected, replayed)
+        http.assert_not_called()
+
+    def test_multica_checkpoint_rejects_endpoint_mismatch_before_http(self) -> None:
+        env = {
+            "MULTICA_TOKEN": "test-token",
+            "MULTICA_SERVER_URL": "https://multica.example.test",
+            "MULTICA_WORKSPACE_ID": "workspace-id",
+        }
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            collector.os.environ, env, clear=True
+        ), mock.patch.object(
+            collector, "_home_candidates", side_effect=AssertionError("profile lookup must not run")
+        ):
+            store = checkpoints.PageCheckpointStore(Path(directory))
+            identity = collector._multica_checkpoint_identity(
+                "https://multica.example.test", "workspace-id", None, None, "/api/issues"
+            )
+            store.open(identity, initial_metadata={"endpoint_path": "/issues"})
+
+            with mock.patch.object(collector, "http_json") as http:
+                result = collector.fetch_multica_issues(checkpoint_store=store)
+
+        self.assertEqual("error", result["status"])
+        self.assertFalse(result["complete"])
+        self.assertEqual([], result["issues"])
+        http.assert_not_called()
+
+    def test_multica_checkpoint_identity_does_not_store_credentials(self) -> None:
+        identity = collector._multica_checkpoint_identity(
+            collector._multica_server_origin(
+                "https://private-user:private-password@multica.example.test/base"
+            ),
+            "workspace-id",
+            SINCE,
+            UNTIL,
+            "/api/issues",
+        )
+        different_origin = collector._multica_checkpoint_identity(
+            "https://other.example.test", "workspace-id", SINCE, UNTIL, "/api/issues"
+        )
+
+        serialized = json.dumps(identity.document(), sort_keys=True)
+        self.assertNotEqual(identity.request_fingerprint, different_origin.request_fingerprint)
+        self.assertNotIn("private-user", serialized)
+        self.assertNotIn("private-password", serialized)
+
+    def test_multica_corrupt_checkpoint_fails_closed_before_http(self) -> None:
+        env = {
+            "MULTICA_TOKEN": "test-token",
+            "MULTICA_SERVER_URL": "https://multica.example.test",
+            "MULTICA_WORKSPACE_ID": "workspace-id",
+        }
+        page = {"issues": [{"id": "completed-issue"}]}
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            collector.os.environ, env, clear=True
+        ), mock.patch.object(
+            collector, "_home_candidates", side_effect=AssertionError("profile lookup must not run")
+        ):
+            root = Path(directory)
+            store = checkpoints.PageCheckpointStore(root)
+            with mock.patch.object(collector, "http_json", return_value=page):
+                collector.fetch_multica_issues(checkpoint_store=store)
+            page_path = next(
+                path / "pages" / "000001.json"
+                for path in root.iterdir()
+                if (path / "pages" / "000001.json").exists()
+            )
+            saved_page = json.loads(page_path.read_text())
+            saved_page["payload"] = {"issues": [{"id": "tampered"}]}
+            page_path.write_text(json.dumps(saved_page))
+
+            with mock.patch.object(collector, "http_json") as http:
+                result = collector.fetch_multica_issues(checkpoint_store=store)
+
+        self.assertEqual("error", result["status"])
+        self.assertFalse(result["complete"])
+        self.assertEqual([], result["issues"])
+        http.assert_not_called()
+
     def test_multica_issue_collection_filters_to_requested_activity_window(self) -> None:
         env = {
             "MULTICA_TOKEN": "test-token",
