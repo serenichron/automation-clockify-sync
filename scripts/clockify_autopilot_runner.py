@@ -71,15 +71,20 @@ def _read_status(path: Path) -> dict[str, object]:
     return value if isinstance(value, dict) else {}
 
 
-def _result_path(stdout: str, root: Path) -> Path:
+def _result_paths(stdout: str, root: Path) -> tuple[Path, ...]:
     lines = [line.strip() for line in stdout.splitlines() if line.strip()]
     if not lines:
         raise ConfigurationError("review workflow did not emit an action contract path")
-    path = Path(lines[-1]).expanduser().resolve()
     runs = (root / "runs").resolve()
-    if path.name != "autopilot-result.json" or runs not in path.parents:
-        raise ConfigurationError("review workflow emitted an unsafe action contract path")
-    return path
+    paths: list[Path] = []
+    for line in lines:
+        path = Path(line).expanduser().resolve()
+        if path.name != "autopilot-result.json" or runs not in path.parents:
+            raise ConfigurationError("review workflow emitted an unsafe action contract path")
+        if path in paths:
+            raise ConfigurationError("review workflow emitted a duplicate action contract path")
+        paths.append(path)
+    return tuple(paths)
 
 
 def _command(
@@ -190,11 +195,13 @@ def run(environment: Mapping[str, str] | None = None) -> int:
             check=False,
         )
         try:
-            result_path = _result_path(completed.stdout, root)
-            result = json.loads(result_path.read_text(encoding="utf-8"))
-            if not isinstance(result, dict):
-                raise ConfigurationError("action contract must be a JSON object")
-            action = str(result.get("action") or "blocked")
+            result_paths = _result_paths(completed.stdout, root)
+            results = []
+            for result_path in result_paths:
+                result = json.loads(result_path.read_text(encoding="utf-8"))
+                if not isinstance(result, dict):
+                    raise ConfigurationError("action contract must be a JSON object")
+                results.append(result)
         except (OSError, json.JSONDecodeError, ConfigurationError) as exc:
             _atomic_write(status_path, {
                 "schema_version": SCHEMA_VERSION,
@@ -205,20 +212,21 @@ def run(environment: Mapping[str, str] | None = None) -> int:
             })
             return 2
 
-        completeness = result.get("source_completeness")
-        date_range = result.get("date_range")
-        if isinstance(completeness, Mapping) and isinstance(date_range, Mapping):
-            interval_since = str(date_range.get("since") or effective_since or "")
-            coverage = source_coverage.update(
-                coverage,
-                completeness=completeness,
-                interval_since=interval_since,
-                interval_until=str(date_range.get("until") or "") or None,
-                coordinator=coordinator,
-                run_id=str(result.get("run_id") or result_path.parent.name),
-                attempted_at=_iso_now(),
-            )
-            source_coverage.write(coverage_path, coverage)
+        for result_path, result in zip(result_paths, results):
+            completeness = result.get("source_completeness")
+            date_range = result.get("date_range")
+            if isinstance(completeness, Mapping) and isinstance(date_range, Mapping):
+                interval_since = str(date_range.get("since") or effective_since or "")
+                coverage = source_coverage.update(
+                    coverage,
+                    completeness=completeness,
+                    interval_since=interval_since,
+                    interval_until=str(date_range.get("until") or "") or None,
+                    coordinator=coordinator,
+                    run_id=str(result.get("run_id") or result_path.parent.name),
+                    attempted_at=_iso_now(),
+                )
+                source_coverage.write(coverage_path, coverage)
         debt = source_coverage.active_debt(coverage)
 
         prior_attempts = (
@@ -226,13 +234,22 @@ def run(environment: Mapping[str, str] | None = None) -> int:
             if prior.get("state") == "retry_scheduled"
             else 0
         )
-        retryable_coverage = (
-            action == "coverage_warning"
-            or _retryable_peer_coverage(
-                result,
-                coordinator,
+        retryable_coverage = False
+        for result in results:
+            action = str(result.get("action") or "blocked")
+            completeness = result.get("source_completeness")
+            incomplete = (
+                isinstance(completeness, Mapping)
+                and completeness.get("status") == "incomplete"
             )
-        )
+            if action not in {"blocked", "coverage_warning"} and not incomplete:
+                continue
+            retryable_coverage = (
+                action == "coverage_warning"
+                or _retryable_peer_coverage(result, coordinator)
+            )
+            break
+        action = str(results[-1].get("action") or "blocked")
         if retryable_coverage:
             attempts = prior_attempts + 1
             retrying = attempts <= max_retries
@@ -254,7 +271,8 @@ def run(environment: Mapping[str, str] | None = None) -> int:
             "updated_at": _iso_now(),
             "exit_code": exit_code,
             "action": action,
-            "result": str(result_path),
+            "result": str(result_paths[-1]),
+            "results": [str(result_path) for result_path in result_paths],
             "coverage_retry_attempts": attempts,
             "max_coverage_retries": max_retries,
             "coverage_debt": debt,
@@ -280,7 +298,13 @@ def mark_reported(environment: Mapping[str, str] | None, result: Path) -> int:
     )
     status = _read_status(status_path)
     resolved = result.expanduser().resolve()
-    if not status or str(resolved) != str(status.get("result") or ""):
+    results = status.get("results")
+    allowed = (
+        {str(path) for path in results if isinstance(path, str)}
+        if isinstance(results, list)
+        else {str(status.get("result") or "")}
+    )
+    if not status or str(resolved) not in allowed:
         print("clockify autopilot runner blocked: result does not match status", file=sys.stderr)
         return 2
     status["reported_at"] = _iso_now()

@@ -44,6 +44,73 @@ class AutopilotRunnerTests(unittest.TestCase):
         self.assertEqual("complete", status["state"])
         self.assertEqual("review_delta", status["action"])
 
+    def test_completed_results_are_recorded_in_order_and_reportable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment, first = self.fixture(
+                directory,
+                "review_delta",
+                date_range={"since": "2026-08-01", "until": "2026-08-02"},
+                source_completeness={"status": "complete", "incomplete_sources": []},
+            )
+            second = first.parent.parent / "run-2" / "autopilot-result.json"
+            second.parent.mkdir()
+            second.write_text(json.dumps({
+                "action": "coverage_warning",
+                "run_id": "run-2",
+                "date_range": {"since": "2026-08-02", "until": "2026-08-03"},
+                "source_completeness": {"status": "complete", "incomplete_sources": []},
+            }) + "\n")
+            completed = subprocess.CompletedProcess(
+                ["review"], 2, stdout=f"{first}\n{second}\n", stderr="later slice incomplete"
+            )
+            with mock.patch.object(runner.subprocess, "run", return_value=completed), mock.patch.object(
+                runner.source_coverage, "update", wraps=runner.source_coverage.update
+            ) as update:
+                self.assertEqual(
+                    runner.TEMPORARY_COVERAGE_EXIT,
+                    runner.run(environment),
+                )
+            status = json.loads(Path(environment["CLOCKIFY_AUTOPILOT_STATUS"]).read_text())
+
+            self.assertEqual([str(first), str(second)], status["results"])
+            self.assertEqual(str(second), status["result"])
+            self.assertEqual(2, update.call_count)
+            self.assertEqual(
+                ["2026-08-01", "2026-08-02"],
+                [call.kwargs["interval_since"] for call in update.call_args_list],
+            )
+            self.assertEqual(0, runner.mark_reported(environment, first))
+            self.assertEqual(0, runner.mark_reported(environment, second))
+            self.assertEqual(2, runner.mark_reported(environment, second.with_name("other.json")))
+
+    def test_first_incomplete_result_controls_multi_result_retry_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment, first = self.fixture(
+                directory,
+                "blocked",
+                source_completeness={
+                    "status": "incomplete",
+                    "incomplete_sources": ["sessions/omarchy-precision"],
+                },
+            )
+            second = first.parent.parent / "run-2" / "autopilot-result.json"
+            second.parent.mkdir()
+            second.write_text(json.dumps({
+                "action": "coverage_warning",
+                "source_completeness": {
+                    "status": "incomplete",
+                    "incomplete_sources": ["sessions/macbook"],
+                },
+            }) + "\n")
+            completed = subprocess.CompletedProcess(
+                ["review"], 2, stdout=f"{first}\n{second}\n", stderr="collection incomplete"
+            )
+            with mock.patch.object(runner.subprocess, "run", return_value=completed):
+                self.assertEqual(2, runner.run(environment))
+            status = json.loads(Path(environment["CLOCKIFY_AUTOPILOT_STATUS"]).read_text())
+
+        self.assertEqual("blocked", status["state"])
+
     def test_command_passes_explicit_analyzer_tuning(self):
         with tempfile.TemporaryDirectory() as directory:
             environment, _result = self.fixture(directory, "no_comment")

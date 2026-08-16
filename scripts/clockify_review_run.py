@@ -356,18 +356,30 @@ def _run(command: list[str]) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _collector_run_dir(stdout: str) -> Path:
-    candidates = [
-        Path(line.strip()).parent
+def _collector_run_dirs(stdout: str) -> tuple[Path, ...]:
+    reports = [
+        Path(line.strip()).expanduser().resolve()
         for line in stdout.splitlines()
         if line.strip().endswith("/run-report.md")
     ]
-    if len(candidates) != 1:
-        raise ValueError("Collector did not emit exactly one run-report.md path.")
-    run_dir = candidates[0].resolve()
-    if run_dir.parent != RUNS.resolve() or not (run_dir / "run-report.json").is_file():
-        raise ValueError(f"Collector emitted an invalid run directory: {run_dir}")
-    return run_dir
+    if not reports:
+        raise ValueError("Collector did not emit a completed run-report.md path.")
+    run_dirs: list[Path] = []
+    seen: set[Path] = set()
+    for report in reports:
+        run_dir = report.parent
+        if (
+            report.name != "run-report.md"
+            or run_dir.parent != RUNS.resolve()
+            or not report.is_file()
+            or not (run_dir / "run-report.json").is_file()
+        ):
+            raise ValueError(f"Collector emitted an invalid run directory: {run_dir}")
+        if run_dir in seen:
+            raise ValueError(f"Collector emitted duplicate run directory: {run_dir}")
+        seen.add(run_dir)
+        run_dirs.append(run_dir)
+    return tuple(run_dirs)
 
 
 def _run_child(path: Path, *, label: str) -> Path:
@@ -714,75 +726,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
-    if args.replay_from and (
-        args.since or args.until or args.no_enrich or args.analysis_fixture
-    ):
-        print(
-            "clockify review run: --replay-from cannot be combined with collection "
-            "range/enrichment options or --analysis-fixture",
-            file=sys.stderr,
-        )
-        return 2
-    acceptance_gate: dict[str, Any] = {
-        "exceptions_only_eligible": False,
-        "status": "not_recorded",
-    }
-    if args.acceptance_ledger.exists():
-        try:
-            acceptance_gate = review_acceptance.evaluate_gate(
-                review_acceptance.load_ledger(args.acceptance_ledger)
-            )
-            acceptance_gate["status"] = "evaluated"
-        except (OSError, json.JSONDecodeError, review_acceptance.AcceptanceError) as exc:
-            if args.review_mode == "exceptions_only":
-                print(f"clockify review run: acceptance ledger invalid: {exc}", file=sys.stderr)
-                return 2
-            acceptance_gate = {
-                "exceptions_only_eligible": False,
-                "status": "invalid",
-                "reason": str(exc),
-            }
-    if args.review_mode == "exceptions_only" and not acceptance_gate.get("exceptions_only_eligible"):
-        print(
-            "clockify review run: exceptions_only is locked until one passing 90% baseline "
-            "and two later consecutive passing 95% guarded periods",
-            file=sys.stderr,
-        )
-        return 2
-    replay_source: Path | None = None
-    replay_analysis_fixture: Path | None = None
-    if args.replay_from:
-        try:
-            replay_source = _run_child(args.replay_from, label="replay source")
-            run_dir = _prepare_replay_run(replay_source)
-            replay_analysis_fixture = _replay_analysis_fixture(replay_source, run_dir)
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            print(f"clockify review run: cannot prepare immutable replay: {exc}", file=sys.stderr)
-            return 2
-    else:
-        collector = [
-            sys.executable,
-            str(SCRIPTS / "clockify_sync_collect.py"),
-            "run",
-        ]
-        if args.since:
-            collector.extend(["--since", args.since])
-        if args.until:
-            collector.extend(["--until", args.until])
-        collector.append("--no-enrich" if args.no_enrich else "--enrich")
-
-        collected = _run(collector)
-        if collected.returncode != 0:
-            print(collected.stderr or collected.stdout, file=sys.stderr)
-            return collected.returncode or 2
-        try:
-            run_dir = _collector_run_dir(collected.stdout)
-        except ValueError as exc:
-            print(f"clockify review run: {exc}", file=sys.stderr)
-            return 2
-
+def _process_run(
+    args: argparse.Namespace,
+    run_dir: Path,
+    acceptance_gate: dict[str, Any],
+) -> tuple[int, Path]:
+    replay_source = getattr(args, "_replay_source", None)
+    replay_analysis_fixture = getattr(args, "_replay_analysis_fixture", None)
     accounting_command = [
         sys.executable,
         str(SCRIPTS / "work_accounting_pipeline.py"),
@@ -826,8 +776,7 @@ def main(argv: list[str] | None = None) -> int:
         summary_path = run_dir / "autopilot-summary.md"
         _write_json(result_path, result)
         write_summary(summary_path, result)
-        print(result_path)
-        return accounted.returncode or 2
+        return accounted.returncode or 2, result_path
 
     if replay_source is not None:
         try:
@@ -848,8 +797,7 @@ def main(argv: list[str] | None = None) -> int:
             result_path = run_dir / "autopilot-result.json"
             _write_json(result_path, result)
             write_summary(run_dir / "autopilot-summary.md", result)
-            print(result_path)
-            return 2
+            return 2, result_path
 
     checked = _run(
         [
@@ -864,7 +812,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     if checked.returncode != 0:
         print(checked.stderr or checked.stdout, file=sys.stderr)
-        return checked.returncode or 2
+        return checked.returncode or 2, run_dir / "autopilot-result.json"
     quality = _read_json(run_dir / "quality_report.json")
 
     snapshot = None
@@ -880,7 +828,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         if reconciled.returncode != 0:
             print(reconciled.stderr or reconciled.stdout, file=sys.stderr)
-            return reconciled.returncode or 2
+            return reconciled.returncode or 2, run_dir / "autopilot-result.json"
         snapshot = _read_json(run_dir / "review-snapshot.json")
 
     result = build_result(
@@ -908,7 +856,92 @@ def main(argv: list[str] | None = None) -> int:
         result["paths"]["review_current_csv"] = None
     _write_json(result_path, result)
     write_summary(summary_path, result)
-    print(result_path)
+    return 0, result_path
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    if args.replay_from and (
+        args.since or args.until or args.no_enrich or args.analysis_fixture
+    ):
+        print(
+            "clockify review run: --replay-from cannot be combined with collection "
+            "range/enrichment options or --analysis-fixture",
+            file=sys.stderr,
+        )
+        return 2
+    acceptance_gate: dict[str, Any] = {
+        "exceptions_only_eligible": False,
+        "status": "not_recorded",
+    }
+    if args.acceptance_ledger.exists():
+        try:
+            acceptance_gate = review_acceptance.evaluate_gate(
+                review_acceptance.load_ledger(args.acceptance_ledger)
+            )
+            acceptance_gate["status"] = "evaluated"
+        except (OSError, json.JSONDecodeError, review_acceptance.AcceptanceError) as exc:
+            if args.review_mode == "exceptions_only":
+                print(f"clockify review run: acceptance ledger invalid: {exc}", file=sys.stderr)
+                return 2
+            acceptance_gate = {
+                "exceptions_only_eligible": False,
+                "status": "invalid",
+                "reason": str(exc),
+            }
+    if args.review_mode == "exceptions_only" and not acceptance_gate.get("exceptions_only_eligible"):
+        print(
+            "clockify review run: exceptions_only is locked until one passing 90% baseline "
+            "and two later consecutive passing 95% guarded periods",
+            file=sys.stderr,
+        )
+        return 2
+
+    collector_code = 0
+    collector_error = ""
+    if args.replay_from:
+        try:
+            replay_source = _run_child(args.replay_from, label="replay source")
+            run_dirs = (_prepare_replay_run(replay_source),)
+            args._replay_source = replay_source
+            args._replay_analysis_fixture = _replay_analysis_fixture(
+                replay_source, run_dirs[0]
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"clockify review run: cannot prepare immutable replay: {exc}", file=sys.stderr)
+            return 2
+    else:
+        collector = [
+            sys.executable,
+            str(SCRIPTS / "clockify_sync_collect.py"),
+            "run",
+        ]
+        if args.since:
+            collector.extend(["--since", args.since])
+        if args.until:
+            collector.extend(["--until", args.until])
+        collector.append("--no-enrich" if args.no_enrich else "--enrich")
+        collected = _run(collector)
+        collector_code = collected.returncode
+        collector_error = collected.stderr or ""
+        try:
+            run_dirs = _collector_run_dirs(collected.stdout)
+        except ValueError as exc:
+            print(f"clockify review run: {exc}", file=sys.stderr)
+            if collector_code != 0 and collector_error:
+                print(collector_error, file=sys.stderr)
+            return collector_code or 2
+
+    for run_dir in run_dirs:
+        code, result_path = _process_run(args, run_dir, acceptance_gate)
+        if code == 0 or result_path.is_file():
+            print(result_path)
+        if code != 0:
+            return code
+    if collector_code != 0:
+        if collector_error:
+            print(collector_error, file=sys.stderr)
+        return collector_code or 2
     return 0
 
 

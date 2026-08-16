@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import subprocess
 import tempfile
 import unittest
 import csv
+from contextlib import redirect_stdout
 from unittest import mock
 
 
@@ -51,6 +53,48 @@ def accounting_result(*, proposal_id: str = "P001") -> dict:
 
 
 class ReviewRunResultTests(unittest.TestCase):
+    def test_completed_slices_are_processed_before_later_collection_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            first = runs / "20260816T120000Z"
+            second = runs / "20260816T130000Z"
+            for run_dir in (first, second):
+                run_dir.mkdir(parents=True)
+                (run_dir / "run-report.json").write_text("{}\n", encoding="utf-8")
+                (run_dir / "run-report.md").write_text("# receipt\n", encoding="utf-8")
+            first_result = first / "autopilot-result.json"
+            second_result = second / "autopilot-result.json"
+            collected = subprocess.CompletedProcess(
+                ["collector"],
+                2,
+                stdout=(
+                    f"{first / 'run-report.md'}\n"
+                    f"{second / 'run-report.md'}\n"
+                ),
+                stderr="third slice incomplete",
+            )
+            output = io.StringIO()
+            with mock.patch.object(review_run, "RUNS", runs), mock.patch.object(
+                review_run, "_run", return_value=collected
+            ), mock.patch.object(
+                review_run,
+                "_process_run",
+                side_effect=[(0, first_result), (0, second_result)],
+            ) as process_run, redirect_stdout(output):
+                code = review_run.main([
+                    "--state", str(Path(tmp) / "state.json"),
+                    "--corrections", str(Path(tmp) / "corrections.jsonl"),
+                ])
+
+        self.assertEqual(2, code)
+        self.assertEqual(
+            [first, second],
+            [call.args[1] for call in process_run.call_args_list],
+        )
+        self.assertEqual(
+            [str(first_result), str(second_result)], output.getvalue().splitlines()
+        )
+
     def test_analysis_versions_recurses_partition_recovery_children(self):
         document = {
             "schema_version": 1,
