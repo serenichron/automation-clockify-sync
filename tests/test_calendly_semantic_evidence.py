@@ -40,18 +40,56 @@ def recording():
 
 
 def _assert_schema_contract(schema, value):
-    required = set(schema["required"])
-    if not required.issubset(value) or not all(isinstance(value[field], str) and value[field] for field in ("recording_id", "meeting_id")):
-        raise AssertionError("required field missing")
-    if not re.fullmatch(r"sha256:[0-9a-f]{64}", value["source_digest"]):
-        raise AssertionError("bad digest")
-    for field in ("start", "end"):
-        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", value[field]):
-            raise AssertionError("non-canonical timestamp")
+    def validate(declaration, candidate):
+        if "$ref" in declaration:
+            target = declaration["$ref"].split("/")[-1]
+            return validate(schema["$defs"][target], candidate)
+        kind = declaration.get("type")
+        if kind == "object":
+            if not isinstance(candidate, dict):
+                raise AssertionError("expected object")
+            for key in declaration.get("required", ()):
+                if key not in candidate:
+                    raise AssertionError("required field missing")
+            if declaration.get("additionalProperties") is False:
+                unknown = set(candidate) - set(declaration.get("properties", ()))
+                if unknown:
+                    raise AssertionError("additional property")
+            for key, child in declaration.get("properties", {}).items():
+                if key in candidate:
+                    validate(child, candidate[key])
+        elif kind == "array":
+            if not isinstance(candidate, list):
+                raise AssertionError("expected array")
+            for item in candidate:
+                validate(declaration["items"], item)
+        elif kind == "string":
+            if not isinstance(candidate, str):
+                raise AssertionError("expected string")
+            if len(candidate) < declaration.get("minLength", 0):
+                raise AssertionError("string too short")
+            if "pattern" in declaration and not re.search(declaration["pattern"], candidate):
+                raise AssertionError("pattern mismatch")
+            if declaration.get("format") == "date-time":
+                try:
+                    parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+                except ValueError as error:
+                    raise AssertionError("invalid date-time") from error
+                if parsed.tzinfo is None:
+                    raise AssertionError("date-time must be aware")
+        elif kind == "integer":
+            if isinstance(candidate, bool) or not isinstance(candidate, int):
+                raise AssertionError("expected integer")
+            if candidate < declaration.get("minimum", candidate):
+                raise AssertionError("integer below minimum")
+        else:
+            raise AssertionError("unsupported schema declaration")
+
+    validate(schema, value)
     start = datetime.strptime(value["start"], "%Y-%m-%dT%H:%M:%SZ")
     end = datetime.strptime(value["end"], "%Y-%m-%dT%H:%M:%SZ")
-    if end <= start or value["duration_seconds"] <= 0:
-        raise AssertionError("invalid duration")
+    if end <= start:
+        raise AssertionError("end must be after start")
 
 
 class CalendlyRecordingContractTests(unittest.TestCase):
@@ -95,6 +133,19 @@ class CalendlyRecordingContractTests(unittest.TestCase):
         value["duration_seconds"] = 0
         with self.assertRaises(AssertionError):
             _assert_schema_contract(schema, value)
+
+    def test_schema_contract_rejects_declared_type_and_shape_violations(self):
+        schema = json.loads((ROOT / "schemas/calendly-recording-source-v1.json").read_text())
+        value = calendly.normalized_recording(recording())
+        invalid_values = (
+            {**value, "extra": True},
+            {**value, "participants": [{"email": 7}]},
+            {**value, "transcript": [{"text": "ok", "extra": True}]},
+            {**value, "duration_seconds": "2220"},
+        )
+        for invalid in invalid_values:
+            with self.subTest(invalid=invalid), self.assertRaises(AssertionError):
+                _assert_schema_contract(schema, invalid)
 
     def test_schema_contract_rejects_missing_identity_naive_and_reversed_window(self):
         schema = json.loads((ROOT / "schemas/calendly-recording-source-v1.json").read_text())
@@ -172,6 +223,22 @@ class CalendlyCliContractTests(unittest.TestCase):
                 calendly.parse_args([
                     "preflight", "--since", "2026-08-04T00:00:00Z", "--until", "2026-08-05T00:00:00Z",
                     "--output", str(Path(directory) / "outside.json"),
+                ])
+
+    def test_cli_rejects_output_traversal_outside_invocation_root(self):
+        with tempfile.TemporaryDirectory() as directory, _working_directory(directory):
+            with self.assertRaises(SystemExit):
+                calendly.parse_args([
+                    "preflight", "--since", "2026-08-04T00:00:00Z", "--until", "2026-08-05T00:00:00Z",
+                    "--output", "nested/../../outside.json",
+                ])
+
+    def test_collect_rejects_checkpoint_traversal_outside_invocation_root(self):
+        with tempfile.TemporaryDirectory() as directory, _working_directory(directory):
+            with self.assertRaises(SystemExit):
+                calendly.parse_args([
+                    "collect", "--since", "2026-08-04T00:00:00Z", "--until", "2026-08-05T00:00:00Z",
+                    "--output", "result.json", "--checkpoint-root", "nested/../../checkpoints",
                 ])
 
     def test_cli_rejects_symlinked_output_component(self):

@@ -62,7 +62,6 @@ def _normal_person(value: object) -> dict[str, str]:
     if not result:
         raise CalendlyCollectorError("person must contain email or name")
     return result
-    return result
 
 
 def _normal_people(value: object) -> list[dict[str, str]]:
@@ -151,7 +150,7 @@ def _safe_path(value: str, root: Path) -> Path:
     candidate = Path(value).expanduser()
     if not candidate.is_absolute():
         candidate = root / candidate
-    candidate = candidate.absolute()
+    candidate = candidate.resolve(strict=False)
     try:
         candidate.relative_to(root)
     except ValueError as error:
