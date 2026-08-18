@@ -6,9 +6,11 @@ from pathlib import Path
 import re
 import tempfile
 import unittest
-from datetime import datetime
+from unittest import mock
+from datetime import datetime, timezone
 
 from scripts import calendly_collector as calendly
+from scripts.collector_checkpoints import PageCheckpointStore
 
 
 ROOT = Path(__file__).parents[1]
@@ -37,6 +39,33 @@ def recording():
         "transcript": [{"offset_seconds": 0, "text": "Reviewed launch"}],
         "summary": "Reviewed launch",
     }
+
+
+COLLECTION_ENV = {
+    "CALENDLY_RECORDINGS_URL": "https://gateway.example.test/calendly/recordings",
+    "CALENDLY_GATEWAY_TOKEN": "private-calendly-token",
+    "CALENDLY_GATEWAY_READ_ONLY": "true",
+}
+COLLECTION_SINCE = datetime(2026, 8, 4, tzinfo=timezone.utc)
+COLLECTION_UNTIL = datetime(2026, 8, 5, tzinfo=timezone.utc)
+
+
+def collection_recording(identifier):
+    value = recording()
+    value["uri"] = f"recordings/{identifier}"
+    return value
+
+
+def responses(values):
+    pending = iter(values)
+
+    def respond(_url, _headers):
+        value = next(pending)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    return respond
 
 
 def _assert_schema_contract(schema, value):
@@ -183,6 +212,126 @@ class CalendlyRecordingContractTests(unittest.TestCase):
     def test_recording_contract_rejects_end_before_start(self):
         with self.assertRaises(calendly.CalendlyCollectorError):
             calendly.normalized_recording({**recording(), "recording_end_time": "2026-08-04T09:59:59Z"})
+
+
+class CalendlyCollectionTests(unittest.TestCase):
+    def test_fetch_resumes_at_saved_cursor_and_exposes_only_complete_results(self):
+        """A failed page must resume from its saved cursor without exposing partial rows."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = PageCheckpointStore(Path(directory))
+            first = responses([
+                {"collection": [collection_recording("one")], "pagination": {"next_page_token": "private-next"}},
+                OSError("offline"),
+            ])
+            partial = calendly.fetch_calendly(
+                COLLECTION_ENV, COLLECTION_SINCE, COLLECTION_UNTIL,
+                checkpoint_store=store, http_json=first,
+            )
+            self.assertFalse(partial["complete"])
+            self.assertEqual([], partial["recordings"])
+
+            calls = []
+
+            def resumed_response(url, _headers):
+                calls.append(url)
+                self.assertIn("page_token=private-next", url)
+                return {"collection": [collection_recording("two")], "pagination": {}}
+
+            resumed = calendly.fetch_calendly(
+                COLLECTION_ENV, COLLECTION_SINCE, COLLECTION_UNTIL,
+                checkpoint_store=store, http_json=resumed_response,
+            )
+
+        self.assertTrue(resumed["complete"])
+        self.assertEqual(
+            ["recordings/one", "recordings/two"],
+            [row["recording_id"] for row in resumed["recordings"]],
+        )
+        self.assertEqual(1, len(calls))
+
+    def test_fetch_hides_credentials_and_rows_when_gateway_capability_is_missing(self):
+        result = calendly.fetch_calendly(
+            {"CALENDLY_GATEWAY_TOKEN": "private-calendly-token"},
+            COLLECTION_SINCE, COLLECTION_UNTIL,
+        )
+
+        self.assertFalse(result["complete"])
+        self.assertEqual([], result["recordings"])
+        self.assertEqual("capability_unavailable", result["status"])
+        self.assertNotIn("private-calendly-token", json.dumps(result))
+
+    def test_fetch_rejects_malformed_recordings_envelope_without_exposing_rows(self):
+        result = calendly.fetch_calendly(
+            COLLECTION_ENV, COLLECTION_SINCE, COLLECTION_UNTIL,
+            http_json=lambda _url, _headers: {"items": [collection_recording("one")]},
+        )
+
+        self.assertFalse(result["complete"])
+        self.assertEqual([], result["recordings"])
+        self.assertEqual("capability_unavailable", result["status"])
+
+    def test_fetch_reports_scheduled_events_without_using_them_as_duration(self):
+        event = {
+            "uri": "events/scheduled-only",
+            "name": "Scheduled only",
+            "start_time": "2026-08-04T12:00:00Z",
+            "end_time": "2026-08-04T13:00:00Z",
+        }
+        result = calendly.fetch_calendly(
+            COLLECTION_ENV, COLLECTION_SINCE, COLLECTION_UNTIL,
+            http_json=lambda _url, _headers: {
+                "collection": [], "scheduled_without_recording": [event], "pagination": {},
+            },
+        )
+
+        self.assertTrue(result["complete"])
+        self.assertEqual([], result["recordings"])
+        self.assertEqual("scheduled_without_recording", result["scheduled_without_recording"][0]["reason"])
+        self.assertNotIn("duration_seconds", result["scheduled_without_recording"][0])
+
+    def test_fetch_rejects_repeated_cursor_without_leaking_it(self):
+        secret_cursor = "private-repeated-cursor"
+        result = calendly.fetch_calendly(
+            COLLECTION_ENV, COLLECTION_SINCE, COLLECTION_UNTIL,
+            http_json=responses([
+                {"collection": [collection_recording("one")], "pagination": {"next_page_token": secret_cursor}},
+                {"collection": [collection_recording("two")], "pagination": {"next_page_token": secret_cursor}},
+            ]),
+        )
+
+        self.assertFalse(result["complete"])
+        self.assertEqual([], result["recordings"])
+        self.assertNotIn(secret_cursor, json.dumps(result))
+        self.assertTrue(result["failure"]["cursor"].startswith("sha256:"))
+
+    def test_fetch_stops_at_pagination_safety_limit_without_exposing_rows(self):
+        with mock.patch.object(calendly, "CALENDLY_MAX_PAGES", 1):
+            result = calendly.fetch_calendly(
+                COLLECTION_ENV, COLLECTION_SINCE, COLLECTION_UNTIL,
+                http_json=lambda _url, _headers: {
+                    "collection": [collection_recording("one")],
+                    "pagination": {"next_page_token": "private-next"},
+                },
+            )
+
+        self.assertFalse(result["complete"])
+        self.assertEqual([], result["recordings"])
+        self.assertEqual(1, result["pages_fetched"])
+
+    def test_fetch_rejects_a_recording_without_exact_recording_window(self):
+        result = calendly.fetch_calendly(
+            COLLECTION_ENV, COLLECTION_SINCE, COLLECTION_UNTIL,
+            http_json=lambda _url, _headers: {
+                "collection": [{
+                    "uri": "recordings/no-window", "event_uri": "events/no-window",
+                    "start_time": "2026-08-04T10:00:00Z", "end_time": "2026-08-04T11:00:00Z",
+                }],
+                "pagination": {},
+            },
+        )
+
+        self.assertFalse(result["complete"])
+        self.assertEqual([], result["recordings"])
 
 
 class CalendlyCliContractTests(unittest.TestCase):

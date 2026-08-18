@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 try:
+    from scripts.calendly_collector import fetch_calendly
     from scripts.collector_checkpoints import (
         CheckpointError,
         CheckpointIdentity,
@@ -45,6 +46,7 @@ try:
         plan_slices,
     )
 except ModuleNotFoundError:  # Support direct execution from this directory.
+    from calendly_collector import fetch_calendly  # type: ignore[no-redef]
     from collector_checkpoints import (  # type: ignore[no-redef]
         CheckpointError,
         CheckpointIdentity,
@@ -120,6 +122,15 @@ def fathom_env_candidates() -> list[str]:
     candidates = [os.environ.get("FATHOM_ENV_FILE", "")]
     candidates.extend(
         str(home / ".config/serenichron/fathom.env")
+        for home in _home_candidates()
+    )
+    return list(dict.fromkeys(candidates))
+
+
+def calendly_env_candidates() -> list[str]:
+    candidates = [os.environ.get("CALENDLY_ENV_FILE", "")]
+    candidates.extend(
+        str(home / ".config/serenichron/calendly.env")
         for home in _home_candidates()
     )
     return list(dict.fromkeys(candidates))
@@ -3492,8 +3503,10 @@ def write_markdown(run_dir: Path, report: dict[str, Any]) -> None:
     ledger_receipt = report.get("evidence_ledger", {})
     if isinstance(ledger_receipt, Mapping) and ledger_receipt.get("ledger_digest"):
         lines.append(f"- Evidence ledger receipt: {ledger_receipt['ledger_digest']}")
+    calendly_evidence = report["evidence"].get("calendly", {"status": "unavailable"})
     lines.append(f"- Clockify: {report['evidence']['clockify']['status']} ({len(report['evidence']['clockify'].get('entries', []))} existing entries)")
     lines.append(f"- Fathom: {report['evidence']['fathom']['status']} ({len(report['evidence']['fathom'].get('meetings', []))} meetings)")
+    lines.append(f"- Calendly: {calendly_evidence['status']} ({len(calendly_evidence.get('recordings', []))} recordings; {len(calendly_evidence.get('scheduled_without_recording', []))} scheduled without recording)")
     lines.append(f"- Multica issues: {report['evidence']['multica_issues']['status']} ({len(report['evidence']['multica_issues'].get('issues', []))} issues)")
     for s in report['evidence']['sessions']:
         lines.append(f"- Sessions/{s['machine']}: {s['status']} — {len(s.get('claude_bursts', []))} Claude bursts, {len(s.get('hermes_sessions', []))} Hermes legacy, {len(s.get('hermes_db_sessions', []))} Hermes DB, {len(s.get('codex_sessions', []))} Codex sessions")
@@ -3713,6 +3726,8 @@ def _collect_slice(
     checkpoint_store: PageCheckpointStore,
     run_dir: Path,
     owned_run_dirs: set[Path] | None = None,
+    *,
+    calendly_env: dict[str, str] | None = None,
 ) -> tuple[Path, dict[str, object]]:
     requested_slices = plan_slices(since, until, zone=BUCHAREST)
     if len(requested_slices) != 1:
@@ -3730,6 +3745,12 @@ def _collect_slice(
             cenv, routing, since, until, checkpoint_store=checkpoint_store
         ),
         "fathom": fetch_fathom(fenv, since, until, checkpoint_store=checkpoint_store),
+        "calendly": fetch_calendly(
+            calendly_env or {"_missing": ["CALENDLY_RECORDINGS_URL"]},
+            since,
+            until,
+            checkpoint_store=checkpoint_store,
+        ),
         "multica_issues": fetch_multica_issues(
             since, until, checkpoint_store=checkpoint_store
         ),
@@ -3797,6 +3818,7 @@ def _collect_slice(
     }
     write_json(run_dir / "evidence" / "clockify-existing.json", evidence["clockify"])
     write_json(run_dir / "evidence" / "fathom-meetings.json", evidence["fathom"])
+    write_json(run_dir / "evidence" / "calendly-recordings.json", evidence["calendly"])
     write_json(run_dir / "evidence" / "multica-issues.json", evidence["multica_issues"])
     write_json(run_dir / "evidence" / "sessions.json", evidence["sessions"])
     if "enriched_context" in evidence:
@@ -3875,12 +3897,20 @@ def _collect_slice(
                      "entry_count": len(evidence.get("clockify", {}).get("entries", []))},
         "fathom": {"status": evidence.get("fathom", {}).get("status"),
                    "meeting_count": len(evidence.get("fathom", {}).get("meetings", []))},
+        "calendly": {
+            "status": evidence.get("calendly", {}).get("status"),
+            "recording_count": len(evidence.get("calendly", {}).get("recordings", [])),
+            "scheduled_without_recording_count": len(
+                evidence.get("calendly", {}).get("scheduled_without_recording", [])
+            ),
+        },
         "multica_issues": {"status": evidence.get("multica_issues", {}).get("status"),
                            "issue_count": len(evidence.get("multica_issues", {}).get("issues", []))},
         "sessions": sess_summary,
         "evidence_files": {
             "clockify": str(run_dir / "evidence" / "clockify-existing.json"),
             "fathom": str(run_dir / "evidence" / "fathom-meetings.json"),
+            "calendly": str(run_dir / "evidence" / "calendly-recordings.json"),
             "multica_issues": str(run_dir / "evidence" / "multica-issues.json"),
             "sessions": str(run_dir / "evidence" / "sessions.json"),
             "enriched_context": str(run_dir / "evidence" / "enriched-context.json") if "enriched_context" in evidence else None,
@@ -3897,6 +3927,14 @@ def run(args: argparse.Namespace) -> int:
     fleet = load_json(ROOT / "fleet.json")
     cenv = load_env_file(clockify_env_candidates(), ["CLOCKIFY_API_KEY", "CLOCKIFY_WORKSPACE_ID"])
     fenv = load_env_file(fathom_env_candidates(), ["FATHOM_API_KEY"])
+    calendly_env = load_env_file(
+        calendly_env_candidates(),
+        [
+            "CALENDLY_RECORDINGS_URL",
+            "CALENDLY_GATEWAY_TOKEN",
+            "CALENDLY_GATEWAY_READ_ONLY",
+        ],
+    )
     since, until, reason = compute_range(args, routing, cenv)
     slices = plan_slices(since, until, zone=BUCHAREST)
     identity = BacklogIdentity(
@@ -3955,6 +3993,7 @@ def run(args: argparse.Namespace) -> int:
                 checkpoint_store,
                 run_dir,
                 owned_run_dirs,
+                calendly_env=calendly_env,
             )
         except (BacklogError, CheckpointError, OSError, ValueError):
             _preserve_incomplete_run(

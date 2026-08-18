@@ -23,6 +23,46 @@ UNTIL = dt.datetime(2026, 7, 2, tzinfo=TZ)
 
 
 class ProcessIntegrationTests(unittest.TestCase):
+    def test_collect_slice_writes_calendly_evidence_and_only_aggregate_report_fields(self) -> None:
+        """Calendly recordings are persisted as evidence, never embedded in the compact report."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "runs" / "bundle"
+            calendly_result = {
+                "status": "ok", "complete": True,
+                "recordings": [{"recording_id": "recordings/private-recording"}],
+                "scheduled_without_recording": [{"meeting_id": "events/scheduled-only"}],
+            }
+            complete = {"status": "ok", "complete": True}
+            with (
+                mock.patch.object(collector, "fetch_clockify", return_value={**complete, "entries": []}),
+                mock.patch.object(collector, "fetch_fathom", return_value={**complete, "meetings": []}),
+                mock.patch.object(collector, "fetch_calendly", return_value=calendly_result),
+                mock.patch.object(collector, "fetch_multica_issues", return_value={**complete, "issues": []}),
+                mock.patch.object(
+                    collector, "collector_runtime_identity",
+                    return_value={"collector_path": "/repo/collector.py", "git_sha": "fixture"},
+                ),
+            ):
+                _path, report = collector._collect_slice(
+                    argparse.Namespace(enrich=False),
+                    {"skip_rules": {}, "session_routes": [], "meeting_routes": []},
+                    {"machines": [], "ssh_options": []},
+                    {"_missing": True}, {"_missing": True}, SINCE, UNTIL, "fixture",
+                    collector.PageCheckpointStore(Path(tmp) / "checkpoints"), run_dir,
+                    calendly_env={"_missing": ["CALENDLY_RECORDINGS_URL"]},
+                )
+
+            compact = json.loads((run_dir / "run-report.json").read_text())
+            self.assertEqual("ok", compact["evidence"]["calendly"]["status"])
+            self.assertEqual(1, compact["evidence"]["calendly"]["recording_count"])
+            self.assertEqual(
+                str(run_dir / "evidence" / "calendly-recordings.json"),
+                compact["evidence"]["evidence_files"]["calendly"],
+            )
+            self.assertEqual(calendly_result, json.loads((run_dir / "evidence" / "calendly-recordings.json").read_text()))
+            self.assertNotIn("recordings/private-recording", json.dumps(compact))
+            self.assertEqual(calendly_result, report["evidence"]["calendly"])
+
     def test_versioned_schemas_cover_the_emitted_document_wrappers(self) -> None:
         root = Path(__file__).resolve().parents[1]
         evidence = json.loads((root / "schemas" / "evidence-ledger-v1.json").read_text())

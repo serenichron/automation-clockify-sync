@@ -328,9 +328,15 @@ class CollectorBurstContextTests(unittest.TestCase):
             account_home = Path(tmp) / "account-home"
             clockify_env = account_home / ".config" / "serenichron" / "clockify.env"
             fathom_env = account_home / ".config" / "serenichron" / "fathom.env"
+            calendly_env = account_home / ".config" / "serenichron" / "calendly.env"
             clockify_env.parent.mkdir(parents=True)
             clockify_env.write_text("CLOCKIFY_API_KEY=clockify-test-key\nCLOCKIFY_WORKSPACE_ID=workspace-id\n")
             fathom_env.write_text("FATHOM_API_KEY=fathom-test-key\n")
+            calendly_env.write_text(
+                "CALENDLY_RECORDINGS_URL=https://gateway.example.test/recordings\n"
+                "CALENDLY_GATEWAY_TOKEN=calendly-test-token\n"
+                "CALENDLY_GATEWAY_READ_ONLY=true\n"
+            )
             account = mock.Mock(pw_dir=str(account_home))
 
             with mock.patch.dict(collector.os.environ, {"HOME": str(task_home)}, clear=True), mock.patch.object(
@@ -343,11 +349,21 @@ class CollectorBurstContextTests(unittest.TestCase):
                 fenv = collector.load_env_file(
                     collector.fathom_env_candidates(), ["FATHOM_API_KEY"]
                 )
+                calenv = collector.load_env_file(
+                    collector.calendly_env_candidates(),
+                    [
+                        "CALENDLY_RECORDINGS_URL",
+                        "CALENDLY_GATEWAY_TOKEN",
+                        "CALENDLY_GATEWAY_READ_ONLY",
+                    ],
+                )
 
         self.assertEqual(str(clockify_env), cenv["_env_file"])
         self.assertEqual("clockify-test-key", cenv["CLOCKIFY_API_KEY"])
         self.assertEqual(str(fathom_env), fenv["_env_file"])
         self.assertEqual("fathom-test-key", fenv["FATHOM_API_KEY"])
+        self.assertEqual(str(calendly_env), calenv["_env_file"])
+        self.assertEqual("calendly-test-token", calenv["CALENDLY_GATEWAY_TOKEN"])
 
     def test_multica_env_only_configuration_needs_no_profile(self) -> None:
         env = {

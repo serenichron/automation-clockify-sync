@@ -8,9 +8,27 @@ import json
 from pathlib import Path
 import re
 from typing import Any, Mapping
+import urllib.parse
+import urllib.request
+
+try:
+    from scripts.collector_checkpoints import (
+        CheckpointError,
+        CheckpointIdentity,
+        CheckpointState,
+        PageCheckpointStore,
+    )
+except ModuleNotFoundError:  # Support direct execution from this directory.
+    from collector_checkpoints import (  # type: ignore[no-redef]
+        CheckpointError,
+        CheckpointIdentity,
+        CheckpointState,
+        PageCheckpointStore,
+    )
 
 
 CALENDLY_COMPATIBILITY_VERSION = "calendly-recordings/v1"
+CALENDLY_MAX_PAGES = 1000
 
 
 class CalendlyCollectorError(ValueError):
@@ -140,6 +158,241 @@ def scheduled_without_recording(event: Mapping[str, Any]) -> dict[str, Any]:
         "end": _iso_utc(end),
         "reason": "scheduled_without_recording",
     }
+
+
+def _cursor_reference(cursor: str | None) -> str:
+    if not cursor:
+        return "initial"
+    return "sha256:" + hashlib.sha256(cursor.encode("utf-8")).hexdigest()[:12]
+
+
+def _gateway_configuration(cenv: Mapping[str, Any]) -> tuple[str, str]:
+    missing = cenv.get("_missing")
+    if missing:
+        raise CalendlyCollectorError("Calendly recording gateway is unavailable")
+    endpoint = cenv.get("CALENDLY_RECORDINGS_URL")
+    token = cenv.get("CALENDLY_GATEWAY_TOKEN")
+    read_only = cenv.get("CALENDLY_GATEWAY_READ_ONLY")
+    if not isinstance(endpoint, str) or not endpoint.strip():
+        raise CalendlyCollectorError("Calendly recording gateway is unavailable")
+    if not isinstance(token, str) or not token.strip():
+        raise CalendlyCollectorError("Calendly recording gateway is unavailable")
+    if str(read_only).casefold() != "true":
+        raise CalendlyCollectorError("Calendly recording gateway is unavailable")
+    parsed = urllib.parse.urlsplit(endpoint)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+    ):
+        raise CalendlyCollectorError("Calendly recording gateway is unavailable")
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", "")), token
+
+
+def _request_fingerprint(cenv: Mapping[str, Any], since: datetime, until: datetime) -> str:
+    endpoint, _token = _gateway_configuration(cenv)
+    request = {
+        "endpoint": endpoint,
+        "query": {"since": _iso_utc(since), "until": _iso_utc(until)},
+        "pagination_parameter": "page_token",
+        "read_only": True,
+    }
+    return "sha256:" + _digest(request)
+
+
+def _checkpoint_identity(cenv: Mapping[str, Any], since: datetime, until: datetime) -> CheckpointIdentity:
+    return CheckpointIdentity(
+        source="calendly",
+        since_utc=_iso_utc(since),
+        until_utc=_iso_utc(until),
+        request_fingerprint=_request_fingerprint(cenv, since, until),
+        compatibility_version=CALENDLY_COMPATIBILITY_VERSION,
+    )
+
+
+def _recordings_url(endpoint: str, since: datetime, until: datetime, cursor: str | None) -> str:
+    query = {"since": _iso_utc(since), "until": _iso_utc(until)}
+    if cursor:
+        query["page_token"] = cursor
+    return endpoint + "?" + urllib.parse.urlencode(query)
+
+
+def _headers(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+
+def _http_json(url: str, headers: Mapping[str, str]) -> Any:
+    request = urllib.request.Request(url, headers=dict(headers))
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _page_response(data: Any) -> tuple[list[Mapping[str, Any]], list[Mapping[str, Any]], str | None]:
+    if not isinstance(data, Mapping) or not isinstance(data.get("collection"), (list, tuple)):
+        raise CalendlyCollectorError("Calendly recordings response did not contain a collection")
+    items = data["collection"]
+    if not all(isinstance(item, Mapping) for item in items):
+        raise CalendlyCollectorError("Calendly recordings collection is invalid")
+    scheduled = data.get("scheduled_without_recording", data.get("scheduled_events", []))
+    if not isinstance(scheduled, (list, tuple)) or not all(isinstance(item, Mapping) for item in scheduled):
+        raise CalendlyCollectorError("Calendly scheduled event collection is invalid")
+    pagination = data.get("pagination", {})
+    if not isinstance(pagination, Mapping):
+        raise CalendlyCollectorError("Calendly pagination is invalid")
+    next_cursor = pagination.get("next_page_token")
+    if next_cursor is not None and (not isinstance(next_cursor, str) or not next_cursor.strip()):
+        raise CalendlyCollectorError("Calendly pagination cursor is invalid")
+    return list(items), list(scheduled), next_cursor.strip() if isinstance(next_cursor, str) else None
+
+
+def _page_signature(
+    items: list[Mapping[str, Any]], scheduled: list[Mapping[str, Any]]
+) -> str:
+    return "sha256:" + _digest({
+        "collection": _mutable(items),
+        "scheduled_without_recording": _mutable(scheduled),
+    })
+
+
+def _mutable(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _mutable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_mutable(item) for item in value]
+    return value
+
+
+def _checkpoint_items(
+    checkpoint_store: PageCheckpointStore,
+    state: CheckpointState,
+) -> tuple[list[Mapping[str, Any]], list[Mapping[str, Any]], set[str], set[str], str | None]:
+    raw: list[Mapping[str, Any]] = []
+    scheduled: list[Mapping[str, Any]] = []
+    seen_cursors: set[str] = set()
+    seen_pages: set[str] = set()
+    cursor: str | None = None
+    for page_number, saved_page in enumerate(checkpoint_store.iter_pages(state), start=1):
+        items, page_scheduled, next_cursor = _page_response(saved_page["payload"])
+        if dict(saved_page["metadata"]) != {"request_cursor": cursor}:
+            raise CheckpointError("checkpoint Calendly request cursor is invalid")
+        if dict(saved_page["continuation"]) != {"cursor": next_cursor}:
+            raise CheckpointError("checkpoint Calendly page continuation is invalid")
+        signature = _page_signature(items, page_scheduled)
+        if saved_page["signature"] != signature:
+            raise CheckpointError("checkpoint Calendly page signature is invalid")
+        if signature in seen_pages:
+            raise CheckpointError("checkpoint Calendly page repeated")
+        seen_pages.add(signature)
+        if next_cursor:
+            if next_cursor in seen_cursors:
+                raise CheckpointError("checkpoint Calendly pagination cursor repeated")
+            seen_cursors.add(next_cursor)
+        elif page_number != len(state.pages):
+            raise CheckpointError("checkpoint Calendly terminal page has a successor")
+        raw.extend(items)
+        scheduled.extend(page_scheduled)
+        cursor = next_cursor
+    expected_continuation: dict[str, str | None] = {} if not state.pages else {"cursor": cursor}
+    if dict(state.continuation) != expected_continuation:
+        raise CheckpointError("checkpoint Calendly continuation is invalid")
+    if state.complete and (not state.pages or cursor is not None):
+        raise CheckpointError("completed Calendly checkpoint has a continuation")
+    return raw, scheduled, seen_cursors, seen_pages, cursor
+
+
+def _failure(status: str, *, page: int, cursor: str | None) -> dict[str, Any]:
+    return {
+        "status": status,
+        "complete": False,
+        "recordings": [],
+        "scheduled_without_recording": [],
+        "pages_fetched": page - 1,
+        "pagination": {"status": "incomplete"},
+        "failure": {"page": page, "cursor": _cursor_reference(cursor)},
+    }
+
+
+def _complete_result(
+    raw: list[Mapping[str, Any]],
+    scheduled: list[Mapping[str, Any]],
+    *,
+    pages_fetched: int,
+) -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "complete": True,
+        "recordings": [normalized_recording(_mutable(record)) for record in raw],
+        "scheduled_without_recording": [scheduled_without_recording(_mutable(event)) for event in scheduled],
+        "pages_fetched": pages_fetched,
+        "pagination": {"status": "complete", "pages_fetched": pages_fetched},
+    }
+
+
+def fetch_calendly(
+    cenv: Mapping[str, Any],
+    since: datetime,
+    until: datetime,
+    *,
+    checkpoint_store: PageCheckpointStore | None = None,
+    http_json: Any | None = None,
+) -> dict[str, Any]:
+    """Fetch one bounded, read-only recording collection without exposing partial data."""
+    if since.tzinfo is None or until.tzinfo is None or until <= since:
+        return _failure("invalid_interval", page=1, cursor=None)
+    cursor: str | None = None
+    pages = 0
+    try:
+        endpoint, token = _gateway_configuration(cenv)
+        state: CheckpointState | None = None
+        raw: list[Mapping[str, Any]] = []
+        scheduled: list[Mapping[str, Any]] = []
+        seen_cursors: set[str] = set()
+        seen_pages: set[str] = set()
+        if checkpoint_store is not None:
+            state = checkpoint_store.open(_checkpoint_identity(cenv, since, until))
+            raw, scheduled, seen_cursors, seen_pages, cursor = _checkpoint_items(checkpoint_store, state)
+            pages = len(state.pages)
+            if state.pages and cursor is None and not state.complete:
+                state = checkpoint_store.mark_complete(state)
+        while state is None or not state.complete:
+            if pages >= CALENDLY_MAX_PAGES:
+                raise CalendlyCollectorError("Calendly pagination exceeded safety limit")
+            data = (http_json or _http_json)(
+                _recordings_url(endpoint, since, until, cursor), _headers(token)
+            )
+            items, page_scheduled, next_cursor = _page_response(data)
+            signature = _page_signature(items, page_scheduled)
+            if signature in seen_pages:
+                raise CalendlyCollectorError("Calendly pagination page repeated")
+            if next_cursor and next_cursor in seen_cursors:
+                raise CalendlyCollectorError("Calendly pagination cursor repeated")
+            if state is not None:
+                state = checkpoint_store.append_page(
+                    state,
+                    payload=data,
+                    continuation={"cursor": next_cursor},
+                    signature=signature,
+                    metadata={"request_cursor": cursor},
+                )
+            raw.extend(items)
+            scheduled.extend(page_scheduled)
+            seen_pages.add(signature)
+            pages += 1
+            if next_cursor:
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+                continue
+            cursor = None
+            if state is not None:
+                state = checkpoint_store.mark_complete(state)
+            break
+        return _complete_result(raw, scheduled, pages_fetched=pages)
+    except CalendlyCollectorError:
+        return _failure("capability_unavailable", page=pages + 1, cursor=cursor)
+    except Exception:
+        return _failure("incomplete", page=pages + 1, cursor=cursor)
 
 
 def _interval(value: str) -> datetime:
