@@ -23,7 +23,24 @@
         "raw_source_span": {"$ref": "#/$defs/jsonObject"},
         "attributes": {"$ref": "#/$defs/jsonObject"},
         "legacy_aliases": {"type": "object", "additionalProperties": {"type": "string"}}
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"source_type": {"const": "calendly"}},
+            "required": ["source_type"]
+          },
+          "then": {
+            "required": ["observed_at"],
+            "properties": {
+              "observed_at": {"type": "string", "format": "date-time", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"},
+              "source_ref": {"$ref": "#/$defs/calendlySourceRef"},
+              "raw_source_span": {"$ref": "#/$defs/calendlySourceSpan"},
+              "attributes": {"$ref": "#/$defs/calendlyAttributes"}
+            }
+          }
+        }
+      ]
     },
     "ledgerDocument": {
       "type": "object",
@@ -59,6 +76,69 @@
         "expected_count": {"type": "integer", "minimum": 0},
         "observed_count": {"type": "integer", "minimum": 0},
         "reason": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "calendlyAttributes": {
+      "type": "object",
+      "required": [
+        "recording_id", "meeting_id", "title", "duration_seconds", "organizer",
+        "participants", "join_url", "transcript", "summary", "source_digest"
+      ],
+      "properties": {
+        "recording_id": {"type": "string", "minLength": 1},
+        "meeting_id": {"type": "string", "minLength": 1},
+        "title": {"type": "string", "minLength": 1},
+        "duration_seconds": {"type": "integer", "minimum": 1},
+        "organizer": {"$ref": "#/$defs/calendlyPerson"},
+        "participants": {"type": "array", "items": {"$ref": "#/$defs/calendlyParticipant"}},
+        "join_url": {"type": "string"},
+        "summary": {"type": "string"},
+        "transcript": {"type": "array", "items": {"$ref": "#/$defs/calendlyTranscriptItem"}},
+        "source_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "calendlySourceRef": {
+      "type": "object",
+      "required": ["source_type", "source_id", "meeting_id"],
+      "properties": {
+        "source_type": {"const": "calendly"},
+        "source_id": {"type": "string", "minLength": 1},
+        "meeting_id": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "calendlySourceSpan": {
+      "type": "object",
+      "required": ["start", "end"],
+      "properties": {
+        "start": {"type": "string", "format": "date-time", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"},
+        "end": {"type": "string", "format": "date-time", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"}
+      },
+      "additionalProperties": false
+    },
+    "calendlyPerson": {
+      "type": "object",
+      "properties": {
+        "email": {"type": "string", "minLength": 1},
+        "name": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "calendlyParticipant": {
+      "allOf": [
+        {"$ref": "#/$defs/calendlyPerson"},
+        {"minProperties": 1}
+      ]
+    },
+    "calendlyTranscriptItem": {
+      "type": "object",
+      "required": ["text"],
+      "properties": {
+        "offset_seconds": {"type": "integer", "minimum": 0},
+        "text": {"type": "string"},
+        "speaker": {"type": "string"}
       },
       "additionalProperties": false
     }

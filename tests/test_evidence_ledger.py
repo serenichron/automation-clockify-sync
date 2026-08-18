@@ -26,6 +26,31 @@ CORPUS_DIR = ROOT / "tests" / "fixtures" / "clockify-regression" / "v1"
 EXPECTED_RECORD_COUNT = 86
 EXPECTED_CORPUS_DIGEST = "43b010aa6bc9c18612e8a3a855244be7bd492364ce28fa40a65cbd341def8618"
 
+CALENDLY_RECORDING = {
+    "recording_id": "rec-1",
+    "meeting_id": "event-1",
+    "title": "Client review",
+    "start": "2026-08-01T10:00:00Z",
+    "end": "2026-08-01T10:37:00Z",
+    "duration_seconds": 2220,
+    "organizer": {"email": "organizer@example.test", "name": "Organizer"},
+    "participants": [{"email": "participant@example.test", "name": "Participant"}],
+    "join_url": "https://example.test/join/rec-1",
+    "summary": "Reviewed launch readiness",
+    "transcript": [{"offset_seconds": 0, "speaker": "Participant", "text": "Ready."}],
+    "source_digest": "sha256:" + "a" * 64,
+}
+
+
+def complete_snapshot(**sources):
+    snapshot = {
+        "clockify": {"status": "ok", "complete": True, "entries": []},
+        "fathom": {"status": "ok", "complete": True, "meetings": []},
+        "multica_issues": {"status": "ok", "complete": True, "issues": []},
+    }
+    snapshot.update(sources)
+    return snapshot
+
 
 def event(*, source_id: str = "session-1", aliases: dict[str, str] | None = None, start: str = "2026-07-31T09:00:00Z"):
     return ledger.evidence_event(
@@ -38,7 +63,250 @@ def event(*, source_id: str = "session-1", aliases: dict[str, str] | None = None
     )
 
 
+def _assert_schema_contract(schema: dict, declaration: dict, candidate: object) -> None:
+    if "$ref" in declaration:
+        _assert_schema_contract(schema, schema["$defs"][declaration["$ref"].split("/")[-1]], candidate)
+        return
+    if "const" in declaration:
+        if candidate != declaration["const"]:
+            raise AssertionError("const violation")
+    kind = declaration.get("type")
+    if kind == "object":
+        if not isinstance(candidate, dict):
+            raise AssertionError("expected object")
+        for key in declaration.get("required", ()):
+            if key not in candidate:
+                raise AssertionError(f"required field missing: {key}")
+        if declaration.get("additionalProperties") is False:
+            unknown = set(candidate) - set(declaration.get("properties", ()))
+            if unknown:
+                raise AssertionError(f"additional properties: {unknown}")
+        if len(candidate) < declaration.get("minProperties", 0):
+            raise AssertionError("too few properties")
+        for key, child in declaration.get("properties", {}).items():
+            if key in candidate:
+                _assert_schema_contract(schema, child, candidate[key])
+    elif kind == "array":
+        if not isinstance(candidate, list):
+            raise AssertionError("expected array")
+        for item in candidate:
+            _assert_schema_contract(schema, declaration["items"], item)
+    elif kind == "string":
+        if not isinstance(candidate, str):
+            raise AssertionError("expected string")
+        if len(candidate) < declaration.get("minLength", 0):
+            raise AssertionError("string too short")
+        if "pattern" in declaration and not re.search(declaration["pattern"], candidate):
+            raise AssertionError("pattern violation")
+    elif kind == "integer":
+        if isinstance(candidate, bool) or not isinstance(candidate, int):
+            raise AssertionError("expected integer")
+        if candidate < declaration.get("minimum", candidate):
+            raise AssertionError("minimum violation")
+    elif kind is None and (
+        "required" in declaration or "properties" in declaration or "minProperties" in declaration
+    ):
+        if not isinstance(candidate, dict):
+            raise AssertionError("expected object")
+        for key in declaration.get("required", ()):
+            if key not in candidate:
+                raise AssertionError(f"required field missing: {key}")
+        if len(candidate) < declaration.get("minProperties", 0):
+            raise AssertionError("too few properties")
+        for key, child in declaration.get("properties", {}).items():
+            if key in candidate:
+                _assert_schema_contract(schema, child, candidate[key])
+    for branch in declaration.get("allOf", ()):
+        if "if" in branch:
+            condition = branch["if"].get("properties", {}).get("source_type", {})
+            if isinstance(candidate, dict) and candidate.get("source_type") != condition.get("const"):
+                continue
+            _assert_schema_contract(schema, branch.get("then", {}), candidate)
+        else:
+            _assert_schema_contract(schema, branch, candidate)
+
+
 class EvidenceLedgerTests(unittest.TestCase):
+    def test_calendly_recording_is_immutable_evidence_with_complete_inventory(self) -> None:
+        snapshot = complete_snapshot(
+            calendly={"status": "ok", "complete": True, "recordings": [CALENDLY_RECORDING]}
+        )
+        events = ledger.normalize_collector_snapshot(snapshot)
+        meeting = next(event for event in events if event.source_type == "calendly")
+        inventory = ledger.source_inventory_from_collector(snapshot)
+        self.assertEqual("rec-1", meeting.attributes["recording_id"])
+        self.assertEqual(
+            {"status": "complete", "expected_count": 1, "observed_count": 1},
+            inventory["calendly"],
+        )
+
+    def test_calendly_event_preserves_normalized_semantics_and_excludes_envelope_metadata(self) -> None:
+        snapshot = complete_snapshot(
+            calendly={
+                "status": "ok",
+                "complete": True,
+                "recordings": [CALENDLY_RECORDING],
+                "credentials": {"token": "must-not-leak"},
+                "pagination": {"next_page_token": "must-not-leak"},
+                "path": "/private/recordings.json",
+                "cwd": "/private",
+            }
+        )
+        meeting = next(
+            event for event in ledger.normalize_collector_snapshot(snapshot)
+            if event.source_type == "calendly"
+        )
+        self.assertEqual("2026-08-01T10:00:00Z", meeting.raw_source_span["start"])
+        self.assertEqual("2026-08-01T10:37:00Z", meeting.raw_source_span["end"])
+        self.assertEqual("event-1", meeting.attributes["meeting_id"])
+        self.assertEqual(tuple(ledger.FrozenDict(CALENDLY_RECORDING["participants"][0]).items()), tuple(meeting.attributes["participants"][0].items()))
+        self.assertEqual(CALENDLY_RECORDING["summary"], meeting.attributes["summary"])
+        self.assertEqual(tuple(ledger.FrozenDict(CALENDLY_RECORDING["transcript"][0]).items()), tuple(meeting.attributes["transcript"][0].items()))
+        self.assertEqual(CALENDLY_RECORDING["source_digest"], meeting.attributes["source_digest"])
+        self.assertNotIn("credentials", meeting.document())
+        self.assertNotIn("pagination", meeting.document())
+        self.assertNotIn("/private", ledger.canonical_json(meeting.document()))
+
+    def test_calendly_missing_or_partial_collection_is_incomplete(self) -> None:
+        for calendly in (
+            {"status": "missing_credentials", "complete": False, "recordings": []},
+            {"status": "incomplete", "complete": False, "recordings": [CALENDLY_RECORDING]},
+        ):
+            with self.subTest(status=calendly["status"]):
+                inventory = ledger.source_inventory_from_collector(complete_snapshot(calendly=calendly))
+                if calendly["status"] == "missing_credentials":
+                    self.assertEqual("unavailable", inventory["calendly"]["status"])
+                self.assertEqual("incomplete", ledger.source_completeness(inventory)["status"])
+
+    def test_calendly_malformed_expected_count_fails_closed(self) -> None:
+        inventory = ledger.source_inventory_from_collector(
+            complete_snapshot(
+                calendly={
+                    "status": "ok",
+                    "complete": True,
+                    "expected_count": "1",
+                    "recordings": [CALENDLY_RECORDING],
+                }
+            )
+        )
+        self.assertEqual("partial", inventory["calendly"]["status"])
+        self.assertEqual(1, inventory["calendly"]["observed_count"])
+        self.assertEqual("incomplete", ledger.source_completeness(inventory)["status"])
+
+    def test_calendly_explicit_recording_count_mismatch_fails_closed(self) -> None:
+        inventory = ledger.source_inventory_from_collector(
+            complete_snapshot(
+                calendly={
+                    "status": "ok",
+                    "complete": True,
+                    "recording_count": 2,
+                    "recordings": [CALENDLY_RECORDING],
+                }
+            )
+        )
+        self.assertEqual("partial", inventory["calendly"]["status"])
+        self.assertEqual(2, inventory["calendly"]["expected_count"])
+        self.assertEqual(1, inventory["calendly"]["observed_count"])
+        self.assertEqual("incomplete", ledger.source_completeness(inventory)["status"])
+
+    def test_calendly_inventory_count_mismatch_with_events_blocks_completeness(self) -> None:
+        snapshot = complete_snapshot(
+            calendly={"status": "ok", "complete": True, "recordings": [CALENDLY_RECORDING]}
+        )
+        events = ledger.normalize_collector_snapshot(snapshot)
+        evidence = ledger.EvidenceLedger(tuple(event for event in events if event.source_type != "calendly"), ledger.source_inventory_from_collector(snapshot))
+        self.assertEqual("incomplete", evidence.manifest.document()["source_completeness"]["status"])
+
+    def test_calendly_source_digest_keeps_event_digest_stable(self) -> None:
+        recording = dict(CALENDLY_RECORDING)
+        reordered = {key: recording[key] for key in reversed(tuple(recording))}
+        first = ledger.normalize_collector_snapshot(complete_snapshot(calendly={"status": "ok", "complete": True, "recordings": [recording]}))
+        second = ledger.normalize_collector_snapshot(complete_snapshot(calendly={"status": "ok", "complete": True, "recordings": [reordered]}))
+        self.assertEqual("sha256:" + "a" * 64, first[0].attributes["source_digest"])
+        self.assertEqual(ledger.event_digest(first), ledger.event_digest(second))
+
+    def test_malformed_calendly_record_is_not_an_event_and_blocks_inventory(self) -> None:
+        malformed_variants = (
+            {key: value for key, value in CALENDLY_RECORDING.items() if key != "recording_id"},
+            {**CALENDLY_RECORDING, "meeting_id": ""},
+            {**CALENDLY_RECORDING, "start": "2026-08-01T10:00:00+00:00"},
+            {**CALENDLY_RECORDING, "duration_seconds": 2221},
+            {**CALENDLY_RECORDING, "source_digest": "sha256:not-a-full-digest"},
+            {**CALENDLY_RECORDING, "cursor": "private-cursor"},
+            {**CALENDLY_RECORDING, "participants": [{"email": 7}]},
+            {**CALENDLY_RECORDING, "transcript": [{"text": "ok", "extra": True}]},
+        )
+        for recording in malformed_variants:
+            with self.subTest(recording=recording):
+                snapshot = complete_snapshot(
+                    calendly={"status": "ok", "complete": True, "recordings": [recording]}
+                )
+                events = ledger.normalize_collector_snapshot(snapshot)
+                inventory = ledger.source_inventory_from_collector(snapshot)
+                self.assertFalse(any(event.source_type == "calendly" for event in events))
+                self.assertEqual("partial", inventory["calendly"]["status"])
+                self.assertEqual("incomplete", ledger.source_completeness(inventory)["status"])
+
+    def test_calendly_event_constructor_rejects_fallback_or_malformed_identity(self) -> None:
+        with self.assertRaises(ValueError):
+            ledger.evidence_event(
+                "calendly",
+                {"source_type": "calendly", "source_id": "row-1"},
+                observed_at=CALENDLY_RECORDING["start"],
+                raw_source_span={"start": CALENDLY_RECORDING["start"], "end": CALENDLY_RECORDING["end"]},
+                attributes={key: value for key, value in CALENDLY_RECORDING.items() if key not in {"start", "end", "meeting_id"}},
+            )
+        valid_ref = {"source_type": "calendly", "source_id": "rec-1", "meeting_id": "event-1"}
+        valid_attrs = {key: value for key, value in CALENDLY_RECORDING.items() if key not in {"start", "end"}}
+        for extra_key in ("start", "end"):
+            with self.subTest(extra_key=extra_key), self.assertRaises(ValueError):
+                ledger.evidence_event(
+                    "calendly",
+                    valid_ref,
+                    observed_at=CALENDLY_RECORDING["start"],
+                    raw_source_span={"start": CALENDLY_RECORDING["start"], "end": CALENDLY_RECORDING["end"]},
+                    attributes={**valid_attrs, extra_key: CALENDLY_RECORDING[extra_key]},
+                )
+
+    def test_calendly_event_schema_is_strict_and_accepts_generated_event(self) -> None:
+        schema = json.loads((ROOT / "schemas" / "evidence-ledger-v1.json").read_text())
+        event_schema = schema["$defs"]["event"]
+        attrs_schema = schema["$defs"]["calendlyAttributes"]
+        source_ref_schema = schema["$defs"]["calendlySourceRef"]
+        span_schema = schema["$defs"]["calendlySourceSpan"]
+        self.assertFalse(attrs_schema["additionalProperties"])
+        self.assertFalse(source_ref_schema["additionalProperties"])
+        self.assertFalse(span_schema["additionalProperties"])
+        self.assertEqual(
+            set(attrs_schema["required"]),
+            set(CALENDLY_RECORDING) - {"start", "end"},
+        )
+        event = next(
+            item
+            for item in ledger.normalize_collector_snapshot(
+                complete_snapshot(
+                    calendly={"status": "ok", "complete": True, "recordings": [CALENDLY_RECORDING]}
+                )
+            )
+            if item.source_type == "calendly"
+        )
+        _assert_schema_contract(schema, schema["$defs"]["event"], event.document())
+        for location, key, value in (
+            ("attributes", "credentials", {"token": "secret"}),
+            ("attributes", "pagination", {"cursor": "secret"}),
+            ("source_ref", "path", "/private/recordings.json"),
+            ("raw_source_span", "cwd", "/private"),
+        ):
+            with self.subTest(location=location, key=key):
+                invalid = copy.deepcopy(event.document())
+                invalid[location][key] = value
+                with self.assertRaises(AssertionError):
+                    _assert_schema_contract(schema, schema["$defs"]["event"], invalid)
+        self.assertEqual(set(source_ref_schema["properties"]), set(event.source_ref))
+        self.assertEqual(set(span_schema["properties"]), set(event.raw_source_span))
+        self.assertEqual(set(attrs_schema["properties"]), set(event.attributes))
+        self.assertRegex(event.attributes["source_digest"], r"^sha256:[0-9a-f]{64}$")
+
     def test_content_address_is_stable_across_mapping_and_event_order(self) -> None:
         first = ledger.evidence_event(
             "codex_session",

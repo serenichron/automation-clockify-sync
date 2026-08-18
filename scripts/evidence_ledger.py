@@ -30,6 +30,13 @@ LEGACY_ALIAS_KEYS = (
     "id",
 )
 
+_CALENDLY_RECORDING_KEYS = frozenset({
+    "recording_id", "meeting_id", "title", "start", "end", "duration_seconds",
+    "organizer", "participants", "join_url", "transcript", "summary", "source_digest",
+})
+_CALENDLY_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+_CALENDLY_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
 
 class FrozenDict(dict):
     """A JSON-serializable mapping that refuses all mutations."""
@@ -88,6 +95,109 @@ def _compact_mapping(value: Mapping[str, Any] | None) -> dict[str, Any]:
     return {str(key): _json_value(item) for key, item in value.items() if item not in (None, "", [], {})}
 
 
+def _event_attributes(source_type: str, value: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize event attributes while retaining empty normalized Calendly fields."""
+    if source_type == "calendly":
+        return {str(key): _json_value(item) for key, item in value.items()}
+    return _compact_mapping(value)
+
+
+def _calendly_person(value: Any, *, allow_empty: bool) -> None:
+    if not isinstance(value, Mapping):
+        raise ValueError("Calendly person must be an object")
+    if set(value) - {"email", "name"}:
+        raise ValueError("Calendly person contains unsupported fields")
+    if not allow_empty and not value:
+        raise ValueError("Calendly participant identity is required")
+    for key in value:
+        if not isinstance(value[key], str) or not value[key]:
+            raise ValueError("Calendly person fields must be non-empty strings")
+
+
+def _calendly_timestamp(value: Any) -> dt.datetime:
+    if not isinstance(value, str) or not _CALENDLY_TIMESTAMP_RE.fullmatch(value):
+        raise ValueError("Calendly timestamps must be canonical UTC")
+    try:
+        return dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+    except ValueError as exc:
+        raise ValueError("Calendly timestamp is invalid") from exc
+
+
+def _validate_calendly_record(record: Any) -> None:
+    """Validate one Task 1 normalized recording without retaining raw envelopes."""
+    if not isinstance(record, Mapping):
+        raise ValueError("Calendly recording must be an object")
+    if set(record) != _CALENDLY_RECORDING_KEYS:
+        raise ValueError("Calendly recording fields are incomplete or unsupported")
+    for key in ("recording_id", "meeting_id"):
+        if not isinstance(record[key], str) or not record[key]:
+            raise ValueError("Calendly provider IDs are required")
+    if not isinstance(record["title"], str) or not record["title"]:
+        raise ValueError("Calendly title is required")
+    start = _calendly_timestamp(record["start"])
+    end = _calendly_timestamp(record["end"])
+    if end <= start:
+        raise ValueError("Calendly recording window is invalid")
+    duration = record["duration_seconds"]
+    if isinstance(duration, bool) or not isinstance(duration, int) or duration <= 0:
+        raise ValueError("Calendly duration must be a positive integer")
+    if duration != int((end - start).total_seconds()):
+        raise ValueError("Calendly duration does not match recording window")
+    _calendly_person(record["organizer"], allow_empty=True)
+    participants = record["participants"]
+    if not isinstance(participants, list):
+        raise ValueError("Calendly participants must be a list")
+    for participant in participants:
+        _calendly_person(participant, allow_empty=False)
+    if not isinstance(record["join_url"], str) or not isinstance(record["summary"], str):
+        raise ValueError("Calendly join URL and summary must be strings")
+    transcript = record["transcript"]
+    if not isinstance(transcript, list):
+        raise ValueError("Calendly transcript must be a list")
+    for item in transcript:
+        if not isinstance(item, Mapping) or set(item) - {"offset_seconds", "text", "speaker"}:
+            raise ValueError("Calendly transcript item is invalid")
+        if "text" not in item or not isinstance(item["text"], str):
+            raise ValueError("Calendly transcript text is required")
+        if "offset_seconds" in item and (
+            isinstance(item["offset_seconds"], bool)
+            or not isinstance(item["offset_seconds"], int)
+            or item["offset_seconds"] < 0
+        ):
+            raise ValueError("Calendly transcript offset is invalid")
+        if "speaker" in item and not isinstance(item["speaker"], str):
+            raise ValueError("Calendly transcript speaker is invalid")
+    if not isinstance(record["source_digest"], str) or not _CALENDLY_DIGEST_RE.fullmatch(record["source_digest"]):
+        raise ValueError("Calendly source digest is invalid")
+
+
+def _calendly_record_is_invalid(record: Any) -> bool:
+    try:
+        _validate_calendly_record(record)
+    except ValueError:
+        return True
+    return False
+
+
+def _validate_calendly_event(
+    source_ref: Mapping[str, Any],
+    observed_at: str | None,
+    raw_source_span: Mapping[str, Any],
+    attributes: Mapping[str, Any],
+) -> None:
+    if set(source_ref) != {"source_type", "source_id", "meeting_id"} or source_ref.get("source_type") != "calendly":
+        raise ValueError("Calendly source reference is invalid")
+    if set(raw_source_span) != {"start", "end"}:
+        raise ValueError("Calendly source span is invalid")
+    if observed_at != raw_source_span["start"]:
+        raise ValueError("Calendly observed timestamp is invalid")
+    if set(attributes) != _CALENDLY_RECORDING_KEYS - {"start", "end"}:
+        raise ValueError("Calendly event attributes are incomplete or unsupported")
+    _validate_calendly_record({**dict(attributes), "start": raw_source_span["start"], "end": raw_source_span["end"]})
+    if source_ref["source_id"] != attributes["recording_id"] or source_ref["meeting_id"] != attributes["meeting_id"]:
+        raise ValueError("Calendly source reference does not match recording")
+
+
 def _freeze_json(value: Any) -> Any:
     if isinstance(value, Mapping):
         return FrozenDict({str(key): _freeze_json(item) for key, item in value.items()})
@@ -122,6 +232,13 @@ class EvidenceEvent:
             raise ValueError("attributes must be an object")
         if not isinstance(self.legacy_aliases, Mapping):
             raise ValueError("legacy_aliases must be an object")
+        if self.source_type == "calendly":
+            _validate_calendly_event(
+                self.source_ref,
+                self.observed_at,
+                self.raw_source_span,
+                self.attributes,
+            )
         document = self.document(include_id=False)
         expected = EVENT_ID_PREFIX + sha256_hex(document)
         if self.evidence_id and self.evidence_id != expected:
@@ -129,7 +246,7 @@ class EvidenceEvent:
         object.__setattr__(self, "evidence_id", expected)
         object.__setattr__(self, "source_ref", _freeze_json(_compact_mapping(self.source_ref)))
         object.__setattr__(self, "raw_source_span", _freeze_json(_compact_mapping(self.raw_source_span)))
-        object.__setattr__(self, "attributes", _freeze_json(_compact_mapping(self.attributes)))
+        object.__setattr__(self, "attributes", _freeze_json(_event_attributes(self.source_type, self.attributes)))
         aliases = {str(key): str(value) for key, value in self.legacy_aliases.items() if value not in (None, "")}
         object.__setattr__(self, "legacy_aliases", _freeze_json(dict(sorted(aliases.items()))))
 
@@ -140,7 +257,7 @@ class EvidenceEvent:
             "source_ref": _compact_mapping(self.source_ref),
             "observed_at": self.observed_at,
             "raw_source_span": _compact_mapping(self.raw_source_span),
-            "attributes": _compact_mapping(self.attributes),
+            "attributes": _event_attributes(self.source_type, self.attributes),
             "legacy_aliases": _compact_mapping(self.legacy_aliases),
         }
         if include_id:
@@ -255,23 +372,39 @@ def _collector_count(details: Mapping[str, Any], record_keys: Sequence[str], cou
             return len(value)
     for key in count_keys:
         value = details.get(key)
-        if isinstance(value, int) and value >= 0:
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
             return value
     return None
+
+
+def _collector_count_is_malformed(details: Mapping[str, Any], count_keys: Sequence[str]) -> bool:
+    """Identify an explicitly supplied count that cannot be trusted."""
+    return any(
+        key in details
+        and details[key] is not None
+        and (
+            isinstance(details[key], bool)
+            or not isinstance(details[key], int)
+            or details[key] < 0
+        )
+        for key in count_keys
+    )
 
 
 def source_inventory_from_collector(snapshot: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     """Derive fail-closed source coverage from a full or compact collector snapshot.
 
     ``observed_count`` comes from materialized records when present, otherwise
-    from the collector's count metadata. ``expected_count`` is retained only
-    when the collector explicitly supplied one; a count is never fabricated.
+    from the collector's count metadata. Calendly's complete materialized
+    collection also supplies its expected count because the collector has no
+    separate total field; no count is inferred for other sources.
     """
     if not isinstance(snapshot, Mapping):
         raise ValueError("Collector snapshot must be an object")
     groups = (
         ("clockify", snapshot.get("clockify"), ("entries",), ("entry_count",)),
         ("fathom", snapshot.get("fathom"), ("meetings",), ("meeting_count",)),
+        ("calendly", snapshot.get("calendly"), ("recordings",), ("recording_count",)),
         ("multica_issues", snapshot.get("multica_issues"), ("issues",), ("issue_count",)),
     )
     inventory: dict[str, dict[str, Any]] = {}
@@ -281,12 +414,54 @@ def source_inventory_from_collector(snapshot: Mapping[str, Any]) -> dict[str, di
             continue
         status, reason = _collector_source_status(value)
         entry: dict[str, Any] = {"status": status}
+        if name == "calendly":
+            if "recordings" not in value and status == "complete":
+                entry.update(status="partial", reason="collector recordings are missing")
+            elif "recordings" in value and not isinstance(value.get("recordings"), list):
+                entry.update(status="partial", reason="collector recordings must be a list")
+            elif any(
+                _calendly_record_is_invalid(record)
+                for record in value["recordings"]
+            ):
+                entry.update(status="partial", reason="collector recording is malformed")
+        malformed_count_keys = ("expected_count", "recording_count") if name == "calendly" else count_keys
+        if _collector_count_is_malformed(value, malformed_count_keys):
+            entry.update(status="partial", reason="collector count metadata is invalid")
+        if (
+            name == "calendly"
+            and isinstance(value.get("recordings"), list)
+            and isinstance(value.get("recording_count"), int)
+            and not isinstance(value.get("recording_count"), bool)
+            and value["recording_count"] >= 0
+            and value["recording_count"] != len(value["recordings"])
+        ):
+            entry.update(status="partial", reason="collector recording count differs")
+        if (
+            name == "calendly"
+            and isinstance(value.get("expected_count"), int)
+            and not isinstance(value.get("expected_count"), bool)
+            and isinstance(value.get("recording_count"), int)
+            and not isinstance(value.get("recording_count"), bool)
+            and value["expected_count"] != value["recording_count"]
+        ):
+            entry.update(status="partial", reason="collector count metadata differs")
         observed = _collector_count(value, record_keys, count_keys)
         if observed is not None:
             entry["observed_count"] = observed
         expected = value.get("expected_count")
-        if isinstance(expected, int) and expected >= 0:
+        if isinstance(expected, int) and not isinstance(expected, bool) and expected >= 0:
             entry["expected_count"] = expected
+        elif (
+            name == "calendly"
+            and isinstance(value.get("recording_count"), int)
+            and not isinstance(value.get("recording_count"), bool)
+            and value["recording_count"] >= 0
+        ):
+            entry["expected_count"] = value["recording_count"]
+        elif name == "calendly" and isinstance(value.get("recordings"), list):
+            # A complete Calendly response has no separate total field; the
+            # materialized recording collection is the authoritative count.
+            entry["expected_count"] = len(value["recordings"])
         if reason:
             entry["reason"] = reason
         inventory[name] = entry
@@ -383,8 +558,23 @@ class EvidenceLedger:
             if current is not None and current.document() != event.document():
                 raise ValueError("Evidence ID collision with distinct content")
             by_id[event.evidence_id] = event
-        object.__setattr__(self, "events", tuple(by_id[event_id] for event_id in sorted(by_id)))
-        object.__setattr__(self, "source_inventory", _freeze_json(_normal_source_inventory(self.source_inventory)))
+        normalized_events = tuple(by_id[event_id] for event_id in sorted(by_id))
+        object.__setattr__(self, "events", normalized_events)
+        inventory = _normal_source_inventory(self.source_inventory)
+        calendly = inventory.get("calendly")
+        if calendly and calendly.get("status") == "complete":
+            event_count = sum(event.source_type == "calendly" for event in normalized_events)
+            if (
+                calendly.get("expected_count") != event_count
+                or calendly.get("observed_count") != event_count
+            ):
+                calendly = dict(calendly)
+                calendly.update(
+                    status="partial",
+                    reason="collector inventory count differs from ledger events",
+                )
+                inventory["calendly"] = calendly
+        object.__setattr__(self, "source_inventory", _freeze_json(inventory))
 
     @property
     def manifest(self) -> LedgerManifest:
@@ -468,6 +658,11 @@ def _snapshot_attributes(source_type: str, record: Mapping[str, Any]) -> dict[st
             "key": record.get("key"),
             "project_id": record.get("project_id"),
         })
+    elif source_type == "calendly":
+        # Calendly records are already normalized by the collector. Retain
+        # only reconciliation fields; transport envelopes and credentials do
+        # not belong in immutable evidence.
+        return {key: record[key] for key in _CALENDLY_RECORDING_KEYS if key not in {"start", "end"}}
     elif source_type in {"codex_sessions", "claude_bursts", "hermes_sessions", "hermes_db_sessions"}:
         shared.update({
             "title": record.get("title"),
@@ -521,13 +716,22 @@ def _multica_observed_at(record: Mapping[str, Any]) -> str | None:
 
 
 def _snapshot_event(source_type: str, record: Mapping[str, Any], index: int) -> EvidenceEvent:
+    if source_type == "calendly":
+        _validate_calendly_record(record)
     provenance = record.get("provenance") if isinstance(record.get("provenance"), Mapping) else {}
-    source_ref = _compact_mapping({
-        "source_type": source_type,
-        "source_id": record.get("recording_id") or record.get("id") or record.get("session_id") or f"row-{index}",
-        "machine": record.get("machine") or provenance.get("source_machine"),
-        "session_id": record.get("session_id") or provenance.get("source_session_id"),
-    })
+    if source_type == "calendly":
+        source_ref = {
+            "source_type": source_type,
+            "source_id": record["recording_id"],
+            "meeting_id": record["meeting_id"],
+        }
+    else:
+        source_ref = _compact_mapping({
+            "source_type": source_type,
+            "source_id": record.get("recording_id") or record.get("id") or record.get("session_id") or f"row-{index}",
+            "machine": record.get("machine") or provenance.get("source_machine"),
+            "session_id": record.get("session_id") or provenance.get("source_session_id"),
+        })
     attributes = _snapshot_attributes(source_type, record)
     return evidence_event(
         source_type,
@@ -537,7 +741,11 @@ def _snapshot_event(source_type: str, record: Mapping[str, Any], index: int) -> 
             if source_type == "multica"
             else str(record.get("start") or record.get("timestamp") or "") or None
         ),
-        raw_source_span=_span(record),
+        raw_source_span=(
+            {"start": record["start"], "end": record["end"]}
+            if source_type == "calendly"
+            else _span(record)
+        ),
         attributes=attributes,
         legacy_aliases=_legacy_aliases(record),
     )
@@ -605,10 +813,16 @@ def normalize_collector_snapshot(snapshot: Mapping[str, Any]) -> list[EvidenceEv
     source_groups = (
         ("clockify", _records(snapshot.get("clockify", {}).get("entries", []) if isinstance(snapshot.get("clockify"), Mapping) else [])),
         ("fathom", _records(snapshot.get("fathom", {}).get("meetings", []) if isinstance(snapshot.get("fathom"), Mapping) else [])),
+        ("calendly", _records(snapshot.get("calendly", {}).get("recordings", []) if isinstance(snapshot.get("calendly"), Mapping) else [])),
         ("multica", _records(snapshot.get("multica_issues", {}).get("issues", []) if isinstance(snapshot.get("multica_issues"), Mapping) else [])),
         ("enriched_context", _records(enriched) if not isinstance(enriched, Mapping) else []),
     )
     for source_type, records in source_groups:
+        if source_type == "calendly":
+            for index, record in enumerate(records, 1):
+                if not _calendly_record_is_invalid(record):
+                    events.append(_snapshot_event(source_type, record, index))
+            continue
         events.extend(_snapshot_event(source_type, record, index) for index, record in enumerate(records, 1))
     if isinstance(enriched, Mapping):
         for context_type, records in enriched.items():

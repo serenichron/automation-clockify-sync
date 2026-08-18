@@ -237,6 +237,10 @@ class ProcessIntegrationTests(unittest.TestCase):
             ledger.validate(ledger.manifest)
             self.assertEqual([], events)
             self.assertEqual("complete", ledger.manifest.document()["source_completeness"]["status"])
+            self.assertEqual(
+                {"status": "complete", "expected_count": 0, "observed_count": 0},
+                ledger.manifest.source_inventory["calendly"],
+            )
             self.assertEqual([], json.loads((run_dir / "proposals.json").read_text()))
             self.assertEqual([], json.loads((run_dir / "ambiguous.json").read_text()))
             self.assertEqual([], json.loads((run_dir / "skipped.json").read_text()))
