@@ -31,6 +31,7 @@ from scripts import clockify_portfolio_replay as portfolio_replay
 
 API = "https://api.clockify.me/api/v1"
 SCHEMA_VERSION = "clockify-approved-portfolio-post/v1"
+BOUNDARY_ADJUSTMENT_ALGORITHM = "clockify-subminute-boundaries/v1"
 POST_HTTP_TIMEOUT_NAME = "CLOCKIFY_POST_HTTP_TIMEOUT_SECONDS"
 POST_HTTP_TIMEOUT_DEFAULT_SECONDS = 45
 POST_HTTP_TIMEOUT_MIN_SECONDS = 5
@@ -462,6 +463,7 @@ def _align_subminute_boundaries(
                 "original_end": original_end,
                 "posted_start": plan["start"],
                 "posted_end": plan["end"],
+                "algorithm": BOUNDARY_ADJUSTMENT_ALGORITHM,
             })
     return adjusted, changes
 
@@ -506,6 +508,51 @@ def _receipt_item(plan: Mapping[str, Any], entry_id: str, disposition: str) -> d
     }
 
 
+def _receipt_key(item: Mapping[str, Any], *, kind: str) -> tuple[str, int]:
+    review_id = str(item.get("review_id") or "")
+    try:
+        segment_index = int(item.get("segment_index") or 0)
+    except (TypeError, ValueError) as error:
+        raise PortfolioPostError(f"prior posting receipt contains an invalid {kind} key") from error
+    if not review_id or segment_index <= 0:
+        raise PortfolioPostError(f"prior posting receipt contains an invalid {kind} key")
+    return review_id, segment_index
+
+
+def _same_instant(left: Any, right: Any) -> bool:
+    try:
+        return _parse(str(left)) == _parse(str(right))
+    except (TypeError, ValueError, PortfolioPostError):
+        return False
+
+
+def _adjustment_digest(
+    portfolio_sha: str, adjustments: Iterable[Mapping[str, Any]]
+) -> str:
+    payload = {
+        "portfolio_sha256": portfolio_sha,
+        "algorithm": BOUNDARY_ADJUSTMENT_ALGORITHM,
+        "adjustments": [
+            {
+                "review_id": str(item.get("review_id") or ""),
+                "segment_index": int(item.get("segment_index") or 0),
+                "original_start": str(item.get("original_start") or ""),
+                "original_end": str(item.get("original_end") or ""),
+                "posted_start": str(item.get("posted_start") or ""),
+                "posted_end": str(item.get("posted_end") or ""),
+                "algorithm": str(item.get("algorithm") or ""),
+            }
+            for item in sorted(
+                adjustments,
+                key=lambda item: _receipt_key(item, kind="boundary adjustment"),
+            )
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 def _apply_prior_receipt(
     plans: list[dict[str, Any]],
     path: Path,
@@ -514,53 +561,90 @@ def _apply_prior_receipt(
     prior = _read(path)
     if not isinstance(prior, Mapping) or prior.get("portfolio_sha256") != portfolio_sha:
         raise PortfolioPostError("prior posting receipt does not match the approved portfolio")
-    items = [
-        item
-        for name in ("created", "already_existing")
-        for item in prior.get(name, [])
-        if isinstance(item, Mapping)
-    ]
-    by_key = {
-        (str(item.get("review_id")), int(item.get("segment_index") or 0)): item
-        for item in items
+    approved_by_key = {
+        _receipt_key(plan, kind="approved plan"): plan for plan in plans
     }
-    adjustments = [
-        dict(item) for item in prior.get("boundary_adjustments", [])
-        if isinstance(item, Mapping)
-    ]
-    adjustments_by_key = {
-        (str(item.get("review_id")), int(item.get("segment_index") or 0)): item
-        for item in adjustments
-    }
+    if len(approved_by_key) != len(plans):
+        raise PortfolioPostError("approved portfolio contains duplicate posting keys")
+
+    by_key: dict[tuple[str, int], Mapping[str, Any]] = {}
+    for name in ("created", "already_existing"):
+        raw_items = prior.get(name, [])
+        if not isinstance(raw_items, list):
+            raise PortfolioPostError("prior posting receipt items must be a list")
+        for item in raw_items:
+            if not isinstance(item, Mapping):
+                raise PortfolioPostError("prior posting receipt contains an invalid item")
+            key = _receipt_key(item, kind="receipt")
+            if key in by_key:
+                raise PortfolioPostError("prior posting receipt contains a duplicate receipt key")
+            if key not in approved_by_key:
+                raise PortfolioPostError("prior posting receipt contains an unknown approved key")
+            by_key[key] = item
+
+    raw_adjustments = prior.get("boundary_adjustments", [])
+    if not isinstance(raw_adjustments, list):
+        raise PortfolioPostError("prior posting receipt boundary adjustments must be a list")
+    adjustments: list[dict[str, Any]] = []
+    adjustments_by_key: dict[tuple[str, int], dict[str, Any]] = {}
+    for raw in raw_adjustments:
+        if not isinstance(raw, Mapping):
+            raise PortfolioPostError("prior posting receipt contains an invalid boundary adjustment")
+        adjustment = dict(raw)
+        key = _receipt_key(adjustment, kind="boundary adjustment")
+        if key in adjustments_by_key:
+            raise PortfolioPostError("prior posting receipt contains a duplicate boundary adjustment key")
+        if key not in approved_by_key:
+            raise PortfolioPostError("prior posting receipt contains an unknown approved key")
+        adjustments.append(adjustment)
+        adjustments_by_key[key] = adjustment
+    if adjustments:
+        digest = prior.get("boundary_adjustments_sha256")
+        if not isinstance(digest, str) or digest != _adjustment_digest(portfolio_sha, adjustments):
+            raise PortfolioPostError("prior posting receipt adjustment digest is invalid")
+
     restored: list[dict[str, Any]] = []
     for original in plans:
         plan = dict(original)
-        item = by_key.get((plan["review_id"], plan["segment_index"]))
-        adjustment = adjustments_by_key.get((plan["review_id"], plan["segment_index"]))
-        if item is not None:
-            plan["start"] = str(item.get("start") or "")
-            plan["end"] = str(item.get("end") or "")
-            if not plan["start"] or not plan["end"]:
-                raise PortfolioPostError("prior posting receipt contains an invalid window")
+        key = _receipt_key(plan, kind="approved plan")
+        item = by_key.get(key)
+        adjustment = adjustments_by_key.get(key)
         if adjustment is not None:
             if (
-                original["start"] != str(adjustment.get("original_start") or "")
-                or original["end"] != str(adjustment.get("original_end") or "")
+                adjustment.get("algorithm") != BOUNDARY_ADJUSTMENT_ALGORITHM
+                or not _same_instant(original["start"], adjustment.get("original_start"))
+                or not _same_instant(original["end"], adjustment.get("original_end"))
             ):
                 raise PortfolioPostError(
                     "prior posting receipt adjustment does not match the approved window"
                 )
             posted_start = str(adjustment.get("posted_start") or "")
             posted_end = str(adjustment.get("posted_end") or "")
+            try:
+                start_delta = abs(int((_parse(posted_start) - _parse(original["start"])).total_seconds()))
+                end_delta = abs(int((_parse(posted_end) - _parse(original["end"])).total_seconds()))
+            except (TypeError, ValueError, PortfolioPostError) as error:
+                raise PortfolioPostError("prior posting receipt contains an invalid boundary adjustment") from error
+            if start_delta >= 60 or end_delta >= 60 or _parse(posted_end) <= _parse(posted_start):
+                raise PortfolioPostError("prior posting receipt adjustment is outside the permitted sub-minute window")
             if item is not None and (
-                plan["start"] != posted_start or plan["end"] != posted_end
+                not _same_instant(item.get("start"), posted_start)
+                or not _same_instant(item.get("end"), posted_end)
             ):
                 raise PortfolioPostError(
                     "prior posting receipt item does not match its adjustment"
                 )
-            plan["start"] = posted_start
-            plan["end"] = posted_end
-        if item is not None or adjustment is not None:
+            plan["start"] = _utc(posted_start)
+            plan["end"] = _utc(posted_end)
+        elif item is not None:
+            if (
+                not _same_instant(item.get("start"), original["start"])
+                or not _same_instant(item.get("end"), original["end"])
+            ):
+                raise PortfolioPostError(
+                    "prior posting receipt bounds do not match the approved window"
+                )
+        if adjustment is not None:
             _recompute_duration_fields(plan)
         restored.append(plan)
     _verify_approved_duration_seconds(restored)
@@ -705,6 +789,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             f"{len(conflicts)} approved blocks conflict with live Clockify entries: {detail}"
         )
 
+    planned_seconds = sum(plan["duration_seconds"] for plan in plans)
     receipt = {
         "schema_version": SCHEMA_VERSION,
         "status": "dry_run" if not args.execute else "running",
@@ -714,8 +799,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "replay_sha256": _sha256(args.replay_integrity.resolve()),
         "review_rows": len(portfolio["activities"]),
         "planned_blocks": len(plans),
-        "planned_minutes": sum(plan["duration_minutes"] for plan in plans),
+        "planned_seconds": planned_seconds,
+        "planned_minutes": planned_seconds // 60,
         "boundary_adjustments": boundary_adjustments,
+        "boundary_adjustments_sha256": _adjustment_digest(
+            portfolio_sha, boundary_adjustments
+        ),
         "created": [],
         "already_existing": [],
     }

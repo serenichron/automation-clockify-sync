@@ -7,7 +7,7 @@
   "required": [
     "schema_version", "allocation_mode", "ledger_manifest", "semantic_analysis",
     "proposals", "ambiguous", "skipped", "allocation", "fathom_reconciliation",
-    "correction_regression", "external_writes", "member_identities"
+    "correction_regression", "external_writes", "member_identities", "coverage_warnings"
   ],
   "properties": {
     "schema_version": {"const": 1},
@@ -37,6 +37,18 @@
     "meeting_dedup_tolerance_seconds": {"type": "integer", "minimum": 0},
     "meeting_split_digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
     "correction_regression": {"$ref": "#/$defs/correctionRegression"},
+    "coverage_warnings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source", "reason"],
+        "properties": {
+          "source": {"type": "string", "minLength": 1},
+          "reason": {"type": "string", "minLength": 1}
+        }
+      }
+    },
     "external_writes": {"const": false}
   },
   "allOf": [{

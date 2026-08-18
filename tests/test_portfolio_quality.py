@@ -179,6 +179,28 @@ class PortfolioQualityTests(unittest.TestCase):
         self.assertEqual({"expected": 1, "represented": 1, "excluded": 0, "missing": 0}, {key: report["fathom_coverage"][key] for key in ("expected", "represented", "excluded", "missing")})
         self.assertEqual(30, report["fragmentation"]["median_minutes"])
 
+    def test_legacy_minute_precision_compares_parsed_bounds(self):
+        event = fathom_event(start_time="09:00:00", end_time="09:30:00")
+        value = document(event)
+        row = value["activities"][0]
+        row.update({
+            "start": "2026-07-10T09:00:00+03:00",
+            "end": "2026-07-10T09:30:00+03:00",
+        })
+        row["allocation_segments"][0].update({
+            "start": row["start"],
+            "end": row["end"],
+        })
+        source = [{
+            **proposals()[0],
+            "start": row["start"],
+            "end": row["end"],
+        }]
+
+        report = quality.audit(value, ledger(event), source_proposals=source)
+
+        self.assertEqual("pass", report["status"])
+
     def test_positive_subminute_segment_is_valid_when_seconds_match_bounds(self):
         event = fathom_event(start_time="09:00:00", end_time="09:00:43")
         value = document(event)

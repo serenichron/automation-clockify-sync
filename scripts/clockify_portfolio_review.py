@@ -415,30 +415,31 @@ def _group_accounting(
         if review_minutes > source_minutes:
             raise PortfolioReviewError("group review minutes exceed its source minutes")
         excluded_minutes = source_minutes - review_minutes
-        source_seconds = source_minutes * 60
-        review_seconds = review_minutes * 60
-        excluded_seconds = excluded_minutes * 60
     exclusion_reasons = (
         _exclusion_reasons(source_activities, exceptions, omissions)
-        if excluded_seconds else []
+        if (excluded_seconds if exact else excluded_minutes) else []
     )
-    if excluded_seconds and not exclusion_reasons:
+    if (excluded_seconds if exact else excluded_minutes) and not exclusion_reasons:
         raise PortfolioReviewError(
-            "excluded source seconds lack a nonempty exception/omission reason"
+            "excluded source duration lacks a nonempty exception/omission reason"
         )
     if not exact and source_minutes != review_minutes + excluded_minutes:
         raise PortfolioReviewError("group source minute accounting does not balance")
-    if source_seconds != review_seconds + excluded_seconds:
+    if exact and source_seconds != review_seconds + excluded_seconds:
         raise PortfolioReviewError("group source second accounting does not balance")
-    return {
+    result = {
         "source_minutes": source_minutes,
         "review_minutes": review_minutes,
         "excluded_minutes": excluded_minutes,
-        "source_seconds": source_seconds,
-        "review_seconds": review_seconds,
-        "excluded_seconds": excluded_seconds,
         "exclusion_reasons": exclusion_reasons,
     }
+    if exact:
+        result.update({
+            "source_seconds": source_seconds,
+            "review_seconds": review_seconds,
+            "excluded_seconds": excluded_seconds,
+        })
+    return result
 
 
 def _portfolio_accounting(
@@ -936,9 +937,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if review_minutes != sum(int(report["review_minutes"]) for report in group_reports):
             raise PortfolioReviewError("portfolio groups do not cover all review minutes")
         _portfolio_accounting(source_minutes, review_minutes, excluded_minutes)
-        source_seconds = source_minutes * 60
-        review_seconds = review_minutes * 60
-        excluded_seconds = excluded_minutes * 60
     result = {
         "schema_version": 1,
         "review_prompt_version": semantic_analyzer.PORTFOLIO_REVIEW_PROMPT_VERSION,
@@ -954,15 +952,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "source_minutes": source_minutes,
         "review_minutes": review_minutes,
         "excluded_minutes": excluded_minutes,
-        "source_seconds": source_seconds,
-        "review_seconds": review_seconds,
-        "excluded_seconds": excluded_seconds,
         "activities": reviewed_rows,
         "exceptions": exceptions,
         "omissions": omissions,
         "groups": group_reports,
         "cache": cache.summary(),
     }
+    if exact:
+        result.update({
+            "source_seconds": source_seconds,
+            "review_seconds": review_seconds,
+            "excluded_seconds": excluded_seconds,
+        })
     args.output_dir.mkdir(parents=True, exist_ok=True)
     _write_json(args.output_dir / "portfolio-review.json", result)
     _write_csv(args.output_dir / "portfolio-review.csv", reviewed_rows)

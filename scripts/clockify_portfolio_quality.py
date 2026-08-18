@@ -1005,8 +1005,16 @@ def audit(
         elif exact_row:
             structural.append({"review_id": review_id, "reason": "missing row duration_seconds"})
         if parsed_segments and (row.get("start") is not None or row.get("end") is not None):
-            timespec = "seconds" if exact_row else "minutes"
-            if row.get("start") != min(start for start, _ in parsed_segments).isoformat(timespec=timespec) or row.get("end") != max(end for _, end in parsed_segments).isoformat(timespec=timespec):
+            try:
+                row_start = _parse(row.get("start"))
+                row_end = _parse(row.get("end"))
+            except (TypeError, ValueError):
+                structural.append({"review_id": review_id, "reason": "invalid row bounds"})
+                continue
+            if (
+                row_start != min(start for start, _ in parsed_segments)
+                or row_end != max(end for _, end in parsed_segments)
+            ):
                 structural.append({"review_id": review_id, "reason": "row bounds do not match allocation segments"})
     intervals.sort()
     overlaps = []

@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 from pathlib import Path
+import re
 import tempfile
 import unittest
 from unittest import mock
@@ -19,6 +20,86 @@ ROOT = Path(__file__).resolve().parents[1]
 def write_json(path: Path, value) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def assert_schema_valid(schema, candidate) -> None:
+    """Validate an emitted artifact against the checked-in JSON Schema subset."""
+    def resolve(declaration):
+        reference = declaration.get("$ref")
+        if not reference:
+            return declaration
+        target = schema
+        for part in reference.removeprefix("#/").split("/"):
+            target = target[part]
+        return target
+
+    def validate(declaration, value, path="$"):
+        declaration = resolve(declaration)
+        for child in declaration.get("allOf", []):
+            validate(child, value, path)
+        if "anyOf" in declaration:
+            failures = []
+            for child in declaration["anyOf"]:
+                try:
+                    validate(child, value, path)
+                except AssertionError as error:
+                    failures.append(error)
+                else:
+                    break
+            else:
+                raise AssertionError(f"{path}: no schema anyOf declaration matched")
+        if "if" in declaration:
+            try:
+                validate(declaration["if"], value, path)
+            except AssertionError:
+                pass
+            else:
+                validate(declaration.get("then", {}), value, path)
+        if "const" in declaration and value != declaration["const"]:
+            raise AssertionError(f"{path}: expected schema constant")
+        if "enum" in declaration and value not in declaration["enum"]:
+            raise AssertionError(f"{path}: value is outside schema enum")
+        kind = declaration.get("type")
+        kinds = kind if isinstance(kind, list) else [kind] if kind else []
+        valid_type = {
+            "object": lambda item: isinstance(item, dict),
+            "array": lambda item: isinstance(item, list),
+            "string": lambda item: isinstance(item, str),
+            "integer": lambda item: isinstance(item, int) and not isinstance(item, bool),
+            "null": lambda item: item is None,
+        }
+        if kinds and not any(valid_type[item](value) for item in kinds):
+            raise AssertionError(f"{path}: wrong JSON Schema type")
+        if isinstance(value, dict):
+            for key in declaration.get("required", []):
+                if key not in value:
+                    raise AssertionError(f"{path}: missing required {key}")
+            properties = declaration.get("properties", {})
+            if declaration.get("additionalProperties") is False:
+                unknown = set(value) - set(properties)
+                if unknown:
+                    raise AssertionError(f"{path}: undeclared properties {sorted(unknown)}")
+            for key, child in properties.items():
+                if key in value:
+                    validate(child, value[key], f"{path}.{key}")
+        if isinstance(value, list):
+            if len(value) < declaration.get("minItems", 0):
+                raise AssertionError(f"{path}: fewer items than schema minimum")
+            if declaration.get("uniqueItems") and len({json.dumps(item, sort_keys=True) for item in value}) != len(value):
+                raise AssertionError(f"{path}: duplicate array items")
+            if "items" in declaration:
+                for index, item in enumerate(value):
+                    validate(declaration["items"], item, f"{path}[{index}]")
+        if isinstance(value, str):
+            if len(value) < declaration.get("minLength", 0):
+                raise AssertionError(f"{path}: string below schema minimum")
+            if "pattern" in declaration and not re.search(declaration["pattern"], value):
+                raise AssertionError(f"{path}: string misses schema pattern")
+        if isinstance(value, int) and not isinstance(value, bool):
+            if value < declaration.get("minimum", value):
+                raise AssertionError(f"{path}: integer below schema minimum")
+
+    validate(schema, candidate)
 
 
 def session_event(source_id: str, timestamp: str, content: str = "Fix Clockify"):
@@ -1617,6 +1698,17 @@ class WorkAccountingPipelineTests(unittest.TestCase):
 
         self.assertIn("semantic_analysis", result)
         self.assertEqual("sessions/macbook", result["coverage_warnings"][0]["source"])
+        self.assertEqual(
+            {
+                "source": "sessions/macbook",
+                "reason": "peer evidence unavailable; interval retained for later backfill",
+            },
+            result["coverage_warnings"][0],
+        )
+        schema = json.loads(
+            (ROOT / "schemas" / "work-accounting-result-v1.json").read_text()
+        )
+        assert_schema_valid(schema, result)
 
     def test_replay_is_byte_stable_for_unchanged_inputs_and_versions(self):
         first = session_event("session-1:event:1", "2026-07-10T09:00:00+03:00")

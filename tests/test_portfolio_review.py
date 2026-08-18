@@ -1,6 +1,16 @@
+import argparse
 import importlib.util
+import json
 from pathlib import Path
+import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest import mock
+
+from scripts import clockify_portfolio_quality as quality
+from scripts import clockify_portfolio_replay as replay
+from scripts import clockify_post_approved_portfolio as poster
+from scripts import evidence_ledger
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "clockify_portfolio_review.py"
@@ -105,6 +115,229 @@ class PortfolioReviewTests(unittest.TestCase):
         self.assertNotIn("duration_seconds", rows[0]["allocation_segments"][0])
         self.assertEqual(1, accounting["review_minutes"])
         self.assertEqual(0, accounting["excluded_minutes"])
+
+    def test_legacy_review_omits_all_exact_second_aggregates(self):
+        source_activities = [{"activity_id": "act-one", "evidence_ids": ["ev-one"]}]
+        analysis = {
+            "activities": [{
+                "activity_id": "act-one",
+                "evidence_ids": ["ev-one"],
+                "action": "Reviewed",
+                "object": "legacy portfolio row",
+                "outcome": "retained one minute",
+                "effort": {"recommended_minutes": 1},
+                "semantic_confidence": "high",
+                "project_recommendation": {
+                    "name": "Serenichron Level 2",
+                    "prefix": "SC",
+                    "tag_names": ["Processes"],
+                },
+            }],
+        }
+        proposal = {
+            "activity_id": "act-one",
+            "start": "2026-07-10T09:00:00+03:00",
+            "end": "2026-07-10T09:01:00+03:00",
+            "duration_minutes": 1,
+        }
+        event = {
+            "evidence_id": "ev-one",
+            "source_type": "fathom",
+            "raw_source_span": {
+                "start": proposal["start"], "end": proposal["end"],
+            },
+        }
+        routing = {
+            "session_routes": [],
+            "meeting_routes": [{
+                "project_name": "Serenichron Level 2",
+                "prefix": "SC",
+                "tag_names": ["Processes"],
+            }],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = root / "run"
+            (run_dir / "evidence").mkdir(parents=True)
+            (run_dir / "evidence" / "evidence-ledger.json").write_text(
+                json.dumps({"events": [event]}), encoding="utf-8"
+            )
+            (run_dir / "proposals.json").write_text(
+                json.dumps([proposal]), encoding="utf-8"
+            )
+            analysis_path = root / "analysis.json"
+            analysis_path.write_text(json.dumps(analysis), encoding="utf-8")
+            routing_path = root / "routing.json"
+            routing_path.write_text(json.dumps(routing), encoding="utf-8")
+            args = argparse.Namespace(
+                run_dir=run_dir,
+                analysis_fixture=analysis_path,
+                routing=routing_path,
+                output_dir=root / "review",
+                cache=root / "cache.json",
+                since="2026-07-01",
+                until="2026-07-31",
+                max_activities=20,
+                workers=1,
+            )
+            endpoint = SimpleNamespace(model="deepseek-v4-flash:cloud", revision="rev")
+            with mock.patch.object(
+                portfolio.semantic_analyzer.AnalyzerEndpoint, "from_env", return_value=endpoint
+            ):
+                result = portfolio.run(args)
+
+        self.assertNotIn("source_seconds", result)
+        self.assertNotIn("review_seconds", result)
+        self.assertNotIn("excluded_seconds", result)
+        self.assertTrue(all(
+            "source_seconds" not in group
+            and "review_seconds" not in group
+            and "excluded_seconds" not in group
+            for group in result["groups"]
+        ))
+
+    def test_legacy_precision_survives_review_quality_replay_and_posting(self):
+        event = evidence_ledger.evidence_event(
+            "fathom",
+            {"source_type": "fathom", "source_id": "legacy-meeting"},
+            observed_at="2026-07-10T09:00:00+03:00",
+            raw_source_span={
+                "start": "2026-07-10T09:00:00+03:00",
+                "end": "2026-07-10T09:01:00+03:00",
+            },
+            attributes={
+                "title": "Legacy client review",
+                "recorded_by_email": "vlad@serenichron.com",
+                "meeting_id": "events/legacy-meeting",
+            },
+        )
+        proposal = {
+            "activity_id": "act-one",
+            "start": "2026-07-10T09:00:00+03:00",
+            "end": "2026-07-10T09:01:00+03:00",
+            "duration_minutes": 1,
+            "client_project": "Serenichron Level 2",
+            "tag_names": ["Processes"],
+        }
+        analysis = {
+            "activities": [{
+                "activity_id": "act-one",
+                "evidence_ids": [event.evidence_id],
+                "action": "Reviewed",
+                "object": "legacy portfolio row",
+                "outcome": "retained one minute",
+                "effort": {"recommended_minutes": 1},
+                "semantic_confidence": "high",
+                "semantic_reviewer_model": quality.REQUIRED_MODEL,
+                "semantic_reviewer_revision": quality.REQUIRED_REVISION,
+                "project_recommendation": {
+                    "name": "Serenichron Level 2",
+                    "prefix": "SC",
+                    "tag_names": ["Processes"],
+                },
+            }],
+        }
+        routing = {
+            "session_routes": [],
+            "meeting_routes": [{
+                "project_name": "Serenichron Level 2",
+                "prefix": "SC",
+                "tag_names": ["Processes"],
+            }],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = root / "run"
+            immutable = evidence_ledger.EvidenceLedger(
+                (event,),
+                {"fathom": {
+                    "status": "complete", "expected_count": 1, "observed_count": 1,
+                }},
+            )
+            ledger_document = {
+                "schema_version": immutable.manifest.schema_version,
+                "manifest": immutable.manifest.document(),
+                "events": [event.document()],
+            }
+            (run_dir / "evidence").mkdir(parents=True)
+            (run_dir / "evidence" / "evidence-ledger.json").write_text(
+                json.dumps(ledger_document), encoding="utf-8"
+            )
+            (run_dir / "proposals.json").write_text(
+                json.dumps([proposal]), encoding="utf-8"
+            )
+            analysis_path = root / "analysis.json"
+            analysis_path.write_text(json.dumps(analysis), encoding="utf-8")
+            routing_path = root / "routing.json"
+            routing_path.write_text(json.dumps(routing), encoding="utf-8")
+            args = argparse.Namespace(
+                run_dir=run_dir,
+                analysis_fixture=analysis_path,
+                routing=routing_path,
+                output_dir=root / "review",
+                cache=root / "cache.json",
+                since="2026-07-01",
+                until="2026-07-31",
+                max_activities=20,
+                workers=1,
+            )
+            endpoint = SimpleNamespace(
+                model=quality.REQUIRED_MODEL, revision=quality.REQUIRED_REVISION,
+            )
+            with (
+                mock.patch.object(
+                    portfolio.semantic_analyzer.AnalyzerEndpoint, "from_env", return_value=endpoint
+                ),
+                mock.patch.object(portfolio.semantic_analyzer, "_require_private_text_approval"),
+            ):
+                review = portfolio.run(args)
+
+            quality_report = quality.audit(
+                review, ledger_document, source_proposals=[proposal], routing=routing,
+            )
+            (run_dir / "semantic-analysis.json").write_text(
+                json.dumps({"analyzer_cache": {"records": []}}), encoding="utf-8"
+            )
+            (run_dir / "work-accounting-result.json").write_text(
+                json.dumps({"proposals": []}), encoding="utf-8"
+            )
+            (run_dir / "fathom-reconciliation.json").write_text("[]", encoding="utf-8")
+            review_path = root / "portfolio-review.json"
+            review_path.write_text(json.dumps(review), encoding="utf-8")
+            quality_path = root / "portfolio-quality.json"
+            quality_path.write_text(json.dumps(quality_report), encoding="utf-8")
+            repair_path = root / "portfolio-repair.json"
+            repair_path.write_text(json.dumps({"repair": {
+                "model": quality.REQUIRED_MODEL, "revision": quality.REQUIRED_REVISION,
+            }}), encoding="utf-8")
+            seal = replay.seal(
+                run_dir=run_dir,
+                review=review_path,
+                repair=repair_path,
+                quality=quality_path,
+                routing=routing_path,
+            )
+            replay_report = replay.verify(
+                seal,
+                run_dir=run_dir,
+                review=review_path,
+                repair=repair_path,
+                quality=quality_path,
+                routing=routing_path,
+            )
+            posting_plans = poster._plans(review, {
+                ("Serenichron Level 2", ("Processes",)): {
+                    "project_id": "project-1", "tag_ids": ["tag-1"], "billable": True,
+                },
+            })
+
+        self.assertNotIn("source_seconds", review)
+        self.assertEqual("pass", quality_report["status"])
+        self.assertEqual("pass", replay_report["status"])
+        self.assertEqual(60, posting_plans[0]["duration_seconds"])
+        self.assertEqual(1, posting_plans[0]["duration_minutes"])
 
     def test_package_review_preserves_subminute_source_boundaries_and_seconds(self):
         source_activities = [{"activity_id": "act-one", "evidence_ids": ["ev-one"]}]

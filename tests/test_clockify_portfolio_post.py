@@ -81,7 +81,7 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
         plans = [
             {
                 "review_id": "pvi-0123456789abcdef01234567",
-                "segment_index": 0,
+                "segment_index": 1,
                 "start": "2026-08-14T10:00:00Z",
                 "end": "2026-08-14T10:10:30Z",
                 "duration_minutes": 10,
@@ -91,7 +91,7 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
             },
             {
                 "review_id": "pvi-0123456789abcdef01234567",
-                "segment_index": 1,
+                "segment_index": 2,
                 "start": "2026-08-14T10:10:30Z",
                 "end": "2026-08-14T10:20:30Z",
                 "duration_minutes": 10,
@@ -118,7 +118,7 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
         plans = [
             {
                 "review_id": "pvi-0123456789abcdef01234567",
-                "segment_index": 0,
+                "segment_index": 1,
                 "start": "2026-08-14T10:00:00Z",
                 "end": "2026-08-14T10:10:30Z",
                 "duration_minutes": 10,
@@ -126,7 +126,7 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
             },
             {
                 "review_id": "pvi-0123456789abcdef01234567",
-                "segment_index": 1,
+                "segment_index": 2,
                 "start": "2026-08-14T10:10:30Z",
                 "end": "2026-08-14T10:20:30Z",
                 "duration_minutes": 10,
@@ -138,7 +138,7 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
             "created": [
                 {
                     "review_id": "pvi-0123456789abcdef01234567",
-                    "segment_index": 0,
+                    "segment_index": 1,
                     "start": "2026-08-14T10:00:17Z",
                     "end": "2026-08-14T10:10:30Z",
                     "duration_minutes": 10,
@@ -146,7 +146,7 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
                 },
                 {
                     "review_id": "pvi-0123456789abcdef01234567",
-                    "segment_index": 1,
+                    "segment_index": 2,
                     "start": "2026-08-14T10:10:30Z",
                     "end": "2026-08-14T10:20:47Z",
                     "duration_minutes": 10,
@@ -154,7 +154,30 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
                 },
             ],
             "already_existing": [],
+            "boundary_adjustments": [
+                {
+                    "review_id": "pvi-0123456789abcdef01234567",
+                    "segment_index": 1,
+                    "original_start": "2026-08-14T10:00:00Z",
+                    "original_end": "2026-08-14T10:10:30Z",
+                    "posted_start": "2026-08-14T10:00:17Z",
+                    "posted_end": "2026-08-14T10:10:30Z",
+                    "algorithm": poster.BOUNDARY_ADJUSTMENT_ALGORITHM,
+                },
+                {
+                    "review_id": "pvi-0123456789abcdef01234567",
+                    "segment_index": 2,
+                    "original_start": "2026-08-14T10:10:30Z",
+                    "original_end": "2026-08-14T10:20:30Z",
+                    "posted_start": "2026-08-14T10:10:30Z",
+                    "posted_end": "2026-08-14T10:20:47Z",
+                    "algorithm": poster.BOUNDARY_ADJUSTMENT_ALGORITHM,
+                },
+            ],
         }
+        receipt["boundary_adjustments_sha256"] = poster._adjustment_digest(
+            "approved-sha", receipt["boundary_adjustments"]
+        )
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "receipt.json"
@@ -169,7 +192,7 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
     def test_prior_dry_run_adjustments_restore_adjusted_bounds(self) -> None:
         plans = [{
             "review_id": "pvi-0123456789abcdef01234567",
-            "segment_index": 0,
+            "segment_index": 1,
             "start": "2026-08-14T10:00:00Z",
             "end": "2026-08-14T10:10:30Z",
             "duration_minutes": 10,
@@ -181,13 +204,17 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
             "already_existing": [],
             "boundary_adjustments": [{
                 "review_id": "pvi-0123456789abcdef01234567",
-                "segment_index": 0,
+                "segment_index": 1,
                 "original_start": "2026-08-14T10:00:00Z",
                 "original_end": "2026-08-14T10:10:30Z",
                 "posted_start": "2026-08-14T10:00:17Z",
                 "posted_end": "2026-08-14T10:10:30Z",
+                "algorithm": poster.BOUNDARY_ADJUSTMENT_ALGORITHM,
             }],
         }
+        receipt["boundary_adjustments_sha256"] = poster._adjustment_digest(
+            "approved-sha", receipt["boundary_adjustments"]
+        )
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "receipt.json"
@@ -205,7 +232,7 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
     def test_prior_executed_receipt_confirms_adjusted_bounds(self) -> None:
         plans = [{
             "review_id": "pvi-0123456789abcdef01234567",
-            "segment_index": 0,
+            "segment_index": 1,
             "start": "2026-08-14T10:00:00Z",
             "end": "2026-08-14T10:10:30Z",
             "duration_minutes": 10,
@@ -215,20 +242,24 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
             "portfolio_sha256": "approved-sha",
             "created": [{
                 "review_id": "pvi-0123456789abcdef01234567",
-                "segment_index": 0,
+                "segment_index": 1,
                 "start": "2026-08-14T10:00:17Z",
                 "end": "2026-08-14T10:10:30Z",
             }],
             "already_existing": [],
             "boundary_adjustments": [{
                 "review_id": "pvi-0123456789abcdef01234567",
-                "segment_index": 0,
+                "segment_index": 1,
                 "original_start": "2026-08-14T10:00:00Z",
                 "original_end": "2026-08-14T10:10:30Z",
                 "posted_start": "2026-08-14T10:00:17Z",
                 "posted_end": "2026-08-14T10:10:30Z",
+                "algorithm": poster.BOUNDARY_ADJUSTMENT_ALGORITHM,
             }],
         }
+        receipt["boundary_adjustments_sha256"] = poster._adjustment_digest(
+            "approved-sha", receipt["boundary_adjustments"]
+        )
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "receipt.json"
@@ -277,7 +308,141 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
             path = Path(directory) / "receipt.json"
             path.write_text(json.dumps(receipt), encoding="utf-8")
             with self.assertRaisesRegex(
-                poster.PortfolioPostError, "approved duration"
+                poster.PortfolioPostError, "bounds do not match"
+            ):
+                poster._apply_prior_receipt(plans, path, "approved-sha")
+
+    def test_prior_receipt_rejects_exact_same_duration_relocation(self) -> None:
+        plans = [{
+            "review_id": "pvi-0123456789abcdef01234567",
+            "segment_index": 1,
+            "start": "2026-08-14T10:00:00Z",
+            "end": "2026-08-14T10:01:00Z",
+            "duration_minutes": 1,
+            "duration_seconds": 60,
+            "approved_duration_seconds": 60,
+        }]
+        receipt = {
+            "portfolio_sha256": "approved-sha",
+            "created": [{
+                "review_id": plans[0]["review_id"],
+                "segment_index": 1,
+                "start": "2026-08-14T17:00:00Z",
+                "end": "2026-08-14T17:01:00Z",
+            }],
+            "already_existing": [],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receipt.json"
+            path.write_text(json.dumps(receipt), encoding="utf-8")
+            with self.assertRaisesRegex(
+                poster.PortfolioPostError, "bounds do not match"
+            ):
+                poster._apply_prior_receipt(plans, path, "approved-sha")
+
+    def test_prior_receipt_rejects_legacy_same_duration_relocation(self) -> None:
+        portfolio = {
+            "activities": [{
+                "review_id": "pvi-0123456789abcdef01234567",
+                "client_project": "Example Level 2",
+                "tag_names": ["Technical development"],
+                "description": "EX — Preserve recorded meeting time",
+                "duration_minutes": 1,
+                "allocation_segments": [{
+                    "start": "2026-08-14T10:00:00+03:00",
+                    "end": "2026-08-14T10:01:00+03:00",
+                    "duration_minutes": 1,
+                }],
+            }],
+        }
+        routes = {
+            ("Example Level 2", ("Technical development",)): {
+                "project_id": "project-1", "tag_ids": ["tag-1"], "billable": True,
+            },
+        }
+        plans = poster._plans(portfolio, routes)
+        receipt = {
+            "portfolio_sha256": "approved-sha",
+            "created": [{
+                "review_id": plans[0]["review_id"],
+                "segment_index": 1,
+                "start": "2026-08-14T17:00:00Z",
+                "end": "2026-08-14T17:01:00Z",
+            }],
+            "already_existing": [],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receipt.json"
+            path.write_text(json.dumps(receipt), encoding="utf-8")
+            with self.assertRaisesRegex(
+                poster.PortfolioPostError, "bounds do not match"
+            ):
+                poster._apply_prior_receipt(plans, path, "approved-sha")
+
+    def test_prior_receipt_rejects_duplicate_receipt_key(self) -> None:
+        plans = [{
+            "review_id": "pvi-0123456789abcdef01234567",
+            "segment_index": 1,
+            "start": "2026-08-14T10:00:00Z",
+            "end": "2026-08-14T10:01:00Z",
+            "duration_minutes": 1,
+            "duration_seconds": 60,
+            "approved_duration_seconds": 60,
+        }]
+        item = {
+            "review_id": plans[0]["review_id"],
+            "segment_index": 1,
+            "start": plans[0]["start"],
+            "end": plans[0]["end"],
+        }
+        receipt = {
+            "portfolio_sha256": "approved-sha",
+            "created": [item],
+            "already_existing": [item],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receipt.json"
+            path.write_text(json.dumps(receipt), encoding="utf-8")
+            with self.assertRaisesRegex(poster.PortfolioPostError, "duplicate receipt key"):
+                poster._apply_prior_receipt(plans, path, "approved-sha")
+
+    def test_prior_receipt_rejects_changed_bounds_without_bound_adjustment(self) -> None:
+        plans = [{
+            "review_id": "pvi-0123456789abcdef01234567",
+            "segment_index": 1,
+            "start": "2026-08-14T10:00:00Z",
+            "end": "2026-08-14T10:01:00Z",
+            "duration_minutes": 1,
+            "duration_seconds": 60,
+            "approved_duration_seconds": 60,
+        }]
+        receipt = {
+            "portfolio_sha256": "approved-sha",
+            "created": [{
+                "review_id": plans[0]["review_id"],
+                "segment_index": 1,
+                "start": "2026-08-14T10:00:17Z",
+                "end": "2026-08-14T10:01:17Z",
+            }],
+            "already_existing": [],
+            "boundary_adjustments": [{
+                "review_id": plans[0]["review_id"],
+                "segment_index": 1,
+                "original_start": plans[0]["start"],
+                "original_end": plans[0]["end"],
+                "posted_start": "2026-08-14T10:00:17Z",
+                "posted_end": "2026-08-14T10:01:17Z",
+            }],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receipt.json"
+            path.write_text(json.dumps(receipt), encoding="utf-8")
+            with self.assertRaisesRegex(
+                poster.PortfolioPostError, "adjustment digest"
             ):
                 poster._apply_prior_receipt(plans, path, "approved-sha")
 
@@ -459,6 +624,92 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
                 "start=2026-08-13T07%3A00%3A00Z&end=2026-08-15T07%3A30%3A00Z",
                 calls,
             )
+
+    def test_receipt_derives_planned_minutes_from_authoritative_seconds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            portfolio_path = root / "portfolio.json"
+            quality_path = root / "quality.json"
+            routing_path = root / "routing.json"
+            receipt_path = root / "receipt.json"
+            replay_path = root / "replay.json"
+            portfolio = {
+                "external_writes": False,
+                "repair": {"status": "complete", "unresolved_wording": []},
+                "activities": [{
+                    "review_id": "pvi-0123456789abcdef01234567",
+                    "client_project": "Example Level 2",
+                    "tag_names": ["Technical development"],
+                    "description": "EX — Preserve exact recorded meeting time",
+                    "duration_minutes": 5,
+                    "duration_seconds": 301,
+                    "validation_status": "flash_validated",
+                    "allocation_segments": [
+                        {
+                            "start": "2026-08-14T10:00:00+03:00",
+                            "end": "2026-08-14T10:02:31+03:00",
+                            "duration_minutes": 2,
+                            "duration_seconds": 151,
+                        },
+                        {
+                            "start": "2026-08-14T10:05:00+03:00",
+                            "end": "2026-08-14T10:07:30+03:00",
+                            "duration_minutes": 2,
+                            "duration_seconds": 150,
+                        },
+                    ],
+                }],
+            }
+            portfolio_path.write_text(json.dumps(portfolio), encoding="utf-8")
+            quality = {"status": "pass"}
+            quality_path.write_text(json.dumps(quality), encoding="utf-8")
+            replay_path.write_text(json.dumps({
+                "status": "pass",
+                "identity": {"artifacts": {
+                    "repair": portfolio_replay._digest(portfolio),
+                    "quality": portfolio_replay._digest(quality),
+                }},
+            }), encoding="utf-8")
+            routing_path.write_text(json.dumps({
+                "clockify_user_id": "user-1",
+                "session_routes": [{
+                    "project_name": "Example Level 2",
+                    "tag_names": ["Technical development"],
+                    "project_suffix": "123456",
+                    "tag_suffixes": ["654321"],
+                }],
+            }), encoding="utf-8")
+            args = argparse.Namespace(
+                portfolio=portfolio_path,
+                quality_report=quality_path,
+                replay_integrity=replay_path,
+                routing=routing_path,
+                receipt=receipt_path,
+                prior_receipt=None,
+                expected_portfolio_sha256=hashlib.sha256(
+                    portfolio_path.read_bytes()
+                ).hexdigest(),
+                execute=False,
+            )
+
+            def paged(path: str, _api_key: str, *, timeout_seconds: int):
+                if path.startswith("/workspaces/workspace-1/projects"):
+                    return [{"id": "project-123456"}]
+                if path.startswith("/workspaces/workspace-1/tags"):
+                    return [{"id": "tag-654321"}]
+                return []
+
+            with (
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "secret",
+                    "CLOCKIFY_WORKSPACE_ID": "workspace-1",
+                }),
+                mock.patch.object(poster, "_paged", side_effect=paged),
+            ):
+                receipt = poster.run(args)
+
+        self.assertEqual(5, receipt["planned_minutes"])
+        self.assertEqual(301, receipt["planned_seconds"])
 
 
 if __name__ == "__main__":
