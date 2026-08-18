@@ -12,8 +12,14 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import re
 import sys
 from typing import Any, Mapping
+
+try:
+    from scripts import meeting_reconciliation
+except ImportError:  # pragma: no cover - direct execution fallback
+    import meeting_reconciliation  # type: ignore[no-redef]
 
 
 VOLATILE_KEYS = frozenset({
@@ -28,6 +34,13 @@ RUN_ARTIFACTS = {
     "proposals": "proposals.json",
     "fathom_reconciliation": "fathom-reconciliation.json",
 }
+_SHA256 = re.compile(r"^sha256:[a-f0-9]{64}$")
+_MEETING_IDENTITY_FIELDS = frozenset({
+    "meeting_reconciliation_digest",
+    "meeting_dedup_version",
+    "meeting_dedup_tolerance_seconds",
+    "meeting_split_digest",
+})
 
 
 class PortfolioReplayError(RuntimeError):
@@ -82,6 +95,84 @@ def _cache_decisions(analysis: Mapping[str, Any]) -> list[dict[str, str]]:
     return sorted(records, key=lambda row: (row["cache_key"], row["decision_digest"]))
 
 
+def _meeting_split_digest(accounting: Mapping[str, Any]) -> str:
+    """Digest only timestamp-evidenced canonical-meeting split provenance."""
+    proposals = accounting.get("proposals", [])
+    meeting_splits = [
+        {
+            "id": proposal.get("id"),
+            "canonical_meeting_id": (proposal.get("provenance") or {}).get("canonical_meeting_id"),
+            "timestamped_split_evidence_ids": (proposal.get("provenance") or {}).get("timestamped_split_evidence_ids"),
+        }
+        for proposal in proposals
+        if isinstance(proposal, Mapping)
+        and isinstance(proposal.get("provenance"), Mapping)
+        and (proposal["provenance"].get("canonical_meeting_id") is not None)
+    ] if isinstance(proposals, list) else []
+    return _digest(meeting_splits)
+
+
+def _canonical_meeting_identity(ledger: Any, accounting: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Recreate the canonical recording identity from immutable evidence."""
+    events = ledger.get("events") if isinstance(ledger, Mapping) else None
+    if not isinstance(events, list) or not all(isinstance(event, Mapping) for event in events):
+        return None
+    recordings = [
+        event for event in events if event.get("source_type") in {"fathom", "calendly"}
+    ]
+    if not recordings:
+        return None
+    try:
+        reconciliation = meeting_reconciliation.reconcile_meetings(
+            [event for event in recordings if event.get("source_type") == "fathom"],
+            [event for event in recordings if event.get("source_type") == "calendly"],
+            vlad_identities={"vlad@serenichron.com"},
+        )
+    except meeting_reconciliation.MeetingReconciliationError as exc:
+        raise PortfolioReplayError(f"canonical meeting reconciliation failed: {exc}") from exc
+    return {
+        "meeting_reconciliation_digest": _digest(reconciliation.document()),
+        "meeting_dedup_version": reconciliation.algorithm_version,
+        "meeting_dedup_tolerance_seconds": reconciliation.tolerance_seconds,
+        "meeting_split_digest": _meeting_split_digest(accounting),
+    }
+
+
+def _meeting_identity(
+    accounting: Mapping[str, Any], reconciliation: Any, ledger: Any
+) -> dict[str, Any]:
+    """Bind canonical meeting semantics without invalidating old sealed runs.
+
+    New accounting results carry these fields directly.  The fallback retains
+    old Fathom-only artifacts as readable, immutable replay inputs; it is not
+    used to claim that a historical run used the canonical algorithm.
+    """
+    supplied = {field: accounting.get(field) for field in _MEETING_IDENTITY_FIELDS}
+    present = {field for field, value in supplied.items() if value is not None}
+    if present:
+        if present != _MEETING_IDENTITY_FIELDS:
+            raise PortfolioReplayError("canonical meeting replay identity is incomplete")
+        if not isinstance(supplied["meeting_reconciliation_digest"], str) or not _SHA256.fullmatch(supplied["meeting_reconciliation_digest"]):
+            raise PortfolioReplayError("canonical meeting reconciliation digest is invalid")
+        if not isinstance(supplied["meeting_dedup_version"], str) or not supplied["meeting_dedup_version"]:
+            raise PortfolioReplayError("canonical meeting dedup version is invalid")
+        tolerance = supplied["meeting_dedup_tolerance_seconds"]
+        if isinstance(tolerance, bool) or not isinstance(tolerance, int) or tolerance < 0:
+            raise PortfolioReplayError("canonical meeting dedup tolerance is invalid")
+        if not isinstance(supplied["meeting_split_digest"], str) or not _SHA256.fullmatch(supplied["meeting_split_digest"]):
+            raise PortfolioReplayError("canonical meeting split digest is invalid")
+        return supplied
+    canonical = _canonical_meeting_identity(ledger, accounting)
+    if canonical is not None:
+        return canonical
+    return {
+        "meeting_reconciliation_digest": _digest(reconciliation),
+        "meeting_dedup_version": "fathom-only/legacy",
+        "meeting_dedup_tolerance_seconds": None,
+        "meeting_split_digest": _meeting_split_digest(accounting),
+    }
+
+
 def _identity(
     *, run_dir: Path, review: Path, repair: Path, quality: Path, routing: Path
 ) -> dict[str, Any]:
@@ -107,6 +198,9 @@ def _identity(
     repair_document = documents["repair"]
     if not isinstance(review_document, Mapping) or not isinstance(repair_document, Mapping):
         raise PortfolioReplayError("review and repair artifacts must be objects")
+    accounting_document = documents["work_accounting_result"]
+    if not isinstance(accounting_document, Mapping):
+        raise PortfolioReplayError("work accounting result must be an object")
     model_revision = {
         "review_model": review_document.get("model"),
         "review_revision": review_document.get("revision"),
@@ -115,10 +209,15 @@ def _identity(
     }
     artifact_digests = {name: _digest(document) for name, document in documents.items()}
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "artifacts": artifact_digests,
         "cache_decisions": _cache_decisions(analysis),
         "model_revision": _normal(model_revision),
+        **_meeting_identity(
+            accounting_document,
+            documents["fathom_reconciliation"],
+            documents["immutable_ledger"],
+        ),
     }
 
 
@@ -131,7 +230,16 @@ def verify(sealed: Mapping[str, Any], *, run_dir: Path, review: Path, repair: Pa
     if sealed.get("status") != "sealed" or not isinstance(sealed.get("identity"), Mapping):
         raise PortfolioReplayError("invalid portfolio replay seal")
     candidate = _identity(run_dir=run_dir, review=review, repair=repair, quality=quality, routing=routing)
-    if _normal(sealed["identity"]) != _normal(candidate):
+    sealed_identity = sealed["identity"]
+    if not _MEETING_IDENTITY_FIELDS.issubset(sealed_identity):
+        # A v1 Fathom-only seal was already immutable at the artifact layer.
+        # Compare exactly the fields it knew, preserving read-only replay.
+        candidate = {
+            key: value for key, value in candidate.items()
+            if key in sealed_identity
+        }
+        candidate["schema_version"] = sealed_identity.get("schema_version")
+    if _normal(sealed_identity) != _normal(candidate):
         raise PortfolioReplayError("portfolio replay identity differs from seal")
     return {
         "schema_version": 1, "status": "pass", "seal_digest": sealed.get("seal_digest"),

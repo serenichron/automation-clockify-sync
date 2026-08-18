@@ -3,7 +3,7 @@ import importlib.util
 from pathlib import Path
 import unittest
 
-from scripts import evidence_ledger
+from scripts import calendly_collector, evidence_ledger
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "clockify_portfolio_quality.py"
@@ -20,7 +20,35 @@ def fathom_event(day="2026-07-10", source_id="meeting-one", *, naive=False):
         "fathom",
         {"source_type": "fathom", "source_id": source_id},
         raw_source_span={"start": start, "end": end},
-        attributes={"recorded_by_email": "vlad@serenichron.com", "title": "July review"},
+        attributes={
+            "recorded_by_email": "vlad@serenichron.com",
+            "meeting_id": f"events/{source_id}",
+            "title": "July review",
+        },
+    )
+
+
+def calendly_event(day="2026-07-10", source_id="calendar-one", *, meeting_id="meeting-one"):
+    recording = calendly_collector.normalized_recording({
+        "uri": f"recordings/{source_id}",
+        "event_uri": f"events/{meeting_id}",
+        "name": "July review",
+        "recording_start_time": f"{day}T06:00:00Z",
+        "recording_end_time": f"{day}T06:30:00Z",
+        "organizer": {"email": "vlad@serenichron.com"},
+        "participants": [{"email": "client@example.test"}],
+        "transcript": [{"offset_seconds": 0, "text": "Reviewed July work"}],
+    })
+    return evidence_ledger.evidence_event(
+        "calendly",
+        {
+            "source_type": "calendly",
+            "source_id": recording["recording_id"],
+            "meeting_id": recording["meeting_id"],
+        },
+        observed_at=recording["start"],
+        raw_source_span={"start": recording["start"], "end": recording["end"]},
+        attributes={key: value for key, value in recording.items() if key not in {"start", "end"}},
     )
 
 
@@ -35,7 +63,21 @@ def clockify_event(day="2026-07-10", source_id="clockify-one"):
 
 def ledger(*events):
     fathom_count = sum(event.source_type == "fathom" for event in events)
-    immutable = evidence_ledger.EvidenceLedger(tuple(events), {"fathom": {"status": "complete", "expected_count": fathom_count, "observed_count": fathom_count}})
+    calendly_count = sum(event.source_type == "calendly" for event in events)
+    immutable = evidence_ledger.EvidenceLedger(tuple(events), {
+        "fathom": {
+            "status": "complete",
+            "expected_count": fathom_count,
+            "observed_count": fathom_count,
+        },
+        **({
+            "calendly": {
+                "status": "complete",
+                "expected_count": calendly_count,
+                "observed_count": calendly_count,
+            },
+        } if calendly_count else {}),
+    })
     return {
         "schema_version": evidence_ledger.SCHEMA_VERSION,
         "manifest": immutable.manifest.document(),
@@ -122,6 +164,29 @@ class PortfolioQualityTests(unittest.TestCase):
         self.assertEqual("pass", report["status"])
         self.assertEqual({"expected": 1, "represented": 1, "excluded": 0, "missing": 0}, {key: report["fathom_coverage"][key] for key in ("expected", "represented", "excluded", "missing")})
         self.assertEqual(30, report["fragmentation"]["median_minutes"])
+
+    def test_every_source_recording_is_accounted_once_by_canonical_meeting(self):
+        fathom = fathom_event()
+        calendly = calendly_event()
+        value = document(fathom)
+        value["activities"][0]["evidence_ids"] = [
+            fathom.evidence_id,
+            calendly.evidence_id,
+        ]
+
+        report = quality.audit(
+            value,
+            ledger_document=ledger(fathom, calendly),
+            source_proposals=proposals(),
+        )
+
+        self.assertEqual("pass", report["status"])
+        self.assertEqual(
+            {"source_recordings": 2, "canonical_meetings": 1, "missing": 0},
+            {key: report["recording_coverage"][key] for key in (
+                "source_recordings", "canonical_meetings", "missing",
+            )},
+        )
 
     def test_canonical_routing_requires_exact_prefix_and_source_route(self):
         event = fathom_event()

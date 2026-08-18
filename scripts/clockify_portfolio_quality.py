@@ -16,10 +16,16 @@ import sys
 from typing import Any, Mapping, Sequence
 
 try:
-    from scripts import caveman_renderer, evidence_ledger, work_accounting_pipeline
+    from scripts import (
+        caveman_renderer,
+        evidence_ledger,
+        meeting_reconciliation,
+        work_accounting_pipeline,
+    )
 except ImportError:  # pragma: no cover - direct execution fallback
     import caveman_renderer  # type: ignore[no-redef]
     import evidence_ledger  # type: ignore[no-redef]
+    import meeting_reconciliation  # type: ignore[no-redef]
     import work_accounting_pipeline  # type: ignore[no-redef]
 
 
@@ -150,7 +156,7 @@ def _reconciled_by_existing_clockify(
     return len(overlapping) == 1 and len(matching) == 1
 
 
-def _accounted_fathom_ids(document: Mapping[str, Any]) -> tuple[set[str], list[dict[str, Any]]]:
+def _accounted_recording_ids(document: Mapping[str, Any]) -> tuple[set[str], list[dict[str, Any]]]:
     accounted: set[str] = set()
     issues: list[dict[str, Any]] = []
     for collection in ("exceptions", "omissions"):
@@ -174,6 +180,12 @@ def _accounted_fathom_ids(document: Mapping[str, Any]) -> tuple[set[str], list[d
                 if value:
                     accounted.add(value)
     return accounted, issues
+
+
+# Existing Fathom-only review artifacts are immutable inputs. Keep this name as
+# a read-only compatibility alias while all new coverage uses canonical IDs.
+def _accounted_fathom_ids(document: Mapping[str, Any]) -> tuple[set[str], list[dict[str, Any]]]:
+    return _accounted_recording_ids(document)
 
 
 def _routing_taxonomy(routing: Mapping[str, Any] | None) -> dict[tuple[str, tuple[str, ...]], set[str]]:
@@ -243,78 +255,226 @@ def _proposal_routes_by_activity(
     return result
 
 
-def _fathom_coverage(
+def _recording_source_inventory_issues(
+    events: Sequence[Mapping[str, Any]], manifest: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    """Require complete inventories for every recording source actually present."""
+    issues: list[dict[str, Any]] = []
+    inventory = manifest.get("source_inventory")
+    inventory = inventory if isinstance(inventory, Mapping) else {}
+    for source in ("fathom", "calendly"):
+        source_events = [event for event in events if event.get("source_type") == source]
+        details = inventory.get(source)
+        # An absent Calendly inventory is the pre-Calendly artifact shape. It
+        # remains inspectable, but an advertised or represented source must
+        # prove complete coverage before a new run can pass.
+        if not isinstance(details, Mapping):
+            if source_events:
+                issues.append({"reason": f"{source.title()} source completeness cannot be proved"})
+            continue
+        if details.get("status") != "complete":
+            issues.append({"reason": f"{source.title()} source completeness cannot be proved"})
+            continue
+        if (
+            "expected_count" in details
+            and "observed_count" in details
+            and details["expected_count"] != details["observed_count"]
+        ):
+            issues.append({"reason": f"{source.title()} source expected and observed counts differ"})
+            continue
+        observed = details.get("observed_count")
+        if isinstance(observed, int) and not isinstance(observed, bool) and observed != len(source_events):
+            issues.append({"reason": f"{source.title()} source inventory does not match immutable ledger events"})
+    return issues
+
+
+def _recording_source_id(event: Mapping[str, Any]) -> str:
+    source = str(event.get("source_type") or "")
+    source_ref = event.get("source_ref")
+    identifier = source_ref.get("source_id") if isinstance(source_ref, Mapping) else None
+    return f"{source}:{identifier}" if source and identifier else ""
+
+
+def _canonical_recordings(
+    events: Sequence[Mapping[str, Any]],
+) -> tuple[meeting_reconciliation.MeetingReconciliation, dict[str, Mapping[str, Any]]]:
+    recording_events = [
+        event for event in events if event.get("source_type") in {"fathom", "calendly"}
+    ]
+    source_events = {
+        _recording_source_id(event): event
+        for event in recording_events
+    }
+    if "" in source_events or len(source_events) != len(recording_events):
+        raise meeting_reconciliation.MeetingReconciliationError(
+            "recording source identity is missing or duplicated"
+        )
+    reconciliation_events: list[dict[str, Any]] = []
+    for event in recording_events:
+        candidate = dict(event)
+        # Historic Fathom ledgers may retain a Bucharest local-minute span.
+        # Reconciliation is UTC-aware, so adapt that representation only in
+        # memory using accounting's established span normalization.
+        interval = _event_interval(event)
+        if interval is not None:
+            start, end = interval
+            candidate["raw_source_span"] = {
+                **dict(event.get("raw_source_span") or {}),
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+            }
+        reconciliation_events.append(candidate)
+    reconciliation = meeting_reconciliation.reconcile_meetings(
+        [event for event in reconciliation_events if event.get("source_type") == "fathom"],
+        [event for event in reconciliation_events if event.get("source_type") == "calendly"],
+        vlad_identities={"vlad@serenichron.com"},
+    )
+    return reconciliation, source_events
+
+
+def _recording_coverage_exclusion(
+    coverage: dict[str, Any],
+    meeting_id: str,
+    evidence_ids: Sequence[str],
+    reason: str,
+) -> None:
+    evidence_id = evidence_ids[0] if evidence_ids else meeting_id
+    _coverage_exclusion(coverage, evidence_id, reason)
+    item = coverage["excluded_evidence"][-1]
+    item["canonical_meeting_id"] = meeting_id
+    item["source_evidence_ids"] = list(evidence_ids)
+
+
+def _recording_coverage(
     document: Mapping[str, Any],
     events: Sequence[Mapping[str, Any]],
     row_intervals_by_evidence: Mapping[str, Sequence[tuple[dt.datetime, dt.datetime]]],
+    row_evidence_ids: set[str],
     review_range: tuple[dt.date, dt.date] | None,
     manifest: Mapping[str, Any],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     coverage: dict[str, Any] = {
+        "source_recordings": 0,
+        "canonical_meetings": 0,
         "expected": 0,
         "represented": 0,
         "excluded": 0,
+        "exceptions": 0,
         "missing": 0,
         "unverifiable": 0,
         "uncovered": 0,
         "missing_evidence_ids": [],
+        "exception_evidence_ids": [],
         "excluded_by_reason": {},
         "excluded_evidence": [],
     }
     issues: list[dict[str, Any]] = []
-    inventory = manifest.get("source_inventory")
-    fathom_inventory = inventory.get("fathom") if isinstance(inventory, Mapping) else None
-    fathom_events = [event for event in events if event.get("source_type") == "fathom"]
+    recording_events = [
+        event for event in events if event.get("source_type") in {"fathom", "calendly"}
+    ]
+    coverage["source_recordings"] = len(recording_events)
     clockify_blocks = work_accounting_pipeline._existing_blocks(events)
-    if not isinstance(fathom_inventory, Mapping) or fathom_inventory.get("status") != "complete":
-        issues.append({"reason": "Fathom source completeness cannot be proved"})
-    elif (
-        "expected_count" in fathom_inventory
-        and "observed_count" in fathom_inventory
-        and fathom_inventory["expected_count"] != fathom_inventory["observed_count"]
-    ):
-        issues.append({"reason": "Fathom source expected and observed counts differ"})
-    elif isinstance(fathom_inventory.get("observed_count"), int) and fathom_inventory["observed_count"] != len(fathom_events):
-        issues.append({"reason": "Fathom source inventory does not match immutable ledger events"})
-    accounted, account_issues = _accounted_fathom_ids(document)
+    issues.extend(_recording_source_inventory_issues(events, manifest))
+    accounted, account_issues = _accounted_recording_ids(document)
     issues.extend(account_issues)
+    try:
+        reconciliation, source_events = _canonical_recordings(events)
+    except meeting_reconciliation.MeetingReconciliationError as exc:
+        issues.append({"reason": f"canonical meeting reconciliation failed: {exc}"})
+        return coverage, issues
+    coverage["canonical_meetings"] = len(reconciliation.meetings)
+    exception_source_ids = {
+        source_id
+        for exception in reconciliation.exceptions
+        for source_id in [
+            *exception.get("source_ids", []),
+            *exception.get("candidate_source_ids", []),
+        ]
+        if isinstance(source_id, str)
+    }
+    coverage["exceptions"] = len(reconciliation.exceptions)
+    coverage["exception_evidence_ids"] = sorted({
+        str(source_events[source_id].get("evidence_id") or "")
+        for source_id in exception_source_ids
+        if source_id in source_events
+    } - {""})
     if review_range is None:
         return coverage, issues
     start_day, end_day = review_range
-    for event in fathom_events:
-        evidence_id = str(event.get("evidence_id") or "")
-        interval = _event_interval(event)
-        if interval is None:
+    for meeting in reconciliation.meetings:
+        meeting_id = meeting.canonical_id
+        source_ids = tuple(meeting.source_ids)
+        evidence_ids = tuple(
+            str(source_events[source_id].get("evidence_id") or "")
+            for source_id in source_ids
+            if source_id in source_events
+        )
+        if any(source_id in exception_source_ids for source_id in source_ids):
+            continue
+        try:
+            start, end = _parse(meeting.start), _parse(meeting.end)
+        except (TypeError, ValueError):
             coverage["unverifiable"] += 1
-            issues.append({"reason": "Fathom event has no valid meeting window", "evidence_id": evidence_id})
+            issues.append({
+                "reason": "canonical meeting has no valid recording window",
+                "canonical_meeting_id": meeting_id,
+                "evidence_ids": list(evidence_ids),
+            })
             continue
-        start, end = interval
         if end.date() < start_day or start.date() > end_day:
-            _coverage_exclusion(coverage, evidence_id, "outside_review_range")
+            _recording_coverage_exclusion(
+                coverage, meeting_id, evidence_ids, "outside_review_range"
+            )
             continue
-        eligible, exclusion = work_accounting_pipeline._meeting_is_eligible(event)
+        representative = next(
+            (source_events[source_id] for source_id in source_ids if source_id.startswith("fathom:")),
+            source_events[source_ids[0]],
+        )
+        eligible, exclusion = work_accounting_pipeline._meeting_is_eligible(representative)
         if not eligible:
-            _coverage_exclusion(coverage, evidence_id, f"ineligible:{exclusion or 'unknown'}")
+            _recording_coverage_exclusion(
+                coverage, meeting_id, evidence_ids, f"ineligible:{exclusion or 'unknown'}"
+            )
             continue
         coverage["expected"] += 1
-        row_intervals = row_intervals_by_evidence.get(evidence_id, [])
-        if row_intervals and _covers(row_intervals, start, end):
+        row_intervals = [
+            interval
+            for evidence_id in evidence_ids
+            for interval in row_intervals_by_evidence.get(evidence_id, [])
+        ]
+        fully_cited = set(evidence_ids).issubset(row_evidence_ids)
+        if fully_cited and row_intervals and _covers(row_intervals, start, end):
             coverage["represented"] += 1
         elif row_intervals:
             coverage["uncovered"] += 1
             coverage["missing"] += 1
-            coverage["missing_evidence_ids"].append(evidence_id)
-            issues.append({"reason": "eligible Fathom meeting interval is not covered by cited row allocation", "evidence_id": evidence_id})
-        elif _reconciled_by_existing_clockify(event, clockify_blocks):
-            _coverage_exclusion(coverage, evidence_id, "existing_clockify_meeting_match")
-        elif evidence_id in accounted:
-            _coverage_exclusion(coverage, evidence_id, "document_omission_or_exception")
+            coverage["missing_evidence_ids"].extend(evidence_ids)
+            issues.append({
+                "reason": "eligible canonical meeting interval is not covered by cited row allocation",
+                "canonical_meeting_id": meeting_id,
+                "evidence_ids": list(evidence_ids),
+            })
+        elif _reconciled_by_existing_clockify(representative, clockify_blocks):
+            _recording_coverage_exclusion(
+                coverage, meeting_id, evidence_ids, "existing_clockify_meeting_match"
+            )
+        elif set(evidence_ids).issubset(accounted):
+            _recording_coverage_exclusion(
+                coverage, meeting_id, evidence_ids, "document_omission_or_exception"
+            )
         else:
             coverage["missing"] += 1
-            coverage["missing_evidence_ids"].append(evidence_id)
+            coverage["missing_evidence_ids"].extend(evidence_ids)
     if coverage["missing"]:
-        issues.append({"reason": "eligible Fathom coverage incomplete", "count": coverage["missing"]})
+        issues.append({"reason": "eligible canonical recording coverage incomplete", "count": coverage["missing"]})
     return coverage, issues
+
+
+# Kept for external read-only callers that still use the old Fathom coverage
+# name. New callers receive this same canonical coverage under
+# ``recording_coverage``.
+def _fathom_coverage(*args: Any, **kwargs: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    return _recording_coverage(*args, **kwargs)
 
 
 def _source_pool_issues(
@@ -435,21 +595,26 @@ def audit(
     document: Mapping[str, Any],
     evidence_ledger_document: Mapping[str, Any] | None = None,
     *,
+    ledger_document: Mapping[str, Any] | None = None,
     source_proposals: Sequence[Mapping[str, Any]] | None = None,
     routing: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return a fail-closed integrity report without changing the review."""
+    if evidence_ledger_document is not None and ledger_document is not None:
+        raise ValueError("provide one immutable evidence ledger document")
+    evidence_ledger_document = ledger_document or evidence_ledger_document
     structural: list[dict[str, Any]] = []
     semantic_repairs: list[dict[str, Any]] = []
     rows = document.get("activities", []) if isinstance(document, Mapping) else []
     if not isinstance(rows, list) or not all(isinstance(row, Mapping) for row in rows):
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "status": "blocked",
             "external_writes": False,
             "structural_issues": [{"reason": "activities must be a list of objects"}],
             "semantic_repair_rows": [],
-            "fathom_coverage": {"expected": 0, "represented": 0, "excluded": 0, "missing": 0, "unverifiable": 0, "missing_evidence_ids": [], "excluded_by_reason": {}, "excluded_evidence": []},
+            "recording_coverage": {"source_recordings": 0, "canonical_meetings": 0, "expected": 0, "represented": 0, "excluded": 0, "exceptions": 0, "missing": 0, "unverifiable": 0, "missing_evidence_ids": [], "exception_evidence_ids": [], "excluded_by_reason": {}, "excluded_evidence": []},
+            "fathom_coverage": {"source_recordings": 0, "canonical_meetings": 0, "expected": 0, "represented": 0, "excluded": 0, "exceptions": 0, "missing": 0, "unverifiable": 0, "missing_evidence_ids": [], "exception_evidence_ids": [], "excluded_by_reason": {}, "excluded_evidence": []},
         }
     review_range = _review_range(document)
     if review_range is None:
@@ -596,8 +761,15 @@ def audit(
             source_proposals, intervals, document, review_range
         )
         structural.extend(source_issues)
-    coverage, fathom_issues = _fathom_coverage(document, events, row_intervals_by_evidence, review_range, manifest)
-    structural.extend(fathom_issues)
+    coverage, recording_issues = _recording_coverage(
+        document,
+        events,
+        row_intervals_by_evidence,
+        row_evidence_ids,
+        review_range,
+        manifest,
+    )
+    structural.extend(recording_issues)
     fragmentation = {
         "row_count": len(rows),
         "total_minutes": row_total,
@@ -606,13 +778,14 @@ def audit(
         "rows_at_most_10_minutes": sum(value <= 10 for value in durations),
     }
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "status": "blocked" if structural else "needs_semantic_repair" if semantic_repairs else "pass",
         "external_writes": False,
         "structural_issues": structural,
         "semantic_repair_rows": semantic_repairs,
         "overlaps": overlaps,
         "fragmentation": fragmentation,
+        "recording_coverage": coverage,
         "fathom_coverage": coverage,
         "source_proposal_coverage": source_pool,
         "ledger": {"manifest_id": manifest.get("manifest_id"), "event_count": manifest.get("event_count")} if manifest else None,

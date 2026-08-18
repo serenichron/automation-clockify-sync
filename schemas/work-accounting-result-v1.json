@@ -31,9 +31,31 @@
     "skipped": {"type": "array", "items": {"type": "object"}},
     "allocation": {"type": "object"},
     "fathom_reconciliation": {"type": "array", "items": {"type": "object"}},
+    "meeting_reconciliation_digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "meeting_dedup_version": {"type": "string", "minLength": 1},
+    "meeting_dedup_tolerance_seconds": {"type": "integer", "minimum": 0},
+    "meeting_split_digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
     "correction_regression": {"$ref": "#/$defs/correctionRegression"},
     "external_writes": {"const": false}
   },
+  "allOf": [{
+    "if": {
+      "anyOf": [
+        {"required": ["meeting_reconciliation_digest"]},
+        {"required": ["meeting_dedup_version"]},
+        {"required": ["meeting_dedup_tolerance_seconds"]},
+        {"required": ["meeting_split_digest"]}
+      ]
+    },
+    "then": {
+      "required": [
+        "meeting_reconciliation_digest",
+        "meeting_dedup_version",
+        "meeting_dedup_tolerance_seconds",
+        "meeting_split_digest"
+      ]
+    }
+  }],
   "$defs": {
     "correctionRegression": {
       "type": "object",

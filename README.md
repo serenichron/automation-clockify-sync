@@ -50,8 +50,9 @@ performs only structural/integrity checks and identifies rows requiring another
 semantic repair; it does not replace the Flash validator with local semantics.
 
 It prints the absolute path to `autopilot-result.json`. Lower-level commands
-remain available for targeted diagnosis. Calendly is intentionally outside the
-current process.
+remain available for targeted diagnosis. Calendly recordings are first-class,
+read-only meeting evidence; scheduled events without a recording are retained
+only as `scheduled_without_recording` exclusions and never supply billable time.
 
 ## Guarded Google Sheet publication
 
@@ -112,11 +113,11 @@ Outputs:
 - `runs/<run-id>/semantic-analysis.json`: cited atomic activities, omissions,
   analyzer provenance, and the reversible content-addressed evidence-bundle
   manifest used for local member expansion;
-- `runs/<run-id>/work-accounting-result.json`: semantic, allocation, Fathom,
-  and exception contract;
+- `runs/<run-id>/work-accounting-result.json`: semantic, allocation, canonical
+  meeting, and exception contract;
 - `runs/<run-id>/allocation-report.json`: strict allocation and contested time;
-- `runs/<run-id>/fathom-reconciliation.json`: disposition for every eligible
-  meeting;
+- `runs/<run-id>/fathom-reconciliation.json`: legacy-named, canonical meeting
+  disposition for every recording-backed meeting;
 - `runs/<run-id>/review-learning-cases.json`: generalized, sanitized correction
   cases derived from the integrity-checked decision log;
 - `runs/<run-id>/review-regression-cases.json`: exact local-only expectations
@@ -267,11 +268,23 @@ that can become proposals. Analyzer wording is never trusted as final text. The
 Caveman renderer regenerates it from prefix, action, object, and bounded outcome,
 then quality checks require proposal `description` to match it exactly.
 
-Fathom eligibility requires a valid meeting window and either Vlad as recorder
-or attendee. Recordings shorter than five minutes require a transcript. A
-title-only record remains an exception; it cannot support an invented outcome.
-Existing Clockify time reconciles a meeting only with reciprocal overlap of at
-least 80%; partial conflicts remain explicit fixed-block exceptions.
+Recording eligibility requires a valid recorded meeting window and either Vlad
+as recorder, organizer, or attendee. Recordings shorter than five minutes
+require a transcript. A title-only record remains an exception; it cannot
+support an invented outcome. Existing Clockify time reconciles a meeting only
+with reciprocal overlap of at least 80%; partial conflicts remain explicit
+fixed-block exceptions.
+
+Fathom and Calendly recordings are deduplicated by `meeting-dedup/v1` before
+accounting. Shared provider, event, or join identities require agreeing start
+and end instants; the fallback requires the same normalized non-Vlad
+participant set and each boundary within five minutes. Missing participants,
+multiple candidates, or timing disagreement are explicit exceptions, never a
+merged or averaged duration. A duplicate pair is one canonical meeting and
+every source recording must be cited by that meeting's review allocation.
+Multi-project meeting allocations are accepted only when timestamped semantic
+evidence partitions the full recorded interval. Human approval or a percentage
+share cannot replace a timestamped boundary.
 
 Review corrections are immutable and bound to stable activity plus evidence
 identity. Only sanitized general rules reach the analyzer. Exact replacement
@@ -570,6 +583,23 @@ from `5` through `120`, inclusive. Empty, non-integer, or out-of-range values
 fail before a Clockify request; Fathom, SSH, canonical-export, and analyzer
 timeouts are unaffected. The systemd and launchd environment examples set the
 documented default explicitly.
+
+Calendly configuration is separate from the accounting runner: by default the
+collector reads `~/.config/serenichron/calendly.env` (or the mode-0600 path in
+`CALENDLY_ENV_FILE`). That file supplies a read-only recording endpoint through
+`CALENDLY_RECORDINGS_URL`, its gateway token, and
+`CALENDLY_GATEWAY_READ_ONLY=true`; values are intentionally not shown here. An
+incomplete recording pagination result, missing recording capability, or a
+non-read-only configuration is a visible capability gap: the Calendly source
+remains incomplete and complete source coverage cannot pass. The collector may
+record scheduled events as `scheduled_without_recording`, but they never create
+duration evidence or a Clockify proposal.
+
+Portfolio quality reports canonical `recording_coverage` while preserving the
+read-only `fathom_coverage` alias for historical artifacts. New replay seals
+bind the canonical reconciliation digest, deduplication version and tolerance,
+and timestamped-split digest. Older Fathom-only seals remain readable and are
+verified against the immutable fields they originally contained.
 
 When the desktop is unavailable, macOS can run the same guarded runner through
 `ops/launchd/com.serenichron.clockify-work-accounting.plist` and
