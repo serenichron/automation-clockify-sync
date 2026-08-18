@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import re
 from typing import Any, Mapping
 
 
@@ -25,10 +26,10 @@ def _digest(value: object) -> str:
 
 
 def _parse_required_utc(value: object) -> datetime:
-    if not isinstance(value, str) or not value or not value.endswith("Z"):
-        raise CalendlyCollectorError("timestamp must be an explicit UTC instant")
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", value):
+        raise CalendlyCollectorError("timestamp must be canonical UTC YYYY-MM-DDTHH:MM:SSZ")
     try:
-        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     except ValueError as error:
         raise CalendlyCollectorError("timestamp is invalid") from error
     if parsed.tzinfo is None:
@@ -47,13 +48,20 @@ def _required_id(value: object) -> str:
 
 
 def _normal_person(value: object) -> dict[str, str]:
-    if not isinstance(value, Mapping):
+    if value is None:
         return {}
+    if not isinstance(value, Mapping):
+        raise CalendlyCollectorError("person must be an object")
     result: dict[str, str] = {}
     for key in ("email", "name"):
         item = value.get(key)
-        if item is not None and str(item):
-            result[key] = str(item)
+        if item is not None:
+            if not isinstance(item, str) or not item:
+                raise CalendlyCollectorError("person fields must be non-empty strings")
+            result[key] = item
+    if not result:
+        raise CalendlyCollectorError("person must contain email or name")
+    return result
     return result
 
 
@@ -62,7 +70,12 @@ def _normal_people(value: object) -> list[dict[str, str]]:
         return []
     if not isinstance(value, list):
         raise CalendlyCollectorError("participants must be a list")
-    return [_normal_person(item) for item in value if isinstance(item, Mapping)]
+    result = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise CalendlyCollectorError("participant items must be objects")
+        result.append(_normal_person(item))
+    return result
 
 
 def _normal_transcript(value: object) -> list[dict[str, Any]]:
@@ -76,11 +89,17 @@ def _normal_transcript(value: object) -> list[dict[str, Any]]:
             raise CalendlyCollectorError("transcript items must be objects")
         if "text" not in item:
             raise CalendlyCollectorError("transcript text is required")
-        entry: dict[str, Any] = {"text": str(item["text"])}
+        if not isinstance(item["text"], str):
+            raise CalendlyCollectorError("transcript text must be a string")
+        entry: dict[str, Any] = {"text": item["text"]}
         if item.get("offset_seconds") is not None:
-            entry["offset_seconds"] = int(item["offset_seconds"])
+            if isinstance(item["offset_seconds"], bool) or not isinstance(item["offset_seconds"], int) or item["offset_seconds"] < 0:
+                raise CalendlyCollectorError("transcript offset must be a non-negative integer")
+            entry["offset_seconds"] = item["offset_seconds"]
         if item.get("speaker") is not None:
-            entry["speaker"] = str(item["speaker"])
+            if not isinstance(item["speaker"], str):
+                raise CalendlyCollectorError("transcript speaker must be a string")
+            entry["speaker"] = item["speaker"]
         result.append(entry)
     return result
 
@@ -128,16 +147,34 @@ def _interval(value: str) -> datetime:
     return _parse_required_utc(value)
 
 
+def _safe_path(value: str, root: Path) -> Path:
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    candidate = candidate.absolute()
+    try:
+        candidate.relative_to(root)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("path must remain below the invocation root") from error
+    current = root
+    for part in candidate.relative_to(root).parts:
+        current = current / part
+        if current.is_symlink():
+            raise argparse.ArgumentTypeError("symlinked path components are not allowed")
+    return candidate
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="calendly_collector")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    root = Path.cwd().resolve()
     for command in ("preflight", "collect"):
         sub = subparsers.add_parser(command)
         sub.add_argument("--since", required=True, type=_interval)
         sub.add_argument("--until", required=True, type=_interval)
-        sub.add_argument("--output", required=True, type=lambda value: Path(value).expanduser().resolve())
+        sub.add_argument("--output", required=True, type=lambda value: _safe_path(value, root))
         if command == "collect":
-            sub.add_argument("--checkpoint-root", required=True, type=lambda value: Path(value).expanduser().resolve())
+            sub.add_argument("--checkpoint-root", required=True, type=lambda value: _safe_path(value, root))
     args = parser.parse_args(argv)
     if args.until <= args.since:
         parser.error("--until must be after --since")
@@ -151,9 +188,24 @@ def run(args: argparse.Namespace) -> int:
         "until": _iso_utc(args.until),
     }
     if args.command == "preflight":
-        document = {**interval, "status": "ready"}
+        document = {
+            **interval,
+            "status": "incomplete",
+            "complete": False,
+            "reason": "capability_unavailable",
+            "capability": "calendly_gateway_unconfigured",
+        }
     else:
-        document = {**interval, "recordings": [], "scheduled_without_recording": []}
+        document = {
+            **interval,
+            "status": "incomplete",
+            "complete": False,
+            "reason": "capability_unavailable",
+            "capability": "calendly_gateway_unconfigured",
+            "checkpoint_root_id": "sha256:" + _digest(str(args.checkpoint_root)),
+            "recordings": [],
+            "scheduled_without_recording": [],
+        }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(document, sort_keys=True) + "\n")
     return 0
