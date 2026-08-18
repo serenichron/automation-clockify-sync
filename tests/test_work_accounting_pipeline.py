@@ -10,7 +10,7 @@ from unittest import mock
 from scripts import evidence_ledger
 from scripts import review_corrections
 from scripts import work_accounting_pipeline as pipeline
-from scripts.meeting_reconciliation import reconcile_meetings
+from scripts.meeting_reconciliation import MeetingReconciliationError, reconcile_meetings
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1027,6 +1027,9 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         self.assertEqual([], result["proposals"])
         self.assertEqual("exception", result["fathom_reconciliation"][0]["status"])
         self.assertEqual("title_only", result["fathom_reconciliation"][0]["reason"])
+        self.assertEqual(meeting.evidence_id, result["fathom_reconciliation"][0]["evidence_id"])
+        self.assertEqual([meeting.evidence_id], result["fathom_reconciliation"][0]["source_evidence_ids"])
+        self.assertEqual(1, len(result["fathom_reconciliation"][0]["fixed_block_ids"]))
         self.assertTrue(any(row.get("exception_kind") == "insufficient_meeting_evidence" for row in result["ambiguous"]))
 
     def test_eligible_fathom_meeting_is_an_exact_fixed_proposal(self):
@@ -1043,6 +1046,8 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         self.assertEqual("2026-07-10T14:11+03:00", proposal["end"])
         self.assertEqual(proposal["description"], proposal["rendered_description"])
         self.assertEqual("proposed", result["fathom_reconciliation"][0]["status"])
+        self.assertEqual(meeting.evidence_id, result["fathom_reconciliation"][0]["evidence_id"])
+        self.assertEqual([meeting.evidence_id], result["fathom_reconciliation"][0]["source_evidence_ids"])
 
     def test_accounting_uses_the_canonical_meeting_identity_for_fixed_time(self):
         meeting = fathom_event(
@@ -1098,6 +1103,125 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             ["2026-07-10T13:00+03:00", "2026-07-10T13:20+03:00"],
             [item["start"] for item in result["proposals"]],
         )
+
+    def test_ambiguous_canonical_sources_are_quarantined_without_booking(self):
+        meeting = fathom_event(
+            "2026-07-10T13:00:00+03:00",
+            "2026-07-10T13:37:00+03:00",
+            status="available",
+        )
+        conflict = calendly_event(
+            "2026-07-10T10:08:00Z", "2026-07-10T10:45:00Z"
+        )
+        analysis = meeting_analysis(meeting)
+        analysis["activities"][0]["project_recommendation"] = {
+            "name": "Serenichron Level 1", "prefix": "SC",
+            "tag_names": ["Project Management"],
+        }
+        calendar_activity = json.loads(json.dumps(analysis["activities"][0]))
+        calendar_activity["evidence_ids"] = [conflict.evidence_id]
+        calendar_activity["evidence_spans"] = [{
+            "evidence_id": conflict.evidence_id,
+            "start": "2026-07-10T10:08:00Z",
+            "end": "2026-07-10T10:45:00Z",
+        }]
+        analysis["activities"].append(calendar_activity)
+
+        _, result = self.make_run([meeting, conflict], analysis)
+
+        self.assertEqual([], result["proposals"])
+        exception = next(
+            row for row in result["ambiguous"]
+            if row.get("exception_kind") == "canonical_meeting_reconciliation"
+        )
+        self.assertEqual(
+            {meeting.evidence_id, conflict.evidence_id}, set(exception["evidence_ids"])
+        )
+        self.assertFalse(any(
+            row["status"] == "proposed" for row in result["fathom_reconciliation"]
+        ))
+
+    def test_rejected_split_member_cannot_fall_back_to_a_full_meeting(self):
+        meeting = fathom_event(
+            "2026-07-10T13:00:00+03:00",
+            "2026-07-10T13:37:00+03:00",
+            status="available",
+        )
+        calendly = calendly_event(
+            "2026-07-10T10:00:00Z", "2026-07-10T10:37:00Z"
+        )
+        analysis = meeting_analysis(meeting)
+        first = analysis["activities"][0]
+        first["evidence_spans"] = [{
+            "evidence_id": meeting.evidence_id,
+            "start": "2026-07-10T13:00:00+03:00",
+            "end": "2026-07-10T13:20:00+03:00",
+        }]
+        rejected = json.loads(json.dumps(first))
+        rejected["evidence_ids"] = [calendly.evidence_id]
+        rejected["evidence_spans"] = [{
+            "evidence_id": calendly.evidence_id,
+            "start": "2026-07-10T13:20:00+03:00",
+            "end": "2026-07-10T13:37:00+03:00",
+        }]
+        rejected["project_recommendation"] = {
+            "name": "TST Prep Level 1", "prefix": "TSTP",
+            "tag_names": ["Project Management"],
+        }
+        analysis["activities"].append(rejected)
+
+        _, result = self.make_run([meeting, calendly], analysis)
+
+        self.assertEqual([], result["proposals"])
+        self.assertEqual(1, sum(
+            row.get("exception_kind") == "invalid_meeting_split"
+            for row in result["ambiguous"]
+        ))
+
+    def test_split_boundary_rejects_unrelated_or_ambiguous_parent_evidence(self):
+        meeting = fathom_event(
+            "2026-07-10T13:00:00+03:00",
+            "2026-07-10T13:37:00+03:00",
+            status="available",
+        )
+        canonical = reconcile_meetings(
+            [meeting.document()], [], vlad_identities={"vlad@serenichron.com"}
+        ).meetings[0]
+        route = {"project_name": "Serenichron Level 2", "tag_names": ["Processes"]}
+        unrelated = session_event("other:event", "2026-07-10T13:00:00+03:00")
+        valid_activity = meeting_analysis(meeting)["activities"][0]
+        valid_activity["evidence_spans"] = [{
+            "start": "2026-07-10T13:00:00+03:00",
+            "end": "2026-07-10T13:20:00+03:00",
+        }]
+        split, _, _ = pipeline._meeting_split_candidate(
+            canonical, valid_activity, route, [meeting.evidence_id], [meeting.evidence_id], 0
+        )
+        self.assertTrue(split.evidence_ids[0].startswith(meeting.evidence_id + ":"))
+
+        for activity, evidence_ids in (
+            (
+                {**valid_activity, "evidence_spans": [{
+                    "evidence_id": unrelated.evidence_id,
+                    "start": "2026-07-10T13:00:00+03:00",
+                    "end": "2026-07-10T13:20:00+03:00",
+                }]},
+                [meeting.evidence_id, unrelated.evidence_id],
+            ),
+            (
+                {**valid_activity, "evidence_spans": [{
+                    "start": "2026-07-10T13:00:00+03:00",
+                    "end": "2026-07-10T13:20:00+03:00",
+                }]},
+                [meeting.evidence_id, unrelated.evidence_id],
+            ),
+        ):
+            with self.subTest(evidence_ids=evidence_ids):
+                with self.assertRaisesRegex(MeetingReconciliationError, "canonical source"):
+                    pipeline._meeting_split_candidate(
+                        canonical, activity, route, evidence_ids,
+                        [meeting.evidence_id], 0,
+                    )
 
     def test_fathom_correction_never_leaves_removed_meeting_marked_proposed(self):
         for decision, expected_status, expected_reason in (
@@ -1210,6 +1334,8 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         reconciliation = result["fathom_reconciliation"][0]
         self.assertEqual("reconciled", reconciliation["status"])
         self.assertEqual("existing_clockify_meeting_match", reconciliation["reason"])
+        self.assertEqual(meeting.evidence_id, reconciliation["evidence_id"])
+        self.assertEqual([meeting.evidence_id], reconciliation["source_evidence_ids"])
 
     def test_partial_clockify_overlap_is_fixed_block_conflict_not_proposal(self):
         meeting = fathom_event(
@@ -1226,6 +1352,8 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         reconciliation = result["fathom_reconciliation"][0]
         self.assertEqual("exception", reconciliation["status"])
         self.assertEqual("meeting_overlap", reconciliation["reason"])
+        self.assertEqual(meeting.evidence_id, reconciliation["evidence_id"])
+        self.assertEqual([meeting.evidence_id], reconciliation["source_evidence_ids"])
         conflict = next(
             row for row in result["ambiguous"]
             if row.get("exception_kind") == "fixed_block_conflict"
