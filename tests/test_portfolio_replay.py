@@ -22,14 +22,10 @@ class PortfolioReplayTests(unittest.TestCase):
     def fixture(self, root: Path) -> dict[str, Path]:
         run = root / "run"
         for relative, value in {
-            "evidence/evidence-ledger.json": {"manifest": {"manifest_id": "elm-a"}},
+            "evidence/evidence-ledger.json": {"manifest": {"manifest_id": "elm-a"}, "events": []},
             "semantic-analysis.json": {"analyzer_cache": {"records": [{"cache_key": "arc-a", "decision_digest": "d" * 64}]}, "generated_at": "volatile"},
             "work-accounting-result.json": {
                 "proposals": ["P001"],
-                "meeting_reconciliation_digest": "sha256:" + "a" * 64,
-                "meeting_dedup_version": "meeting-dedup/v1",
-                "meeting_dedup_tolerance_seconds": 300,
-                "meeting_split_digest": "sha256:" + "b" * 64,
             },
             "proposals.json": [{"id": "P001"}],
             "fathom-reconciliation.json": [],
@@ -69,6 +65,22 @@ class PortfolioReplayTests(unittest.TestCase):
             write(paths["quality"], changed)
             report = replay.verify(seal, **paths)
         self.assertEqual("pass", report["status"])
+
+    def test_empty_recording_ledger_does_not_trust_supplied_modern_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self.fixture(Path(tmp))
+            accounting_path = paths["run_dir"] / "work-accounting-result.json"
+            accounting = json.loads(accounting_path.read_text())
+            accounting.update({
+                "meeting_reconciliation_digest": "sha256:" + "a" * 64,
+                "meeting_dedup_version": "meeting-dedup/v1",
+                "meeting_dedup_tolerance_seconds": 300,
+                "meeting_split_digest": "sha256:" + "b" * 64,
+            })
+            write(accounting_path, accounting)
+
+            with self.assertRaisesRegex(replay.PortfolioReplayError, "does not match"):
+                replay.seal(**paths)
 
     def test_tampered_accounting_or_cache_blocks_and_does_not_emit_integrity(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -153,7 +165,7 @@ class PortfolioReplayTests(unittest.TestCase):
                 "meeting_dedup_tolerance_seconds",
                 "meeting_split_digest",
             ):
-                accounting.pop(field)
+                accounting.pop(field, None)
             write(accounting_path, accounting)
 
             sealed = replay.seal(**paths)
@@ -165,6 +177,15 @@ class PortfolioReplayTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             paths = self.fixture(Path(tmp))
             write(paths["run_dir"] / "evidence/evidence-ledger.json", self.recording_ledger())
+            accounting_path = paths["run_dir"] / "work-accounting-result.json"
+            accounting = json.loads(accounting_path.read_text())
+            accounting.update({
+                "meeting_reconciliation_digest": "sha256:" + "a" * 64,
+                "meeting_dedup_version": "meeting-dedup/v1",
+                "meeting_dedup_tolerance_seconds": 300,
+                "meeting_split_digest": "sha256:" + "b" * 64,
+            })
+            write(accounting_path, accounting)
 
             with self.assertRaisesRegex(replay.PortfolioReplayError, "does not match"):
                 replay.seal(**paths)
@@ -179,7 +200,7 @@ class PortfolioReplayTests(unittest.TestCase):
                 "meeting_reconciliation_digest", "meeting_dedup_version",
                 "meeting_dedup_tolerance_seconds", "meeting_split_digest",
             ):
-                accounting.pop(field)
+                accounting.pop(field, None)
             write(accounting_path, accounting)
             sealed = replay.seal(**paths)
             accounting.update({
@@ -204,7 +225,7 @@ class PortfolioReplayTests(unittest.TestCase):
                 "meeting_reconciliation_digest", "meeting_dedup_version",
                 "meeting_dedup_tolerance_seconds", "meeting_split_digest",
             ):
-                accounting.pop(field)
+                accounting.pop(field, None)
             write(accounting_path, accounting)
             sealed = replay.seal(**self.fixture(Path(tmp) / "legacy-source"))
             legacy = copy.deepcopy(sealed)
@@ -231,7 +252,7 @@ class PortfolioReplayTests(unittest.TestCase):
                 "meeting_reconciliation_digest", "meeting_dedup_version",
                 "meeting_dedup_tolerance_seconds", "meeting_split_digest",
             ):
-                accounting.pop(field)
+                accounting.pop(field, None)
             write(accounting_path, accounting)
 
             sealed = replay.seal(**paths)

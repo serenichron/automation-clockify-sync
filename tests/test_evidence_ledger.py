@@ -366,6 +366,26 @@ class EvidenceLedgerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "validation failed"):
             evidence.validate(forged)
 
+    def test_manifest_binds_and_validates_period_timezone(self) -> None:
+        evidence = ledger.EvidenceLedger((event(),))
+        manifest = ledger.LedgerManifest(
+            events_digest=evidence.manifest.events_digest,
+            event_count=evidence.manifest.event_count,
+            source_inventory=evidence.manifest.source_inventory,
+            timezone="Europe/Bucharest",
+        )
+        tampered = copy.deepcopy(manifest.document())
+        tampered["timezone"] = "America/New_York"
+        with self.assertRaisesRegex(ValueError, "Manifest ID"):
+            ledger.LedgerManifest.from_document(tampered)
+        with self.assertRaisesRegex(ValueError, "timezone"):
+            ledger.LedgerManifest(
+                events_digest=evidence.manifest.events_digest,
+                event_count=evidence.manifest.event_count,
+                source_inventory=evidence.manifest.source_inventory,
+                timezone="Not/A_Timezone",
+            )
+
     def test_event_document_tampering_is_detected(self) -> None:
         original = event()
         document = original.document()

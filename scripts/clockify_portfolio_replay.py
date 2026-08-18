@@ -126,8 +126,6 @@ def _canonical_meeting_identity(ledger: Any, accounting: Mapping[str, Any]) -> d
         )
     except (meeting_reconciliation.MeetingReconciliationError, ValueError) as exc:
         raise PortfolioReplayError(f"canonical meeting timezone normalization failed: {exc}") from exc
-    if not recordings:
-        return None
     try:
         reconciliation = meeting_reconciliation.reconcile_meetings(
             [event for event in recordings if event.get("source_type") == "fathom"],

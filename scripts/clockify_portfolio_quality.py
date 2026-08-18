@@ -104,13 +104,11 @@ def _validated_ledger(ledger_document: Mapping[str, Any] | None) -> tuple[list[d
     if len(ids) != len(set(ids)):
         raise ValueError("evidence ledger contains duplicate evidence IDs")
     candidate_manifest = evidence_ledger.LedgerManifest.from_document(manifest_document)
-    immutable = evidence_ledger.EvidenceLedger(tuple(events), candidate_manifest.source_inventory)
+    immutable = evidence_ledger.EvidenceLedger(
+        tuple(events), candidate_manifest.source_inventory, candidate_manifest.timezone
+    )
     immutable.validate(candidate_manifest)
-    manifest = immutable.manifest.document()
-    for field in ("timezone", "period_timezone"):
-        if field in manifest_document:
-            manifest[field] = manifest_document[field]
-    return [event.document() for event in immutable.events], manifest
+    return [event.document() for event in immutable.events], immutable.manifest.document()
 
 
 def _event_interval(event: Mapping[str, Any]) -> tuple[dt.datetime, dt.datetime] | None:

@@ -17,6 +17,7 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 SCHEMA_VERSION = "evidence-ledger/v1"
@@ -505,6 +506,7 @@ class LedgerManifest:
     events_digest: str
     event_count: int
     source_inventory: Mapping[str, Mapping[str, Any]] = dataclasses.field(default_factory=dict)
+    timezone: str = ""
     schema_version: str = SCHEMA_VERSION
     manifest_id: str = ""
 
@@ -513,6 +515,13 @@ class LedgerManifest:
             raise ValueError("event_count cannot be negative")
         if self.schema_version != SCHEMA_VERSION:
             raise ValueError(f"Unsupported ledger schema: {self.schema_version}")
+        if not isinstance(self.timezone, str):
+            raise ValueError("ledger timezone must be a string")
+        if self.timezone:
+            try:
+                ZoneInfo(self.timezone)
+            except ZoneInfoNotFoundError as error:
+                raise ValueError("ledger timezone is invalid") from error
         object.__setattr__(self, "source_inventory", _freeze_json(_normal_source_inventory(self.source_inventory)))
         expected = MANIFEST_ID_PREFIX + sha256_hex(self.document(include_id=False))
         if self.manifest_id and self.manifest_id != expected:
@@ -527,6 +536,8 @@ class LedgerManifest:
             "source_inventory": _normal_source_inventory(self.source_inventory),
             "source_completeness": source_completeness(self.source_inventory),
         }
+        if self.timezone:
+            document["timezone"] = self.timezone
         if include_id:
             document["manifest_id"] = self.manifest_id
         return document
@@ -537,6 +548,7 @@ class LedgerManifest:
             events_digest=str(document.get("events_digest") or ""),
             event_count=int(document.get("event_count", -1)),
             source_inventory=document.get("source_inventory") or {},
+            timezone=document.get("timezone") or "",
             schema_version=str(document.get("schema_version") or ""),
             manifest_id=str(document.get("manifest_id") or ""),
         )
@@ -548,6 +560,7 @@ class EvidenceLedger:
 
     events: tuple[EvidenceEvent, ...] = ()
     source_inventory: Mapping[str, Mapping[str, Any]] = dataclasses.field(default_factory=dict)
+    timezone: str = ""
 
     def __post_init__(self) -> None:
         by_id: dict[str, EvidenceEvent] = {}
@@ -575,6 +588,8 @@ class EvidenceLedger:
                 )
                 inventory["calendly"] = calendly
         object.__setattr__(self, "source_inventory", _freeze_json(inventory))
+        if not isinstance(self.timezone, str):
+            raise ValueError("ledger timezone must be a string")
 
     @property
     def manifest(self) -> LedgerManifest:
@@ -582,11 +597,12 @@ class EvidenceLedger:
             events_digest=event_digest(self.events),
             event_count=len(self.events),
             source_inventory=self.source_inventory,
+            timezone=self.timezone,
         )
 
     def append(self, events: Iterable[EvidenceEvent]) -> "EvidenceLedger":
         """Return a new ledger; exact duplicates are idempotent, never rewritten."""
-        return EvidenceLedger(self.events + tuple(events), self.source_inventory)
+        return EvidenceLedger(self.events + tuple(events), self.source_inventory, self.timezone)
 
     def aliases(self) -> dict[str, str]:
         result: dict[str, str] = {}

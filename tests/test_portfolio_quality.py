@@ -84,7 +84,12 @@ def ledger(*events, timezone="Europe/Bucharest"):
         "events": [event.document() for event in immutable.events],
     }
     if timezone is not None:
-        document["manifest"]["timezone"] = timezone
+        document["manifest"] = evidence_ledger.LedgerManifest(
+            events_digest=document["manifest"]["events_digest"],
+            event_count=document["manifest"]["event_count"],
+            source_inventory=document["manifest"]["source_inventory"],
+            timezone=timezone,
+        ).document()
     return document
 
 
