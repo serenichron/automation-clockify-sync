@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serenichron.example/schemas/calendly-recording-source-v1.json",
+  "title": "Calendly normalized recording source v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "recording_id", "meeting_id", "title", "start", "end", "duration_seconds",
+    "organizer", "participants", "join_url", "transcript", "summary", "source_digest"
+  ],
+  "properties": {
+    "recording_id": {"type": "string", "minLength": 1},
+    "meeting_id": {"type": "string", "minLength": 1},
+    "title": {"type": "string"},
+    "start": {"type": "string", "format": "date-time", "pattern": "Z$"},
+    "end": {"type": "string", "format": "date-time", "pattern": "Z$"},
+    "duration_seconds": {"type": "integer", "minimum": 1},
+    "organizer": {"$ref": "#/$defs/person"},
+    "participants": {"type": "array", "items": {"$ref": "#/$defs/person"}},
+    "join_url": {"type": "string"},
+    "transcript": {"type": "array", "items": {"$ref": "#/$defs/transcriptItem"}},
+    "summary": {"type": "string"},
+    "source_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "person": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {"email": {"type": "string"}, "name": {"type": "string"}}
+    },
+    "transcriptItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["text"],
+      "properties": {
+        "offset_seconds": {"type": "integer", "minimum": 0},
+        "text": {"type": "string"},
+        "speaker": {"type": "string"}
+      }
+    }
+  }
+}
