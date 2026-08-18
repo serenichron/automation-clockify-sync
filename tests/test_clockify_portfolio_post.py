@@ -240,6 +240,47 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
         self.assertEqual("2026-08-14T10:00:17Z", restored[0]["start"])
         self.assertEqual(613, restored[0]["duration_seconds"])
 
+    def test_legacy_receipt_replay_rejects_changed_timestamp_seconds(self) -> None:
+        portfolio = {
+            "activities": [{
+                "review_id": "pvi-0123456789abcdef01234567",
+                "client_project": "Example Level 2",
+                "tag_names": ["Technical development"],
+                "description": "EX — Preserve recorded meeting time",
+                "duration_minutes": 1,
+                "allocation_segments": [{
+                    "start": "2026-08-14T10:00:00+03:00",
+                    "end": "2026-08-14T10:01:00+03:00",
+                    "duration_minutes": 1,
+                }],
+            }],
+        }
+        routes = {
+            ("Example Level 2", ("Technical development",)): {
+                "project_id": "project-1", "tag_ids": ["tag-1"], "billable": True,
+            },
+        }
+        plans = poster._plans(portfolio, routes)
+        receipt = {
+            "portfolio_sha256": "approved-sha",
+            "created": [{
+                "review_id": "pvi-0123456789abcdef01234567",
+                "segment_index": 1,
+                "start": "2026-08-14T07:00:00Z",
+                "end": "2026-08-14T07:01:01Z",
+            }],
+            "already_existing": [],
+        }
+
+        self.assertEqual(60, plans[0]["approved_duration_seconds"])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receipt.json"
+            path.write_text(json.dumps(receipt), encoding="utf-8")
+            with self.assertRaisesRegex(
+                poster.PortfolioPostError, "approved duration"
+            ):
+                poster._apply_prior_receipt(plans, path, "approved-sha")
+
     def test_posting_plan_rejects_malformed_allocation_segment_as_domain_error(self) -> None:
         portfolio = {
             "activities": [{

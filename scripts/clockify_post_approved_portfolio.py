@@ -308,7 +308,11 @@ def _plans(
         route = routes.get((project_name, tuple(tag_names)))
         if route is None:
             raise PortfolioPostError(f"Clockify route is missing: {project_name} / {', '.join(tag_names)}")
-        for index, segment in enumerate(_merged_segments(row), 1):
+        segments = _merged_segments(row)
+        approved_duration_seconds = sum(
+            segment["duration_seconds"] for segment in segments
+        )
+        for index, segment in enumerate(segments, 1):
             plans.append({
                 "review_id": str(row.get("review_id") or ""),
                 "segment_index": index,
@@ -316,7 +320,7 @@ def _plans(
                 "end": _utc(segment["end"]),
                 "duration_minutes": segment["duration_minutes"],
                 "duration_seconds": segment["duration_seconds"],
-                "approved_duration_seconds": int(row.get("duration_seconds") or 0),
+                "approved_duration_seconds": approved_duration_seconds,
                 "project_name": project_name,
                 "project_id": route["project_id"],
                 "tag_names": tag_names,

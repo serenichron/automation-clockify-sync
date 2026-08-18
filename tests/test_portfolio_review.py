@@ -66,6 +66,46 @@ class PortfolioReviewTests(unittest.TestCase):
         self.assertEqual([], exceptions)
         self.assertEqual([], omissions)
 
+    def test_package_review_keeps_one_minute_legacy_source_fully_legacy(self):
+        source_activities = [{"activity_id": "act-one", "evidence_ids": ["ev-one"]}]
+        source_proposals = [{
+            "activity_id": "act-one",
+            "start": "2026-07-10T09:00:00+03:00",
+            "end": "2026-07-10T09:01:00+03:00",
+            "duration_minutes": 1,
+        }]
+        reviewed = {
+            "activities": [{
+                "activity_id": "act-one",
+                "evidence_ids": ["ev-one"],
+                "action": "Reviewed",
+                "object": "legacy portfolio row",
+                "outcome": "retained one minute",
+                "effort": {"recommended_minutes": 1},
+                "semantic_confidence": "high",
+                "project_recommendation": {
+                    "name": "Serenichron Level 2",
+                    "prefix": "SC",
+                    "tag_names": ["Processes"],
+                },
+            }],
+            "exceptions": [],
+            "omissions": [],
+        }
+
+        rows, exceptions, omissions = portfolio._package_review(
+            reviewed, source_activities, source_proposals, {}
+        )
+        accounting = portfolio._group_accounting(
+            source_activities, source_proposals, rows, exceptions, omissions
+        )
+
+        self.assertEqual(1, rows[0]["duration_minutes"])
+        self.assertNotIn("duration_seconds", rows[0])
+        self.assertNotIn("duration_seconds", rows[0]["allocation_segments"][0])
+        self.assertEqual(1, accounting["review_minutes"])
+        self.assertEqual(0, accounting["excluded_minutes"])
+
     def test_package_review_preserves_subminute_source_boundaries_and_seconds(self):
         source_activities = [{"activity_id": "act-one", "evidence_ids": ["ev-one"]}]
         source_proposals = [{

@@ -519,7 +519,7 @@ def _package_review(
     events_by_id: Mapping[str, dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     intervals = [(_parse(row["start"]), _parse(row["end"])) for row in source_proposals]
-    total_seconds = _seconds(source_proposals)
+    exact = any("duration_seconds" in row for row in source_proposals)
     activities = sorted(
         reviewed["activities"], key=lambda row: _sort_activity(row, events_by_id)
     )
@@ -527,9 +527,14 @@ def _package_review(
         int((row.get("effort") or {}).get("recommended_minutes") or 1)
         for row in activities
     ]
-    allocations = _allocate_seconds_from_pool(
-        intervals, _split_minutes(total_seconds, weights)
-    )
+    if exact:
+        allocations = _allocate_seconds_from_pool(
+            intervals, _split_minutes(_seconds(source_proposals), weights)
+        )
+    else:
+        allocations = _allocate_from_pool(
+            intervals, _split_minutes(_minutes(source_proposals), weights)
+        )
     source_by_evidence = {
         str(evidence_id): str(activity.get("activity_id") or "")
         for activity in source_activities
@@ -541,8 +546,12 @@ def _package_review(
         project = activity.get("project_recommendation")
         if not isinstance(project, Mapping):
             project = {}
-        duration_seconds = sum(int(row["duration_seconds"]) for row in segments)
-        packaged.append({
+        duration_seconds = (
+            sum(int(segment["duration_seconds"]) for segment in segments)
+            if exact
+            else None
+        )
+        row = {
             "review_id": semantic_analyzer.stable_digest(
                 "pvi-", {"activity_id": activity["activity_id"], "evidence_ids": evidence_ids}
             ),
@@ -552,8 +561,11 @@ def _package_review(
             "allocation_segments": segments,
             "start": segments[0]["start"],
             "end": segments[-1]["end"],
-            "duration_minutes": duration_seconds // 60,
-            "duration_seconds": duration_seconds,
+            "duration_minutes": (
+                duration_seconds // 60
+                if duration_seconds is not None
+                else sum(int(segment["duration_minutes"]) for segment in segments)
+            ),
             "client_project": str(project.get("name") or ""),
             "tag_names": [str(value) for value in project.get("tag_names", [])],
             "confidence": _confidence(activity),
@@ -564,7 +576,10 @@ def _package_review(
             "semantic_reviewer_revision": activity.get("semantic_reviewer_revision"),
             "validation_status": activity.get("portfolio_validation_status")
             or "flash_validated",
-        })
+        }
+        if duration_seconds is not None:
+            row["duration_seconds"] = duration_seconds
+        packaged.append(row)
     return packaged, list(reviewed["exceptions"]), list(reviewed["omissions"])
 
 
