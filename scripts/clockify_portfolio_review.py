@@ -55,7 +55,7 @@ def _parse(value: Any) -> dt.datetime:
 
 
 def _iso(value: dt.datetime) -> str:
-    return value.isoformat(timespec="minutes")
+    return value.isoformat(timespec="seconds")
 
 
 def _now() -> str:
@@ -272,6 +272,63 @@ def _minutes(proposals: Iterable[Mapping[str, Any]]) -> int:
     return total
 
 
+def _seconds(proposals: Iterable[Mapping[str, Any]]) -> int:
+    """Return exact source duration, rejecting any supplied seconds mismatch."""
+    total = 0
+    for proposal in proposals:
+        if "start" not in proposal or "end" not in proposal:
+            minutes = _minutes([proposal])
+            total += minutes * 60
+            continue
+        try:
+            start, end = _parse(proposal["start"]), _parse(proposal["end"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise PortfolioReviewError("source proposal bounds are invalid") from error
+        actual = int((end - start).total_seconds())
+        declared = proposal.get("duration_seconds")
+        if declared is not None and (
+            isinstance(declared, bool) or not isinstance(declared, int) or declared != actual
+        ):
+            raise PortfolioReviewError("source proposal seconds do not match its bounds")
+        if actual < 0:
+            raise PortfolioReviewError("source proposal duration must be nonnegative")
+        total += actual
+    return total
+
+
+def _allocate_seconds_from_pool(
+    intervals: list[tuple[dt.datetime, dt.datetime]], seconds: list[int]
+) -> list[list[dict[str, Any]]]:
+    pool = [[start, end] for start, end in sorted(intervals)]
+    output: list[list[dict[str, Any]]] = []
+    for requested in seconds:
+        remaining = requested
+        segments: list[dict[str, Any]] = []
+        while remaining > 0 and pool:
+            start, end = pool[0]
+            available = max(0, int((end - start).total_seconds()))
+            if available == 0:
+                pool.pop(0)
+                continue
+            used = min(remaining, available)
+            segment_end = start + dt.timedelta(seconds=used)
+            segments.append({
+                "start": _iso(start),
+                "end": _iso(segment_end),
+                "duration_minutes": used // 60,
+                "duration_seconds": used,
+            })
+            remaining -= used
+            if segment_end >= end:
+                pool.pop(0)
+            else:
+                pool[0][0] = segment_end
+        if remaining:
+            raise PortfolioReviewError("portfolio allocation exceeded its source pool")
+        output.append(segments)
+    return output
+
+
 def _exclusion_reasons(
     source_activities: Iterable[Mapping[str, Any]],
     exceptions: Iterable[Mapping[str, Any]],
@@ -334,10 +391,13 @@ def _group_accounting(
 ) -> dict[str, Any]:
     """Conserve a group's source pool without inventing excluded allocations."""
     source_minutes = _minutes(source_proposals)
+    source_seconds = _seconds(source_proposals)
     review_minutes = sum(int(row.get("duration_minutes") or 0) for row in reviewed_rows)
+    review_seconds = sum(int(row.get("duration_seconds") or 0) for row in reviewed_rows)
     if review_minutes > source_minutes:
         raise PortfolioReviewError("group review minutes exceed its source minutes")
     excluded_minutes = source_minutes - review_minutes
+    excluded_seconds = source_seconds - review_seconds
     exclusion_reasons = (
         _exclusion_reasons(source_activities, exceptions, omissions)
         if excluded_minutes else []
@@ -348,10 +408,15 @@ def _group_accounting(
         )
     if source_minutes != review_minutes + excluded_minutes:
         raise PortfolioReviewError("group source minute accounting does not balance")
+    if source_seconds != review_seconds + excluded_seconds:
+        raise PortfolioReviewError("group source second accounting does not balance")
     return {
         "source_minutes": source_minutes,
         "review_minutes": review_minutes,
         "excluded_minutes": excluded_minutes,
+        "source_seconds": source_seconds,
+        "review_seconds": review_seconds,
+        "excluded_seconds": excluded_seconds,
         "exclusion_reasons": exclusion_reasons,
     }
 
@@ -434,7 +499,7 @@ def _package_review(
     events_by_id: Mapping[str, dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     intervals = [(_parse(row["start"]), _parse(row["end"])) for row in source_proposals]
-    total_minutes = _minutes(source_proposals)
+    total_seconds = _seconds(source_proposals)
     activities = sorted(
         reviewed["activities"], key=lambda row: _sort_activity(row, events_by_id)
     )
@@ -442,7 +507,9 @@ def _package_review(
         int((row.get("effort") or {}).get("recommended_minutes") or 1)
         for row in activities
     ]
-    allocations = _allocate_from_pool(intervals, _split_minutes(total_minutes, weights))
+    allocations = _allocate_seconds_from_pool(
+        intervals, _split_minutes(total_seconds, weights)
+    )
     source_by_evidence = {
         str(evidence_id): str(activity.get("activity_id") or "")
         for activity in source_activities
@@ -465,6 +532,7 @@ def _package_review(
             "start": segments[0]["start"],
             "end": segments[-1]["end"],
             "duration_minutes": sum(int(row["duration_minutes"]) for row in segments),
+            "duration_seconds": sum(int(row["duration_seconds"]) for row in segments),
             "client_project": str(project.get("name") or ""),
             "tag_names": [str(value) for value in project.get("tag_names", [])],
             "confidence": _confidence(activity),
@@ -807,13 +875,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     reviewed_rows.sort(key=lambda row: (row["start"], row["review_id"]))
     source_minutes = _minutes(target_proposals)
+    source_seconds = _seconds(target_proposals)
     review_minutes = sum(int(row["duration_minutes"]) for row in reviewed_rows)
+    review_seconds = sum(int(row["duration_seconds"]) for row in reviewed_rows)
     excluded_minutes = sum(int(report["excluded_minutes"]) for report in group_reports)
+    excluded_seconds = sum(int(report["excluded_seconds"]) for report in group_reports)
     if source_minutes != sum(int(report["source_minutes"]) for report in group_reports):
         raise PortfolioReviewError("portfolio groups do not cover all source minutes")
     if review_minutes != sum(int(report["review_minutes"]) for report in group_reports):
         raise PortfolioReviewError("portfolio groups do not cover all review minutes")
     _portfolio_accounting(source_minutes, review_minutes, excluded_minutes)
+    _portfolio_accounting(source_seconds, review_seconds, excluded_seconds)
     result = {
         "schema_version": 1,
         "review_prompt_version": semantic_analyzer.PORTFOLIO_REVIEW_PROMPT_VERSION,
@@ -829,6 +901,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "source_minutes": source_minutes,
         "review_minutes": review_minutes,
         "excluded_minutes": excluded_minutes,
+        "source_seconds": source_seconds,
+        "review_seconds": review_seconds,
+        "excluded_seconds": excluded_seconds,
         "activities": reviewed_rows,
         "exceptions": exceptions,
         "omissions": omissions,

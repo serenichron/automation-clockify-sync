@@ -194,7 +194,7 @@ def _find_item(state: dict[str, Any], keys: dict[str, str], *, excluded_ids: set
 
 def _item_view(item: dict[str, Any]) -> dict[str, Any]:
     current = item.get("current", {})
-    return {
+    view = {
         "id": item["id"],
         "candidate_key": item["candidate_key"],
         "activity_id": current.get("activity_id"),
@@ -219,6 +219,9 @@ def _item_view(item: dict[str, Any]) -> dict[str, Any]:
         "parent_review_item_id": item.get("parent_review_item_id"),
         "supersedes": item.get("supersedes", []),
     }
+    if "duration_seconds" in current:
+        view["duration_seconds"] = current["duration_seconds"]
+    return view
 
 
 def _add_warning(warnings: list[dict[str, str]], kind: str, source: str, reason: str) -> None:
@@ -318,16 +321,18 @@ def _aggregate_semantic_allocations(
             passthrough.extend((disposition, value) for value in ordered)
             continue
         aggregate = copy.deepcopy(ordered[0])
-        segments = [
-            {
+        segments = []
+        for index, value in enumerate(ordered, 1):
+            segment = {
                 "candidate_key": str(value.get("candidate_key") or ""),
                 "segment": int(value.get("allocation_segment") or index),
                 "start": value.get("start"),
                 "end": value.get("end"),
                 "duration_minutes": value.get("duration_minutes"),
             }
-            for index, value in enumerate(ordered, 1)
-        ]
+            if "duration_seconds" in value:
+                segment["duration_seconds"] = value["duration_seconds"]
+            segments.append(segment)
         aggregate["candidate_key"] = activity_key
         aggregate["review_activity_key"] = activity_key
         aggregate["start"] = segments[0]["start"]
@@ -335,6 +340,10 @@ def _aggregate_semantic_allocations(
         aggregate["duration_minutes"] = sum(
             int(segment.get("duration_minutes") or 0) for segment in segments
         )
+        if any(segment.get("duration_seconds") is not None for segment in segments):
+            aggregate["duration_seconds"] = sum(
+                int(segment.get("duration_seconds") or 0) for segment in segments
+            )
         aggregate["allocation_segments"] = segments
         aggregate["proposal_candidate_keys"] = [segment["candidate_key"] for segment in segments]
         if isinstance(aggregate.get("provenance"), dict):

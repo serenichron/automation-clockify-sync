@@ -66,6 +66,38 @@ class PortfolioReviewTests(unittest.TestCase):
         self.assertEqual([], exceptions)
         self.assertEqual([], omissions)
 
+    def test_package_review_preserves_subminute_source_boundaries_and_seconds(self):
+        source_activities = [{"activity_id": "act-one", "evidence_ids": ["ev-one"]}]
+        source_proposals = [{
+            "activity_id": "act-one",
+            "start": "2026-07-10T09:00:17+03:00",
+            "end": "2026-07-10T09:30:43+03:00",
+            "duration_minutes": 30,
+            "duration_seconds": 1826,
+        }]
+        reviewed = {
+            "activities": [{
+                "activity_id": "act-one", "evidence_ids": ["ev-one"],
+                "action": "Rebuilt", "object": "review contract",
+                "outcome": "preserved exact time", "effort": {"recommended_minutes": 30},
+                "semantic_confidence": "high",
+                "project_recommendation": {
+                    "name": "Serenichron Level 2", "prefix": "SC",
+                    "tag_names": ["Processes"],
+                },
+            }],
+            "exceptions": [], "omissions": [],
+        }
+
+        rows, _exceptions, _omissions = portfolio._package_review(
+            reviewed, source_activities, source_proposals, {}
+        )
+
+        self.assertEqual("2026-07-10T09:00:17+03:00", rows[0]["start"])
+        self.assertEqual("2026-07-10T09:30:43+03:00", rows[0]["end"])
+        self.assertEqual(1826, rows[0]["duration_seconds"])
+        self.assertEqual(1826, rows[0]["allocation_segments"][0]["duration_seconds"])
+
     def test_allocate_from_pool_never_fills_gap(self):
         parse = portfolio._parse
         allocations = portfolio._allocate_from_pool(
@@ -77,8 +109,8 @@ class PortfolioReviewTests(unittest.TestCase):
         )
 
         self.assertEqual(2, len(allocations[0]))
-        self.assertEqual("2026-07-10T09:20+03:00", allocations[0][0]["end"])
-        self.assertEqual("2026-07-10T10:00+03:00", allocations[0][1]["start"])
+        self.assertEqual("2026-07-10T09:20:00+03:00", allocations[0][0]["end"])
+        self.assertEqual("2026-07-10T10:00:00+03:00", allocations[0][1]["start"])
 
     def test_group_accounting_all_retained(self):
         accounting = portfolio._group_accounting(

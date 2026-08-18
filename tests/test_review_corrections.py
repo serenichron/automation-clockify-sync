@@ -169,6 +169,34 @@ class ReviewCorrectionsTests(unittest.TestCase):
         self.assertEqual(1, result["summary"]["fail"])
         self.assertEqual(["reviewed activity is missing"], result["results"][0]["failures"])
 
+    def test_duration_seconds_correction_is_retained_and_replayed_exactly(self):
+        record = decision(
+            item(),
+            "modify",
+            categories=["allocation"],
+            field_patch={
+                "duration_seconds": {"op": "replace", "value": 2246},
+            },
+        )
+
+        case = corrections.derive_regression_cases([record])[0]
+        proposals = [
+            {
+                "activity_id": "act-stable",
+                "duration_seconds": 1123,
+                "provenance": {"evidence_ids": ["ev-001", "ev-002"]},
+            },
+            {
+                "activity_id": "act-stable",
+                "duration_seconds": 1123,
+                "provenance": {"evidence_ids": ["ev-001", "ev-002"]},
+            },
+        ]
+
+        self.assertEqual(1, corrections.evaluate_regression_cases([case], proposals)["summary"]["pass"])
+        proposals[1]["duration_seconds"] = 1122
+        self.assertEqual(1, corrections.evaluate_regression_cases([case], proposals)["summary"]["fail"])
+
     def test_split_correction_replay_requires_exact_child_evidence_partition(self):
         record = decision(
             item(evidence_ids=["ev-001", "ev-002", "ev-003"]),

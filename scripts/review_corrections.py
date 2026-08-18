@@ -25,6 +25,7 @@ PATCH_FIELDS = {
     "start",
     "end",
     "duration_minutes",
+    "duration_seconds",
     "billable",
 }
 
@@ -492,7 +493,7 @@ def evaluate_regression_cases(
             patch = case.get("expected_field_patch") if isinstance(case.get("expected_field_patch"), Mapping) else {}
             for field, operation in patch.items():
                 expected = operation.get("value") if isinstance(operation, Mapping) else None
-                if field == "duration_minutes":
+                if field in {"duration_minutes", "duration_seconds"}:
                     actual = sum(int(row.get(field) or 0) for row in rows)
                     if actual != expected:
                         failures.append(f"{field} differs from reviewed value")

@@ -13,7 +13,10 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(quality)
 
 
-def fathom_event(day="2026-07-10", source_id="meeting-one", *, naive=False):
+def fathom_event(
+    day="2026-07-10", source_id="meeting-one", *, naive=False,
+    member_identity="vlad@serenichron.com", participants=None,
+):
     start = f"{day} 09:00" if naive else f"{day}T09:00+03:00"
     end = f"{day} 09:30" if naive else f"{day}T09:30+03:00"
     return evidence_ledger.evidence_event(
@@ -21,9 +24,10 @@ def fathom_event(day="2026-07-10", source_id="meeting-one", *, naive=False):
         {"source_type": "fathom", "source_id": source_id},
         raw_source_span={"start": start, "end": end},
         attributes={
-            "recorded_by_email": "vlad@serenichron.com",
+            "recorded_by_email": member_identity,
             "meeting_id": f"events/{source_id}",
             "title": "July review",
+            **({"calendar_invitees": participants} if participants is not None else {}),
         },
     )
 
@@ -61,7 +65,7 @@ def clockify_event(day="2026-07-10", source_id="clockify-one"):
     )
 
 
-def ledger(*events, timezone="Europe/Bucharest"):
+def ledger(*events, timezone="Europe/Bucharest", member_identities=()):
     fathom_count = sum(event.source_type == "fathom" for event in events)
     calendly_count = sum(event.source_type == "calendly" for event in events)
     immutable = evidence_ledger.EvidenceLedger(tuple(events), {
@@ -77,7 +81,7 @@ def ledger(*events, timezone="Europe/Bucharest"):
                 "observed_count": calendly_count,
             },
         } if calendly_count else {}),
-    })
+    }, **({"member_identities": member_identities} if member_identities else {}))
     document = {
         "schema_version": evidence_ledger.SCHEMA_VERSION,
         "manifest": immutable.manifest.document(),
@@ -89,6 +93,7 @@ def ledger(*events, timezone="Europe/Bucharest"):
             event_count=document["manifest"]["event_count"],
             source_inventory=document["manifest"]["source_inventory"],
             timezone=timezone,
+            **({"member_identities": member_identities} if member_identities else {}),
         ).document()
     return document
 
@@ -173,6 +178,60 @@ class PortfolioQualityTests(unittest.TestCase):
         self.assertEqual({"expected": 1, "represented": 1, "excluded": 0, "missing": 0}, {key: report["fathom_coverage"][key] for key in ("expected", "represented", "excluded", "missing")})
         self.assertEqual(30, report["fragmentation"]["median_minutes"])
 
+    def test_row_duration_seconds_must_match_its_allocation_segments(self):
+        event = fathom_event()
+        value = document(event)
+        value["activities"][0]["duration_seconds"] = 1799
+        value["activities"][0]["allocation_segments"][0]["duration_seconds"] = 1800
+
+        report = quality.audit(value, ledger(event), source_proposals=proposals())
+
+        self.assertEqual("blocked", report["status"])
+        self.assertTrue(any(
+            item["reason"] == "duration seconds do not match segments"
+            for item in report["structural_issues"]
+        ))
+
+    def test_source_proposal_duration_seconds_must_match_its_bounds(self):
+        event = fathom_event()
+        source = [{**proposals()[0], "duration_seconds": 1799}]
+
+        report = quality.audit(document(event), ledger(event), source_proposals=source)
+
+        self.assertEqual("blocked", report["status"])
+        self.assertTrue(any(
+            item["reason"] == "invalid authoritative source proposal duration"
+            for item in report["structural_issues"]
+        ))
+
+    def test_second_accounting_must_match_exact_row_and_segment_totals(self):
+        event = fathom_event()
+        value = document(event)
+        row = value["activities"][0]
+        row.update({
+            "start": "2026-07-10T09:00:00+03:00",
+            "end": "2026-07-10T09:30:00+03:00",
+            "duration_seconds": 1800,
+        })
+        row["allocation_segments"][0].update({
+            "start": row["start"], "end": row["end"], "duration_seconds": 1800,
+        })
+        value.update({"source_seconds": 1800, "review_seconds": 1799, "excluded_seconds": 1})
+        value["groups"][0].update({
+            "source_seconds": 1800, "review_seconds": 1799, "excluded_seconds": 1,
+        })
+        source = [{
+            **proposals()[0], "start": row["start"], "end": row["end"], "duration_seconds": 1800,
+        }]
+
+        report = quality.audit(value, ledger(event), source_proposals=source)
+
+        self.assertEqual("blocked", report["status"])
+        self.assertTrue(any(
+            item["reason"] == "review_seconds does not equal row and segment seconds"
+            for item in report["structural_issues"]
+        ))
+
     def test_every_source_recording_is_accounted_once_by_canonical_meeting(self):
         fathom = fathom_event()
         calendly = calendly_event()
@@ -202,6 +261,32 @@ class PortfolioQualityTests(unittest.TestCase):
             },
             report["recording_coverage"]["source_dispositions"],
         )
+
+    def test_manifest_member_identity_controls_canonical_recording_coverage(self):
+        fathom = fathom_event(
+            member_identity="alternate@example.test",
+            participants=[
+                {"email": "alternate@example.test"},
+                {"email": "client@example.test"},
+            ],
+        )
+        calendly = calendly_event()
+        value = document(fathom)
+        value["activities"][0]["evidence_ids"] = [
+            fathom.evidence_id, calendly.evidence_id,
+        ]
+
+        report = quality.audit(
+            value,
+            ledger_document=ledger(
+                fathom, calendly,
+                member_identities=("alternate@example.test",),
+            ),
+            source_proposals=proposals(),
+        )
+
+        self.assertEqual("pass", report["status"])
+        self.assertEqual(1, report["recording_coverage"]["canonical_meetings"])
 
     def test_timing_conflict_is_a_blocking_recording_exception(self):
         fathom = fathom_event()

@@ -3847,6 +3847,7 @@ def _collect_slice(
         tuple(normalize_collector_snapshot(evidence)),
         source_inventory_from_collector(evidence),
         BUCHAREST.key,
+        tuple(routing.get("member_identities") or ("vlad@serenichron.com",)),
     )
     ledger_path = run_dir / "evidence" / "evidence-ledger.json"
     write_json(

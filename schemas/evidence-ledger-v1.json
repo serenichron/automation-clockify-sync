@@ -66,6 +66,12 @@
         "event_count": {"type": "integer", "minimum": 0},
         "source_inventory": {"type": "object", "additionalProperties": {"$ref": "#/$defs/sourceStatus"}},
         "timezone": {"type": "string", "minLength": 1},
+        "member_identities": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
         "source_completeness": {"type": "object"}
       }
     },

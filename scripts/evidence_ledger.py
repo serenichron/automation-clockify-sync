@@ -329,6 +329,20 @@ def _normal_source_inventory(source_inventory: Mapping[str, Mapping[str, Any]] |
     return dict(sorted(normalized.items()))
 
 
+def _normal_member_identities(value: object) -> tuple[str, ...]:
+    """Return the immutable, normalized set of approved member identities."""
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        raise ValueError("member identities must be a sequence")
+    identities = tuple(sorted({
+        item.strip().casefold()
+        for item in value
+        if isinstance(item, str) and item.strip()
+    }))
+    if not identities or len(identities) != len(value):
+        raise ValueError("member identities must be non-empty strings")
+    return identities
+
+
 def source_completeness(source_inventory: Mapping[str, Mapping[str, Any]] | None) -> dict[str, Any]:
     """Summarize source availability without silently treating missing data as work."""
     inventory = _normal_source_inventory(source_inventory)
@@ -507,6 +521,7 @@ class LedgerManifest:
     event_count: int
     source_inventory: Mapping[str, Mapping[str, Any]] = dataclasses.field(default_factory=dict)
     timezone: str = ""
+    member_identities: tuple[str, ...] = ()
     schema_version: str = SCHEMA_VERSION
     manifest_id: str = ""
 
@@ -522,6 +537,10 @@ class LedgerManifest:
                 ZoneInfo(self.timezone)
             except ZoneInfoNotFoundError as error:
                 raise ValueError("ledger timezone is invalid") from error
+        if self.member_identities:
+            object.__setattr__(
+                self, "member_identities", _normal_member_identities(self.member_identities)
+            )
         object.__setattr__(self, "source_inventory", _freeze_json(_normal_source_inventory(self.source_inventory)))
         expected = MANIFEST_ID_PREFIX + sha256_hex(self.document(include_id=False))
         if self.manifest_id and self.manifest_id != expected:
@@ -538,17 +557,24 @@ class LedgerManifest:
         }
         if self.timezone:
             document["timezone"] = self.timezone
+        if self.member_identities:
+            document["member_identities"] = list(self.member_identities)
         if include_id:
             document["manifest_id"] = self.manifest_id
         return document
 
     @classmethod
     def from_document(cls, document: Mapping[str, Any]) -> "LedgerManifest":
+        member_identities = (
+            _normal_member_identities(document["member_identities"])
+            if "member_identities" in document else ()
+        )
         return cls(
             events_digest=str(document.get("events_digest") or ""),
             event_count=int(document.get("event_count", -1)),
             source_inventory=document.get("source_inventory") or {},
             timezone=document.get("timezone") or "",
+            member_identities=member_identities,
             schema_version=str(document.get("schema_version") or ""),
             manifest_id=str(document.get("manifest_id") or ""),
         )
@@ -561,6 +587,7 @@ class EvidenceLedger:
     events: tuple[EvidenceEvent, ...] = ()
     source_inventory: Mapping[str, Mapping[str, Any]] = dataclasses.field(default_factory=dict)
     timezone: str = ""
+    member_identities: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         by_id: dict[str, EvidenceEvent] = {}
@@ -590,6 +617,10 @@ class EvidenceLedger:
         object.__setattr__(self, "source_inventory", _freeze_json(inventory))
         if not isinstance(self.timezone, str):
             raise ValueError("ledger timezone must be a string")
+        if self.member_identities:
+            object.__setattr__(
+                self, "member_identities", _normal_member_identities(self.member_identities)
+            )
 
     @property
     def manifest(self) -> LedgerManifest:
@@ -598,11 +629,15 @@ class EvidenceLedger:
             event_count=len(self.events),
             source_inventory=self.source_inventory,
             timezone=self.timezone,
+            member_identities=self.member_identities,
         )
 
     def append(self, events: Iterable[EvidenceEvent]) -> "EvidenceLedger":
         """Return a new ledger; exact duplicates are idempotent, never rewritten."""
-        return EvidenceLedger(self.events + tuple(events), self.source_inventory, self.timezone)
+        return EvidenceLedger(
+            self.events + tuple(events), self.source_inventory, self.timezone,
+            self.member_identities,
+        )
 
     def aliases(self) -> dict[str, str]:
         result: dict[str, str] = {}

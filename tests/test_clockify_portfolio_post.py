@@ -11,6 +11,34 @@ from scripts import clockify_portfolio_replay as portfolio_replay
 
 
 class ClockifyPortfolioPostTests(unittest.TestCase):
+    def test_posting_plan_preserves_subminute_approved_segments(self) -> None:
+        portfolio = {
+            "activities": [{
+                "review_id": "pvi-0123456789abcdef01234567",
+                "client_project": "Example Level 2",
+                "tag_names": ["Technical development"],
+                "description": "EX — Preserve exact recorded meeting time",
+                "duration_minutes": 30,
+                "duration_seconds": 1826,
+                "allocation_segments": [{
+                    "start": "2026-08-14T10:00:17+03:00",
+                    "end": "2026-08-14T10:30:43+03:00",
+                    "duration_minutes": 30,
+                    "duration_seconds": 1826,
+                }],
+            }],
+        }
+        routes = {
+            ("Example Level 2", ("Technical development",)): {
+                "project_id": "project-1", "tag_ids": ["tag-1"], "billable": True,
+            },
+        }
+
+        plan = poster._plans(portfolio, routes)[0]
+
+        self.assertEqual("2026-08-14T07:00:17Z", plan["start"])
+        self.assertEqual("2026-08-14T07:30:43Z", plan["end"])
+        self.assertEqual(1826, plan["duration_seconds"])
     def test_post_gate_requires_clean_flash_validated_replay_bound_repair(self) -> None:
         portfolio = {
             "external_writes": False,

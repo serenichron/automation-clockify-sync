@@ -4,13 +4,14 @@
   "title": "Canonical meeting reconciliation v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["reconciliation_id", "schema_version", "algorithm_version", "tolerance_seconds", "input_digests", "meetings", "exclusions", "exceptions"],
+  "required": ["reconciliation_id", "schema_version", "algorithm_version", "tolerance_seconds", "input_digests", "member_identities", "meetings", "exclusions", "exceptions"],
   "properties": {
     "reconciliation_id": {"type": "string", "pattern": "^mr-[0-9a-f]{64}$"},
     "schema_version": {"const": "meeting-reconciliation/v1"},
     "algorithm_version": {"type": "string", "minLength": 1},
     "tolerance_seconds": {"type": "integer", "minimum": 0},
     "input_digests": {"type": "object", "additionalProperties": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}},
+    "member_identities": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
     "meetings": {"type": "array", "items": {"$ref": "#/$defs/meeting"}},
     "exclusions": {"type": "array", "items": {"type": "object"}},
     "exceptions": {"type": "array", "items": {"$ref": "#/$defs/exception"}}
@@ -40,7 +41,7 @@
       "required": ["kind", "reason", "source_ids", "candidate_source_ids"],
       "properties": {
         "kind": {"const": "duplicate_ambiguous"},
-        "reason": {"enum": ["missing_participants", "timing_conflict", "multiple_candidates"]},
+        "reason": {"enum": ["missing_participants", "participant_conflict", "timing_conflict", "multiple_candidates"]},
         "source_ids": {"type": "array", "minItems": 1, "items": {"type": "string"}},
         "candidate_source_ids": {"type": "array", "items": {"type": "string"}}
       }

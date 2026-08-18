@@ -5,6 +5,7 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 from typing import Any, Mapping
@@ -450,23 +451,31 @@ def run(args: argparse.Namespace) -> int:
         "until": _iso_utc(args.until),
     }
     if args.command == "preflight":
-        document = {
-            **interval,
-            "status": "incomplete",
-            "complete": False,
-            "reason": "capability_unavailable",
-            "capability": "calendly_gateway_unconfigured",
-        }
+        try:
+            _gateway_configuration(os.environ)
+        except CalendlyCollectorError:
+            document = {
+                **interval,
+                "status": "incomplete",
+                "complete": False,
+                "reason": "capability_unavailable",
+                "capability": "calendly_gateway_unconfigured",
+            }
+        else:
+            document = {
+                **interval,
+                "status": "ready",
+                "complete": False,
+                "capability": "calendly_gateway_configured",
+            }
     else:
+        result = fetch_calendly(
+            os.environ, args.since, args.until,
+            checkpoint_store=PageCheckpointStore(args.checkpoint_root),
+        )
         document = {
-            **interval,
-            "status": "incomplete",
-            "complete": False,
-            "reason": "capability_unavailable",
-            "capability": "calendly_gateway_unconfigured",
+            **interval, **result,
             "checkpoint_root_id": "sha256:" + _digest(str(args.checkpoint_root)),
-            "recordings": [],
-            "scheduled_without_recording": [],
         }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(document, sort_keys=True) + "\n")

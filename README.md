@@ -286,6 +286,18 @@ Multi-project meeting allocations are accepted only when timestamped semantic
 evidence partitions the full recorded interval. Human approval or a percentage
 share cannot replace a timestamped boundary.
 
+`routing.json.member_identities` is copied into, and therefore bound by, each
+immutable evidence-ledger manifest. That bound identity set controls recording
+eligibility and the identities removed before participant-window fallback
+matching; a later routing change cannot alter a previously collected period.
+Recollect a period to apply an identity change.
+
+When present, `duration_seconds` and second-precision `start`/`end` bounds are
+authoritative for a recording, proposal, review row, and its allocation
+segments. `duration_minutes` remains a display and legacy-compatibility field;
+minute-only historical artifacts remain readable, while an artifact that
+supplies exact seconds is checked against its exact bounds.
+
 Review corrections are immutable and bound to stable activity plus evidence
 identity. Only sanitized general rules reach the analyzer. Exact replacement
 values remain local-only regression cases. A reappearing skip is removed from
@@ -594,6 +606,13 @@ non-read-only configuration is a visible capability gap: the Calendly source
 remains incomplete and complete source coverage cannot pass. The collector may
 record scheduled events as `scheduled_without_recording`, but they never create
 duration evidence or a Clockify proposal.
+
+Use `scripts/calendly_collector.py preflight` with `--since`, `--until`, and
+`--output` to validate the configured read-only gateway and canonical interval
+without making a network request. `collect` takes the same arguments plus a
+required `--checkpoint-root`; it resumes or creates a checkpointed collection
+and emits recordings only after pagination is complete. Any unavailable or
+partial result has `complete: false` and no partial recording output.
 
 Portfolio quality reports canonical `recording_coverage` while preserving the
 read-only `fathom_coverage` alias for historical artifacts. New replay seals

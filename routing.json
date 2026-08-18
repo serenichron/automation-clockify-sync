@@ -1,6 +1,9 @@
 {
   "timezone": "Europe/Bucharest",
   "clockify_user_id": "5f5b5121a551633f6dfa31e6",
+  "member_identities": [
+    "vlad@serenichron.com"
+  ],
   "default_since_policy": "one_day_before_latest_clockify_entry",
   "prefix_overrides": [
     {

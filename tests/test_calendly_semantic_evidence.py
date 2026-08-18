@@ -366,8 +366,51 @@ class CalendlyCliContractTests(unittest.TestCase):
             self.assertEqual(root.resolve(), args.checkpoint_root)
             self.assertEqual(0, calendly.run(args))
             self.assertEqual([], json.loads(output.read_text())["recordings"])
-            self.assertEqual("incomplete", json.loads(output.read_text())["status"])
+            self.assertEqual("capability_unavailable", json.loads(output.read_text())["status"])
             self.assertFalse(root.exists())
+
+    def test_preflight_checks_config_without_network_access(self):
+        with tempfile.TemporaryDirectory() as directory, _working_directory(directory):
+            output = Path(directory) / "result.json"
+            args = calendly.parse_args([
+                "preflight", "--since", "2026-08-04T00:00:00Z",
+                "--until", "2026-08-05T00:00:00Z", "--output", str(output),
+            ])
+            with (
+                mock.patch.dict(os.environ, COLLECTION_ENV, clear=False),
+                mock.patch.object(calendly, "_http_json") as http_json,
+            ):
+                self.assertEqual(0, calendly.run(args))
+
+            document = json.loads(output.read_text())
+        self.assertEqual("ready", document["status"])
+        self.assertEqual("calendly_gateway_configured", document["capability"])
+        http_json.assert_not_called()
+
+    def test_collect_uses_read_only_environment_and_checkpoint_store(self):
+        with tempfile.TemporaryDirectory() as directory, _working_directory(directory):
+            root = Path(directory) / "checkpoints"
+            output = Path(directory) / "result.json"
+            args = calendly.parse_args([
+                "collect", "--since", "2026-08-04T00:00:00Z",
+                "--until", "2026-08-05T00:00:00Z", "--output", str(output),
+                "--checkpoint-root", str(root),
+            ])
+            with (
+                mock.patch.dict(os.environ, COLLECTION_ENV, clear=False),
+                mock.patch.object(
+                    calendly,
+                    "_http_json",
+                    return_value={"collection": [collection_recording("cli")], "pagination": {}},
+                ) as http_json,
+            ):
+                self.assertEqual(0, calendly.run(args))
+
+            document = json.loads(output.read_text())
+            self.assertTrue(document["complete"])
+            self.assertEqual(["recordings/cli"], [row["recording_id"] for row in document["recordings"]])
+            self.assertTrue(root.is_dir())
+            http_json.assert_called_once()
 
     def test_cli_rejects_output_outside_invocation_root(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -147,7 +147,7 @@ class ProcessIntegrationTests(unittest.TestCase):
                 "schema_version", "allocation_mode", "ledger_manifest",
                 "semantic_analysis", "proposals", "ambiguous", "skipped",
                 "allocation", "fathom_reconciliation", "correction_regression",
-                "external_writes",
+                "external_writes", "member_identities",
             },
             set(accounting["required"]),
         )

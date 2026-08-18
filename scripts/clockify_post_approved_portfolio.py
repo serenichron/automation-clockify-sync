@@ -210,17 +210,28 @@ def _merged_segments(row: Mapping[str, Any]) -> list[dict[str, Any]]:
         start = str(segment.get("start") or "")
         end = str(segment.get("end") or "")
         minutes = int(segment.get("duration_minutes") or 0)
+        seconds = int(segment.get("duration_seconds") or 0)
         if not start or not end or _parse(end) <= _parse(start):
             raise PortfolioPostError("portfolio contains an invalid allocation segment")
-        if minutes != int((_parse(end) - _parse(start)).total_seconds() // 60):
+        actual_seconds = int((_parse(end) - _parse(start)).total_seconds())
+        if minutes != actual_seconds // 60:
             raise PortfolioPostError("portfolio segment duration is inconsistent")
+        if "duration_seconds" in segment and seconds != actual_seconds:
+            raise PortfolioPostError("portfolio segment seconds are inconsistent")
+        seconds = actual_seconds
         if merged and merged[-1]["end"] == start:
             merged[-1]["end"] = end
             merged[-1]["duration_minutes"] += minutes
+            merged[-1]["duration_seconds"] += seconds
         else:
-            merged.append({"start": start, "end": end, "duration_minutes": minutes})
+            merged.append({
+                "start": start, "end": end, "duration_minutes": minutes,
+                "duration_seconds": seconds,
+            })
     if sum(item["duration_minutes"] for item in merged) != int(row.get("duration_minutes") or 0):
         raise PortfolioPostError("portfolio row minutes do not match its allocation segments")
+    if "duration_seconds" in row and sum(item["duration_seconds"] for item in merged) != int(row.get("duration_seconds") or 0):
+        raise PortfolioPostError("portfolio row seconds do not match its allocation segments")
     return merged
 
 
@@ -247,6 +258,7 @@ def _plans(
                 "start": _utc(segment["start"]),
                 "end": _utc(segment["end"]),
                 "duration_minutes": segment["duration_minutes"],
+                "duration_seconds": segment["duration_seconds"],
                 "project_name": project_name,
                 "project_id": route["project_id"],
                 "tag_names": tag_names,
@@ -418,6 +430,7 @@ def _receipt_item(plan: Mapping[str, Any], entry_id: str, disposition: str) -> d
         "start": plan["start"],
         "end": plan["end"],
         "duration_minutes": plan["duration_minutes"],
+        "duration_seconds": plan["duration_seconds"],
         "project_name": plan["project_name"],
         "description_digest": hashlib.sha256(plan["description"].encode("utf-8")).hexdigest(),
         "disposition": disposition,

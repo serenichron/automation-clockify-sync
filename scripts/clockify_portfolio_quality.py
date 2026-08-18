@@ -75,6 +75,18 @@ def _nonnegative_minutes(value: Any) -> int | None:
     return minutes if minutes >= 0 else None
 
 
+def _positive_seconds(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value > 0 else None
+
+
+def _nonnegative_seconds(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value >= 0 else None
+
+
 def _review_range(document: Mapping[str, Any]) -> tuple[dt.date, dt.date] | None:
     source = document.get("range")
     if not isinstance(source, Mapping):
@@ -105,7 +117,8 @@ def _validated_ledger(ledger_document: Mapping[str, Any] | None) -> tuple[list[d
         raise ValueError("evidence ledger contains duplicate evidence IDs")
     candidate_manifest = evidence_ledger.LedgerManifest.from_document(manifest_document)
     immutable = evidence_ledger.EvidenceLedger(
-        tuple(events), candidate_manifest.source_inventory, candidate_manifest.timezone
+        tuple(events), candidate_manifest.source_inventory, candidate_manifest.timezone,
+        candidate_manifest.member_identities,
     )
     immutable.validate(candidate_manifest)
     return [event.document() for event in immutable.events], immutable.manifest.document()
@@ -304,30 +317,7 @@ def canonical_recording_events(
     recordings = [
         event for event in events if event.get("source_type") in {"fathom", "calendly"}
     ]
-    normalized: list[Mapping[str, Any]] = []
-    timezone = None
-    for event in recordings:
-        candidate = dict(event)
-        span = event.get("raw_source_span")
-        if event.get("source_type") == "fathom" and isinstance(span, Mapping):
-            local_fields = [
-                field for field in ("start", "end")
-                if isinstance(span.get(field), str)
-                and meeting_reconciliation._LOCAL_MINUTE.fullmatch(span[field])
-            ]
-            if local_fields:
-                timezone = timezone or meeting_reconciliation._manifest_timezone(manifest)
-                candidate["raw_source_span"] = {
-                    **dict(span),
-                    **{
-                        field: meeting_reconciliation._iso_utc(
-                            meeting_reconciliation._parse_local_minute(span[field], timezone)
-                        )
-                        for field in local_fields
-                    },
-                }
-        normalized.append(candidate)
-    return normalized
+    return meeting_reconciliation.normalize_ledger_recordings(recordings, manifest)
 
 
 def _canonical_recordings(
@@ -348,7 +338,7 @@ def _canonical_recordings(
     reconciliation = meeting_reconciliation.reconcile_meetings(
         [event for event in reconciliation_events if event.get("source_type") == "fathom"],
         [event for event in reconciliation_events if event.get("source_type") == "calendly"],
-        vlad_identities={"vlad@serenichron.com"},
+        vlad_identities=meeting_reconciliation.manifest_member_identities(manifest),
     )
     return reconciliation, source_events
 
@@ -582,6 +572,7 @@ def _source_pool_issues(
     pool: list[tuple[dt.datetime, dt.datetime]] = []
     issues: list[dict[str, Any]] = []
     proposal_minutes = 0
+    proposal_seconds = 0
     for proposal in source_proposals:
         try:
             start = _parse(proposal.get("start"))
@@ -599,12 +590,20 @@ def _source_pool_issues(
             issues.append({"reason": "invalid authoritative source proposal window"})
             continue
         minutes = _positive_minutes(proposal.get("duration_minutes"))
-        actual = int((end - start).total_seconds() // 60)
-        if end <= start or minutes is None or minutes != actual:
+        actual_seconds = int((end - start).total_seconds())
+        actual_minutes = actual_seconds // 60
+        seconds = proposal.get("duration_seconds")
+        if (
+            end <= start
+            or minutes is None
+            or minutes != actual_minutes
+            or (seconds is not None and _positive_seconds(seconds) != actual_seconds)
+        ):
             issues.append({"reason": "invalid authoritative source proposal duration"})
             continue
         pool.append((start, end))
         proposal_minutes += minutes
+        proposal_seconds += actual_seconds
         metrics["in_range_proposal_minutes"] += minutes
     for prior, current in zip(sorted(pool), sorted(pool)[1:]):
         if current[0] < prior[1]:
@@ -614,6 +613,9 @@ def _source_pool_issues(
     if source_minutes is not None:
         if _nonnegative_minutes(source_minutes) != proposal_minutes:
             issues.append({"reason": "source_minutes does not match authoritative proposal pool"})
+    if "source_seconds" in document:
+        if _nonnegative_seconds(document.get("source_seconds")) != proposal_seconds:
+            issues.append({"reason": "source_seconds does not match authoritative proposal pool"})
     for start, end, review_id in segments:
         if not _covers(pool, start, end):
             issues.append({"review_id": review_id, "reason": "allocation lies outside authoritative source proposal pool"})
@@ -680,6 +682,46 @@ def _minute_accounting_issues(
     return issues
 
 
+def _second_accounting_issues(
+    document: Mapping[str, Any], row_total: int, segment_total: int
+) -> list[dict[str, Any]]:
+    """Validate exact totals when the review opts into second precision."""
+    fields = ("source_seconds", "review_seconds", "excluded_seconds")
+    if not any(field in document for field in fields):
+        return []
+    issues: list[dict[str, Any]] = []
+    totals: dict[str, int] = {}
+    for field in fields:
+        value = _nonnegative_seconds(document.get(field))
+        if value is None:
+            issues.append({"reason": f"missing or invalid {field}"})
+        else:
+            totals[field] = value
+    if len(totals) == len(fields):
+        if totals["review_seconds"] != row_total or totals["review_seconds"] != segment_total:
+            issues.append({"reason": "review_seconds does not equal row and segment seconds"})
+        if totals["source_seconds"] != totals["review_seconds"] + totals["excluded_seconds"]:
+            issues.append({"reason": "source_seconds does not equal review_seconds plus excluded_seconds"})
+    groups = document.get("groups")
+    if not isinstance(groups, list) or not all(isinstance(group, Mapping) for group in groups):
+        return [*issues, {"reason": "groups must be a list of accounting objects"}]
+    group_totals = {field: 0 for field in fields}
+    for index, group in enumerate(groups, 1):
+        values: dict[str, int] = {}
+        for field in fields:
+            value = _nonnegative_seconds(group.get(field))
+            if value is None:
+                issues.append({"group": index, "reason": f"missing or invalid group {field}"})
+            else:
+                values[field] = value
+                group_totals[field] += value
+        if len(values) == len(fields) and values["source_seconds"] != values["review_seconds"] + values["excluded_seconds"]:
+            issues.append({"group": index, "reason": "group source seconds do not balance"})
+    if len(totals) == len(fields) and group_totals != totals:
+        issues.append({"reason": "group second totals do not equal portfolio totals"})
+    return issues
+
+
 def audit(
     document: Mapping[str, Any],
     evidence_ledger_document: Mapping[str, Any] | None = None,
@@ -726,6 +768,12 @@ def audit(
     intervals: list[tuple[dt.datetime, dt.datetime, str]] = []
     durations: list[int] = []
     segment_total = 0
+    row_seconds_total = 0
+    segment_seconds_total = 0
+    exact_accounting = any(
+        field in document
+        for field in ("source_seconds", "review_seconds", "excluded_seconds")
+    )
     try:
         taxonomy = _routing_taxonomy(routing) if routing is not None else {}
     except ValueError as exc:
@@ -802,6 +850,8 @@ def audit(
             structural.append({"review_id": review_id, "reason": "missing allocation segments"})
             segments = []
         row_segment_minutes = 0
+        row_segment_seconds = 0
+        exact_bounds = "duration_seconds" in row
         parsed_segments: list[tuple[dt.datetime, dt.datetime]] = []
         for segment in segments:
             if not isinstance(segment, Mapping):
@@ -813,14 +863,26 @@ def audit(
                 structural.append({"review_id": review_id, "reason": "invalid allocation segment"})
                 continue
             minutes = _positive_minutes(segment.get("duration_minutes"))
-            actual = int((end - start).total_seconds() // 60)
-            if end <= start or minutes is None or minutes != actual:
+            actual_seconds = int((end - start).total_seconds())
+            actual_minutes = actual_seconds // 60
+            seconds = segment.get("duration_seconds")
+            exact_bounds = exact_bounds or seconds is not None
+            if exact_accounting and seconds is None:
+                structural.append({"review_id": review_id, "reason": "missing allocation segment duration_seconds"})
+            if (
+                end <= start
+                or minutes is None
+                or minutes != actual_minutes
+                or (seconds is not None and _positive_seconds(seconds) != actual_seconds)
+            ):
                 structural.append({"review_id": review_id, "reason": "invalid allocation segment"})
                 continue
             if review_range is not None and not (review_range[0] <= start.date() <= review_range[1] and review_range[0] <= end.date() <= review_range[1]):
                 structural.append({"review_id": review_id, "reason": "allocation outside review range"})
             row_segment_minutes += minutes
+            row_segment_seconds += actual_seconds
             segment_total += minutes
+            segment_seconds_total += actual_seconds
             parsed_segments.append((start, end))
             intervals.append((start, end, review_id))
         for evidence_id in normalized_ids if isinstance(evidence_ids, list) else []:
@@ -830,8 +892,15 @@ def audit(
             structural.append({"review_id": review_id, "reason": "duration does not match segments"})
         else:
             durations.append(duration)
+        if "duration_seconds" in row and _positive_seconds(row.get("duration_seconds")) != row_segment_seconds:
+            structural.append({"review_id": review_id, "reason": "duration seconds do not match segments"})
+        elif "duration_seconds" in row:
+            row_seconds_total += row_segment_seconds
+        elif exact_accounting:
+            structural.append({"review_id": review_id, "reason": "missing row duration_seconds"})
         if parsed_segments and (row.get("start") is not None or row.get("end") is not None):
-            if row.get("start") != min(start for start, _ in parsed_segments).isoformat(timespec="minutes") or row.get("end") != max(end for _, end in parsed_segments).isoformat(timespec="minutes"):
+            timespec = "seconds" if exact_bounds else "minutes"
+            if row.get("start") != min(start for start, _ in parsed_segments).isoformat(timespec=timespec) or row.get("end") != max(end for _, end in parsed_segments).isoformat(timespec=timespec):
                 structural.append({"review_id": review_id, "reason": "row bounds do not match allocation segments"})
     intervals.sort()
     overlaps = []
@@ -842,6 +911,9 @@ def audit(
         structural.append({"reason": "allocation overlaps", "count": len(overlaps)})
     row_total = sum(durations)
     structural.extend(_minute_accounting_issues(document, row_total, segment_total))
+    structural.extend(
+        _second_accounting_issues(document, row_seconds_total, segment_seconds_total)
+    )
     if source_proposals is not None and not all(isinstance(row, Mapping) for row in source_proposals):
         structural.append({"reason": "authoritative source proposals must be objects"})
         source_pool = {"available": True, "in_range_proposal_count": 0, "in_range_proposal_minutes": 0}

@@ -127,6 +127,24 @@ def _assert_schema_contract(schema: dict, declaration: dict, candidate: object) 
 
 
 class EvidenceLedgerTests(unittest.TestCase):
+    def test_manifest_binds_normalized_approved_member_identities(self) -> None:
+        evidence = ledger.EvidenceLedger((event(),))
+        manifest = ledger.LedgerManifest(
+            events_digest=evidence.manifest.events_digest,
+            event_count=evidence.manifest.event_count,
+            source_inventory=evidence.manifest.source_inventory,
+            member_identities=("Vlad@Example.Test", " alternate@example.test "),
+        )
+
+        self.assertEqual(
+            ["alternate@example.test", "vlad@example.test"],
+            manifest.document()["member_identities"],
+        )
+        self.assertEqual(
+            manifest.manifest_id,
+            ledger.LedgerManifest.from_document(manifest.document()).manifest_id,
+        )
+
     def test_calendly_recording_is_immutable_evidence_with_complete_inventory(self) -> None:
         snapshot = complete_snapshot(
             calendly={"status": "ok", "complete": True, "recordings": [CALENDLY_RECORDING]}

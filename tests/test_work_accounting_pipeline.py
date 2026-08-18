@@ -646,6 +646,97 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         )
         return run_dir, result
 
+    def test_collector_snapshot_local_minute_fathom_reaches_accounting_in_ledger_timezone(self):
+        """The collector's local Fathom minute evidence is normalized before deduplication."""
+        snapshot = {
+            "clockify": {"status": "ok", "complete": True, "entries": []},
+            "fathom": {
+                "status": "ok", "complete": True,
+                "meetings": [{
+                    "recording_id": "local-minute", "meeting_id": "local-event",
+                    "title": "Local-minute client review",
+                    "start": "2026-07-10 13:00", "end": "2026-07-10 13:37",
+                    "recorded_by_email": "vlad@serenichron.com",
+                    "calendar_invitees": [{"email": "client@example.test", "is_external": True}],
+                    "semantic_evidence_status": "available",
+                }],
+            },
+            "calendly": {"status": "disabled", "complete": True, "recordings": []},
+            "multica_issues": {"status": "ok", "complete": True, "issues": []},
+        }
+        events = evidence_ledger.normalize_collector_snapshot(snapshot)
+        meeting = next(event for event in events if event.source_type == "fathom")
+        inventory = evidence_ledger.source_inventory_from_collector(snapshot)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = root / "runs" / "fixture"
+            immutable = evidence_ledger.EvidenceLedger(
+                tuple(events), inventory, "Europe/Bucharest"
+            )
+            write_json(run_dir / "evidence" / "evidence-ledger.json", {
+                "schema_version": immutable.manifest.schema_version,
+                "manifest": immutable.manifest.document(),
+                "events": [event.document() for event in immutable.events],
+            })
+            fixture = root / "analysis.json"
+            write_json(fixture, meeting_analysis(meeting))
+            result = pipeline.run_accounting(run_dir, root=ROOT, analysis_fixture=fixture)
+
+        self.assertEqual("2026-07-10T13:00:00+03:00", result["proposals"][0]["start"])
+        self.assertEqual("2026-07-10T13:37:00+03:00", result["proposals"][0]["end"])
+
+    def test_meeting_seconds_survive_accounting_proposal_contract(self):
+        meeting = fathom_event(
+            "2026-07-10T13:00:17+03:00",
+            "2026-07-10T13:37:43+03:00",
+            status="available",
+        )
+        _, result = self.make_run([meeting], meeting_analysis(meeting))
+
+        proposal = result["proposals"][0]
+        self.assertEqual("2026-07-10T13:00:17+03:00", proposal["start"])
+        self.assertEqual("2026-07-10T13:37:43+03:00", proposal["end"])
+        self.assertEqual(2246, proposal["duration_seconds"])
+
+    def test_manifest_member_identity_is_used_for_meeting_eligibility(self):
+        meeting = evidence_ledger.evidence_event(
+            "fathom",
+            {"source_type": "fathom", "source_id": "member-alias"},
+            raw_source_span={
+                "start": "2026-07-10T13:00:00+03:00",
+                "end": "2026-07-10T13:37:00+03:00",
+            },
+            attributes={
+                "title": "Member alias review",
+                "semantic_evidence_status": "available",
+                "recorded_by_email": "alternate@example.test",
+                "calendar_invitees": [{"email": "client@example.test", "is_external": True}],
+            },
+        )
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        run_dir = Path(temp.name) / "runs" / "fixture"
+        immutable = evidence_ledger.EvidenceLedger(
+            (meeting,),
+            {
+                "clockify": {"status": "complete"},
+                "fathom": {"status": "complete"},
+                "sessions/macbook": {"status": "complete"},
+            },
+            member_identities=("alternate@example.test",),
+        )
+        write_json(run_dir / "evidence" / "evidence-ledger.json", {
+            "schema_version": immutable.manifest.schema_version,
+            "manifest": immutable.manifest.document(),
+            "events": [event.document() for event in immutable.events],
+        })
+        fixture = Path(temp.name) / "analysis.json"
+        write_json(fixture, meeting_analysis(meeting))
+
+        result = pipeline.run_accounting(run_dir, root=ROOT, analysis_fixture=fixture)
+
+        self.assertEqual("proposed", result["fathom_reconciliation"][0]["status"])
+
     def append_correction(self, path, proposal, decision, *, field_patch=None, categories=None):
         item = {"id": "rvi-regression", "current": proposal}
         record = review_corrections.build_decision(
@@ -753,7 +844,7 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         )
         self.assertEqual(2, len(result["proposals"]))
         self.assertEqual(120, sum(row["duration_minutes"] for row in result["proposals"]))
-        self.assertLessEqual(result["proposals"][0]["end"], "2026-07-10T10:00+03:00")
+        self.assertLessEqual(result["proposals"][0]["end"], "2026-07-10T10:00:00+03:00")
         self.assertGreaterEqual(result["proposals"][1]["start"], "2026-07-10T10:30+03:00")
         self.assertTrue(all(row["allocation_mode"] == "non_overlapping_v1" for row in result["proposals"]))
 
@@ -1017,7 +1108,7 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         )
         self.assertEqual(60, contested["unallocated_minutes"])
         self.assertIn(
-            ["2026-07-10T09:00+03:00", "2026-07-10T09:21+03:00"],
+            ["2026-07-10T09:00:00+03:00", "2026-07-10T09:21:00+03:00"],
             result["allocation"]["unallocated_capacity"]["intervals"],
         )
 
@@ -1042,8 +1133,8 @@ class WorkAccountingPipelineTests(unittest.TestCase):
 
         self.assertEqual(1, len(result["proposals"]))
         proposal = result["proposals"][0]
-        self.assertEqual("2026-07-10T13:07+03:00", proposal["start"])
-        self.assertEqual("2026-07-10T14:11+03:00", proposal["end"])
+        self.assertEqual("2026-07-10T13:07:00+03:00", proposal["start"])
+        self.assertEqual("2026-07-10T14:11:00+03:00", proposal["end"])
         self.assertEqual(proposal["description"], proposal["rendered_description"])
         self.assertEqual("proposed", result["fathom_reconciliation"][0]["status"])
         self.assertEqual(meeting.evidence_id, result["fathom_reconciliation"][0]["evidence_id"])
@@ -1100,7 +1191,7 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         self.assertEqual(2, len(result["proposals"]))
         self.assertEqual(37, sum(item["duration_minutes"] for item in result["proposals"]))
         self.assertEqual(
-            ["2026-07-10T13:00+03:00", "2026-07-10T13:20+03:00"],
+            ["2026-07-10T13:00:00+03:00", "2026-07-10T13:20:00+03:00"],
             [item["start"] for item in result["proposals"]],
         )
 

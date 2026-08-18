@@ -93,11 +93,29 @@ def _identity(value: object) -> str:
 
 def _identity_set(value: object) -> frozenset[str]:
     if not isinstance(value, (list, tuple, set, frozenset)):
-        raise MeetingReconciliationError("Vlad identities must be a sequence")
+        raise MeetingReconciliationError("member identities must be a sequence")
     identities = frozenset(item for item in (_identity(item) for item in value) if item)
     if not identities:
-        raise MeetingReconciliationError("at least one Vlad identity is required")
+        raise MeetingReconciliationError("at least one member identity is required")
     return identities
+
+
+_LEGACY_MEMBER_IDENTITIES = frozenset({"vlad@serenichron.com"})
+
+
+def manifest_member_identities(manifest: Mapping[str, Any]) -> frozenset[str]:
+    """Read the bound member set while retaining compatible legacy artifacts."""
+    if not isinstance(manifest, Mapping):
+        raise MeetingReconciliationError("period manifest must be an object")
+    for key in ("member_identities", "vlad_identities"):
+        if key in manifest:
+            return _identity_set(manifest[key])
+    identity = manifest.get("identity")
+    if isinstance(identity, Mapping):
+        for key in ("member_identities", "vlad_identities"):
+            if key in identity:
+                return _identity_set(identity[key])
+    return _LEGACY_MEMBER_IDENTITIES
 
 
 def _person_identities(value: object) -> set[str]:
@@ -148,7 +166,7 @@ class _Candidate:
     title: str
     organizer: Mapping[str, str]
     participants: tuple[Mapping[str, str], ...]
-    participant_ids: frozenset[str]
+    participant_people: frozenset[frozenset[str]]
     summary: str
     transcript: tuple[Mapping[str, Any], ...]
     action_items: tuple[Mapping[str, Any], ...]
@@ -295,6 +313,7 @@ class MeetingReconciliation:
     exclusions: tuple[Mapping[str, Any], ...]
     exceptions: tuple[Mapping[str, Any], ...]
     input_digests: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    member_identities: tuple[str, ...] = ()
 
     def document(self) -> dict[str, Any]:
         contents = {
@@ -302,6 +321,7 @@ class MeetingReconciliation:
             "algorithm_version": self.algorithm_version,
             "tolerance_seconds": self.tolerance_seconds,
             "input_digests": dict(sorted(self.input_digests.items())),
+            "member_identities": list(self.member_identities),
             "meetings": [meeting.document() for meeting in self.meetings],
             "exclusions": [dict(item) for item in self.exclusions],
             "exceptions": [dict(item) for item in self.exceptions],
@@ -347,13 +367,17 @@ def _candidate(provider: str, record: Mapping[str, Any], vlad: frozenset[str]) -
     organizer_normal = {key: str(organizer[key]) for key in ("email", "name", "id") if isinstance(organizer.get(key), str) and organizer[key].strip()}
     # The fallback rule is deliberately limited to participant/invitee lists.
     # A recorder or organizer is provenance, not evidence of attendance.
-    people_ids = set().union(*(_person_identities(person) for person in participants)) if participants else set()
+    participant_people = frozenset(
+        frozenset(identities)
+        for person in participants
+        if (identities := _person_identities(person)) and not identities.intersection(vlad)
+    )
     return _Candidate(
         provider=provider,
         source_id=f"{provider}:{identifier}", source_digest=digest,
         provider_ids=provider_ids, meeting_ids=meeting_ids, join_urls=join_urls,
         start=start, end=end, title=_text(source.get("title")), organizer=organizer_normal,
-        participants=participants, participant_ids=frozenset(people_ids - set(vlad)),
+        participants=participants, participant_people=participant_people,
         summary=_text(source.get("summary") or source.get("default_summary")),
         transcript=_items(source.get("transcript")), action_items=_items(source.get("action_items")),
     )
@@ -379,9 +403,16 @@ def _window_agrees(left: _Candidate, right: _Candidate, tolerance: dt.timedelta)
 def _relation(left: _Candidate, right: _Candidate, tolerance: dt.timedelta) -> tuple[str | None, str | None]:
     """Return a verified match strength or a review-only ambiguity reason."""
     explicit = bool(left.provider_ids & right.provider_ids) or bool(left.meeting_ids & right.meeting_ids) or bool(left.join_urls & right.join_urls)
-    same_people = bool(left.participant_ids) and left.participant_ids == right.participant_ids
+    same_people = bool(left.participant_people) and left.participant_people == right.participant_people
+    conflicting_people = (
+        bool(left.participant_people)
+        and bool(right.participant_people)
+        and left.participant_people != right.participant_people
+    )
     near_window = _window_agrees(left, right, tolerance)
     if explicit:
+        if conflicting_people:
+            return None, "participant_conflict"
         if not near_window:
             return None, "timing_conflict"
         if left.provider_ids & right.provider_ids:
@@ -391,9 +422,27 @@ def _relation(left: _Candidate, right: _Candidate, tolerance: dt.timedelta) -> t
         return "participant_window", None
     if same_people and not near_window:
         return None, "timing_conflict"
-    if near_window and (not left.participant_ids or not right.participant_ids):
-        return None, "missing_participants"
+    if near_window:
+        if not left.participant_people or not right.participant_people:
+            return None, "missing_participants"
+        if conflicting_people:
+            return None, "participant_conflict"
     return None, None
+
+
+def _has_priority_identity(left: _Candidate, right: _Candidate, strength: str, tolerance: dt.timedelta) -> bool:
+    """Return whether a pair belongs to one deduplication priority tier.
+
+    A conflict at a stronger tier must block a weaker fallback even though it
+    cannot form a canonical match itself.
+    """
+    if strength == "shared_identity":
+        return bool(left.provider_ids & right.provider_ids)
+    if strength == "cross_provider_identity":
+        return bool(left.meeting_ids & right.meeting_ids) or bool(left.join_urls & right.join_urls)
+    if strength == "participant_window":
+        return _window_agrees(left, right, tolerance)
+    raise MeetingReconciliationError("unknown reconciliation match priority")
 
 
 def _exception(source_ids: Sequence[str], reason: str, candidates: Sequence[str] = ()) -> dict[str, Any]:
@@ -407,26 +456,38 @@ def _match_in_priority_order(fathom: tuple[_Candidate, ...], calendly: tuple[_Ca
     exceptions: list[Mapping[str, Any]] = []
     quarantined: set[str] = set()
     for strength in ("shared_identity", "cross_provider_identity", "participant_window"):
-        edges: list[tuple[_Candidate, _Candidate]] = []
+        tier_pairs: list[tuple[_Candidate, _Candidate, str | None, str | None]] = []
         for left in remaining_f.values():
             for right in remaining_c.values():
                 if left.source_id in quarantined or right.source_id in quarantined:
                     continue
-                relation, _reason = _relation(left, right, tolerance)
-                if relation == strength:
-                    edges.append((left, right))
+                if not _has_priority_identity(left, right, strength, tolerance):
+                    continue
+                relation, reason = _relation(left, right, tolerance)
+                tier_pairs.append((left, right, relation, reason))
+        edges = [
+            (left, right)
+            for left, right, relation, _reason in tier_pairs
+            if relation == strength
+        ]
         by_source: dict[str, list[str]] = {}
-        for left, right in edges:
+        for left, right, _relation_kind, _reason in tier_pairs:
             by_source.setdefault(left.source_id, []).append(right.source_id)
             by_source.setdefault(right.source_id, []).append(left.source_id)
         ambiguous = {source for source, values in by_source.items() if len(values) > 1}
         for source in sorted(ambiguous):
             if source in remaining_f or source in remaining_c:
                 exceptions.append(_exception((source, *by_source[source]), "multiple_candidates", by_source[source]))
+        for left, right, _relation_kind, reason in tier_pairs:
+            if reason:
+                exceptions.append(_exception((left.source_id, right.source_id), reason))
         # An uncertainty at a stronger priority must never be revisited by a
-        # weaker rule. Quarantine both endpoints of every ambiguous edge.
-        for left, right in edges:
+        # weaker rule. Quarantine both endpoints of every ambiguous or
+        # conflicting priority pair.
+        for left, right, _relation_kind, reason in tier_pairs:
             if left.source_id in ambiguous or right.source_id in ambiguous:
+                quarantined.update((left.source_id, right.source_id))
+            if reason:
                 quarantined.update((left.source_id, right.source_id))
         for left, right in edges:
             if left.source_id in ambiguous or right.source_id in ambiguous:
@@ -484,10 +545,41 @@ def reconcile_meetings(fathom: Iterable[Mapping[str, Any]], calendly: Iterable[M
         raise MeetingReconciliationError("tolerance must be a non-negative whole-second duration")
     if not isinstance(algorithm_version, str) or not algorithm_version:
         raise MeetingReconciliationError("algorithm version is required")
-    f_candidates, c_candidates = _normalized_candidates(fathom, calendly, vlad_identities)
+    member_identities = _identity_set(vlad_identities)
+    f_candidates, c_candidates = _normalized_candidates(fathom, calendly, member_identities)
     groups, exceptions = _match_in_priority_order(f_candidates, c_candidates, tolerance)
     meetings = tuple(_canonical_meeting(group, algorithm_version) for group in groups)
-    return MeetingReconciliation(algorithm_version, int(tolerance.total_seconds()), meetings, (), exceptions)
+    return MeetingReconciliation(
+        algorithm_version, int(tolerance.total_seconds()), meetings, (), exceptions,
+        member_identities=tuple(sorted(member_identities)),
+    )
+
+
+def normalize_ledger_recordings(
+    records: Iterable[Mapping[str, Any]], manifest: Mapping[str, Any],
+) -> list[Mapping[str, Any]]:
+    """Convert local-minute Fathom ledger spans through the bound timezone."""
+    normalized: list[Mapping[str, Any]] = []
+    timezone: ZoneInfo | None = None
+    for record in records:
+        candidate = dict(record)
+        span = record.get("raw_source_span")
+        if record.get("source_type") == "fathom" and isinstance(span, Mapping):
+            local_fields = [
+                field for field in ("start", "end")
+                if isinstance(span.get(field), str) and _LOCAL_MINUTE.fullmatch(span[field])
+            ]
+            if local_fields:
+                timezone = timezone or _manifest_timezone(manifest)
+                candidate["raw_source_span"] = {
+                    **dict(span),
+                    **{
+                        field: _iso_utc(_parse_local_minute(span[field], timezone))
+                        for field in local_fields
+                    },
+                }
+        normalized.append(candidate)
+    return normalized
 
 
 def _read_json(path: Path) -> Mapping[str, Any]:
@@ -511,15 +603,7 @@ def _artifact_reference(manifest: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def _manifest_vlad_identities(manifest: Mapping[str, Any]) -> Sequence[str]:
-    for key in ("vlad_identities", "member_identities"):
-        if key in manifest:
-            value = manifest[key]
-            if isinstance(value, (list, tuple)):
-                return value
-    identity = manifest.get("identity")
-    if isinstance(identity, Mapping) and isinstance(identity.get("vlad_identities"), (list, tuple)):
-        return identity["vlad_identities"]
-    raise MeetingReconciliationError("period manifest has no Vlad identities")
+    return tuple(sorted(manifest_member_identities(manifest)))
 
 
 def _manifest_timezone(manifest: Mapping[str, Any]) -> ZoneInfo:
@@ -538,15 +622,13 @@ def _manifest_timezone(manifest: Mapping[str, Any]) -> ZoneInfo:
 def _normalize_fathom_ingestion(records: Sequence[Mapping[str, Any]], manifest: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     """Adapt the collector's local-minute artifact only at the CLI boundary."""
     timezone: ZoneInfo | None = None
-    normalized: list[Mapping[str, Any]] = []
-    for record in records:
-        item = dict(record)
+    normalized = normalize_ledger_recordings(records, manifest)
+    for item in normalized:
         for field in ("start", "end"):
             value = item.get(field)
             if isinstance(value, str) and _LOCAL_MINUTE.fullmatch(value):
                 timezone = timezone or _manifest_timezone(manifest)
                 item[field] = _iso_utc(_parse_local_minute(value, timezone))
-        normalized.append(item)
     return normalized
 
 

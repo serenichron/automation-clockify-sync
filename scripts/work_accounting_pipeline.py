@@ -90,11 +90,15 @@ def _parse_dt(value: Any) -> dt.datetime | None:
 
 
 def _iso(value: dt.datetime) -> str:
-    return value.isoformat(timespec="minutes")
+    return value.isoformat(timespec="seconds")
 
 
 def _minutes(start: dt.datetime, end: dt.datetime) -> int:
     return max(0, int((end - start).total_seconds() // 60))
+
+
+def _seconds(start: dt.datetime, end: dt.datetime) -> int:
+    return max(0, int((end - start).total_seconds()))
 
 
 def _drop_failed_allocations(
@@ -194,13 +198,16 @@ def load_ledger(path: Path) -> tuple[evidence_ledger.EvidenceLedger, list[dict[s
     manifest_document = document.get("manifest") or {}
     manifest = evidence_ledger.LedgerManifest.from_document(manifest_document)
     ledger = evidence_ledger.EvidenceLedger(
-        events, manifest.source_inventory, manifest.timezone
+        events, manifest.source_inventory, manifest.timezone, manifest.member_identities
     )
     ledger.validate(manifest)
     return ledger, [event.document() for event in ledger.events]
 
 
-def _analysis_events(events: Iterable[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+def _analysis_events(
+    events: Iterable[dict[str, Any]],
+    member_identities: frozenset[str] = frozenset({"vlad@serenichron.com"}),
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     event_list = list(events)
     retained: list[dict[str, Any]] = []
     noise: list[dict[str, str]] = []
@@ -256,7 +263,7 @@ def _analysis_events(events: Iterable[dict[str, Any]]) -> tuple[list[dict[str, A
         if source_type == "clockify":
             continue
         if source_type in {"fathom", "calendly"}:
-            eligible, exclusion = _meeting_is_eligible(event)
+            eligible, exclusion = _meeting_is_eligible(event, member_identities)
             semantic_status = str(_attributes(event).get("semantic_evidence_status") or "")
             if not eligible or semantic_status == "title_only":
                 noise.append({
@@ -722,6 +729,7 @@ def _existing_blocks(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _recording_events(
     events: Iterable[dict[str, Any]],
+    manifest: Mapping[str, Any],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Bind source evidence to the one canonical meeting it represents."""
     recording_sources = [
@@ -731,10 +739,13 @@ def _recording_events(
         f"{event['source_type']}:{(event.get('source_ref') or {}).get('source_id')}": event
         for event in recording_sources
     }
+    reconciliation_sources = meeting_reconciliation.normalize_ledger_recordings(
+        recording_sources, manifest
+    )
     reconciliation = meeting_reconciliation.reconcile_meetings(
-        [event for event in recording_sources if event.get("source_type") == "fathom"],
-        [event for event in recording_sources if event.get("source_type") == "calendly"],
-        vlad_identities={"vlad@serenichron.com"},
+        [event for event in reconciliation_sources if event.get("source_type") == "fathom"],
+        [event for event in reconciliation_sources if event.get("source_type") == "calendly"],
+        vlad_identities=meeting_reconciliation.manifest_member_identities(manifest),
     )
     result = []
     for meeting in reconciliation.meetings:
@@ -761,7 +772,9 @@ def _recording_events(
     return result, exceptions
 
 
-def _meeting_is_eligible(event: Mapping[str, Any]) -> tuple[bool, str | None]:
+def _meeting_is_eligible(
+    event: Mapping[str, Any], member_identities: frozenset[str] = frozenset({"vlad@serenichron.com"}),
+) -> tuple[bool, str | None]:
     attrs = _attributes(event)
     start, end = _span(event)
     if not start or not end:
@@ -778,8 +791,8 @@ def _meeting_is_eligible(event: Mapping[str, Any]) -> tuple[bool, str | None]:
         for value in invitees
         if isinstance(value, Mapping)
     } if isinstance(invitees, list) else set()
-    vlad_attended = "vlad@serenichron.com" in invitee_emails
-    if recorded_by == "vlad@serenichron.com" or vlad_attended:
+    member_attended = bool(member_identities.intersection(invitee_emails))
+    if recorded_by in member_identities or member_attended:
         return True, None
     if recorded_by:
         return False, "not_vlads_meeting"
@@ -990,6 +1003,7 @@ def _proposal(
         "start": _iso(start),
         "end": _iso(end),
         "duration_minutes": _minutes(start, end),
+        "duration_seconds": _seconds(start, end),
         "client_project": route.get("project_name"),
         "clockify_project_suffix": route.get("project_suffix"),
         "tag_suffixes": list(route.get("tag_suffixes", [])),
@@ -1052,7 +1066,13 @@ def run_accounting(
         raise WorkAccountingError(
             f"required evidence is incomplete; semantic accounting is blocked: {missing}"
         )
-    analysis_events, noise = _analysis_events(all_events)
+    try:
+        member_identities = meeting_reconciliation.manifest_member_identities(
+            ledger.manifest.document()
+        )
+    except meeting_reconciliation.MeetingReconciliationError as exc:
+        raise WorkAccountingError(f"ledger member identities are invalid: {exc}") from exc
+    analysis_events, noise = _analysis_events(all_events, member_identities)
     routing = _read_json(root / "routing.json")
     corrections = _load_corrections(corrections_path)
     regression_cases = _load_regression_cases(corrections_path)
@@ -1087,7 +1107,9 @@ def run_accounting(
     events_by_id = {str(event["evidence_id"]): event for event in all_events}
     existing = _existing_blocks(all_events)
     try:
-        recordings, recording_exceptions = _recording_events(all_events)
+        recordings, recording_exceptions = _recording_events(
+            all_events, ledger.manifest.document()
+        )
     except meeting_reconciliation.MeetingReconciliationError as exc:
         raise WorkAccountingError(f"canonical meeting reconciliation failed: {exc}") from exc
     quarantined_evidence_ids = {
@@ -1112,7 +1134,7 @@ def run_accounting(
             (event for event in source_events if event.get("source_type") == "fathom"),
             source_events[0],
         )
-        eligible, exclusion = _meeting_is_eligible(representative)
+        eligible, exclusion = _meeting_is_eligible(representative, member_identities)
         meeting_id = meeting.canonical_id
         manifest_base = {
             "canonical_id": meeting_id,
@@ -1566,6 +1588,7 @@ def run_accounting(
         "schema_version": SCHEMA_VERSION,
         "allocation_mode": ALLOCATION_MODE,
         "ledger_manifest": ledger.manifest.document(),
+        "member_identities": sorted(member_identities),
         "semantic_analysis": {
             "prompt_version": analysis.get("prompt_version"),
             "activity_count": len(analysis.get("activities", [])),

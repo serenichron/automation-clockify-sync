@@ -97,6 +97,35 @@ class CanonicalMeetingTests(unittest.TestCase):
         self.assertEqual(1, len(by_meeting.meetings))
         self.assertEqual(1, len(by_join.meetings))
 
+    def test_explicit_identity_with_conflicting_people_is_quarantined(self):
+        """Changing either source's participant set must not merge a conflict."""
+        result = reconcile_meetings(
+            [fathom()],
+            [calendly(participants=[{"email": "different-client@example.test"}])],
+            vlad_identities=VLAD_IDS,
+        )
+
+        self.assertEqual(2, len(result.meetings))
+        self.assertEqual("participant_conflict", result.exceptions[0]["reason"])
+        self.assertEqual(
+            {"fathom:f-1", "calendly:rec-1"},
+            set(result.exceptions[0]["source_ids"]),
+        )
+
+    def test_near_window_with_conflicting_people_is_quarantined(self):
+        """A plausible overlap with different people is review evidence, not two silos."""
+        result = reconcile_meetings(
+            [fathom(meeting_id="", share_url="")],
+            [calendly(
+                meeting_id="", join_url="",
+                participants=[{"email": "different-client@example.test"}],
+            )],
+            vlad_identities=VLAD_IDS,
+        )
+
+        self.assertEqual(2, len(result.meetings))
+        self.assertEqual("participant_conflict", result.exceptions[0]["reason"])
+
     def test_fallback_duplicate_requires_same_participants_and_five_minute_boundaries(self):
         result = reconcile_meetings(
             [fathom(meeting_id="", share_url="")],
@@ -153,16 +182,16 @@ class CanonicalMeetingTests(unittest.TestCase):
     def test_fallback_uses_participant_lists_not_organizer_or_recorder_identities(self):
         result = reconcile_meetings(
             [fathom(
-                meeting_id="", share_url="", calendar_invitees=[{"email": "first@example.test"}],
-                organizer={"email": "second@example.test"}, recorded_by_email="vlad@example.test",
+                meeting_id="", share_url="", calendar_invitees=[{"email": "client@example.test"}],
+                organizer={"email": "first@example.test"}, recorded_by_email="vlad@example.test",
             )],
             [calendly(
-                meeting_id="", join_url="", participants=[{"email": "second@example.test"}],
-                organizer={"email": "first@example.test"},
+                meeting_id="", join_url="", participants=[{"email": "client@example.test"}],
+                organizer={"email": "second@example.test"},
             )],
             vlad_identities=VLAD_IDS,
         )
-        self.assertEqual(2, len(result.meetings))
+        self.assertEqual(1, len(result.meetings))
         self.assertEqual((), result.exceptions)
 
     def test_timing_conflict_never_averages_or_trims_time(self):

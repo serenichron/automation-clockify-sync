@@ -279,6 +279,30 @@ class ReviewStateTests(unittest.TestCase):
         self.assertEqual(2, len(state["items"][item_id]["current"]["allocation_segments"]))
         self.assertEqual(0, snapshot["summary"]["new"])
 
+    def test_semantic_allocation_aggregation_preserves_exact_seconds(self):
+        first = semantic_proposal(
+            "wks-one", "act-clockify", ["ev-1", "ev-2"],
+            end="2026-07-28T09:30:17+03:00",
+        )
+        first.update({"duration_minutes": 30, "duration_seconds": 1817})
+        second = semantic_proposal(
+            "wks-two", "act-clockify", ["ev-1", "ev-2"],
+            start="2026-07-28T10:00:00+03:00",
+            end="2026-07-28T10:17:29+03:00",
+        )
+        second.update({"allocation_segment": 2, "duration_minutes": 17, "duration_seconds": 1049})
+
+        state, _snapshot, _ = ingest(
+            self.tmp_path, "run-exact-seconds", [first, second]
+        )
+
+        current = next(iter(state["items"].values()))["current"]
+        self.assertEqual(2866, current["duration_seconds"])
+        self.assertEqual(
+            [1817, 1049],
+            [segment["duration_seconds"] for segment in current["allocation_segments"]],
+        )
+
     def test_verified_split_links_children_and_supersedes_parent_without_id_reuse(self):
         legacy = semantic_proposal("legacy-candidate", "legacy-activity", ["ev-1", "ev-2"])
         legacy.pop("activity_id")

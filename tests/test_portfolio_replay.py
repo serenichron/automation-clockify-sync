@@ -5,6 +5,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from scripts import meeting_reconciliation
+
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "clockify_portfolio_replay.py"
 SPEC = importlib.util.spec_from_file_location("clockify_portfolio_replay", SCRIPT)
@@ -258,6 +260,55 @@ class PortfolioReplayTests(unittest.TestCase):
             sealed = replay.seal(**paths)
 
         self.assertEqual("meeting-dedup/v1", sealed["identity"]["meeting_dedup_version"])
+
+    def test_replay_uses_manifest_member_identities_for_fallback_deduplication(self):
+        ledger = {
+            "manifest": {
+                "timezone": "Europe/Bucharest",
+                "member_identities": ["alternate@example.test"],
+            },
+            "events": [
+                {
+                    "source_type": "fathom",
+                    "source_ref": {"source_id": "f-1"},
+                    "raw_source_span": {
+                        "start": "2026-08-04T10:00:00Z",
+                        "end": "2026-08-04T10:30:00Z",
+                    },
+                    "attributes": {
+                        "recording_id": "f-1",
+                        "calendar_invitees": [
+                            {"email": "alternate@example.test"},
+                            {"email": "client@example.test"},
+                        ],
+                    },
+                },
+                {
+                    "source_type": "calendly",
+                    "source_ref": {"source_id": "c-1"},
+                    "raw_source_span": {
+                        "start": "2026-08-04T10:00:00Z",
+                        "end": "2026-08-04T10:30:00Z",
+                    },
+                    "attributes": {
+                        "recording_id": "c-1",
+                        "participants": [{"email": "client@example.test"}],
+                    },
+                },
+            ],
+        }
+        expected = meeting_reconciliation.reconcile_meetings(
+            [ledger["events"][0]], [ledger["events"][1]],
+            vlad_identities={"alternate@example.test"},
+        )
+
+        identity = replay._canonical_meeting_identity(ledger, {"proposals": []})
+
+        self.assertIsNotNone(identity)
+        self.assertEqual(
+            replay._digest(expected.document()),
+            identity["meeting_reconciliation_digest"],
+        )
 
     def test_nonpassing_quality_cannot_be_sealed(self):
         with tempfile.TemporaryDirectory() as tmp:

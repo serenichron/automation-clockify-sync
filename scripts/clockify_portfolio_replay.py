@@ -130,7 +130,9 @@ def _canonical_meeting_identity(ledger: Any, accounting: Mapping[str, Any]) -> d
         reconciliation = meeting_reconciliation.reconcile_meetings(
             [event for event in recordings if event.get("source_type") == "fathom"],
             [event for event in recordings if event.get("source_type") == "calendly"],
-            vlad_identities={"vlad@serenichron.com"},
+            vlad_identities=meeting_reconciliation.manifest_member_identities(
+                ledger.get("manifest", {})
+            ),
         )
     except meeting_reconciliation.MeetingReconciliationError as exc:
         raise PortfolioReplayError(f"canonical meeting reconciliation failed: {exc}") from exc
