@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serenichron.example/schemas/meeting-reconciliation-v1.json",
+  "title": "Canonical meeting reconciliation v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["reconciliation_id", "schema_version", "algorithm_version", "tolerance_seconds", "input_digests", "meetings", "exclusions", "exceptions"],
+  "properties": {
+    "reconciliation_id": {"type": "string", "pattern": "^mr-[0-9a-f]{64}$"},
+    "schema_version": {"const": "meeting-reconciliation/v1"},
+    "algorithm_version": {"type": "string", "minLength": 1},
+    "tolerance_seconds": {"type": "integer", "minimum": 0},
+    "input_digests": {"type": "object", "additionalProperties": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}},
+    "meetings": {"type": "array", "items": {"$ref": "#/$defs/meeting"}},
+    "exclusions": {"type": "array", "items": {"type": "object"}},
+    "exceptions": {"type": "array", "items": {"$ref": "#/$defs/exception"}}
+  },
+  "$defs": {
+    "person": {"type": "object", "additionalProperties": false, "properties": {"email": {"type": "string"}, "name": {"type": "string"}, "id": {"type": "string"}}},
+    "semantic_item": {"type": "object"},
+    "meeting": {
+      "type": "object", "additionalProperties": false,
+      "required": ["canonical_id", "source_ids", "source_digests", "start", "end", "duration_seconds", "title", "organizer", "participants", "join_url", "summary", "transcript", "action_items"],
+      "properties": {
+        "canonical_id": {"type": "string", "pattern": "^cm-[0-9a-f]{64}$"},
+        "source_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^(fathom|calendly):.+$"}},
+        "source_digests": {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}},
+        "start": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"},
+        "end": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"},
+        "duration_seconds": {"type": "integer", "minimum": 1},
+        "title": {"type": "string"}, "organizer": {"$ref": "#/$defs/person"},
+        "participants": {"type": "array", "items": {"$ref": "#/$defs/person"}},
+        "join_url": {"type": "string"}, "summary": {"type": "string"},
+        "transcript": {"type": "array", "items": {"$ref": "#/$defs/semantic_item"}},
+        "action_items": {"type": "array", "items": {"$ref": "#/$defs/semantic_item"}}
+      }
+    },
+    "exception": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "reason", "source_ids", "candidate_source_ids"],
+      "properties": {
+        "kind": {"const": "duplicate_ambiguous"},
+        "reason": {"enum": ["missing_participants", "timing_conflict", "multiple_candidates"]},
+        "source_ids": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "candidate_source_ids": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  }
+}
