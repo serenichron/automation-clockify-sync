@@ -20,9 +20,67 @@ from scripts import work_accounting_pipeline
 TZ = dt.timezone(dt.timedelta(hours=3))
 SINCE = dt.datetime(2026, 7, 1, tzinfo=TZ)
 UNTIL = dt.datetime(2026, 7, 2, tzinfo=TZ)
+COMPLETE_CALENDLY = {
+    "status": "ok",
+    "complete": True,
+    "recordings": [],
+    "scheduled_without_recording": [],
+}
 
 
 class ProcessIntegrationTests(unittest.TestCase):
+    def test_incomplete_calendly_result_never_records_a_completed_slice_receipt(self) -> None:
+        """Calendly capability and pagination failures block the current slice before receipt creation."""
+        incomplete_results = (
+            ("missing_gateway", {"status": "capability_unavailable", "complete": False}),
+            ("malformed_response", {"status": "incomplete", "complete": False}),
+            ("repeated_cursor", {"status": "incomplete", "complete": False}),
+            ("safety_limit", {"status": "incomplete", "complete": False}),
+        )
+        routing = {"skip_rules": {}, "session_routes": [], "meeting_routes": []}
+        fleet = {"machines": [], "ssh_options": []}
+        complete = {"status": "ok", "complete": True}
+
+        for failure_kind, calendly_result in incomplete_results:
+            with self.subTest(failure_kind=failure_kind), tempfile.TemporaryDirectory() as tmp:
+                checkpoint_root = Path(tmp) / "checkpoints"
+                args = argparse.Namespace(since="2026-07-01", until="2026-07-01", enrich=False)
+
+                def config(path: Path):
+                    return routing if path.name == "routing.json" else fleet
+
+                with (
+                    mock.patch.object(collector, "RUNS", Path(tmp) / "runs"),
+                    mock.patch.dict(
+                        collector.os.environ,
+                        {"CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT": str(checkpoint_root)},
+                    ),
+                    mock.patch.object(collector, "load_json", side_effect=config),
+                    mock.patch.object(collector, "load_env_file", return_value={"_missing": True}),
+                    mock.patch.object(collector, "compute_range", return_value=(SINCE, UNTIL, "fixture")),
+                    mock.patch.object(collector, "fetch_clockify", return_value={**complete, "entries": []}),
+                    mock.patch.object(collector, "fetch_fathom", return_value={**complete, "meetings": []}),
+                    mock.patch.object(collector, "fetch_calendly", return_value={**calendly_result, "recordings": []}),
+                    mock.patch.object(collector, "fetch_multica_issues", return_value={**complete, "issues": []}),
+                    mock.patch.object(
+                        collector,
+                        "collector_runtime_identity",
+                        return_value={"collector_path": "/repo/collector.py", "git_sha": "fixture"},
+                    ),
+                ):
+                    self.assertEqual(2, collector.run(args))
+
+                slices = collector.plan_slices(SINCE, UNTIL, zone=collector.BUCHAREST)
+                identity = collector.BacklogIdentity(
+                    since_utc=collector.iso_utc(SINCE),
+                    until_utc=collector.iso_utc(UNTIL),
+                    timezone=collector.BUCHAREST.key,
+                    max_days=2,
+                    compatibility_version=collector._backlog_compatibility_version(routing, fleet),
+                )
+                backlog = collector.BacklogStore(checkpoint_root).open(identity, slices)
+                self.assertEqual((), backlog.completed)
+
     def test_collect_slice_writes_calendly_evidence_and_only_aggregate_report_fields(self) -> None:
         """Calendly recordings are persisted as evidence, never embedded in the compact report."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -154,6 +212,8 @@ class ProcessIntegrationTests(unittest.TestCase):
                 "fetch_fathom",
                 return_value={"status": "ok", "complete": True, "meetings": []},
             ), mock.patch.object(
+                collector, "fetch_calendly", return_value=COMPLETE_CALENDLY
+            ), mock.patch.object(
                 collector, "fetch_multica_issues", return_value={"status": "ok", "issues": []}
             ), mock.patch.object(
                 collector, "machine_is_local", return_value=True
@@ -283,6 +343,9 @@ class ProcessIntegrationTests(unittest.TestCase):
                     side_effect=lambda fenv, since, until, **kwargs: dated_result(
                         "fathom", since, until
                     ),
+                ),
+                mock.patch.object(
+                    collector, "fetch_calendly", return_value=COMPLETE_CALENDLY
                 ),
                 mock.patch.object(
                     collector,
@@ -492,6 +555,7 @@ class ProcessIntegrationTests(unittest.TestCase):
                 ),
                 mock.patch.object(collector, "fetch_clockify", side_effect=clockify),
                 mock.patch.object(collector, "fetch_fathom", side_effect=fathom),
+                mock.patch.object(collector, "fetch_calendly", return_value=COMPLETE_CALENDLY),
                 mock.patch.object(collector, "fetch_multica_issues", side_effect=multica),
                 mock.patch.object(collector, "machine_is_local", return_value=True),
                 mock.patch.object(collector, "collect_local_sessions", side_effect=sessions),
@@ -574,6 +638,7 @@ class ProcessIntegrationTests(unittest.TestCase):
                 ),
                 mock.patch.object(collector, "fetch_clockify", side_effect=clockify),
                 mock.patch.object(collector, "fetch_fathom", side_effect=fathom),
+                mock.patch.object(collector, "fetch_calendly", return_value=COMPLETE_CALENDLY),
                 mock.patch.object(collector, "fetch_multica_issues", side_effect=multica),
                 mock.patch.object(
                     collector,
@@ -632,6 +697,9 @@ class ProcessIntegrationTests(unittest.TestCase):
                     collector,
                     "fetch_fathom",
                     return_value={"status": "ok", "complete": True, "meetings": []},
+                ),
+                mock.patch.object(
+                    collector, "fetch_calendly", return_value=COMPLETE_CALENDLY
                 ),
                 mock.patch.object(
                     collector,
@@ -704,6 +772,7 @@ class ProcessIntegrationTests(unittest.TestCase):
                 ),
                 mock.patch.object(collector, "fetch_clockify", side_effect=clockify),
                 mock.patch.object(collector, "fetch_fathom", side_effect=fathom),
+                mock.patch.object(collector, "fetch_calendly", return_value=COMPLETE_CALENDLY),
                 mock.patch.object(collector, "fetch_multica_issues", side_effect=multica),
                 mock.patch.object(
                     collector,
@@ -767,6 +836,9 @@ class ProcessIntegrationTests(unittest.TestCase):
                     collector,
                     "fetch_fathom",
                     return_value={"status": "ok", "complete": True, "meetings": []},
+                ),
+                mock.patch.object(
+                    collector, "fetch_calendly", return_value=COMPLETE_CALENDLY
                 ),
                 mock.patch.object(
                     collector,

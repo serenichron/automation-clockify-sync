@@ -3684,7 +3684,15 @@ def _slice_is_complete(report: Mapping[str, object]) -> bool:
     if not isinstance(ledger, Mapping):
         return False
     completeness = ledger.get("source_completeness")
-    return isinstance(completeness, Mapping) and completeness.get("status") == "complete"
+    evidence = report.get("evidence")
+    calendly = evidence.get("calendly") if isinstance(evidence, Mapping) else None
+    return (
+        isinstance(completeness, Mapping)
+        and completeness.get("status") == "complete"
+        and isinstance(calendly, Mapping)
+        and calendly.get("status") == "ok"
+        and calendly.get("complete") is True
+    )
 
 
 def _claim_slice_run_dir(run_dir: Path) -> bool:
@@ -3899,6 +3907,7 @@ def _collect_slice(
                    "meeting_count": len(evidence.get("fathom", {}).get("meetings", []))},
         "calendly": {
             "status": evidence.get("calendly", {}).get("status"),
+            "complete": evidence.get("calendly", {}).get("complete") is True,
             "recording_count": len(evidence.get("calendly", {}).get("recordings", [])),
             "scheduled_without_recording_count": len(
                 evidence.get("calendly", {}).get("scheduled_without_recording", [])
