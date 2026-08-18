@@ -1499,6 +1499,22 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(pipeline.WorkAccountingError, "invalid"):
             pipeline._load_corrections(path)
 
+    def test_load_ledger_preserves_digest_bound_timezone(self):
+        with tempfile.TemporaryDirectory() as temp:
+            event = evidence_ledger.evidence_event(
+                "fathom", {"source_type": "fathom", "source_id": "meeting-one"},
+                raw_source_span={"start": "2026-07-10 09:00", "end": "2026-07-10 09:30"},
+                attributes={"recorded_by_email": "vlad@serenichron.com", "meeting_id": "one", "title": "Review"},
+            )
+            ledger = evidence_ledger.EvidenceLedger((event,), {"fathom": {"status": "complete"}}, "Europe/Bucharest")
+            path = Path(temp) / "evidence-ledger.json"
+            write_json(path, {"schema_version": ledger.manifest.schema_version, "manifest": ledger.manifest.document(), "events": [event.document()]})
+
+            loaded, _ = pipeline.load_ledger(path)
+
+        self.assertEqual("Europe/Bucharest", loaded.timezone)
+        self.assertEqual(ledger.manifest.manifest_id, loaded.manifest.manifest_id)
+
 
 if __name__ == "__main__":
     unittest.main()

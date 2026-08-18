@@ -3846,6 +3846,7 @@ def _collect_slice(
     ledger = EvidenceLedger(
         tuple(normalize_collector_snapshot(evidence)),
         source_inventory_from_collector(evidence),
+        BUCHAREST.key,
     )
     ledger_path = run_dir / "evidence" / "evidence-ledger.json"
     write_json(

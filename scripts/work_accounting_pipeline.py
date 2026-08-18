@@ -193,7 +193,9 @@ def load_ledger(path: Path) -> tuple[evidence_ledger.EvidenceLedger, list[dict[s
     )
     manifest_document = document.get("manifest") or {}
     manifest = evidence_ledger.LedgerManifest.from_document(manifest_document)
-    ledger = evidence_ledger.EvidenceLedger(events, manifest.source_inventory)
+    ledger = evidence_ledger.EvidenceLedger(
+        events, manifest.source_inventory, manifest.timezone
+    )
     ledger.validate(manifest)
     return ledger, [event.document() for event in ledger.events]
 
