@@ -28,13 +28,13 @@ def fathom_event(day="2026-07-10", source_id="meeting-one", *, naive=False):
     )
 
 
-def calendly_event(day="2026-07-10", source_id="calendar-one", *, meeting_id="meeting-one"):
+def calendly_event(day="2026-07-10", source_id="calendar-one", *, meeting_id="meeting-one", start="06:00:00", end="06:30:00"):
     recording = calendly_collector.normalized_recording({
         "uri": f"recordings/{source_id}",
         "event_uri": f"events/{meeting_id}",
         "name": "July review",
-        "recording_start_time": f"{day}T06:00:00Z",
-        "recording_end_time": f"{day}T06:30:00Z",
+        "recording_start_time": f"{day}T{start}Z",
+        "recording_end_time": f"{day}T{end}Z",
         "organizer": {"email": "vlad@serenichron.com"},
         "participants": [{"email": "client@example.test"}],
         "transcript": [{"offset_seconds": 0, "text": "Reviewed July work"}],
@@ -61,7 +61,7 @@ def clockify_event(day="2026-07-10", source_id="clockify-one"):
     )
 
 
-def ledger(*events):
+def ledger(*events, timezone="Europe/Bucharest"):
     fathom_count = sum(event.source_type == "fathom" for event in events)
     calendly_count = sum(event.source_type == "calendly" for event in events)
     immutable = evidence_ledger.EvidenceLedger(tuple(events), {
@@ -78,11 +78,14 @@ def ledger(*events):
             },
         } if calendly_count else {}),
     })
-    return {
+    document = {
         "schema_version": evidence_ledger.SCHEMA_VERSION,
         "manifest": immutable.manifest.document(),
         "events": [event.document() for event in immutable.events],
     }
+    if timezone is not None:
+        document["manifest"]["timezone"] = timezone
+    return document
 
 
 def document(event, description="SC — Rebuilt Clockify review into invoice-ready July entries"):
@@ -186,6 +189,46 @@ class PortfolioQualityTests(unittest.TestCase):
             {key: report["recording_coverage"][key] for key in (
                 "source_recordings", "canonical_meetings", "missing",
             )},
+        )
+        self.assertEqual(
+            {
+                fathom.evidence_id: "represented",
+                calendly.evidence_id: "represented",
+            },
+            report["recording_coverage"]["source_dispositions"],
+        )
+
+    def test_timing_conflict_is_a_blocking_recording_exception(self):
+        fathom = fathom_event()
+        calendly = calendly_event(start="06:10:00", end="06:40:00")
+        report = quality.audit(
+            document(fathom),
+            ledger_document=ledger(fathom, calendly),
+            source_proposals=proposals(),
+        )
+
+        self.assertEqual("blocked", report["status"])
+        self.assertEqual(1, report["recording_coverage"]["exceptions"])
+        self.assertEqual(
+            {fathom.evidence_id, calendly.evidence_id},
+            set(report["recording_coverage"]["exception_evidence_ids"]),
+        )
+        self.assertTrue(any("reconciliation exception" in item["reason"] for item in report["structural_issues"]))
+
+    def test_multiple_candidates_are_a_blocking_recording_exception(self):
+        fathom = fathom_event()
+        first = calendly_event(source_id="calendar-one")
+        second = calendly_event(source_id="calendar-two")
+        report = quality.audit(
+            document(fathom),
+            ledger_document=ledger(fathom, first, second),
+            source_proposals=proposals(),
+        )
+
+        self.assertEqual("blocked", report["status"])
+        self.assertEqual(
+            {fathom.evidence_id, first.evidence_id, second.evidence_id},
+            set(report["recording_coverage"]["exception_evidence_ids"]),
         )
 
     def test_canonical_routing_requires_exact_prefix_and_source_route(self):
@@ -294,6 +337,19 @@ class PortfolioQualityTests(unittest.TestCase):
 
         self.assertEqual("pass", report["status"])
         self.assertEqual(1, report["fathom_coverage"]["excluded_by_reason"]["existing_clockify_meeting_match"])
+
+    def test_manifest_timezone_controls_local_minute_fathom_reconciliation(self):
+        fathom = fathom_event(naive=True)
+        calendly = calendly_event()
+
+        report = quality.audit(
+            document(fathom),
+            ledger(fathom, calendly, timezone="America/New_York"),
+            source_proposals=proposals(),
+        )
+
+        self.assertEqual("blocked", report["status"])
+        self.assertEqual(1, report["recording_coverage"]["exceptions"])
 
     def test_fathom_account_without_reason_blocks(self):
         first, second = fathom_event(source_id="one"), fathom_event(source_id="two")

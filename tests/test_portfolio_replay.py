@@ -47,6 +47,19 @@ class PortfolioReplayTests(unittest.TestCase):
             paths[name] = path
         return paths
 
+    def recording_ledger(self, *, local_minute=False):
+        start = "2026-08-04 10:00" if local_minute else "2026-08-04T10:00:00Z"
+        end = "2026-08-04 10:30" if local_minute else "2026-08-04T10:30:00Z"
+        return {
+            "manifest": {"manifest_id": "elm-a", "timezone": "Europe/Bucharest"},
+            "events": [{
+                "source_type": "fathom",
+                "source_ref": {"source_id": "f-1"},
+                "raw_source_span": {"start": start, "end": end},
+                "attributes": {"recording_id": "f-1", "meeting_id": "event-1"},
+            }],
+        }
+
     def test_seal_and_exact_replay_pass_without_volatile_drift(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths = self.fixture(Path(tmp))
@@ -147,6 +160,83 @@ class PortfolioReplayTests(unittest.TestCase):
 
         self.assertEqual("meeting-dedup/v1", sealed["identity"]["meeting_dedup_version"])
         self.assertEqual(300, sealed["identity"]["meeting_dedup_tolerance_seconds"])
+
+    def test_seal_rejects_well_formed_supplied_identity_that_disagrees_with_recordings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self.fixture(Path(tmp))
+            write(paths["run_dir"] / "evidence/evidence-ledger.json", self.recording_ledger())
+
+            with self.assertRaisesRegex(replay.PortfolioReplayError, "does not match"):
+                replay.seal(**paths)
+
+    def test_verify_rejects_supplied_identity_drift_against_immutable_recordings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self.fixture(Path(tmp))
+            write(paths["run_dir"] / "evidence/evidence-ledger.json", self.recording_ledger())
+            accounting_path = paths["run_dir"] / "work-accounting-result.json"
+            accounting = json.loads(accounting_path.read_text())
+            for field in (
+                "meeting_reconciliation_digest", "meeting_dedup_version",
+                "meeting_dedup_tolerance_seconds", "meeting_split_digest",
+            ):
+                accounting.pop(field)
+            write(accounting_path, accounting)
+            sealed = replay.seal(**paths)
+            accounting.update({
+                "meeting_reconciliation_digest": "sha256:" + "c" * 64,
+                "meeting_dedup_version": "meeting-dedup/v9",
+                "meeting_dedup_tolerance_seconds": 1,
+                "meeting_split_digest": "sha256:" + "d" * 64,
+            })
+            write(accounting_path, accounting)
+
+            with self.assertRaisesRegex(replay.PortfolioReplayError, "does not match"):
+                replay.verify(sealed, **paths)
+
+    def test_legacy_seal_with_local_minute_fathom_does_not_require_modern_derivation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self.fixture(Path(tmp))
+            ledger = self.recording_ledger(local_minute=True)
+            write(paths["run_dir"] / "evidence/evidence-ledger.json", ledger)
+            accounting_path = paths["run_dir"] / "work-accounting-result.json"
+            accounting = json.loads(accounting_path.read_text())
+            for field in (
+                "meeting_reconciliation_digest", "meeting_dedup_version",
+                "meeting_dedup_tolerance_seconds", "meeting_split_digest",
+            ):
+                accounting.pop(field)
+            write(accounting_path, accounting)
+            sealed = replay.seal(**self.fixture(Path(tmp) / "legacy-source"))
+            legacy = copy.deepcopy(sealed)
+            legacy["identity"]["schema_version"] = 1
+            legacy["identity"]["artifacts"]["immutable_ledger"] = replay._digest(ledger)
+            legacy["identity"]["artifacts"]["work_accounting_result"] = replay._digest(accounting)
+            for field in (
+                "meeting_reconciliation_digest", "meeting_dedup_version",
+                "meeting_dedup_tolerance_seconds", "meeting_split_digest",
+            ):
+                legacy["identity"].pop(field)
+
+            report = replay.verify(legacy, **paths)
+
+        self.assertEqual("pass", report["status"])
+
+    def test_modern_seal_normalizes_local_minute_fathom_with_manifest_timezone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self.fixture(Path(tmp))
+            write(paths["run_dir"] / "evidence/evidence-ledger.json", self.recording_ledger(local_minute=True))
+            accounting_path = paths["run_dir"] / "work-accounting-result.json"
+            accounting = json.loads(accounting_path.read_text())
+            for field in (
+                "meeting_reconciliation_digest", "meeting_dedup_version",
+                "meeting_dedup_tolerance_seconds", "meeting_split_digest",
+            ):
+                accounting.pop(field)
+            write(accounting_path, accounting)
+
+            sealed = replay.seal(**paths)
+
+        self.assertEqual("meeting-dedup/v1", sealed["identity"]["meeting_dedup_version"])
 
     def test_nonpassing_quality_cannot_be_sealed(self):
         with tempfile.TemporaryDirectory() as tmp:

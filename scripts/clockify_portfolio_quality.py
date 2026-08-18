@@ -106,7 +106,11 @@ def _validated_ledger(ledger_document: Mapping[str, Any] | None) -> tuple[list[d
     candidate_manifest = evidence_ledger.LedgerManifest.from_document(manifest_document)
     immutable = evidence_ledger.EvidenceLedger(tuple(events), candidate_manifest.source_inventory)
     immutable.validate(candidate_manifest)
-    return [event.document() for event in immutable.events], immutable.manifest.document()
+    manifest = immutable.manifest.document()
+    for field in ("timezone", "period_timezone"):
+        if field in manifest_document:
+            manifest[field] = manifest_document[field]
+    return [event.document() for event in immutable.events], manifest
 
 
 def _event_interval(event: Mapping[str, Any]) -> tuple[dt.datetime, dt.datetime] | None:
@@ -295,8 +299,41 @@ def _recording_source_id(event: Mapping[str, Any]) -> str:
     return f"{source}:{identifier}" if source and identifier else ""
 
 
+def canonical_recording_events(
+    events: Sequence[Mapping[str, Any]], manifest: Mapping[str, Any]
+) -> list[Mapping[str, Any]]:
+    """Normalize local-minute Fathom spans using the immutable period timezone."""
+    recordings = [
+        event for event in events if event.get("source_type") in {"fathom", "calendly"}
+    ]
+    normalized: list[Mapping[str, Any]] = []
+    timezone = None
+    for event in recordings:
+        candidate = dict(event)
+        span = event.get("raw_source_span")
+        if event.get("source_type") == "fathom" and isinstance(span, Mapping):
+            local_fields = [
+                field for field in ("start", "end")
+                if isinstance(span.get(field), str)
+                and meeting_reconciliation._LOCAL_MINUTE.fullmatch(span[field])
+            ]
+            if local_fields:
+                timezone = timezone or meeting_reconciliation._manifest_timezone(manifest)
+                candidate["raw_source_span"] = {
+                    **dict(span),
+                    **{
+                        field: meeting_reconciliation._iso_utc(
+                            meeting_reconciliation._parse_local_minute(span[field], timezone)
+                        )
+                        for field in local_fields
+                    },
+                }
+        normalized.append(candidate)
+    return normalized
+
+
 def _canonical_recordings(
-    events: Sequence[Mapping[str, Any]],
+    events: Sequence[Mapping[str, Any]], manifest: Mapping[str, Any],
 ) -> tuple[meeting_reconciliation.MeetingReconciliation, dict[str, Mapping[str, Any]]]:
     recording_events = [
         event for event in events if event.get("source_type") in {"fathom", "calendly"}
@@ -309,21 +346,7 @@ def _canonical_recordings(
         raise meeting_reconciliation.MeetingReconciliationError(
             "recording source identity is missing or duplicated"
         )
-    reconciliation_events: list[dict[str, Any]] = []
-    for event in recording_events:
-        candidate = dict(event)
-        # Historic Fathom ledgers may retain a Bucharest local-minute span.
-        # Reconciliation is UTC-aware, so adapt that representation only in
-        # memory using accounting's established span normalization.
-        interval = _event_interval(event)
-        if interval is not None:
-            start, end = interval
-            candidate["raw_source_span"] = {
-                **dict(event.get("raw_source_span") or {}),
-                "start": start.isoformat(),
-                "end": end.isoformat(),
-            }
-        reconciliation_events.append(candidate)
+    reconciliation_events = canonical_recording_events(recording_events, manifest)
     reconciliation = meeting_reconciliation.reconcile_meetings(
         [event for event in reconciliation_events if event.get("source_type") == "fathom"],
         [event for event in reconciliation_events if event.get("source_type") == "calendly"],
@@ -367,6 +390,7 @@ def _recording_coverage(
         "exception_evidence_ids": [],
         "excluded_by_reason": {},
         "excluded_evidence": [],
+        "source_dispositions": {},
     }
     issues: list[dict[str, Any]] = []
     recording_events = [
@@ -378,20 +402,68 @@ def _recording_coverage(
     accounted, account_issues = _accounted_recording_ids(document)
     issues.extend(account_issues)
     try:
-        reconciliation, source_events = _canonical_recordings(events)
+        reconciliation, source_events = _canonical_recordings(events, manifest)
     except meeting_reconciliation.MeetingReconciliationError as exc:
         issues.append({"reason": f"canonical meeting reconciliation failed: {exc}"})
         return coverage, issues
     coverage["canonical_meetings"] = len(reconciliation.meetings)
-    exception_source_ids = {
-        source_id
-        for exception in reconciliation.exceptions
-        for source_id in [
-            *exception.get("source_ids", []),
-            *exception.get("candidate_source_ids", []),
-        ]
-        if isinstance(source_id, str)
-    }
+    exception_source_ids: set[str] = set()
+    for exception in reconciliation.exceptions:
+        source_ids = {
+            source_id
+            for source_id in [
+                *exception.get("source_ids", []),
+                *exception.get("candidate_source_ids", []),
+            ]
+            if isinstance(source_id, str) and source_id
+        }
+        unknown = sorted(source_ids - set(source_events))
+        if not source_ids or unknown:
+            issues.append({
+                "reason": "canonical reconciliation exception has incomplete source coverage",
+                "source_ids": sorted(source_ids),
+                "unknown_source_ids": unknown,
+            })
+            continue
+        exception_source_ids.update(source_ids)
+        issues.append({
+            "reason": "canonical reconciliation exception remains unresolved",
+            "source_ids": sorted(source_ids),
+            "exception_reason": str(exception.get("reason") or "unknown"),
+        })
+    for meeting in reconciliation.meetings:
+        if exception_source_ids.intersection(meeting.source_ids):
+            exception_source_ids.update(meeting.source_ids)
+
+    source_dispositions: dict[str, str] = {}
+
+    def assign_disposition(source_ids: Sequence[str], disposition: str) -> None:
+        for source_id in source_ids:
+            event = source_events.get(source_id)
+            if event is None:
+                issues.append({
+                    "reason": "canonical recording disposition references an unknown source",
+                    "source_id": source_id,
+                })
+                continue
+            evidence_id = str(event.get("evidence_id") or "")
+            if not evidence_id:
+                issues.append({
+                    "reason": "canonical recording disposition lacks immutable evidence",
+                    "source_id": source_id,
+                })
+                continue
+            previous = source_dispositions.get(source_id)
+            if previous is not None and previous != disposition:
+                issues.append({
+                    "reason": "canonical recording has multiple dispositions",
+                    "source_id": source_id,
+                    "dispositions": sorted({previous, disposition}),
+                })
+                continue
+            source_dispositions[source_id] = disposition
+
+    assign_disposition(tuple(sorted(exception_source_ids)), "exception")
     coverage["exceptions"] = len(reconciliation.exceptions)
     coverage["exception_evidence_ids"] = sorted({
         str(source_events[source_id].get("evidence_id") or "")
@@ -415,6 +487,7 @@ def _recording_coverage(
             start, end = _parse(meeting.start), _parse(meeting.end)
         except (TypeError, ValueError):
             coverage["unverifiable"] += 1
+            assign_disposition(source_ids, "unverifiable")
             issues.append({
                 "reason": "canonical meeting has no valid recording window",
                 "canonical_meeting_id": meeting_id,
@@ -422,6 +495,7 @@ def _recording_coverage(
             })
             continue
         if end.date() < start_day or start.date() > end_day:
+            assign_disposition(source_ids, "excluded")
             _recording_coverage_exclusion(
                 coverage, meeting_id, evidence_ids, "outside_review_range"
             )
@@ -432,6 +506,7 @@ def _recording_coverage(
         )
         eligible, exclusion = work_accounting_pipeline._meeting_is_eligible(representative)
         if not eligible:
+            assign_disposition(source_ids, "excluded")
             _recording_coverage_exclusion(
                 coverage, meeting_id, evidence_ids, f"ineligible:{exclusion or 'unknown'}"
             )
@@ -445,9 +520,11 @@ def _recording_coverage(
         fully_cited = set(evidence_ids).issubset(row_evidence_ids)
         if fully_cited and row_intervals and _covers(row_intervals, start, end):
             coverage["represented"] += 1
+            assign_disposition(source_ids, "represented")
         elif row_intervals:
             coverage["uncovered"] += 1
             coverage["missing"] += 1
+            assign_disposition(source_ids, "missing")
             coverage["missing_evidence_ids"].extend(evidence_ids)
             issues.append({
                 "reason": "eligible canonical meeting interval is not covered by cited row allocation",
@@ -455,16 +532,30 @@ def _recording_coverage(
                 "evidence_ids": list(evidence_ids),
             })
         elif _reconciled_by_existing_clockify(representative, clockify_blocks):
+            assign_disposition(source_ids, "excluded")
             _recording_coverage_exclusion(
                 coverage, meeting_id, evidence_ids, "existing_clockify_meeting_match"
             )
         elif set(evidence_ids).issubset(accounted):
+            assign_disposition(source_ids, "excluded")
             _recording_coverage_exclusion(
                 coverage, meeting_id, evidence_ids, "document_omission_or_exception"
             )
         else:
             coverage["missing"] += 1
+            assign_disposition(source_ids, "missing")
             coverage["missing_evidence_ids"].extend(evidence_ids)
+    unassigned_source_ids = sorted(set(source_events) - set(source_dispositions))
+    if unassigned_source_ids:
+        issues.append({
+            "reason": "canonical recording has no disposition",
+            "source_ids": unassigned_source_ids,
+        })
+    coverage["source_dispositions"] = {
+        str(source_events[source_id].get("evidence_id") or ""): source_dispositions[source_id]
+        for source_id in sorted(source_dispositions)
+        if str(source_events[source_id].get("evidence_id") or "")
+    }
     if coverage["missing"]:
         issues.append({"reason": "eligible canonical recording coverage incomplete", "count": coverage["missing"]})
     return coverage, issues
@@ -613,8 +704,8 @@ def audit(
             "external_writes": False,
             "structural_issues": [{"reason": "activities must be a list of objects"}],
             "semantic_repair_rows": [],
-            "recording_coverage": {"source_recordings": 0, "canonical_meetings": 0, "expected": 0, "represented": 0, "excluded": 0, "exceptions": 0, "missing": 0, "unverifiable": 0, "missing_evidence_ids": [], "exception_evidence_ids": [], "excluded_by_reason": {}, "excluded_evidence": []},
-            "fathom_coverage": {"source_recordings": 0, "canonical_meetings": 0, "expected": 0, "represented": 0, "excluded": 0, "exceptions": 0, "missing": 0, "unverifiable": 0, "missing_evidence_ids": [], "exception_evidence_ids": [], "excluded_by_reason": {}, "excluded_evidence": []},
+            "recording_coverage": {"source_recordings": 0, "canonical_meetings": 0, "expected": 0, "represented": 0, "excluded": 0, "exceptions": 0, "missing": 0, "unverifiable": 0, "missing_evidence_ids": [], "exception_evidence_ids": [], "excluded_by_reason": {}, "excluded_evidence": [], "source_dispositions": {}},
+            "fathom_coverage": {"source_recordings": 0, "canonical_meetings": 0, "expected": 0, "represented": 0, "excluded": 0, "exceptions": 0, "missing": 0, "unverifiable": 0, "missing_evidence_ids": [], "exception_evidence_ids": [], "excluded_by_reason": {}, "excluded_evidence": [], "source_dispositions": {}},
         }
     review_range = _review_range(document)
     if review_range is None:

@@ -17,8 +17,9 @@ import sys
 from typing import Any, Mapping
 
 try:
-    from scripts import meeting_reconciliation
+    from scripts import clockify_portfolio_quality, meeting_reconciliation
 except ImportError:  # pragma: no cover - direct execution fallback
+    import clockify_portfolio_quality  # type: ignore[no-redef]
     import meeting_reconciliation  # type: ignore[no-redef]
 
 
@@ -114,12 +115,17 @@ def _meeting_split_digest(accounting: Mapping[str, Any]) -> str:
 
 def _canonical_meeting_identity(ledger: Any, accounting: Mapping[str, Any]) -> dict[str, Any] | None:
     """Recreate the canonical recording identity from immutable evidence."""
-    events = ledger.get("events") if isinstance(ledger, Mapping) else None
+    if not isinstance(ledger, Mapping):
+        return None
+    events = ledger.get("events")
     if not isinstance(events, list) or not all(isinstance(event, Mapping) for event in events):
         return None
-    recordings = [
-        event for event in events if event.get("source_type") in {"fathom", "calendly"}
-    ]
+    try:
+        recordings = clockify_portfolio_quality.canonical_recording_events(
+            events, ledger.get("manifest", {})
+        )
+    except (meeting_reconciliation.MeetingReconciliationError, ValueError) as exc:
+        raise PortfolioReplayError(f"canonical meeting timezone normalization failed: {exc}") from exc
     if not recordings:
         return None
     try:
@@ -139,7 +145,7 @@ def _canonical_meeting_identity(ledger: Any, accounting: Mapping[str, Any]) -> d
 
 
 def _meeting_identity(
-    accounting: Mapping[str, Any], reconciliation: Any, ledger: Any
+    accounting: Mapping[str, Any], reconciliation: Any, ledger: Any, *, derive: bool
 ) -> dict[str, Any]:
     """Bind canonical meeting semantics without invalidating old sealed runs.
 
@@ -161,10 +167,13 @@ def _meeting_identity(
             raise PortfolioReplayError("canonical meeting dedup tolerance is invalid")
         if not isinstance(supplied["meeting_split_digest"], str) or not _SHA256.fullmatch(supplied["meeting_split_digest"]):
             raise PortfolioReplayError("canonical meeting split digest is invalid")
-        return supplied
-    canonical = _canonical_meeting_identity(ledger, accounting)
+    canonical = _canonical_meeting_identity(ledger, accounting) if derive else None
     if canonical is not None:
+        if present and supplied != canonical:
+            raise PortfolioReplayError("supplied canonical meeting identity does not match immutable recordings")
         return canonical
+    if present:
+        return supplied
     return {
         "meeting_reconciliation_digest": _digest(reconciliation),
         "meeting_dedup_version": "fathom-only/legacy",
@@ -174,7 +183,8 @@ def _meeting_identity(
 
 
 def _identity(
-    *, run_dir: Path, review: Path, repair: Path, quality: Path, routing: Path
+    *, run_dir: Path, review: Path, repair: Path, quality: Path, routing: Path,
+    derive_meetings: bool = True,
 ) -> dict[str, Any]:
     run_dir = run_dir.resolve()
     documents: dict[str, Any] = {}
@@ -217,6 +227,7 @@ def _identity(
             accounting_document,
             documents["fathom_reconciliation"],
             documents["immutable_ledger"],
+            derive=derive_meetings,
         ),
     }
 
@@ -229,9 +240,12 @@ def seal(*, run_dir: Path, review: Path, repair: Path, quality: Path, routing: P
 def verify(sealed: Mapping[str, Any], *, run_dir: Path, review: Path, repair: Path, quality: Path, routing: Path) -> dict[str, Any]:
     if sealed.get("status") != "sealed" or not isinstance(sealed.get("identity"), Mapping):
         raise PortfolioReplayError("invalid portfolio replay seal")
-    candidate = _identity(run_dir=run_dir, review=review, repair=repair, quality=quality, routing=routing)
     sealed_identity = sealed["identity"]
     if not _MEETING_IDENTITY_FIELDS.issubset(sealed_identity):
+        candidate = _identity(
+            run_dir=run_dir, review=review, repair=repair, quality=quality,
+            routing=routing, derive_meetings=False,
+        )
         # A v1 Fathom-only seal was already immutable at the artifact layer.
         # Compare exactly the fields it knew, preserving read-only replay.
         candidate = {
@@ -239,6 +253,8 @@ def verify(sealed: Mapping[str, Any], *, run_dir: Path, review: Path, repair: Pa
             if key in sealed_identity
         }
         candidate["schema_version"] = sealed_identity.get("schema_version")
+    else:
+        candidate = _identity(run_dir=run_dir, review=review, repair=repair, quality=quality, routing=routing)
     if _normal(sealed_identity) != _normal(candidate):
         raise PortfolioReplayError("portfolio replay identity differs from seal")
     return {
