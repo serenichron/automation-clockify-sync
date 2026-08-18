@@ -126,6 +126,31 @@ class PortfolioReviewTests(unittest.TestCase):
         self.assertEqual(0, accounting["excluded_minutes"])
         self.assertEqual([], accounting["exclusion_reasons"])
 
+    def test_exact_second_split_does_not_create_floor_minute_exclusion(self):
+        accounting = portfolio._group_accounting(
+            [{"activity_id": "act-one", "evidence_ids": ["ev-one"]}],
+            [{
+                "start": "2026-07-10T09:00:00+03:00",
+                "end": "2026-07-10T09:05:01+03:00",
+                "duration_minutes": 5,
+                "duration_seconds": 301,
+            }],
+            [
+                {"duration_minutes": 2, "duration_seconds": 151},
+                {"duration_minutes": 2, "duration_seconds": 150},
+            ],
+            [],
+            [],
+        )
+
+        self.assertEqual(301, accounting["source_seconds"])
+        self.assertEqual(301, accounting["review_seconds"])
+        self.assertEqual(0, accounting["excluded_seconds"])
+        self.assertEqual(5, accounting["source_minutes"])
+        self.assertEqual(5, accounting["review_minutes"])
+        self.assertEqual(0, accounting["excluded_minutes"])
+        self.assertEqual([], accounting["exclusion_reasons"])
+
     def test_group_accounting_all_excluded_with_flash_reasons(self):
         accounting = portfolio._group_accounting(
             [{"activity_id": "act-one", "evidence_ids": ["ev-one", "ev-two"]}],

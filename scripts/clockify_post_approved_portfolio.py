@@ -204,35 +204,92 @@ def _merged_segments(row: Mapping[str, Any]) -> list[dict[str, Any]]:
     raw = row.get("allocation_segments")
     if not isinstance(raw, list) or not raw:
         raise PortfolioPostError("portfolio row lacks allocation segments")
-    segments = sorted((dict(item) for item in raw), key=lambda item: str(item.get("start")))
-    merged: list[dict[str, Any]] = []
-    for segment in segments:
+    segments: list[tuple[dt.datetime, dict[str, Any]]] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            raise PortfolioPostError("portfolio contains an invalid allocation segment")
+        segment = dict(item)
         start = str(segment.get("start") or "")
         end = str(segment.get("end") or "")
+        try:
+            start_time = _parse(start)
+            end_time = _parse(end)
+            int(segment.get("duration_minutes") or 0)
+            int(segment.get("duration_seconds") or 0)
+        except (TypeError, ValueError) as error:
+            raise PortfolioPostError(
+                "portfolio contains an invalid allocation segment"
+            ) from error
+        if end_time <= start_time:
+            raise PortfolioPostError("portfolio contains an invalid allocation segment")
+        segments.append((start_time, segment))
+    merged: list[dict[str, Any]] = []
+    exact_row = "duration_seconds" in row
+    exact_segments: list[bool] = []
+    for start_time, segment in sorted(segments, key=lambda item: item[0]):
+        start = str(segment.get("start") or "")
+        end = str(segment.get("end") or "")
+        end_time = _parse(end)
         minutes = int(segment.get("duration_minutes") or 0)
         seconds = int(segment.get("duration_seconds") or 0)
-        if not start or not end or _parse(end) <= _parse(start):
-            raise PortfolioPostError("portfolio contains an invalid allocation segment")
-        actual_seconds = int((_parse(end) - _parse(start)).total_seconds())
+        exact_segments.append("duration_seconds" in segment)
+        actual_seconds = int((end_time - start_time).total_seconds())
         if minutes != actual_seconds // 60:
             raise PortfolioPostError("portfolio segment duration is inconsistent")
         if "duration_seconds" in segment and seconds != actual_seconds:
             raise PortfolioPostError("portfolio segment seconds are inconsistent")
         seconds = actual_seconds
-        if merged and merged[-1]["end"] == start:
+        if merged and _parse(merged[-1]["end"]) == start_time:
             merged[-1]["end"] = end
-            merged[-1]["duration_minutes"] += minutes
             merged[-1]["duration_seconds"] += seconds
+            merged[-1]["duration_minutes"] = merged[-1]["duration_seconds"] // 60
         else:
             merged.append({
                 "start": start, "end": end, "duration_minutes": minutes,
                 "duration_seconds": seconds,
             })
-    if sum(item["duration_minutes"] for item in merged) != int(row.get("duration_minutes") or 0):
+    if exact_row or any(exact_segments):
+        if not exact_row or not all(exact_segments):
+            raise PortfolioPostError("portfolio row mixes exact and legacy allocation segments")
+        total_seconds = sum(item["duration_seconds"] for item in merged)
+        if total_seconds != int(row.get("duration_seconds") or 0):
+            raise PortfolioPostError("portfolio row seconds do not match its allocation segments")
+        if int(row.get("duration_minutes") or 0) != total_seconds // 60:
+            raise PortfolioPostError("portfolio row minutes are not derived from its exact seconds")
+    elif sum(item["duration_minutes"] for item in merged) != int(row.get("duration_minutes") or 0):
         raise PortfolioPostError("portfolio row minutes do not match its allocation segments")
-    if "duration_seconds" in row and sum(item["duration_seconds"] for item in merged) != int(row.get("duration_seconds") or 0):
-        raise PortfolioPostError("portfolio row seconds do not match its allocation segments")
     return merged
+
+
+def _recompute_duration_fields(plan: dict[str, Any]) -> None:
+    try:
+        start = _parse(str(plan.get("start") or ""))
+        end = _parse(str(plan.get("end") or ""))
+    except (TypeError, ValueError) as error:
+        raise PortfolioPostError("portfolio contains an invalid posting window") from error
+    seconds = int((end - start).total_seconds())
+    if seconds <= 0:
+        raise PortfolioPostError("adjusted portfolio block is not positive")
+    plan["duration_seconds"] = seconds
+    plan["duration_minutes"] = seconds // 60
+
+
+def _verify_approved_duration_seconds(plans: Iterable[Mapping[str, Any]]) -> None:
+    approved_seconds: dict[str, set[int]] = {}
+    posted_seconds: dict[str, int] = {}
+    for plan in plans:
+        review_id = str(plan["review_id"])
+        approved = int(plan.get("approved_duration_seconds") or 0)
+        if approved > 0:
+            approved_seconds.setdefault(review_id, set()).add(approved)
+        posted_seconds[review_id] = posted_seconds.get(review_id, 0) + int(
+            plan["duration_seconds"]
+        )
+    for review_id, expected in approved_seconds.items():
+        if len(expected) != 1 or posted_seconds.get(review_id) != next(iter(expected)):
+            raise PortfolioPostError(
+                "adjusted portfolio review seconds do not match approved duration"
+            )
 
 
 def _plans(
@@ -259,6 +316,7 @@ def _plans(
                 "end": _utc(segment["end"]),
                 "duration_minutes": segment["duration_minutes"],
                 "duration_seconds": segment["duration_seconds"],
+                "approved_duration_seconds": int(row.get("duration_seconds") or 0),
                 "project_name": project_name,
                 "project_id": route["project_id"],
                 "tag_names": tag_names,
@@ -381,6 +439,13 @@ def _align_subminute_boundaries(
                 f"cannot preserve approved minutes after sub-minute boundary trim: {review_id}"
             )
 
+    for plan in adjusted:
+        key = (plan["review_id"], plan["segment_index"])
+        if key in exact_keys:
+            continue
+        _recompute_duration_fields(plan)
+    _verify_approved_duration_seconds(adjusted)
+
     changes: list[dict[str, Any]] = []
     for plan in adjusted:
         key = (plan["review_id"], plan["segment_index"])
@@ -455,20 +520,47 @@ def _apply_prior_receipt(
         (str(item.get("review_id")), int(item.get("segment_index") or 0)): item
         for item in items
     }
+    adjustments = [
+        dict(item) for item in prior.get("boundary_adjustments", [])
+        if isinstance(item, Mapping)
+    ]
+    adjustments_by_key = {
+        (str(item.get("review_id")), int(item.get("segment_index") or 0)): item
+        for item in adjustments
+    }
     restored: list[dict[str, Any]] = []
     for original in plans:
         plan = dict(original)
         item = by_key.get((plan["review_id"], plan["segment_index"]))
+        adjustment = adjustments_by_key.get((plan["review_id"], plan["segment_index"]))
         if item is not None:
             plan["start"] = str(item.get("start") or "")
             plan["end"] = str(item.get("end") or "")
             if not plan["start"] or not plan["end"]:
                 raise PortfolioPostError("prior posting receipt contains an invalid window")
+        if adjustment is not None:
+            if (
+                original["start"] != str(adjustment.get("original_start") or "")
+                or original["end"] != str(adjustment.get("original_end") or "")
+            ):
+                raise PortfolioPostError(
+                    "prior posting receipt adjustment does not match the approved window"
+                )
+            posted_start = str(adjustment.get("posted_start") or "")
+            posted_end = str(adjustment.get("posted_end") or "")
+            if item is not None and (
+                plan["start"] != posted_start or plan["end"] != posted_end
+            ):
+                raise PortfolioPostError(
+                    "prior posting receipt item does not match its adjustment"
+                )
+            plan["start"] = posted_start
+            plan["end"] = posted_end
+        if item is not None or adjustment is not None:
+            _recompute_duration_fields(plan)
         restored.append(plan)
-    return restored, [
-        dict(item) for item in prior.get("boundary_adjustments", [])
-        if isinstance(item, Mapping)
-    ]
+    _verify_approved_duration_seconds(restored)
+    return restored, adjustments
 
 
 def _verify_approved_artifacts(

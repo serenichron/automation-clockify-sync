@@ -276,7 +276,13 @@ def _seconds(proposals: Iterable[Mapping[str, Any]]) -> int:
     """Return exact source duration, rejecting any supplied seconds mismatch."""
     total = 0
     for proposal in proposals:
+        declared = proposal.get("duration_seconds")
         if "start" not in proposal or "end" not in proposal:
+            if declared is not None:
+                if isinstance(declared, bool) or not isinstance(declared, int) or declared <= 0:
+                    raise PortfolioReviewError("source proposal seconds must be a positive integer")
+                total += declared
+                continue
             minutes = _minutes([proposal])
             total += minutes * 60
             continue
@@ -285,13 +291,12 @@ def _seconds(proposals: Iterable[Mapping[str, Any]]) -> int:
         except (KeyError, TypeError, ValueError) as error:
             raise PortfolioReviewError("source proposal bounds are invalid") from error
         actual = int((end - start).total_seconds())
-        declared = proposal.get("duration_seconds")
         if declared is not None and (
             isinstance(declared, bool) or not isinstance(declared, int) or declared != actual
         ):
             raise PortfolioReviewError("source proposal seconds do not match its bounds")
-        if actual < 0:
-            raise PortfolioReviewError("source proposal duration must be nonnegative")
+        if actual <= 0:
+            raise PortfolioReviewError("source proposal duration must be positive")
         total += actual
     return total
 
@@ -390,23 +395,38 @@ def _group_accounting(
     omissions: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Conserve a group's source pool without inventing excluded allocations."""
-    source_minutes = _minutes(source_proposals)
-    source_seconds = _seconds(source_proposals)
-    review_minutes = sum(int(row.get("duration_minutes") or 0) for row in reviewed_rows)
-    review_seconds = sum(int(row.get("duration_seconds") or 0) for row in reviewed_rows)
-    if review_minutes > source_minutes:
-        raise PortfolioReviewError("group review minutes exceed its source minutes")
-    excluded_minutes = source_minutes - review_minutes
-    excluded_seconds = source_seconds - review_seconds
+    exact = any("duration_seconds" in row for row in [*source_proposals, *reviewed_rows])
+    if exact:
+        if any("duration_seconds" not in row for row in source_proposals):
+            raise PortfolioReviewError("group source proposals mix exact and legacy durations")
+        if any("duration_seconds" not in row for row in reviewed_rows):
+            raise PortfolioReviewError("group review rows mix exact and legacy durations")
+        source_seconds = _seconds(source_proposals)
+        review_seconds = sum(int(row["duration_seconds"]) for row in reviewed_rows)
+        if review_seconds > source_seconds:
+            raise PortfolioReviewError("group review seconds exceed its source seconds")
+        excluded_seconds = source_seconds - review_seconds
+        source_minutes = source_seconds // 60
+        review_minutes = review_seconds // 60
+        excluded_minutes = excluded_seconds // 60
+    else:
+        source_minutes = _minutes(source_proposals)
+        review_minutes = sum(int(row.get("duration_minutes") or 0) for row in reviewed_rows)
+        if review_minutes > source_minutes:
+            raise PortfolioReviewError("group review minutes exceed its source minutes")
+        excluded_minutes = source_minutes - review_minutes
+        source_seconds = source_minutes * 60
+        review_seconds = review_minutes * 60
+        excluded_seconds = excluded_minutes * 60
     exclusion_reasons = (
         _exclusion_reasons(source_activities, exceptions, omissions)
-        if excluded_minutes else []
+        if excluded_seconds else []
     )
-    if excluded_minutes and not exclusion_reasons:
+    if excluded_seconds and not exclusion_reasons:
         raise PortfolioReviewError(
-            "excluded source minutes lack a nonempty exception/omission reason"
+            "excluded source seconds lack a nonempty exception/omission reason"
         )
-    if source_minutes != review_minutes + excluded_minutes:
+    if not exact and source_minutes != review_minutes + excluded_minutes:
         raise PortfolioReviewError("group source minute accounting does not balance")
     if source_seconds != review_seconds + excluded_seconds:
         raise PortfolioReviewError("group source second accounting does not balance")
@@ -521,6 +541,7 @@ def _package_review(
         project = activity.get("project_recommendation")
         if not isinstance(project, Mapping):
             project = {}
+        duration_seconds = sum(int(row["duration_seconds"]) for row in segments)
         packaged.append({
             "review_id": semantic_analyzer.stable_digest(
                 "pvi-", {"activity_id": activity["activity_id"], "evidence_ids": evidence_ids}
@@ -531,8 +552,8 @@ def _package_review(
             "allocation_segments": segments,
             "start": segments[0]["start"],
             "end": segments[-1]["end"],
-            "duration_minutes": sum(int(row["duration_minutes"]) for row in segments),
-            "duration_seconds": sum(int(row["duration_seconds"]) for row in segments),
+            "duration_minutes": duration_seconds // 60,
+            "duration_seconds": duration_seconds,
             "client_project": str(project.get("name") or ""),
             "tag_names": [str(value) for value in project.get("tag_names", [])],
             "confidence": _confidence(activity),
@@ -874,18 +895,35 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         group_reports.extend(reports)
 
     reviewed_rows.sort(key=lambda row: (row["start"], row["review_id"]))
-    source_minutes = _minutes(target_proposals)
-    source_seconds = _seconds(target_proposals)
-    review_minutes = sum(int(row["duration_minutes"]) for row in reviewed_rows)
-    review_seconds = sum(int(row["duration_seconds"]) for row in reviewed_rows)
-    excluded_minutes = sum(int(report["excluded_minutes"]) for report in group_reports)
-    excluded_seconds = sum(int(report["excluded_seconds"]) for report in group_reports)
-    if source_minutes != sum(int(report["source_minutes"]) for report in group_reports):
-        raise PortfolioReviewError("portfolio groups do not cover all source minutes")
-    if review_minutes != sum(int(report["review_minutes"]) for report in group_reports):
-        raise PortfolioReviewError("portfolio groups do not cover all review minutes")
-    _portfolio_accounting(source_minutes, review_minutes, excluded_minutes)
-    _portfolio_accounting(source_seconds, review_seconds, excluded_seconds)
+    exact = any("duration_seconds" in row for row in [*target_proposals, *reviewed_rows])
+    if exact:
+        if any("duration_seconds" not in row for row in target_proposals):
+            raise PortfolioReviewError("portfolio source proposals mix exact and legacy durations")
+        if any("duration_seconds" not in row for row in reviewed_rows):
+            raise PortfolioReviewError("portfolio review rows mix exact and legacy durations")
+        source_seconds = _seconds(target_proposals)
+        review_seconds = sum(int(row["duration_seconds"]) for row in reviewed_rows)
+        excluded_seconds = sum(int(report["excluded_seconds"]) for report in group_reports)
+        if source_seconds != sum(int(report["source_seconds"]) for report in group_reports):
+            raise PortfolioReviewError("portfolio groups do not cover all source seconds")
+        if review_seconds != sum(int(report["review_seconds"]) for report in group_reports):
+            raise PortfolioReviewError("portfolio groups do not cover all review seconds")
+        _portfolio_accounting(source_seconds, review_seconds, excluded_seconds)
+        source_minutes = source_seconds // 60
+        review_minutes = review_seconds // 60
+        excluded_minutes = excluded_seconds // 60
+    else:
+        source_minutes = _minutes(target_proposals)
+        review_minutes = sum(int(row["duration_minutes"]) for row in reviewed_rows)
+        excluded_minutes = sum(int(report["excluded_minutes"]) for report in group_reports)
+        if source_minutes != sum(int(report["source_minutes"]) for report in group_reports):
+            raise PortfolioReviewError("portfolio groups do not cover all source minutes")
+        if review_minutes != sum(int(report["review_minutes"]) for report in group_reports):
+            raise PortfolioReviewError("portfolio groups do not cover all review minutes")
+        _portfolio_accounting(source_minutes, review_minutes, excluded_minutes)
+        source_seconds = source_minutes * 60
+        review_seconds = review_minutes * 60
+        excluded_seconds = excluded_minutes * 60
     result = {
         "schema_version": 1,
         "review_prompt_version": semantic_analyzer.PORTFOLIO_REVIEW_PROMPT_VERSION,

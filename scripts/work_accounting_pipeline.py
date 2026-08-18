@@ -976,6 +976,9 @@ def _proposal(
     evidence_ids: list[str],
     segment: int,
 ) -> dict[str, Any]:
+    seconds = int((end - start).total_seconds())
+    if seconds <= 0:
+        raise WorkAccountingError("proposal bounds must have positive duration")
     activity_id = str(activity["activity_id"])
     review_activity_key = semantic_analyzer.stable_digest(
         "wka-",
@@ -1002,8 +1005,8 @@ def _proposal(
         "workstream_id": activity.get("workstream_id"),
         "start": _iso(start),
         "end": _iso(end),
-        "duration_minutes": _minutes(start, end),
-        "duration_seconds": _seconds(start, end),
+        "duration_minutes": seconds // 60,
+        "duration_seconds": seconds,
         "client_project": route.get("project_name"),
         "clockify_project_suffix": route.get("project_suffix"),
         "tag_suffixes": list(route.get("tag_suffixes", [])),

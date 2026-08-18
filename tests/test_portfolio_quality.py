@@ -16,9 +16,10 @@ SPEC.loader.exec_module(quality)
 def fathom_event(
     day="2026-07-10", source_id="meeting-one", *, naive=False,
     member_identity="vlad@serenichron.com", participants=None,
+    start_time="09:00", end_time="09:30",
 ):
-    start = f"{day} 09:00" if naive else f"{day}T09:00+03:00"
-    end = f"{day} 09:30" if naive else f"{day}T09:30+03:00"
+    start = f"{day} {start_time}" if naive else f"{day}T{start_time}+03:00"
+    end = f"{day} {end_time}" if naive else f"{day}T{end_time}+03:00"
     return evidence_ledger.evidence_event(
         "fathom",
         {"source_type": "fathom", "source_id": source_id},
@@ -177,6 +178,76 @@ class PortfolioQualityTests(unittest.TestCase):
         self.assertEqual("pass", report["status"])
         self.assertEqual({"expected": 1, "represented": 1, "excluded": 0, "missing": 0}, {key: report["fathom_coverage"][key] for key in ("expected", "represented", "excluded", "missing")})
         self.assertEqual(30, report["fragmentation"]["median_minutes"])
+
+    def test_positive_subminute_segment_is_valid_when_seconds_match_bounds(self):
+        event = fathom_event(start_time="09:00:00", end_time="09:00:43")
+        value = document(event)
+        row = value["activities"][0]
+        row.update({
+            "start": "2026-07-10T09:00:00+03:00",
+            "end": "2026-07-10T09:00:43+03:00",
+            "duration_minutes": 0,
+            "duration_seconds": 43,
+        })
+        row["allocation_segments"][0].update({
+            "start": row["start"],
+            "end": row["end"],
+            "duration_minutes": 0,
+            "duration_seconds": 43,
+        })
+        value.update({
+            "source_minutes": 0,
+            "review_minutes": 0,
+            "excluded_minutes": 0,
+            "source_seconds": 43,
+            "review_seconds": 43,
+            "excluded_seconds": 0,
+        })
+        value["groups"][0].update({
+            "source_minutes": 0,
+            "review_minutes": 0,
+            "excluded_minutes": 0,
+            "source_seconds": 43,
+            "review_seconds": 43,
+            "excluded_seconds": 0,
+        })
+        source = [{
+            **proposals()[0],
+            "start": row["start"],
+            "end": row["end"],
+            "duration_minutes": 0,
+            "duration_seconds": 43,
+        }]
+
+        report = quality.audit(value, ledger(event), source_proposals=source)
+
+        self.assertEqual("pass", report["status"])
+
+    def test_exact_row_rejects_legacy_allocation_segment(self):
+        event = fathom_event()
+        value = document(event)
+        value["activities"][0]["duration_seconds"] = 1800
+
+        report = quality.audit(value, ledger(event), source_proposals=proposals())
+
+        self.assertEqual("blocked", report["status"])
+        self.assertTrue(any(
+            item["reason"] == "mixed exact and legacy allocation segment durations"
+            for item in report["structural_issues"]
+        ))
+
+    def test_missing_allocation_segments_blocks_without_an_audit_error(self):
+        event = fathom_event()
+        value = document(event)
+        value["activities"][0]["allocation_segments"] = None
+
+        report = quality.audit(value, ledger(event), source_proposals=proposals())
+
+        self.assertEqual("blocked", report["status"])
+        self.assertTrue(any(
+            item["reason"] == "missing allocation segments"
+            for item in report["structural_issues"]
+        ))
 
     def test_row_duration_seconds_must_match_its_allocation_segments(self):
         event = fathom_event()

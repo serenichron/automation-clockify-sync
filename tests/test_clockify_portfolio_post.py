@@ -39,6 +39,267 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
         self.assertEqual("2026-08-14T07:00:17Z", plan["start"])
         self.assertEqual("2026-08-14T07:30:43Z", plan["end"])
         self.assertEqual(1826, plan["duration_seconds"])
+
+    def test_posting_plan_derives_merged_display_minutes_from_seconds(self) -> None:
+        portfolio = {
+            "activities": [{
+                "review_id": "pvi-0123456789abcdef01234567",
+                "client_project": "Example Level 2",
+                "tag_names": ["Technical development"],
+                "description": "EX — Preserve exact recorded meeting time",
+                "duration_minutes": 5,
+                "duration_seconds": 301,
+                "allocation_segments": [
+                    {
+                        "start": "2026-08-14T10:00:00+03:00",
+                        "end": "2026-08-14T10:02:31+03:00",
+                        "duration_minutes": 2,
+                        "duration_seconds": 151,
+                    },
+                    {
+                        "start": "2026-08-14T10:02:31+03:00",
+                        "end": "2026-08-14T10:05:01+03:00",
+                        "duration_minutes": 2,
+                        "duration_seconds": 150,
+                    },
+                ],
+            }],
+        }
+        routes = {
+            ("Example Level 2", ("Technical development",)): {
+                "project_id": "project-1", "tag_ids": ["tag-1"], "billable": True,
+            },
+        }
+
+        plan = poster._plans(portfolio, routes)
+
+        self.assertEqual(1, len(plan))
+        self.assertEqual(301, plan[0]["duration_seconds"])
+        self.assertEqual(5, plan[0]["duration_minutes"])
+
+    def test_boundary_adjustment_recomputes_exact_duration_fields(self) -> None:
+        plans = [
+            {
+                "review_id": "pvi-0123456789abcdef01234567",
+                "segment_index": 0,
+                "start": "2026-08-14T10:00:00Z",
+                "end": "2026-08-14T10:10:30Z",
+                "duration_minutes": 10,
+                "duration_seconds": 630,
+                "project_name": "Example Level 2",
+                "description": "EX — Preserve exact recorded meeting time",
+            },
+            {
+                "review_id": "pvi-0123456789abcdef01234567",
+                "segment_index": 1,
+                "start": "2026-08-14T10:10:30Z",
+                "end": "2026-08-14T10:20:30Z",
+                "duration_minutes": 10,
+                "duration_seconds": 600,
+                "project_name": "Example Level 2",
+                "description": "EX — Preserve exact recorded meeting time",
+            },
+        ]
+        live = [
+            {"start": "2026-08-14T09:59:00Z", "end": "2026-08-14T10:00:17Z"},
+            {"start": "2026-08-14T10:10:30Z", "end": "2026-08-14T10:10:31Z"},
+        ]
+
+        adjusted, _changes = poster._align_subminute_boundaries(plans, live, set())
+
+        self.assertEqual([613, 617], [item["duration_seconds"] for item in adjusted])
+        self.assertEqual([10, 10], [item["duration_minutes"] for item in adjusted])
+        self.assertEqual(1230, sum(item["duration_seconds"] for item in adjusted))
+        receipt = poster._receipt_item(adjusted[0], "entry-1", "created")
+        self.assertEqual(613, receipt["duration_seconds"])
+        self.assertEqual(10, receipt["duration_minutes"])
+
+    def test_prior_receipt_recomputes_duration_fields_from_restored_bounds(self) -> None:
+        plans = [
+            {
+                "review_id": "pvi-0123456789abcdef01234567",
+                "segment_index": 0,
+                "start": "2026-08-14T10:00:00Z",
+                "end": "2026-08-14T10:10:30Z",
+                "duration_minutes": 10,
+                "duration_seconds": 630,
+            },
+            {
+                "review_id": "pvi-0123456789abcdef01234567",
+                "segment_index": 1,
+                "start": "2026-08-14T10:10:30Z",
+                "end": "2026-08-14T10:20:30Z",
+                "duration_minutes": 10,
+                "duration_seconds": 600,
+            },
+        ]
+        receipt = {
+            "portfolio_sha256": "approved-sha",
+            "created": [
+                {
+                    "review_id": "pvi-0123456789abcdef01234567",
+                    "segment_index": 0,
+                    "start": "2026-08-14T10:00:17Z",
+                    "end": "2026-08-14T10:10:30Z",
+                    "duration_minutes": 10,
+                    "duration_seconds": 630,
+                },
+                {
+                    "review_id": "pvi-0123456789abcdef01234567",
+                    "segment_index": 1,
+                    "start": "2026-08-14T10:10:30Z",
+                    "end": "2026-08-14T10:20:47Z",
+                    "duration_minutes": 10,
+                    "duration_seconds": 600,
+                },
+            ],
+            "already_existing": [],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receipt.json"
+            path.write_text(json.dumps(receipt), encoding="utf-8")
+            restored, _adjustments = poster._apply_prior_receipt(
+                plans, path, "approved-sha"
+            )
+
+        self.assertEqual([613, 617], [item["duration_seconds"] for item in restored])
+        self.assertEqual([10, 10], [item["duration_minutes"] for item in restored])
+
+    def test_prior_dry_run_adjustments_restore_adjusted_bounds(self) -> None:
+        plans = [{
+            "review_id": "pvi-0123456789abcdef01234567",
+            "segment_index": 0,
+            "start": "2026-08-14T10:00:00Z",
+            "end": "2026-08-14T10:10:30Z",
+            "duration_minutes": 10,
+            "duration_seconds": 630,
+        }]
+        receipt = {
+            "portfolio_sha256": "approved-sha",
+            "created": [],
+            "already_existing": [],
+            "boundary_adjustments": [{
+                "review_id": "pvi-0123456789abcdef01234567",
+                "segment_index": 0,
+                "original_start": "2026-08-14T10:00:00Z",
+                "original_end": "2026-08-14T10:10:30Z",
+                "posted_start": "2026-08-14T10:00:17Z",
+                "posted_end": "2026-08-14T10:10:30Z",
+            }],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receipt.json"
+            path.write_text(json.dumps(receipt), encoding="utf-8")
+            restored, adjustments = poster._apply_prior_receipt(
+                plans, path, "approved-sha"
+            )
+
+        self.assertEqual("2026-08-14T10:00:17Z", restored[0]["start"])
+        self.assertEqual("2026-08-14T10:10:30Z", restored[0]["end"])
+        self.assertEqual(613, restored[0]["duration_seconds"])
+        self.assertEqual(10, restored[0]["duration_minutes"])
+        self.assertEqual(receipt["boundary_adjustments"], adjustments)
+
+    def test_prior_executed_receipt_confirms_adjusted_bounds(self) -> None:
+        plans = [{
+            "review_id": "pvi-0123456789abcdef01234567",
+            "segment_index": 0,
+            "start": "2026-08-14T10:00:00Z",
+            "end": "2026-08-14T10:10:30Z",
+            "duration_minutes": 10,
+            "duration_seconds": 630,
+        }]
+        receipt = {
+            "portfolio_sha256": "approved-sha",
+            "created": [{
+                "review_id": "pvi-0123456789abcdef01234567",
+                "segment_index": 0,
+                "start": "2026-08-14T10:00:17Z",
+                "end": "2026-08-14T10:10:30Z",
+            }],
+            "already_existing": [],
+            "boundary_adjustments": [{
+                "review_id": "pvi-0123456789abcdef01234567",
+                "segment_index": 0,
+                "original_start": "2026-08-14T10:00:00Z",
+                "original_end": "2026-08-14T10:10:30Z",
+                "posted_start": "2026-08-14T10:00:17Z",
+                "posted_end": "2026-08-14T10:10:30Z",
+            }],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receipt.json"
+            path.write_text(json.dumps(receipt), encoding="utf-8")
+            restored, _adjustments = poster._apply_prior_receipt(
+                plans, path, "approved-sha"
+            )
+
+        self.assertEqual("2026-08-14T10:00:17Z", restored[0]["start"])
+        self.assertEqual(613, restored[0]["duration_seconds"])
+
+    def test_posting_plan_rejects_malformed_allocation_segment_as_domain_error(self) -> None:
+        portfolio = {
+            "activities": [{
+                "review_id": "pvi-0123456789abcdef01234567",
+                "client_project": "Example Level 2",
+                "tag_names": ["Technical development"],
+                "description": "EX — Preserve exact recorded meeting time",
+                "duration_minutes": 5,
+                "duration_seconds": 301,
+                "allocation_segments": ["malformed"],
+            }],
+        }
+        routes = {
+            ("Example Level 2", ("Technical development",)): {
+                "project_id": "project-1", "tag_ids": ["tag-1"], "billable": True,
+            },
+        }
+
+        with self.assertRaisesRegex(
+            poster.PortfolioPostError, "invalid allocation segment"
+        ):
+            poster._plans(portfolio, routes)
+
+    def test_posting_plan_merges_contiguous_segments_with_equivalent_offsets(self) -> None:
+        portfolio = {
+            "activities": [{
+                "review_id": "pvi-0123456789abcdef01234567",
+                "client_project": "Example Level 2",
+                "tag_names": ["Technical development"],
+                "description": "EX — Preserve exact recorded meeting time",
+                "duration_minutes": 5,
+                "duration_seconds": 301,
+                "allocation_segments": [
+                    {
+                        "start": "2026-08-14T10:00:00+03:00",
+                        "end": "2026-08-14T10:02:31+03:00",
+                        "duration_minutes": 2,
+                        "duration_seconds": 151,
+                    },
+                    {
+                        "start": "2026-08-14T07:02:31Z",
+                        "end": "2026-08-14T07:05:01Z",
+                        "duration_minutes": 2,
+                        "duration_seconds": 150,
+                    },
+                ],
+            }],
+        }
+        routes = {
+            ("Example Level 2", ("Technical development",)): {
+                "project_id": "project-1", "tag_ids": ["tag-1"], "billable": True,
+            },
+        }
+
+        plan = poster._plans(portfolio, routes)
+
+        self.assertEqual(1, len(plan))
+        self.assertEqual(301, plan[0]["duration_seconds"])
+        self.assertEqual(5, plan[0]["duration_minutes"])
+
     def test_post_gate_requires_clean_flash_validated_replay_bound_repair(self) -> None:
         portfolio = {
             "external_writes": False,

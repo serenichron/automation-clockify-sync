@@ -76,7 +76,10 @@ def calendly_event(start: str, end: str):
         attributes={
             "recording_id": "calendly-meeting-1",
             "meeting_id": "meeting-1",
-            "duration_seconds": 37 * 60,
+            "duration_seconds": int((
+                dt.datetime.fromisoformat(end.replace("Z", "+00:00"))
+                - dt.datetime.fromisoformat(start.replace("Z", "+00:00"))
+            ).total_seconds()),
             "title": "Discovery call",
             "organizer": {"email": "vlad@serenichron.com"},
             "participants": [{"email": "prospect@example.test"}],
@@ -697,6 +700,60 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         self.assertEqual("2026-07-10T13:00:17+03:00", proposal["start"])
         self.assertEqual("2026-07-10T13:37:43+03:00", proposal["end"])
         self.assertEqual(2246, proposal["duration_seconds"])
+
+    def test_subminute_final_meeting_segment_preserves_positive_seconds(self):
+        meeting = fathom_event(
+            "2026-07-10T13:00:00+03:00",
+            "2026-07-10T13:35:43+03:00",
+            status="available",
+        )
+        calendly = calendly_event(
+            "2026-07-10T10:00:00Z", "2026-07-10T10:35:43Z"
+        )
+        analysis = meeting_analysis(meeting)
+        first = analysis["activities"][0]
+        first["evidence_spans"][0]["end"] = "2026-07-10T13:35:00+03:00"
+        final = json.loads(json.dumps(first))
+        final["object"] = "Discovery call follow-up"
+        final["project_recommendation"] = {
+            "name": "Serenichron Level 1",
+            "prefix": "SC",
+            "tag_names": ["Project Management"],
+        }
+        final["evidence_ids"] = [calendly.evidence_id]
+        final["evidence_spans"][0].update({
+            "evidence_id": calendly.evidence_id,
+            "start": "2026-07-10T13:35:00+03:00",
+            "end": "2026-07-10T13:35:43+03:00",
+        })
+        analysis["activities"].append(final)
+        _, result = self.make_run([meeting, calendly], analysis)
+
+        proposal = result["proposals"][-1]
+        self.assertEqual("2026-07-10T13:35:00+03:00", proposal["start"])
+        self.assertEqual("2026-07-10T13:35:43+03:00", proposal["end"])
+        self.assertEqual(43, proposal["duration_seconds"])
+        self.assertEqual(0, proposal["duration_minutes"])
+
+        schema = json.loads((ROOT / "schemas" / "work-accounting-result-v1.json").read_text())
+        duration_minutes = schema["$defs"]["proposal"]["properties"]["duration_minutes"]
+        duration_seconds = schema["$defs"]["proposal"]["properties"]["duration_seconds"]
+        self.assertGreaterEqual(proposal["duration_minutes"], duration_minutes["minimum"])
+        self.assertGreaterEqual(proposal["duration_seconds"], duration_seconds["minimum"])
+
+    def test_proposal_rejects_nonpositive_bounds(self):
+        start = dt.datetime(2026, 7, 10, 13, 35, tzinfo=dt.timezone.utc)
+
+        with self.assertRaisesRegex(pipeline.WorkAccountingError, "positive"):
+            pipeline._proposal(
+                {"activity_id": "act-one", "workstream_id": "ws-one"},
+                {},
+                "SC — Preserve exact seconds",
+                start,
+                start,
+                ["ev-one"],
+                1,
+            )
 
     def test_manifest_member_identity_is_used_for_meeting_eligibility(self):
         meeting = evidence_ledger.evidence_event(
