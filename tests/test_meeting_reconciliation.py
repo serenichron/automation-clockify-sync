@@ -112,6 +112,76 @@ class CanonicalMeetingTests(unittest.TestCase):
             set(result.exceptions[0]["source_ids"]),
         )
 
+    def test_same_email_with_extra_name_token_is_same_participant(self):
+        """An optional display name cannot split an explicitly identified person."""
+        for fathom_record, calendly_record in (
+            (
+                fathom(calendar_invitees=[
+                    {"email": "vlad@example.test"},
+                    {"email": "client@example.test", "name": "Client"},
+                ]),
+                calendly(participants=[{"email": "client@example.test"}]),
+            ),
+            (
+                fathom(
+                    meeting_id="", share_url="",
+                    calendar_invitees=[
+                        {"email": "vlad@example.test"},
+                        {"email": "client@example.test", "name": "Client"},
+                    ],
+                ),
+                calendly(
+                    meeting_id="", join_url="",
+                    participants=[{"email": "client@example.test"}],
+                ),
+            ),
+        ):
+            with self.subTest(fallback=not fathom_record["meeting_id"]):
+                result = reconcile_meetings(
+                    [fathom_record], [calendly_record], vlad_identities=VLAD_IDS
+                )
+                self.assertEqual(1, len(result.meetings), result.exceptions)
+                self.assertEqual(
+                    ("calendly:rec-1", "fathom:f-1"), result.meetings[0].source_ids
+                )
+
+    def test_same_name_with_disjoint_explicit_emails_is_participant_conflict(self):
+        """A shared display name cannot override contradictory email identities."""
+        result = reconcile_meetings(
+            [fathom(calendar_invitees=[
+                {"email": "vlad@example.test"},
+                {"email": "fathom-client@example.test", "name": "Client"},
+            ])],
+            [calendly(participants=[{
+                "email": "calendly-client@example.test", "name": "Client",
+            }])],
+            vlad_identities=VLAD_IDS,
+        )
+
+        self.assertEqual(2, len(result.meetings))
+        self.assertEqual("participant_conflict", result.exceptions[0]["reason"])
+
+    def test_participant_people_require_one_to_one_matching(self):
+        """Two source people cannot both match one target through a weak name."""
+        result = reconcile_meetings(
+            [fathom(
+                meeting_id="", share_url="",
+                calendar_invitees=[
+                    {"email": "vlad@example.test"},
+                    {"name": "Client"},
+                    {"name": "Client"},
+                ],
+            )],
+            [calendly(
+                meeting_id="", join_url="",
+                participants=[{"name": "Client"}, {"name": "Other"}],
+            )],
+            vlad_identities=VLAD_IDS,
+        )
+
+        self.assertEqual(2, len(result.meetings))
+        self.assertEqual("participant_conflict", result.exceptions[0]["reason"])
+
     def test_near_window_with_conflicting_people_is_quarantined(self):
         """A plausible overlap with different people is review evidence, not two silos."""
         result = reconcile_meetings(

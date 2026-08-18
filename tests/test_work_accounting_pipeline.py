@@ -1212,6 +1212,50 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         self.assertEqual(canonical.canonical_id, reconciliation["canonical_id"])
         self.assertEqual([meeting.evidence_id], reconciliation["source_evidence_ids"])
 
+    def test_accounting_proposes_one_canonical_meeting_for_same_email_with_extra_name(self):
+        """Accounting must retain both source receipts for one compatible person."""
+        base_meeting = fathom_event(
+            "2026-07-10T13:07:00+03:00",
+            "2026-07-10T14:11:00+03:00",
+            status="available",
+        )
+        meeting = evidence_ledger.evidence_event(
+            "fathom",
+            dict(base_meeting.source_ref),
+            observed_at=base_meeting.observed_at,
+            raw_source_span=dict(base_meeting.raw_source_span),
+            attributes={
+                **dict(base_meeting.attributes),
+                "calendar_invitees": [
+                    {"email": "vlad@serenichron.com"},
+                    {"email": "prospect@example.test", "name": "Prospect"},
+                ],
+            },
+        )
+        calendly = calendly_event(
+            "2026-07-10T10:07:00Z", "2026-07-10T11:11:00Z"
+        )
+        analysis = meeting_analysis(meeting)
+        analysis["activities"][0]["project_recommendation"] = {
+            "name": "Serenichron Level 1",
+            "prefix": "SC",
+            "tag_names": ["Project Management"],
+        }
+        analysis["activities"][0]["evidence_ids"].append(calendly.evidence_id)
+        analysis["activities"][0]["evidence_spans"].append({
+            "evidence_id": calendly.evidence_id,
+            "start": "2026-07-10T10:07:00Z",
+            "end": "2026-07-10T11:11:00Z",
+        })
+
+        _, result = self.make_run([meeting, calendly], analysis)
+
+        self.assertEqual(1, len(result["proposals"]))
+        self.assertEqual(
+            {meeting.evidence_id, calendly.evidence_id},
+            set(result["proposals"][0]["provenance"]["evidence_ids"]),
+        )
+
     def test_timestamped_meeting_activities_become_conserved_fixed_splits(self):
         meeting = fathom_event(
             "2026-07-10T13:00:00+03:00",

@@ -118,12 +118,59 @@ def manifest_member_identities(manifest: Mapping[str, Any]) -> frozenset[str]:
     return _LEGACY_MEMBER_IDENTITIES
 
 
-def _person_identities(value: object) -> set[str]:
+def _person_identities(value: object) -> frozenset[str]:
+    """Normalize a person to typed identity tokens without conflating fields."""
     if isinstance(value, str):
-        return {_identity(value)} - {""}
+        identity = _identity(value)
+        return frozenset({f"name:{identity}"}) if identity else frozenset()
     if not isinstance(value, Mapping):
-        return set()
-    return {_identity(value.get(key)) for key in ("email", "name", "id")} - {""}
+        return frozenset()
+    return frozenset(
+        f"{key}:{identity}"
+        for key in ("email", "name", "id")
+        if (identity := _identity(value.get(key)))
+    )
+
+
+def _identity_values(tokens: frozenset[str], kind: str) -> frozenset[str]:
+    prefix = f"{kind}:"
+    return frozenset(token.removeprefix(prefix) for token in tokens if token.startswith(prefix))
+
+
+def _is_member(tokens: frozenset[str], member_identities: frozenset[str]) -> bool:
+    values = (
+        _identity_values(tokens, "email")
+        | _identity_values(tokens, "name")
+        | _identity_values(tokens, "id")
+    )
+    return bool(values & member_identities)
+
+
+def _people_are_compatible(left: frozenset[str], right: frozenset[str]) -> bool:
+    left_emails, right_emails = _identity_values(left, "email"), _identity_values(right, "email")
+    if left_emails and right_emails:
+        return bool(left_emails & right_emails)
+    left_ids, right_ids = _identity_values(left, "id"), _identity_values(right, "id")
+    if left_ids and right_ids:
+        return bool(left_ids & right_ids)
+    return bool(left & right)
+
+
+def _same_people(
+    left_people: tuple[frozenset[str], ...], right_people: tuple[frozenset[str], ...]
+) -> bool:
+    """Require an unambiguous one-to-one match between participant people."""
+    if not left_people or len(left_people) != len(right_people):
+        return False
+    left = tuple(sorted(left_people, key=lambda tokens: tuple(sorted(tokens))))
+    right = tuple(sorted(right_people, key=lambda tokens: tuple(sorted(tokens))))
+    partners = [
+        tuple(index for index, person in enumerate(right) if _people_are_compatible(source, person))
+        for source in left
+    ]
+    if any(len(indices) != 1 for indices in partners):
+        return False
+    return len({indices[0] for indices in partners}) == len(right)
 
 
 def _people(value: object) -> tuple[dict[str, str], ...]:
@@ -166,7 +213,7 @@ class _Candidate:
     title: str
     organizer: Mapping[str, str]
     participants: tuple[Mapping[str, str], ...]
-    participant_people: frozenset[frozenset[str]]
+    participant_people: tuple[frozenset[str], ...]
     summary: str
     transcript: tuple[Mapping[str, Any], ...]
     action_items: tuple[Mapping[str, Any], ...]
@@ -367,10 +414,10 @@ def _candidate(provider: str, record: Mapping[str, Any], vlad: frozenset[str]) -
     organizer_normal = {key: str(organizer[key]) for key in ("email", "name", "id") if isinstance(organizer.get(key), str) and organizer[key].strip()}
     # The fallback rule is deliberately limited to participant/invitee lists.
     # A recorder or organizer is provenance, not evidence of attendance.
-    participant_people = frozenset(
-        frozenset(identities)
+    participant_people = tuple(
+        identities
         for person in participants
-        if (identities := _person_identities(person)) and not identities.intersection(vlad)
+        if (identities := _person_identities(person)) and not _is_member(identities, vlad)
     )
     return _Candidate(
         provider=provider,
@@ -403,11 +450,11 @@ def _window_agrees(left: _Candidate, right: _Candidate, tolerance: dt.timedelta)
 def _relation(left: _Candidate, right: _Candidate, tolerance: dt.timedelta) -> tuple[str | None, str | None]:
     """Return a verified match strength or a review-only ambiguity reason."""
     explicit = bool(left.provider_ids & right.provider_ids) or bool(left.meeting_ids & right.meeting_ids) or bool(left.join_urls & right.join_urls)
-    same_people = bool(left.participant_people) and left.participant_people == right.participant_people
+    same_people = _same_people(left.participant_people, right.participant_people)
     conflicting_people = (
         bool(left.participant_people)
         and bool(right.participant_people)
-        and left.participant_people != right.participant_people
+        and not same_people
     )
     near_window = _window_agrees(left, right, tolerance)
     if explicit:
