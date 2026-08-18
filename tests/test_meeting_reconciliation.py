@@ -125,6 +125,41 @@ class CanonicalMeetingTests(unittest.TestCase):
         self.assertEqual("duplicate_ambiguous", result.exceptions[0]["kind"])
         self.assertEqual("multiple_candidates", result.exceptions[0]["reason"])
 
+    def test_higher_priority_ambiguity_quarantines_fallback_compatible_sources(self):
+        result = reconcile_meetings(
+            [fathom(meeting_id="", share_url="", provider_recording_id="shared-provider")],
+            [
+                calendly(
+                    meeting_id="", join_url="", provider_recording_id="shared-provider",
+                    participants=[{"email": "first@example.test"}],
+                ),
+                calendly(
+                    recording_id="rec-2", meeting_id="", join_url="", provider_recording_id="shared-provider",
+                    participants=[{"email": "second@example.test"}],
+                ),
+                calendly(recording_id="rec-3", meeting_id="", join_url=""),
+            ],
+            vlad_identities=VLAD_IDS,
+        )
+        self.assertEqual(4, len(result.meetings))
+        self.assertTrue(any(item["reason"] == "multiple_candidates" for item in result.exceptions))
+        self.assertFalse(any(len(meeting.source_ids) > 1 for meeting in result.meetings))
+
+    def test_fallback_uses_participant_lists_not_organizer_or_recorder_identities(self):
+        result = reconcile_meetings(
+            [fathom(
+                meeting_id="", share_url="", calendar_invitees=[{"email": "first@example.test"}],
+                organizer={"email": "second@example.test"}, recorded_by_email="vlad@example.test",
+            )],
+            [calendly(
+                meeting_id="", join_url="", participants=[{"email": "second@example.test"}],
+                organizer={"email": "first@example.test"},
+            )],
+            vlad_identities=VLAD_IDS,
+        )
+        self.assertEqual(2, len(result.meetings))
+        self.assertEqual((), result.exceptions)
+
     def test_timing_conflict_never_averages_or_trims_time(self):
         result = reconcile_meetings(
             [fathom()],
@@ -207,6 +242,53 @@ class ReconciliationCliTests(unittest.TestCase):
 
             changed = calendly_source["recordings"][0] | {"title": "tampered"}
             self._write(calendly_path, {"status": "ok", "complete": True, "recordings": [changed]})
+            failed = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+            self.assertNotEqual(0, failed.returncode)
+            self.assertEqual(original, output_path.read_bytes())
+
+    def test_cli_normalizes_local_minute_fathom_artifact_with_manifest_timezone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            fathom_path = base / "fathom.json"
+            calendly_path = base / "calendly.json"
+            manifest_path = base / "period-manifest.json"
+            output_path = base / "meeting-reconciliation.json"
+            fathom_source = {
+                "status": "ok", "complete": True,
+                "meetings": [{
+                    "recording_id": "f-local", "title": "Local Fathom recording",
+                    "start": "2026-08-04 13:00", "end": "2026-08-04 13:37",
+                    "recorded_by_email": "vlad@example.test",
+                    "calendar_invitees": [
+                        {"email": "vlad@example.test"}, {"email": "client@example.test"},
+                    ],
+                    "share_url": "", "summary": "Local Fathom summary", "transcript": [],
+                }],
+            }
+            signed_calendly = calendly(recording_id="rec-local", meeting_id="", join_url="")
+            signed_calendly["source_digest"] = digest(
+                {key: value for key, value in signed_calendly.items() if key != "source_digest"}
+            )
+            self._write(fathom_path, fathom_source)
+            self._write(calendly_path, {"status": "ok", "complete": True, "recordings": [signed_calendly]})
+            manifest = {
+                "timezone": "Europe/Bucharest", "vlad_identities": ["vlad@example.test"],
+                "artifacts": {"fathom": {"path": "fathom.json", "digest": "sha256:" + hashlib.sha256(fathom_path.read_bytes()).hexdigest()}},
+            }
+            self._write(manifest_path, manifest)
+            command = [
+                sys.executable, str(ROOT / "scripts" / "meeting_reconciliation.py"),
+                "--period-manifest", str(manifest_path), "--fathom-from-manifest",
+                "--calendly", str(calendly_path), "--output", str(output_path),
+            ]
+            completed = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            document = json.loads(output_path.read_text())
+            self.assertEqual(1, len(document["meetings"]))
+            self.assertEqual("2026-08-04T10:00:00Z", document["meetings"][0]["start"])
+            original = output_path.read_bytes()
+
+            self._write(manifest_path, manifest | {"timezone": "Not/A_Timezone"})
             failed = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
             self.assertNotEqual(0, failed.returncode)
             self.assertEqual(original, output_path.read_bytes())

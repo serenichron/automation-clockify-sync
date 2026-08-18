@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import sys
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 DEDUP_VERSION = "meeting-dedup/v1"
@@ -19,6 +20,7 @@ DEDUP_TOLERANCE = dt.timedelta(minutes=5)
 SCHEMA_VERSION = "meeting-reconciliation/v1"
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 _UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+_LOCAL_MINUTE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
 
 
 class MeetingReconciliationError(ValueError):
@@ -63,6 +65,25 @@ def _parse_utc(value: object) -> dt.datetime:
 
 def _iso_utc(value: dt.datetime) -> str:
     return value.astimezone(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _parse_local_minute(value: str, timezone: ZoneInfo) -> dt.datetime:
+    """Convert one exact local-minute Fathom timestamp without guessing DST."""
+    try:
+        local = dt.datetime.strptime(value, "%Y-%m-%d %H:%M")
+    except ValueError as error:  # The caller has already checked the exact shape.
+        raise MeetingReconciliationError("Fathom local timestamp is invalid") from error
+    instants = set()
+    for fold in (0, 1):
+        candidate = local.replace(tzinfo=timezone, fold=fold)
+        round_trip = candidate.astimezone(dt.timezone.utc).astimezone(timezone)
+        if round_trip.replace(tzinfo=None) == local:
+            instants.add(candidate.astimezone(dt.timezone.utc))
+    if not instants:
+        raise MeetingReconciliationError("Fathom local timestamp does not exist in manifest timezone")
+    if len(instants) != 1:
+        raise MeetingReconciliationError("Fathom local timestamp is ambiguous in manifest timezone")
+    return next(iter(instants))
 
 
 def _identity(value: object) -> str:
@@ -232,9 +253,9 @@ def _candidate(provider: str, record: Mapping[str, Any], vlad: frozenset[str]) -
     participants = _people(source.get("participants", source.get("calendar_invitees", ())))
     organizer = _mapping(source.get("organizer") or {}, "organizer")
     organizer_normal = {key: str(organizer[key]) for key in ("email", "name", "id") if isinstance(organizer.get(key), str) and organizer[key].strip()}
+    # The fallback rule is deliberately limited to participant/invitee lists.
+    # A recorder or organizer is provenance, not evidence of attendance.
     people_ids = set().union(*(_person_identities(person) for person in participants)) if participants else set()
-    people_ids.update(_person_identities(organizer_normal))
-    people_ids.update(_person_identities(source.get("recorded_by_email")))
     return _Candidate(
         provider=provider,
         source_id=f"{provider}:{identifier}", source_digest=digest,
@@ -292,10 +313,13 @@ def _match_in_priority_order(fathom: tuple[_Candidate, ...], calendly: tuple[_Ca
     remaining_c = {item.source_id: item for item in calendly}
     groups: list[tuple[_Candidate, ...]] = []
     exceptions: list[Mapping[str, Any]] = []
+    quarantined: set[str] = set()
     for strength in ("shared_identity", "cross_provider_identity", "participant_window"):
         edges: list[tuple[_Candidate, _Candidate]] = []
         for left in remaining_f.values():
             for right in remaining_c.values():
+                if left.source_id in quarantined or right.source_id in quarantined:
+                    continue
                 relation, _reason = _relation(left, right, tolerance)
                 if relation == strength:
                     edges.append((left, right))
@@ -306,7 +330,12 @@ def _match_in_priority_order(fathom: tuple[_Candidate, ...], calendly: tuple[_Ca
         ambiguous = {source for source, values in by_source.items() if len(values) > 1}
         for source in sorted(ambiguous):
             if source in remaining_f or source in remaining_c:
-                exceptions.append(_exception((source,), "multiple_candidates", by_source[source]))
+                exceptions.append(_exception((source, *by_source[source]), "multiple_candidates", by_source[source]))
+        # An uncertainty at a stronger priority must never be revisited by a
+        # weaker rule. Quarantine both endpoints of every ambiguous edge.
+        for left, right in edges:
+            if left.source_id in ambiguous or right.source_id in ambiguous:
+                quarantined.update((left.source_id, right.source_id))
         for left, right in edges:
             if left.source_id in ambiguous or right.source_id in ambiguous:
                 continue
@@ -317,6 +346,8 @@ def _match_in_priority_order(fathom: tuple[_Candidate, ...], calendly: tuple[_Ca
             remaining_c.pop(right.source_id)
     for left in remaining_f.values():
         for right in remaining_c.values():
+            if left.source_id in quarantined or right.source_id in quarantined:
+                continue
             _relation_kind, reason = _relation(left, right, tolerance)
             if reason:
                 exceptions.append(_exception((left.source_id, right.source_id), reason))
@@ -399,6 +430,34 @@ def _manifest_vlad_identities(manifest: Mapping[str, Any]) -> Sequence[str]:
     raise MeetingReconciliationError("period manifest has no Vlad identities")
 
 
+def _manifest_timezone(manifest: Mapping[str, Any]) -> ZoneInfo:
+    value = manifest.get("timezone") or manifest.get("period_timezone")
+    identity = manifest.get("identity")
+    if value is None and isinstance(identity, Mapping):
+        value = identity.get("timezone")
+    if not isinstance(value, str) or not value:
+        raise MeetingReconciliationError("period manifest has no timezone for local Fathom timestamps")
+    try:
+        return ZoneInfo(value)
+    except ZoneInfoNotFoundError as error:
+        raise MeetingReconciliationError("period manifest timezone is invalid") from error
+
+
+def _normalize_fathom_ingestion(records: Sequence[Mapping[str, Any]], manifest: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Adapt the collector's local-minute artifact only at the CLI boundary."""
+    timezone: ZoneInfo | None = None
+    normalized: list[Mapping[str, Any]] = []
+    for record in records:
+        item = dict(record)
+        for field in ("start", "end"):
+            value = item.get(field)
+            if isinstance(value, str) and _LOCAL_MINUTE.fullmatch(value):
+                timezone = timezone or _manifest_timezone(manifest)
+                item[field] = _iso_utc(_parse_local_minute(value, timezone))
+        normalized.append(item)
+    return normalized
+
+
 def _source_records(document: Mapping[str, Any], key: str) -> Sequence[Mapping[str, Any]]:
     if document.get("complete") is not True:
         raise MeetingReconciliationError("recording source is incomplete")
@@ -452,7 +511,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         calendly_path = args.calendly.resolve()
         fathom_document = _read_json(fathom_path)
         calendly_document = _read_json(calendly_path)
-        fathom_records = _source_records(fathom_document, "meetings")
+        fathom_records = _normalize_fathom_ingestion(_source_records(fathom_document, "meetings"), manifest)
         calendly_records = _source_records(calendly_document, "recordings")
         _verify_calendly_records(calendly_records)
         result = reconcile_meetings(
