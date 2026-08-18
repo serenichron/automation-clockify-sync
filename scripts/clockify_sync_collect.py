@@ -32,6 +32,10 @@ from typing import Any, Mapping
 
 try:
     from scripts.calendly_collector import fetch_calendly
+    from scripts.provider_env import (
+        calendly_env_candidates as _provider_calendly_env_candidates,
+        load_env_file as _provider_load_env_file,
+    )
     from scripts.collector_checkpoints import (
         CheckpointError,
         CheckpointIdentity,
@@ -47,6 +51,10 @@ try:
     )
 except ModuleNotFoundError:  # Support direct execution from this directory.
     from calendly_collector import fetch_calendly  # type: ignore[no-redef]
+    from provider_env import (  # type: ignore[no-redef]
+        calendly_env_candidates as _provider_calendly_env_candidates,
+        load_env_file as _provider_load_env_file,
+    )
     from collector_checkpoints import (  # type: ignore[no-redef]
         CheckpointError,
         CheckpointIdentity,
@@ -128,12 +136,7 @@ def fathom_env_candidates() -> list[str]:
 
 
 def calendly_env_candidates() -> list[str]:
-    candidates = [os.environ.get("CALENDLY_ENV_FILE", "")]
-    candidates.extend(
-        str(home / ".config/serenichron/calendly.env")
-        for home in _home_candidates()
-    )
-    return list(dict.fromkeys(candidates))
+    return _provider_calendly_env_candidates()
 
 
 def load_json(path: Path) -> Any:
@@ -205,20 +208,7 @@ def collector_runtime_identity() -> dict[str, Any]:
 
 
 def load_env_file(candidates: list[str], required_keys: list[str]) -> dict[str, Any]:
-    env: dict[str, str] = {}
-    used = None
-    for c in candidates:
-        if c and Path(c).exists():
-            used = c
-            for raw in Path(c).read_text().splitlines():
-                line = raw.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                env[k.strip()] = v.strip().strip('"').strip("'")
-            break
-    missing = [k for k in required_keys if not env.get(k)]
-    return {"_env_file": used or "missing", "_missing": missing, **env}
+    return _provider_load_env_file(candidates, required_keys)
 
 
 def iso_utc(d: dt.datetime) -> str:

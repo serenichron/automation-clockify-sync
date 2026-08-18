@@ -412,6 +412,67 @@ class CalendlyCliContractTests(unittest.TestCase):
             self.assertTrue(root.is_dir())
             http_json.assert_called_once()
 
+    def test_collect_loads_gateway_configuration_from_explicit_env_file(self):
+        with tempfile.TemporaryDirectory() as directory, _working_directory(directory):
+            env_file = Path(directory) / "calendly.env"
+            env_file.write_text(
+                "CALENDLY_RECORDINGS_URL=https://gateway.example.test/calendly/recordings\n"
+                "CALENDLY_GATEWAY_TOKEN=private-calendly-token\n"
+                "CALENDLY_GATEWAY_READ_ONLY=true\n"
+            )
+            root = Path(directory) / "checkpoints"
+            output = Path(directory) / "result.json"
+            args = calendly.parse_args([
+                "collect", "--since", "2026-08-04T00:00:00Z",
+                "--until", "2026-08-05T00:00:00Z", "--output", str(output),
+                "--checkpoint-root", str(root),
+            ])
+            with (
+                mock.patch.dict(
+                    os.environ, {"CALENDLY_ENV_FILE": str(env_file)}, clear=True,
+                ),
+                mock.patch.object(
+                    calendly,
+                    "_http_json",
+                    return_value={"collection": [collection_recording("file")], "pagination": {}},
+                ),
+            ):
+                self.assertEqual(0, calendly.run(args))
+
+            document = json.loads(output.read_text())
+            self.assertTrue(document["complete"])
+            self.assertEqual(["recordings/file"], [row["recording_id"] for row in document["recordings"]])
+            self.assertTrue(root.is_dir())
+
+    def test_preflight_loads_gateway_configuration_from_explicit_env_file_without_network(self):
+        with tempfile.TemporaryDirectory() as directory, _working_directory(directory):
+            env_file = Path(directory) / "calendly.env"
+            env_file.write_text(
+                "CALENDLY_RECORDINGS_URL=https://gateway.example.test/calendly/recordings\n"
+                "CALENDLY_GATEWAY_TOKEN=private-calendly-token\n"
+                "CALENDLY_GATEWAY_READ_ONLY=true\n"
+            )
+            output = Path(directory) / "result.json"
+            args = calendly.parse_args([
+                "preflight", "--since", "2026-08-04T00:00:00Z",
+                "--until", "2026-08-05T00:00:00Z", "--output", str(output),
+            ])
+
+            def network_must_not_run(*_args, **_kwargs):
+                raise AssertionError("preflight must not call the network")
+
+            with (
+                mock.patch.dict(
+                    os.environ, {"CALENDLY_ENV_FILE": str(env_file)}, clear=True,
+                ),
+                mock.patch.object(calendly, "_http_json", side_effect=network_must_not_run),
+            ):
+                self.assertEqual(0, calendly.run(args))
+
+            document = json.loads(output.read_text())
+        self.assertEqual("ready", document["status"])
+        self.assertEqual("calendly_gateway_configured", document["capability"])
+
     def test_cli_rejects_output_outside_invocation_root(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(SystemExit):

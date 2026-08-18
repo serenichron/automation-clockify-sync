@@ -19,6 +19,11 @@ try:
         CheckpointState,
         PageCheckpointStore,
     )
+    from scripts.provider_env import (
+        calendly_env_candidates,
+        load_env_file,
+        merged_provider_environment,
+    )
 except ModuleNotFoundError:  # Support direct execution from this directory.
     from collector_checkpoints import (  # type: ignore[no-redef]
         CheckpointError,
@@ -26,10 +31,20 @@ except ModuleNotFoundError:  # Support direct execution from this directory.
         CheckpointState,
         PageCheckpointStore,
     )
+    from provider_env import (  # type: ignore[no-redef]
+        calendly_env_candidates,
+        load_env_file,
+        merged_provider_environment,
+    )
 
 
 CALENDLY_COMPATIBILITY_VERSION = "calendly-recordings/v1"
 CALENDLY_MAX_PAGES = 1000
+CALENDLY_REQUIRED_KEYS = (
+    "CALENDLY_RECORDINGS_URL",
+    "CALENDLY_GATEWAY_TOKEN",
+    "CALENDLY_GATEWAY_READ_ONLY",
+)
 
 
 class CalendlyCollectorError(ValueError):
@@ -445,6 +460,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def run(args: argparse.Namespace) -> int:
+    cenv = merged_provider_environment(
+        load_env_file(calendly_env_candidates(), CALENDLY_REQUIRED_KEYS),
+        os.environ,
+        CALENDLY_REQUIRED_KEYS,
+    )
     interval = {
         "compatibility_version": CALENDLY_COMPATIBILITY_VERSION,
         "since": _iso_utc(args.since),
@@ -452,7 +472,7 @@ def run(args: argparse.Namespace) -> int:
     }
     if args.command == "preflight":
         try:
-            _gateway_configuration(os.environ)
+            _gateway_configuration(cenv)
         except CalendlyCollectorError:
             document = {
                 **interval,
@@ -470,7 +490,7 @@ def run(args: argparse.Namespace) -> int:
             }
     else:
         result = fetch_calendly(
-            os.environ, args.since, args.until,
+            cenv, args.since, args.until,
             checkpoint_store=PageCheckpointStore(args.checkpoint_root),
         )
         document = {
