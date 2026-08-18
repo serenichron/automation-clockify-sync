@@ -10,6 +10,7 @@ from unittest import mock
 from scripts import evidence_ledger
 from scripts import review_corrections
 from scripts import work_accounting_pipeline as pipeline
+from scripts.meeting_reconciliation import reconcile_meetings
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -59,6 +60,30 @@ def fathom_event(start: str, end: str, status: str = "title_only"):
             "semantic_evidence_status": status,
             "recorded_by_email": "vlad@serenichron.com",
             "calendar_invitees": [{"email": "prospect@example.test", "is_external": True}],
+        },
+    )
+
+
+def calendly_event(start: str, end: str):
+    return evidence_ledger.evidence_event(
+        "calendly",
+        {
+            "source_type": "calendly", "source_id": "calendly-meeting-1",
+            "meeting_id": "meeting-1",
+        },
+        observed_at=start,
+        raw_source_span={"start": start, "end": end},
+        attributes={
+            "recording_id": "calendly-meeting-1",
+            "meeting_id": "meeting-1",
+            "duration_seconds": 37 * 60,
+            "title": "Discovery call",
+            "organizer": {"email": "vlad@serenichron.com"},
+            "participants": [{"email": "prospect@example.test"}],
+            "join_url": "https://meet.example.test/meeting-1",
+            "summary": "Recorded discovery discussion",
+            "transcript": [],
+            "source_digest": "sha256:" + "c" * 64,
         },
     )
 
@@ -1018,6 +1043,61 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         self.assertEqual("2026-07-10T14:11+03:00", proposal["end"])
         self.assertEqual(proposal["description"], proposal["rendered_description"])
         self.assertEqual("proposed", result["fathom_reconciliation"][0]["status"])
+
+    def test_accounting_uses_the_canonical_meeting_identity_for_fixed_time(self):
+        meeting = fathom_event(
+            "2026-07-10T13:07:00+03:00",
+            "2026-07-10T14:11:00+03:00",
+            status="available",
+        )
+        _, result = self.make_run([meeting], meeting_analysis(meeting))
+
+        canonical = reconcile_meetings(
+            [meeting.document()], [], vlad_identities={"vlad@serenichron.com"}
+        ).meetings[0]
+        reconciliation = result["fathom_reconciliation"][0]
+        self.assertEqual(canonical.canonical_id, reconciliation["canonical_id"])
+        self.assertEqual([meeting.evidence_id], reconciliation["source_evidence_ids"])
+
+    def test_timestamped_meeting_activities_become_conserved_fixed_splits(self):
+        meeting = fathom_event(
+            "2026-07-10T13:00:00+03:00",
+            "2026-07-10T13:37:00+03:00",
+            status="available",
+        )
+        calendly = calendly_event(
+            "2026-07-10T10:00:00Z", "2026-07-10T10:37:00Z"
+        )
+        analysis = meeting_analysis(meeting)
+        first = analysis["activities"][0]
+        first["evidence_spans"] = [{
+            "evidence_id": meeting.evidence_id,
+            "start": "2026-07-10T13:00:00+03:00",
+            "end": "2026-07-10T13:20:00+03:00",
+        }]
+        second = json.loads(json.dumps(first))
+        second["object"] = "Internal project handoff"
+        second["project_recommendation"] = {
+            "name": "Serenichron Level 1",
+            "prefix": "SC",
+            "tag_names": ["Project Management"],
+        }
+        second["evidence_spans"] = [{
+            "evidence_id": calendly.evidence_id,
+            "start": "2026-07-10T13:20:00+03:00",
+            "end": "2026-07-10T13:37:00+03:00",
+        }]
+        second["evidence_ids"] = [calendly.evidence_id]
+        analysis["activities"].append(second)
+
+        _, result = self.make_run([meeting, calendly], analysis)
+
+        self.assertEqual(2, len(result["proposals"]))
+        self.assertEqual(37, sum(item["duration_minutes"] for item in result["proposals"]))
+        self.assertEqual(
+            ["2026-07-10T13:00+03:00", "2026-07-10T13:20+03:00"],
+            [item["start"] for item in result["proposals"]],
+        )
 
     def test_fathom_correction_never_leaves_removed_meeting_marked_proposed(self):
         for decision, expected_status, expected_reason in (

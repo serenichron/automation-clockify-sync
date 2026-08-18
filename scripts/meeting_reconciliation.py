@@ -21,6 +21,7 @@ SCHEMA_VERSION = "meeting-reconciliation/v1"
 _SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 _UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 _LOCAL_MINUTE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+_TIMESTAMPED_EVIDENCE = re.compile(r"^[^:]+:(\d+)-(\d+)$")
 
 
 class MeetingReconciliationError(ValueError):
@@ -193,6 +194,97 @@ class CanonicalMeeting:
             "transcript": [dict(item) for item in self.transcript],
             "action_items": [dict(item) for item in self.action_items],
         }
+
+
+@dataclasses.dataclass(frozen=True)
+class MeetingSplit:
+    """One evidence-bound, fixed-duration route inside a canonical meeting."""
+
+    canonical_id: str
+    index: int
+    start: str
+    end: str
+    route: Mapping[str, Any]
+    evidence_ids: tuple[str, ...]
+
+    @property
+    def duration_seconds(self) -> int:
+        return int((_parse_utc(self.end) - _parse_utc(self.start)).total_seconds())
+
+    @property
+    def duration_minutes(self) -> int:
+        return self.duration_seconds // 60
+
+
+def _split_route_identity(route: Mapping[str, Any]) -> tuple[str, str]:
+    project = _text(route.get("project_name"))
+    task = _text(route.get("task_name"))
+    if not project or not task:
+        raise MeetingReconciliationError("split route must include a validated project and task")
+    return project.casefold(), task.casefold()
+
+
+def _split_boundaries_are_evidenced(
+    meeting_start: dt.datetime, split: MeetingSplit
+) -> bool:
+    start_offset = int((_parse_utc(split.start) - meeting_start).total_seconds())
+    end_offset = int((_parse_utc(split.end) - meeting_start).total_seconds())
+    for evidence_id in split.evidence_ids:
+        match = _TIMESTAMPED_EVIDENCE.fullmatch(evidence_id)
+        if match and (int(match.group(1)), int(match.group(2))) == (start_offset, end_offset):
+            return True
+    return False
+
+
+def validate_meeting_splits(
+    meeting: CanonicalMeeting,
+    splits: Iterable[MeetingSplit],
+    *,
+    granularity_minutes: int = 5,
+) -> tuple[MeetingSplit, ...]:
+    """Validate a complete, evidence-timestamped partition of one meeting."""
+    if not isinstance(meeting, CanonicalMeeting):
+        raise MeetingReconciliationError("canonical meeting is required")
+    if not isinstance(granularity_minutes, int) or granularity_minutes <= 0:
+        raise MeetingReconciliationError("split granularity must be a positive whole number of minutes")
+    values = tuple(splits)
+    if not values:
+        raise MeetingReconciliationError("meeting split list cannot be empty")
+    if not all(isinstance(split, MeetingSplit) for split in values):
+        raise MeetingReconciliationError("meeting splits must use MeetingSplit records")
+    meeting_start, meeting_end = _parse_utc(meeting.start), _parse_utc(meeting.end)
+    if any(split.canonical_id != meeting.canonical_id for split in values):
+        raise MeetingReconciliationError("meeting splits must share the canonical meeting ID")
+    ordered = tuple(sorted(values, key=lambda split: split.index))
+    if tuple(split.index for split in ordered) != tuple(range(len(ordered))):
+        raise MeetingReconciliationError("meeting split indexes must be consecutive and ordered")
+    if ordered != values:
+        raise MeetingReconciliationError("meeting splits must be ordered by index")
+    routes: set[tuple[str, str]] = set()
+    granularity_seconds = granularity_minutes * 60
+    cursor = meeting_start
+    for index, split in enumerate(ordered):
+        start, end = _parse_utc(split.start), _parse_utc(split.end)
+        if end <= start:
+            raise MeetingReconciliationError("meeting split duration must be positive")
+        if start != cursor:
+            raise MeetingReconciliationError("meeting splits must cover the full meeting without gaps or overlap")
+        duration_seconds = int((end - start).total_seconds())
+        is_final = index == len(ordered) - 1
+        if duration_seconds % granularity_seconds and not is_final:
+            raise MeetingReconciliationError("non-final meeting splits must use the configured minute granularity")
+        if is_final and end != meeting_end:
+            raise MeetingReconciliationError("meeting splits must cover the full meeting without gaps or overlap")
+        if not _split_boundaries_are_evidenced(meeting_start, split):
+            raise MeetingReconciliationError("timestamped boundary evidence is required for every meeting split")
+        route_identity = _split_route_identity(split.route)
+        if route_identity in routes:
+            raise MeetingReconciliationError("meeting splits must use distinct validated routes")
+        routes.add(route_identity)
+        cursor = end
+    if cursor != meeting_end:
+        raise MeetingReconciliationError("meeting splits must cover the full meeting without gaps or overlap")
+    return ordered
 
 
 @dataclasses.dataclass(frozen=True)

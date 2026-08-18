@@ -23,6 +23,7 @@ try:
     from scripts import caveman_renderer
     from scripts import clockify_sync_collect as collector
     from scripts import evidence_ledger
+    from scripts import meeting_reconciliation
     from scripts import review_corrections
     from scripts import semantic_analyzer
     from scripts import work_allocator
@@ -30,6 +31,7 @@ except ModuleNotFoundError:
     import caveman_renderer  # type: ignore[no-redef]
     import clockify_sync_collect as collector  # type: ignore[no-redef]
     import evidence_ledger  # type: ignore[no-redef]
+    import meeting_reconciliation  # type: ignore[no-redef]
     import review_corrections  # type: ignore[no-redef]
     import semantic_analyzer  # type: ignore[no-redef]
     import work_allocator  # type: ignore[no-redef]
@@ -251,13 +253,13 @@ def _analysis_events(events: Iterable[dict[str, Any]]) -> tuple[list[dict[str, A
         source_type = str(event.get("source_type") or "")
         if source_type == "clockify":
             continue
-        if source_type == "fathom":
+        if source_type in {"fathom", "calendly"}:
             eligible, exclusion = _meeting_is_eligible(event)
             semantic_status = str(_attributes(event).get("semantic_evidence_status") or "")
             if not eligible or semantic_status == "title_only":
                 noise.append({
                     "evidence_id": str(event.get("evidence_id")),
-                    "reason": f"fathom_preclassified:{exclusion or semantic_status}",
+                    "reason": f"recording_preclassified:{exclusion or semantic_status}",
                 })
                 continue
         source = (
@@ -487,7 +489,7 @@ def _semantic_route_hint(
     event: Mapping[str, Any], routing: Mapping[str, Any]
 ) -> dict[str, Any] | None:
     record = _event_record(event)
-    if event.get("source_type") == "fathom":
+    if event.get("source_type") in {"fathom", "calendly"}:
         candidate = collector.route_meeting(record, dict(routing))
     else:
         candidate = _route_session_record(record, routing)
@@ -619,7 +621,7 @@ def _event_record(event: Mapping[str, Any]) -> dict[str, Any]:
     attrs = dict(_attributes(event))
     raw = event.get("raw_source_span") if isinstance(event.get("raw_source_span"), Mapping) else {}
     source = event.get("source_ref") if isinstance(event.get("source_ref"), Mapping) else {}
-    return {
+    record = {
         **attrs,
         "start": raw.get("start") or raw.get("timestamp") or event.get("observed_at"),
         "end": raw.get("end") or raw.get("timestamp"),
@@ -628,6 +630,9 @@ def _event_record(event: Mapping[str, Any]) -> dict[str, Any]:
         "machine": source.get("machine"),
         "session_id": source.get("session_id"),
     }
+    if event.get("source_type") == "calendly":
+        record["calendar_invitees"] = list(attrs.get("participants") or [])
+    return record
 
 
 def resolve_route(
@@ -639,7 +644,7 @@ def resolve_route(
     skipped_routes: list[str] = []
     for event in cited_events:
         record = _event_record(event)
-        if event.get("source_type") == "fathom":
+        if event.get("source_type") in {"fathom", "calendly"}:
             candidate = collector.route_meeting(record, dict(routing))
         else:
             candidate = _route_session_record(record, routing)
@@ -713,8 +718,29 @@ def _existing_blocks(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     return blocks
 
 
-def _fathom_events(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [event for event in events if event.get("source_type") == "fathom"]
+def _recording_events(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Bind source evidence to the one canonical meeting it represents."""
+    recording_sources = [
+        event for event in events if event.get("source_type") in {"fathom", "calendly"}
+    ]
+    by_source_id = {
+        f"{event['source_type']}:{(event.get('source_ref') or {}).get('source_id')}": event
+        for event in recording_sources
+    }
+    reconciliation = meeting_reconciliation.reconcile_meetings(
+        [event for event in recording_sources if event.get("source_type") == "fathom"],
+        [event for event in recording_sources if event.get("source_type") == "calendly"],
+        vlad_identities={"vlad@serenichron.com"},
+    )
+    result = []
+    for meeting in reconciliation.meetings:
+        source_events = [by_source_id[source_id] for source_id in meeting.source_ids]
+        result.append({
+            "meeting": meeting,
+            "events": source_events,
+            "source_evidence_ids": [str(event["evidence_id"]) for event in source_events],
+        })
+    return result
 
 
 def _meeting_is_eligible(event: Mapping[str, Any]) -> tuple[bool, str | None]:
@@ -725,7 +751,10 @@ def _meeting_is_eligible(event: Mapping[str, Any]) -> tuple[bool, str | None]:
     if _minutes(start, end) < 5 and not attrs.get("transcript"):
         return False, "short_recording_without_transcript"
     recorded_by = str(attrs.get("recorded_by_email") or "").strip().casefold()
-    invitees = attrs.get("calendar_invitees")
+    organizer = attrs.get("organizer")
+    if not recorded_by and isinstance(organizer, Mapping):
+        recorded_by = str(organizer.get("email") or "").strip().casefold()
+    invitees = attrs.get("calendar_invitees", attrs.get("participants"))
     invitee_emails = {
         str(value.get("email") or "").strip().casefold()
         for value in invitees
@@ -766,6 +795,64 @@ def _meeting_matches_existing_block(
         >= MEETING_RECONCILIATION_MIN_RATIO
         and _overlap_ratio(block["start"], block["end"], start, end)
         >= MEETING_RECONCILIATION_MIN_RATIO
+    )
+
+
+def _canonical_meeting_span(
+    meeting: meeting_reconciliation.CanonicalMeeting,
+    representative: Mapping[str, Any],
+) -> tuple[dt.datetime, dt.datetime]:
+    """Use canonical instants while retaining the source's stable display zone."""
+    start, end = _parse_dt(meeting.start), _parse_dt(meeting.end)
+    source_start, _source_end = _span(representative)
+    assert start and end
+    if source_start is not None:
+        start, end = start.astimezone(source_start.tzinfo), end.astimezone(source_start.tzinfo)
+    return start, end
+
+
+def _meeting_split_candidate(
+    meeting: meeting_reconciliation.CanonicalMeeting,
+    activity: Mapping[str, Any],
+    route: Mapping[str, Any],
+    evidence_ids: list[str],
+    index: int,
+) -> tuple[meeting_reconciliation.MeetingSplit, dt.datetime, dt.datetime]:
+    """Turn one timestamped semantic activity into a split-validation input."""
+    spans = [
+        span for span in activity.get("evidence_spans", [])
+        if isinstance(span, Mapping)
+        and (
+            str(span.get("evidence_id") or "") in evidence_ids
+            or (not span.get("evidence_id") and len(evidence_ids) == 1)
+        )
+    ]
+    if len(spans) != 1:
+        raise meeting_reconciliation.MeetingReconciliationError(
+            "meeting split requires exactly one timestamped evidence span"
+        )
+    start, end = _parse_dt(spans[0].get("start")), _parse_dt(spans[0].get("end"))
+    if start is None or end is None:
+        raise meeting_reconciliation.MeetingReconciliationError(
+            "meeting split requires timestamped boundary evidence"
+        )
+    meeting_start = _parse_dt(meeting.start)
+    assert meeting_start is not None
+    start_offset = int((start - meeting_start).total_seconds())
+    end_offset = int((end - meeting_start).total_seconds())
+    evidence_id = str(spans[0].get("evidence_id") or evidence_ids[0])
+    task_name = ", ".join(sorted(str(value) for value in route.get("tag_names", [])))
+    return (
+        meeting_reconciliation.MeetingSplit(
+            canonical_id=meeting.canonical_id,
+            index=index,
+            start=start.astimezone(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            end=end.astimezone(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            route={"project_name": route.get("project_name"), "task_name": task_name},
+            evidence_ids=(f"{evidence_id}:{start_offset}-{end_offset}",),
+        ),
+        start,
+        end,
     )
 
 
@@ -972,30 +1059,58 @@ def run_accounting(
 
     events_by_id = {str(event["evidence_id"]): event for event in all_events}
     existing = _existing_blocks(all_events)
-    fathom = _fathom_events(all_events)
-    eligible_fathom = []
+    try:
+        recordings = _recording_events(all_events)
+    except meeting_reconciliation.MeetingReconciliationError as exc:
+        raise WorkAccountingError(f"canonical meeting reconciliation failed: {exc}") from exc
+    recordings_by_id = {
+        entry["meeting"].canonical_id: entry for entry in recordings
+    }
+    recording_by_evidence_id = {
+        evidence_id: entry
+        for entry in recordings
+        for evidence_id in entry["source_evidence_ids"]
+    }
+    eligible_recordings = []
     fathom_manifest: dict[str, dict[str, Any]] = {}
-    for event in fathom:
-        eligible, exclusion = _meeting_is_eligible(event)
-        meeting_id = str(event["evidence_id"])
+    for entry in recordings:
+        meeting = entry["meeting"]
+        source_events = entry["events"]
+        representative = next(
+            (event for event in source_events if event.get("source_type") == "fathom"),
+            source_events[0],
+        )
+        eligible, exclusion = _meeting_is_eligible(representative)
+        meeting_id = meeting.canonical_id
+        manifest_base = {
+            "canonical_id": meeting_id,
+            "source_evidence_ids": entry["source_evidence_ids"],
+        }
         if eligible:
-            eligible_fathom.append(event)
-            if _attributes(event).get("semantic_evidence_status") == "title_only":
+            eligible_recordings.append(entry)
+            if _attributes(representative).get("semantic_evidence_status") == "title_only":
                 fathom_manifest[meeting_id] = {
+                    **manifest_base,
                     "status": "exception",
                     "reason": "title_only",
                 }
             else:
-                fathom_manifest[meeting_id] = {"status": "unresolved"}
+                fathom_manifest[meeting_id] = {**manifest_base, "status": "unresolved"}
         else:
-            fathom_manifest[meeting_id] = {"status": "excluded", "reason": exclusion}
+            fathom_manifest[meeting_id] = {
+                **manifest_base, "status": "excluded", "reason": exclusion
+            }
 
     fixed = list(existing)
     meeting_conflicts: list[dict[str, Any]] = []
-    for event in eligible_fathom:
-        start, end = _span(event)
-        assert start and end
-        meeting_id = str(event["evidence_id"])
+    for entry in eligible_recordings:
+        meeting = entry["meeting"]
+        representative = next(
+            (event for event in entry["events"] if event.get("source_type") == "fathom"),
+            entry["events"][0],
+        )
+        start, end = _canonical_meeting_span(meeting, representative)
+        meeting_id = meeting.canonical_id
         overlapping_blocks = [
             block
             for block in fixed
@@ -1027,7 +1142,7 @@ def run_accounting(
                     "reason": "eligible Fathom meeting overlaps fixed Clockify time without a reciprocal meeting match",
                     "exception_kind": "fixed_block_conflict",
                     "conflict_reason": "meeting_overlap",
-                    "evidence_ids": [meeting_id],
+                    "evidence_ids": entry["source_evidence_ids"],
                     "fixed_block_ids": block_ids,
                 }
             )
@@ -1049,6 +1164,7 @@ def run_accounting(
     ambiguous: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     meeting_proposals: list[dict[str, Any]] = []
+    meeting_activities: dict[str, list[dict[str, Any]]] = {}
 
     ambiguous.extend(meeting_conflicts)
 
@@ -1121,20 +1237,31 @@ def run_accounting(
                 continue
             description = str(rendered.description)
         activity["rendered_description"] = description
-        meeting_events = [event for event in cited if event.get("source_type") == "fathom"]
+        meeting_events = [
+            event for event in cited if event.get("source_type") in {"fathom", "calendly"}
+        ]
         if lifecycle == "meeting" or meeting_events:
-            if len(meeting_events) != 1:
-                ambiguous.append({"id": activity_id, "reason": "meeting activity requires exactly one Fathom event", "exception_kind": "meeting_evidence", "evidence_ids": evidence_ids})
+            canonical_ids = {
+                entry["meeting"].canonical_id
+                for event in meeting_events
+                if (entry := recording_by_evidence_id.get(str(event["evidence_id"])))
+            }
+            if len(canonical_ids) != 1:
+                ambiguous.append({"id": activity_id, "reason": "meeting activity requires exactly one canonical recording", "exception_kind": "meeting_evidence", "evidence_ids": evidence_ids})
                 continue
-            meeting = meeting_events[0]
-            meeting_id = str(meeting["evidence_id"])
-            attrs = _attributes(meeting)
+            meeting_id = next(iter(canonical_ids))
+            entry = recordings_by_id[meeting_id]
+            meeting = entry["meeting"]
+            representative = next(
+                (event for event in entry["events"] if event.get("source_type") == "fathom"),
+                entry["events"][0],
+            )
+            attrs = _attributes(representative)
             if attrs.get("semantic_evidence_status") == "title_only":
                 ambiguous.append({"id": activity_id, "reason": "title-only Fathom evidence cannot support a meeting outcome", "exception_kind": "insufficient_meeting_evidence", "evidence_ids": evidence_ids})
-                fathom_manifest[meeting_id] = {"status": "exception", "reason": "title_only"}
+                fathom_manifest[meeting_id].update({"status": "exception", "reason": "title_only"})
                 continue
-            start, end = _span(meeting)
-            assert start and end
+            start, end = _canonical_meeting_span(meeting, representative)
             meeting_status = fathom_manifest.get(meeting_id, {}).get("status")
             if meeting_status == "reconciled":
                 skipped.append({"id": activity_id, "reason": "meeting already reconciled by existing Clockify entry", "evidence_ids": evidence_ids})
@@ -1142,9 +1269,13 @@ def run_accounting(
             if meeting_status == "exception":
                 skipped.append({"id": activity_id, "reason": "meeting has a fixed-block conflict", "evidence_ids": evidence_ids})
                 continue
-            proposal = _proposal(activity, route, description, start, end, evidence_ids, 1)
-            meeting_proposals.append(proposal)
-            fathom_manifest[meeting_id] = {"status": "proposed", "activity_id": activity_id}
+            meeting_activities.setdefault(meeting_id, []).append({
+                "activity": activity,
+                "route": route,
+                "description": description,
+                "evidence_ids": evidence_ids,
+                "entry": entry,
+            })
             continue
 
         spans = _authoritative_spans(cited)
@@ -1164,6 +1295,60 @@ def run_accounting(
         }
         allocation_demands.append(demand)
         activity_context[activity_id] = {"activity": activity, "route": route, "description": description, "evidence_ids": evidence_ids}
+
+    for meeting_id, candidates in meeting_activities.items():
+        entry = recordings_by_id[meeting_id]
+        meeting = entry["meeting"]
+        representative = next(
+            (event for event in entry["events"] if event.get("source_type") == "fathom"),
+            entry["events"][0],
+        )
+        if len(candidates) == 1:
+            candidate = candidates[0]
+            start, end = _canonical_meeting_span(meeting, representative)
+            meeting_proposals.append(_proposal(
+                candidate["activity"], candidate["route"], candidate["description"],
+                start, end, entry["source_evidence_ids"], 1,
+            ))
+            fathom_manifest[meeting_id].update({
+                "status": "proposed", "activity_id": str(candidate["activity"].get("activity_id") or ""),
+            })
+            continue
+        try:
+            split_candidates = [
+                (candidate, *_meeting_split_candidate(
+                    meeting, candidate["activity"], candidate["route"],
+                    candidate["evidence_ids"], index,
+                ))
+                for index, candidate in enumerate(candidates)
+            ]
+            split_candidates.sort(key=lambda value: value[1].start)
+            splits = tuple(
+                dataclasses.replace(value[1], index=index)
+                for index, value in enumerate(split_candidates)
+            )
+            validated = meeting_reconciliation.validate_meeting_splits(meeting, splits)
+        except meeting_reconciliation.MeetingReconciliationError as exc:
+            fathom_manifest[meeting_id].update({"status": "exception", "reason": "invalid_meeting_split"})
+            ambiguous.append({
+                "id": meeting_id,
+                "reason": str(exc),
+                "exception_kind": "invalid_meeting_split",
+                "evidence_ids": entry["source_evidence_ids"],
+            })
+            continue
+        for segment, (candidate, _split, start, end) in zip(validated, split_candidates):
+            proposal = _proposal(
+                candidate["activity"], candidate["route"], candidate["description"],
+                start, end, candidate["evidence_ids"], segment.index + 1,
+            )
+            proposal["provenance"]["canonical_meeting_id"] = meeting_id
+            proposal["provenance"]["timestamped_split_evidence_ids"] = list(segment.evidence_ids)
+            meeting_proposals.append(proposal)
+        fathom_manifest[meeting_id].update({
+            "status": "proposed",
+            "activity_ids": [str(candidate["activity"].get("activity_id") or "") for candidate in candidates],
+        })
 
     allocation = work_allocator.allocate_work(allocation_demands, fixed)
     proposals = list(meeting_proposals)
@@ -1240,7 +1425,13 @@ def run_accounting(
             })
             for proposal in related:
                 for evidence_id in (proposal.get("provenance") or {}).get("evidence_ids", []):
-                    meeting_status = fathom_manifest.get(str(evidence_id))
+                    recording = recording_by_evidence_id.get(str(evidence_id))
+                    meeting_key = (
+                        recording["meeting"].canonical_id
+                        if recording is not None
+                        else str(evidence_id)
+                    )
+                    meeting_status = fathom_manifest.get(meeting_key)
                     if not meeting_status or meeting_status.get("activity_id") != target[0]:
                         continue
                     if failure["decision"] == "skip":

@@ -9,7 +9,12 @@ import sys
 import tempfile
 import unittest
 
-from scripts.meeting_reconciliation import reconcile_meetings
+from scripts.meeting_reconciliation import (
+    MeetingReconciliationError,
+    MeetingSplit,
+    reconcile_meetings,
+    validate_meeting_splits,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -192,6 +197,51 @@ class CanonicalMeetingTests(unittest.TestCase):
             json.dumps(first.document(), sort_keys=True, separators=(",", ":")).encode(),
             json.dumps(second.document(), sort_keys=True, separators=(",", ":")).encode(),
         )
+
+
+class MeetingSplitTests(unittest.TestCase):
+    def setUp(self):
+        self.meeting = reconcile_meetings(
+            [],
+            [calendly(start="2026-08-04T10:00:00Z", end="2026-08-04T10:37:00Z")],
+            vlad_identities=VLAD_IDS,
+        ).meetings[0]
+
+    def split(self, index, start, end, project, evidence_ids):
+        return MeetingSplit(
+            canonical_id=self.meeting.canonical_id,
+            index=index,
+            start=f"2026-08-04T{start}:00Z",
+            end=f"2026-08-04T{end}:00Z",
+            route={"project_name": project, "task_name": "Meeting"},
+            evidence_ids=evidence_ids,
+        )
+
+    def test_timestamped_split_covers_full_meeting_without_overlap(self):
+        splits = validate_meeting_splits(self.meeting, [
+            self.split(0, "10:00", "10:20", "Client A", ("transcript:0-1200",)),
+            self.split(1, "10:20", "10:37", "Client B", ("transcript:1200-2220",)),
+        ])
+        self.assertEqual(37, sum(item.duration_minutes for item in splits))
+
+    def test_untimestamped_share_is_rejected_even_when_human_approved(self):
+        with self.assertRaisesRegex(MeetingReconciliationError, "timestamped boundary"):
+            validate_meeting_splits(self.meeting, [
+                self.split(0, "10:00", "10:20", "Client A", ()),
+                self.split(1, "10:20", "10:37", "Client B", ()),
+            ])
+
+    def test_split_rejects_gap_or_reused_route(self):
+        with self.assertRaisesRegex(MeetingReconciliationError, "cover the full meeting"):
+            validate_meeting_splits(self.meeting, [
+                self.split(0, "10:00", "10:15", "Client A", ("transcript:0-900",)),
+                self.split(1, "10:20", "10:37", "Client B", ("transcript:1200-2220",)),
+            ])
+        with self.assertRaisesRegex(MeetingReconciliationError, "distinct"):
+            validate_meeting_splits(self.meeting, [
+                self.split(0, "10:00", "10:20", "Client A", ("transcript:0-1200",)),
+                self.split(1, "10:20", "10:37", "Client A", ("transcript:1200-2220",)),
+            ])
 
 
 class ReconciliationCliTests(unittest.TestCase):
