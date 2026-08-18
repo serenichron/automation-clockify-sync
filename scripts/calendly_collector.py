@@ -150,16 +150,26 @@ def _safe_path(value: str, root: Path) -> Path:
     candidate = Path(value).expanduser()
     if not candidate.is_absolute():
         candidate = root / candidate
-    candidate = candidate.resolve(strict=False)
+    lexical = candidate
+    try:
+        relative = lexical.relative_to(root)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("path must remain below the invocation root") from error
+    current = root
+    for part in relative.parts:
+        if part == ".":
+            continue
+        if part == "..":
+            current = current.parent
+            continue
+        current = current / part
+        if current.is_symlink():
+            raise argparse.ArgumentTypeError("symlinked path components are not allowed")
+    candidate = lexical.resolve(strict=False)
     try:
         candidate.relative_to(root)
     except ValueError as error:
         raise argparse.ArgumentTypeError("path must remain below the invocation root") from error
-    current = root
-    for part in candidate.relative_to(root).parts:
-        current = current / part
-        if current.is_symlink():
-            raise argparse.ArgumentTypeError("symlinked path components are not allowed")
     return candidate
 
 

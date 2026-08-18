@@ -71,6 +71,8 @@ def _assert_schema_contract(schema, value):
             if "pattern" in declaration and not re.search(declaration["pattern"], candidate):
                 raise AssertionError("pattern mismatch")
             if declaration.get("format") == "date-time":
+                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", candidate):
+                    raise AssertionError("date-time is not canonical UTC")
                 try:
                     parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
                 except ValueError as error:
@@ -153,6 +155,7 @@ class CalendlyRecordingContractTests(unittest.TestCase):
         for invalid in (
             {**value, "recording_id": None},
             {**value, "start": "2026-08-04T10:00:00"},
+            {**value, "start": "2026-08-04 10:00:00Z"},
             {**value, "end": "2026-08-04T09:59:59Z"},
         ):
             with self.subTest(invalid=invalid):
@@ -251,10 +254,34 @@ class CalendlyCliContractTests(unittest.TestCase):
                     "--output", str(link / "result.json"),
                 ])
 
+    def test_cli_rejects_in_root_output_symlink_component(self):
+        with tempfile.TemporaryDirectory() as directory, _working_directory(directory):
+            target = Path(directory) / "target"
+            target.mkdir()
+            link = Path(directory) / "link"
+            link.symlink_to(target, target_is_directory=True)
+            with self.assertRaises(SystemExit):
+                calendly.parse_args([
+                    "preflight", "--since", "2026-08-04T00:00:00Z", "--until", "2026-08-05T00:00:00Z",
+                    "--output", str(link / "result.json"),
+                ])
+
     def test_collect_rejects_symlinked_checkpoint_root(self):
         with tempfile.TemporaryDirectory() as directory, _working_directory(directory):
             link = Path(directory) / "link"
             link.symlink_to(ROOT, target_is_directory=True)
+            with self.assertRaises(SystemExit):
+                calendly.parse_args([
+                    "collect", "--since", "2026-08-04T00:00:00Z", "--until", "2026-08-05T00:00:00Z",
+                    "--output", str(Path(directory) / "result.json"), "--checkpoint-root", str(link),
+                ])
+
+    def test_collect_rejects_in_root_checkpoint_symlink_component(self):
+        with tempfile.TemporaryDirectory() as directory, _working_directory(directory):
+            target = Path(directory) / "target"
+            target.mkdir()
+            link = Path(directory) / "link"
+            link.symlink_to(target, target_is_directory=True)
             with self.assertRaises(SystemExit):
                 calendly.parse_args([
                     "collect", "--since", "2026-08-04T00:00:00Z", "--until", "2026-08-05T00:00:00Z",
