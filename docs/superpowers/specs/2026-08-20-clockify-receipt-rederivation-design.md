@@ -1,6 +1,6 @@
 # Clockify Receipt Re-Derivation Design
 
-**Status:** Board-approved architecture, awaiting written-spec confirmation
+**Status:** Board-approved
 
 **Date:** 2026-08-20
 
