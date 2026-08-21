@@ -11,6 +11,363 @@ from scripts import clockify_portfolio_replay as portfolio_replay
 
 
 class ClockifyPortfolioPostTests(unittest.TestCase):
+    def _write_posting_fixture(
+        self, root: Path, *, allocation_segments: list[dict[str, object]] | None = None
+    ) -> argparse.Namespace:
+        portfolio_path = root / "portfolio.json"
+        quality_path = root / "quality.json"
+        routing_path = root / "routing.json"
+        replay_path = root / "replay.json"
+        receipt_path = root / "receipt.json"
+        segments = allocation_segments or [{
+            "start": "2026-08-14T10:00:00Z", "end": "2026-08-14T10:10:00Z",
+            "duration_minutes": 10,
+        }]
+        portfolio = {
+            "external_writes": False,
+            "repair": {"status": "complete", "unresolved_wording": []},
+            "activities": [{
+                "review_id": "review-a", "client_project": "Example Level 2",
+                "tag_names": ["Technical development"],
+                "description": "EX — Approved work", "duration_minutes": sum(
+                    int(segment["duration_minutes"]) for segment in segments
+                ),
+                "validation_status": "flash_validated", "allocation_segments": segments,
+            }],
+        }
+        quality = {"status": "pass"}
+        portfolio_path.write_text(json.dumps(portfolio), encoding="utf-8")
+        quality_path.write_text(json.dumps(quality), encoding="utf-8")
+        replay_path.write_text(json.dumps({
+            "status": "pass", "identity": {"artifacts": {
+                "repair": portfolio_replay._digest(portfolio),
+                "quality": portfolio_replay._digest(quality),
+            }},
+        }), encoding="utf-8")
+        routing_path.write_text(json.dumps({
+            "clockify_user_id": "user-1", "session_routes": [{
+                "project_name": "Example Level 2",
+                "tag_names": ["Technical development"], "project_suffix": "123456",
+                "tag_suffixes": ["654321"],
+            }],
+        }), encoding="utf-8")
+        return argparse.Namespace(
+            portfolio=portfolio_path, quality_report=quality_path,
+            replay_integrity=replay_path, routing=routing_path, receipt=receipt_path,
+            prior_receipt=None,
+            expected_portfolio_sha256=hashlib.sha256(portfolio_path.read_bytes()).hexdigest(),
+            execute=False,
+        )
+
+    def _clockify_entry(
+        self, entry_id: str, start: str, end: str, *, project_id: str = "project-123456",
+        tag_ids: list[str] | None = None, description: str = "EX — Approved work",
+    ) -> dict[str, object]:
+        return {
+            "id": entry_id, "timeInterval": {"start": start, "end": end},
+            "projectId": project_id, "tagIds": tag_ids or ["tag-654321"],
+            "description": description,
+        }
+
+    def _paged_with_live(self, live_entries: list[dict[str, object]]):
+        def paged(path: str, _api_key: str, *, timeout_seconds: int):
+            self.assertEqual(45, timeout_seconds)
+            if path.startswith("/workspaces/workspace-1/projects"):
+                return [{"id": "project-123456"}]
+            if path.startswith("/workspaces/workspace-1/tags"):
+                return [{"id": "tag-654321"}]
+            return live_entries
+        return paged
+
+    def test_normalized_snapshot_digest_is_order_independent_and_covers_live_identity(self) -> None:
+        entries = [
+            {
+                "id": "entry-b", "start": "2026-08-14T10:10:00+00:00",
+                "end": "2026-08-14T10:20:00Z", "project_id": "project-b",
+                "tag_ids": ["tag-z", "tag-a"], "description": " Work B ",
+            },
+            {
+                "id": "entry-a", "start": "2026-08-14T10:00:00Z",
+                "end": "2026-08-14T10:10:00Z", "project_id": "project-a",
+                "tag_ids": ["tag-b"], "description": "Work A",
+            },
+        ]
+        reordered = [
+            {**entries[0], "tag_ids": ["tag-a", "tag-z"]},
+            entries[1],
+        ]
+
+        baseline = poster._normalized_snapshot_sha256(entries)
+        self.assertEqual(baseline, poster._normalized_snapshot_sha256(reordered))
+        for field, changed in (
+            ("id", "entry-other"),
+            ("start", "2026-08-14T10:00:01Z"),
+            ("end", "2026-08-14T10:10:01Z"),
+            ("project_id", "project-other"),
+            ("tag_ids", ["tag-other"]),
+            ("description", "Other work"),
+        ):
+            with self.subTest(field=field):
+                mutated = [dict(entries[0]), dict(entries[1])]
+                mutated[1][field] = changed
+                self.assertNotEqual(baseline, poster._normalized_snapshot_sha256(mutated))
+
+    def test_adjustment_digest_is_bound_to_blocker_snapshot(self) -> None:
+        adjustments = [{
+            "review_id": "review-a", "segment_index": 1,
+            "original_start": "2026-08-14T10:00:00Z",
+            "original_end": "2026-08-14T10:10:00Z",
+            "posted_start": "2026-08-14T10:00:30Z",
+            "posted_end": "2026-08-14T10:10:30Z",
+            "algorithm": poster.BOUNDARY_ADJUSTMENT_ALGORITHM,
+        }]
+        left = poster._adjustment_digest("portfolio-sha", "blockers-a", adjustments)
+        right = poster._adjustment_digest("portfolio-sha", "blockers-b", adjustments)
+
+        self.assertNotEqual(left, right)
+
+    def test_run_rederives_prior_candidate_from_fresh_live_readback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = self._write_posting_fixture(root)
+            prior_path = root / "prior.json"
+            prior_path.write_text(json.dumps({
+                "portfolio_sha256": args.expected_portfolio_sha256,
+                "created": [{
+                    "review_id": "review-a", "segment_index": 1,
+                    "clockify_entry_id": "entry-prior",
+                    "start": "2026-08-14T10:00:00Z",
+                    "end": "2026-08-14T10:10:00Z", "duration_seconds": 600,
+                }], "already_existing": [],
+            }), encoding="utf-8")
+            args.prior_receipt = prior_path
+            live = [self._clockify_entry(
+                "entry-prior", "2026-08-14T10:00:00Z", "2026-08-14T10:10:00Z"
+            )]
+            with (
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
+                }),
+                mock.patch.object(poster, "_paged", side_effect=self._paged_with_live(live)),
+            ):
+                receipt = poster.run(args)
+
+        self.assertEqual("dry_run", receipt["status"])
+        self.assertEqual(["entry-prior"], [
+            item["clockify_entry_id"] for item in receipt["already_existing"]
+        ])
+
+    def test_run_dry_retry_keeps_fresh_derivation_evidence_stable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            args = self._write_posting_fixture(Path(directory))
+            with (
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
+                }),
+                mock.patch.object(poster, "_paged", side_effect=self._paged_with_live([])),
+            ):
+                first = poster.run(args)
+                second = poster.run(args)
+
+        for field in (
+            "live_snapshot_sha256", "blocker_snapshot_sha256",
+            "boundary_adjustments", "boundary_adjustments_sha256",
+        ):
+            self.assertEqual(first[field], second[field])
+
+    def test_run_accepts_nonreceipt_exact_entry_without_posting(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            args = self._write_posting_fixture(Path(directory))
+            args.execute = True
+            live = [self._clockify_entry(
+                "entry-exact", "2026-08-14T10:00:00Z", "2026-08-14T10:10:00Z"
+            )]
+            with (
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
+                }),
+                mock.patch.object(poster, "_paged", side_effect=self._paged_with_live(live)),
+                mock.patch.object(poster, "_request") as request,
+            ):
+                receipt = poster.run(args)
+
+        self.assertEqual("complete", receipt["status"])
+        self.assertEqual(["entry-exact"], [
+            item["clockify_entry_id"] for item in receipt["already_existing"]
+        ])
+        request.assert_not_called()
+
+    def test_run_rejects_multiple_exact_entries_and_reports_overlap_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            args = self._write_posting_fixture(Path(directory))
+            exact = self._clockify_entry(
+                "entry-exact", "2026-08-14T10:00:00Z", "2026-08-14T10:10:00Z"
+            )
+            with (
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
+                }),
+                mock.patch.object(poster, "_paged", side_effect=self._paged_with_live([
+                    exact, {**exact, "id": "entry-exact-2"},
+                ])),
+            ):
+                with self.assertRaisesRegex(
+                    poster.PortfolioPostError, "multiple exact Clockify entries"
+                ):
+                    poster.run(args)
+
+            conflict = self._clockify_entry(
+                "entry-blocker", "2026-08-14T10:01:00Z", "2026-08-14T10:02:00Z",
+                description="EX — Unrelated blocker",
+            )
+            with (
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
+                }),
+                mock.patch.object(poster, "_paged", side_effect=self._paged_with_live([conflict])),
+            ):
+                with self.assertRaisesRegex(
+                    poster.PortfolioPostError,
+                    r"review-a 2026-08-14T10:00:00Z\.\.2026-08-14T10:10:00Z.*"
+                    r"EX — Approved work.*entry-blocker "
+                    r"2026-08-14T10:01:00Z\.\.2026-08-14T10:02:00Z.*"
+                    r"EX — Unrelated blocker",
+                ):
+                    poster.run(args)
+
+    def test_run_rejects_candidate_and_nonreceipt_duplicate_exact_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = self._write_posting_fixture(root)
+            prior_path = root / "prior.json"
+            prior_path.write_text(json.dumps({
+                "portfolio_sha256": args.expected_portfolio_sha256,
+                "created": [{
+                    "review_id": "review-a", "segment_index": 1,
+                    "clockify_entry_id": "entry-prior",
+                }], "already_existing": [],
+            }), encoding="utf-8")
+            args.prior_receipt = prior_path
+            live = [
+                self._clockify_entry(
+                    "entry-prior", "2026-08-14T10:00:00Z", "2026-08-14T10:10:00Z"
+                ),
+                self._clockify_entry(
+                    "entry-other", "2026-08-14T10:00:00Z", "2026-08-14T10:10:00Z"
+                ),
+            ]
+            with (
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
+                }),
+                mock.patch.object(poster, "_paged", side_effect=self._paged_with_live(live)),
+            ):
+                with self.assertRaisesRegex(
+                    poster.PortfolioPostError, "multiple exact Clockify entries"
+                ):
+                    poster.run(args)
+
+    def test_run_retry_posts_only_unfulfilled_plan_after_interruption(self) -> None:
+        segments = [
+            {"start": "2026-08-14T10:00:00Z", "end": "2026-08-14T10:10:00Z", "duration_minutes": 10},
+            {"start": "2026-08-14T10:20:00Z", "end": "2026-08-14T10:30:00Z", "duration_minutes": 10},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            args = self._write_posting_fixture(Path(directory), allocation_segments=segments)
+            args.execute = True
+            with (
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
+                }),
+                mock.patch.object(poster, "_paged", side_effect=self._paged_with_live([])),
+                mock.patch.object(poster, "_request", side_effect=[
+                    {"id": "entry-first"}, poster.PortfolioPostError("write uncertain"),
+                ]),
+            ):
+                with self.assertRaisesRegex(poster.PortfolioPostError, "write uncertain"):
+                    poster.run(args)
+            interrupted = json.loads(args.receipt.read_text(encoding="utf-8"))
+
+            first_live = [self._clockify_entry(
+                "entry-first", "2026-08-14T10:00:00Z", "2026-08-14T10:10:00Z"
+            )]
+            with (
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
+                }),
+                mock.patch.object(poster, "_paged", side_effect=self._paged_with_live(first_live)),
+                mock.patch.object(poster, "_request", return_value={"id": "entry-second"}) as retry_post,
+            ):
+                completed = poster.run(args)
+
+        self.assertEqual(["entry-first"], [
+            item["clockify_entry_id"] for item in interrupted["created"]
+        ])
+        self.assertEqual(1, retry_post.call_count)
+        self.assertEqual("complete", completed["status"])
+        self.assertEqual(2, len(completed["created"] + completed["already_existing"]))
+
+    def test_run_rejects_prior_candidate_when_fresh_blockers_change_derived_bounds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = self._write_posting_fixture(root)
+            prior_path = root / "prior.json"
+            prior_path.write_text(json.dumps({
+                "portfolio_sha256": args.expected_portfolio_sha256,
+                "created": [{
+                    "review_id": "review-a", "segment_index": 1,
+                    "clockify_entry_id": "entry-prior",
+                }], "already_existing": [],
+            }), encoding="utf-8")
+            args.prior_receipt = prior_path
+            live = [
+                self._clockify_entry(
+                    "entry-prior", "2026-08-14T10:00:00Z", "2026-08-14T10:10:00Z"
+                ),
+                self._clockify_entry(
+                    "entry-blocker", "2026-08-14T09:59:00Z", "2026-08-14T10:00:30Z",
+                    project_id="project-other", description="EX — Unrelated blocker",
+                ),
+            ]
+            with (
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
+                }),
+                mock.patch.object(poster, "_paged", side_effect=self._paged_with_live(live)),
+            ):
+                with self.assertRaisesRegex(
+                    poster.PortfolioPostError, "freshly derived plan"
+                ):
+                    poster.run(args)
+
+    def test_run_rejects_prior_receipt_that_names_an_unrelated_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = self._write_posting_fixture(root)
+            prior_path = root / "prior.json"
+            prior_path.write_text(json.dumps({
+                "portfolio_sha256": args.expected_portfolio_sha256,
+                "created": [{
+                    "review_id": "review-a", "segment_index": 1,
+                    "clockify_entry_id": "entry-blocker",
+                }], "already_existing": [],
+            }), encoding="utf-8")
+            args.prior_receipt = prior_path
+            blocker = self._clockify_entry(
+                "entry-blocker", "2026-08-14T10:01:00Z", "2026-08-14T10:02:00Z",
+                project_id="project-other", description="EX — Unrelated blocker",
+            )
+            with (
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
+                }),
+                mock.patch.object(poster, "_paged", side_effect=self._paged_with_live([blocker])),
+            ):
+                with self.assertRaisesRegex(
+                    poster.PortfolioPostError, "semantic fields differ from approval"
+                ):
+                    poster.run(args)
+
     def test_posting_plan_preserves_subminute_approved_segments(self) -> None:
         portfolio = {
             "activities": [{

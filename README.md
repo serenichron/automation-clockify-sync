@@ -106,6 +106,13 @@ drift, non-identical live overlaps, and portfolio digest mismatches. A failed or
 ambiguous POST is reconciled through a fresh exact live readback before the run
 can continue; it is never blindly retried after a server-side 5xx response.
 
+`--prior-receipt` identifies candidate live entries but never authorizes receipt
+timestamps. Every retry reads Clockify again, excludes candidates provisionally,
+re-derives approved bounds, and fails if the live readback differs. Receipt audit
+evidence includes `boundary_adjustment_algorithm`, `live_snapshot_sha256`,
+`blocker_snapshot_sha256`, and `boundary_adjustments_sha256`. An interrupted
+receipt is safe to retry, but is not proof that its entries remain valid.
+
 Outputs:
 
 - `runs/<run-id>/evidence/evidence-ledger.json`: immutable evidence and

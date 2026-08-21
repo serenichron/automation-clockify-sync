@@ -668,12 +668,37 @@ def _validate_prior_candidates(
     return accepted
 
 
+def _normalized_snapshot_sha256(entries: Iterable[Mapping[str, Any]]) -> str:
+    """Return a stable digest for the live fields that affect derivation."""
+    rows = [
+        {
+            "id": str(entry.get("id") or ""),
+            "start": _utc(str(entry.get("start") or "")),
+            "end": _utc(str(entry.get("end") or "")),
+            "project_id": str(entry.get("project_id") or ""),
+            "tag_ids": sorted(str(value) for value in entry.get("tag_ids", [])),
+            "description": str(entry.get("description") or "").strip(),
+        }
+        for entry in entries
+    ]
+    rows.sort(key=lambda row: (
+        row["start"], row["end"], row["id"], row["project_id"],
+        tuple(row["tag_ids"]), row["description"],
+    ))
+    return hashlib.sha256(
+        json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 def _adjustment_digest(
-    portfolio_sha: str, adjustments: Iterable[Mapping[str, Any]]
+    portfolio_sha: str,
+    blocker_snapshot_sha256: str,
+    adjustments: Iterable[Mapping[str, Any]],
 ) -> str:
     payload = {
         "portfolio_sha256": portfolio_sha,
         "algorithm": BOUNDARY_ADJUSTMENT_ALGORITHM,
+        "blocker_snapshot_sha256": blocker_snapshot_sha256,
         "adjustments": [
             {
                 "review_id": str(item.get("review_id") or ""),
@@ -772,30 +797,64 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "tag",
     )
-    plans = _plans(portfolio, _resolved_routes(routing, project_ids, tag_ids))
+    approved_plans = _plans(
+        portfolio, _resolved_routes(routing, project_ids, tag_ids)
+    )
+    approved_by_key = {
+        _receipt_key(plan, kind="approved plan"): plan for plan in approved_plans
+    }
+    if len(approved_by_key) != len(approved_plans):
+        raise PortfolioPostError("approved portfolio contains duplicate posting keys")
     prior_path = args.prior_receipt
     if prior_path is None and args.receipt.exists():
         prior_path = args.receipt
-    if prior_path is not None:
-        raise PortfolioPostError(
-            "prior receipt candidate validation requires fresh derivation"
-        )
     live = _live_entries(
-        workspace, user, api_key, plans, timeout_seconds=timeout_seconds
+        workspace, user, api_key, approved_plans, timeout_seconds=timeout_seconds
+    )
+    live_snapshot_sha256 = _normalized_snapshot_sha256(live)
+    candidates = (
+        _prior_receipt_candidates(
+            prior_path.resolve(), portfolio_sha, set(approved_by_key)
+        )
+        if prior_path is not None else ()
+    )
+    receipt_candidates = {
+        (candidate.review_id, candidate.segment_index): candidate
+        for candidate in candidates
+    }
+    candidate_live, blockers = _resolve_prior_candidates(
+        candidates, live, approved_by_key
     )
     exact: dict[tuple[str, int], dict[str, Any]] = {}
-    for plan in plans:
-        matches = [entry for entry in live if _exact(plan, entry)]
+    for plan in approved_plans:
+        matches = [entry for entry in blockers if _exact(plan, entry)]
         if len(matches) > 1:
             raise PortfolioPostError("multiple exact Clockify entries match one approved block")
         if matches:
             exact[(plan["review_id"], plan["segment_index"])] = matches[0]
-    plans, boundary_adjustments = _align_subminute_boundaries(plans, live, set(exact))
+    blocker_snapshot_sha256 = _normalized_snapshot_sha256(blockers)
+    plans, boundary_adjustments = _align_subminute_boundaries(
+        [dict(plan) for plan in approved_plans], blockers, set(exact)
+    )
+    derived_by_key = {
+        _receipt_key(plan, kind="freshly derived plan"): plan for plan in plans
+    }
+    if len(derived_by_key) != len(plans):
+        raise PortfolioPostError("fresh derivation contains duplicate posting keys")
+    validated_candidates = _validate_prior_candidates(
+        candidate_live, derived_by_key, receipt_candidates
+    )
+    for key in validated_candidates:
+        if key in exact:
+            raise PortfolioPostError(
+                "multiple exact Clockify entries match one derived block"
+            )
+    exact.update(validated_candidates)
     for plan in plans:
         key = (plan["review_id"], plan["segment_index"])
         if key in exact:
             continue
-        matches = [entry for entry in live if _exact(plan, entry)]
+        matches = [entry for entry in blockers if _exact(plan, entry)]
         if len(matches) > 1:
             raise PortfolioPostError("multiple exact Clockify entries match one adjusted block")
         if matches:
@@ -808,7 +867,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         key = (plan["review_id"], plan["segment_index"])
         if key in exact:
             continue
-        overlaps = [entry for entry in live if _overlaps(plan, entry)]
+        overlaps = [entry for entry in blockers if _overlaps(plan, entry)]
         if overlaps:
             conflicts.append({
                 "review_id": plan["review_id"],
@@ -841,9 +900,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "planned_blocks": len(plans),
         "planned_seconds": planned_seconds,
         "planned_minutes": planned_seconds // 60,
+        "boundary_adjustment_algorithm": BOUNDARY_ADJUSTMENT_ALGORITHM,
+        "live_snapshot_sha256": live_snapshot_sha256,
+        "blocker_snapshot_sha256": blocker_snapshot_sha256,
         "boundary_adjustments": boundary_adjustments,
         "boundary_adjustments_sha256": _adjustment_digest(
-            portfolio_sha, boundary_adjustments
+            portfolio_sha, blocker_snapshot_sha256, boundary_adjustments
         ),
         "created": [],
         "already_existing": [],
