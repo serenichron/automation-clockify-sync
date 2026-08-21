@@ -944,11 +944,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             refreshed = _live_entries(
                 workspace, user, api_key, plans, timeout_seconds=timeout_seconds
             )
-            recovered = next((entry for entry in refreshed if _exact(plan, entry)), None)
-            if recovered is None:
+            recovered_matches = [entry for entry in refreshed if _exact(plan, entry)]
+            if len(recovered_matches) != 1:
                 receipt["status"] = "interrupted"
                 _atomic_write(args.receipt.resolve(), receipt)
+                if len(recovered_matches) > 1:
+                    raise PortfolioPostError(
+                        "multiple exact Clockify entries match ambiguous POST recovery"
+                    )
                 raise
+            recovered = recovered_matches[0]
             receipt["created"].append(_receipt_item(plan, recovered["id"], "recovered"))
         else:
             if not isinstance(created, Mapping) or not created.get("id"):

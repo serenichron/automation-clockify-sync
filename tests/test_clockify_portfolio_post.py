@@ -307,6 +307,46 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
         self.assertEqual("complete", completed["status"])
         self.assertEqual(2, len(completed["created"] + completed["already_existing"]))
 
+    def test_ambiguous_post_recovery_rejects_multiple_exact_live_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            args = self._write_posting_fixture(Path(directory))
+            args.execute = True
+            exact_entries = [
+                self._clockify_entry(
+                    "entry-first", "2026-08-14T10:00:00Z", "2026-08-14T10:10:00Z"
+                ),
+                self._clockify_entry(
+                    "entry-second", "2026-08-14T10:00:00Z", "2026-08-14T10:10:00Z"
+                ),
+            ]
+            readbacks = [[], exact_entries]
+
+            def paged(path: str, _api_key: str, *, timeout_seconds: int):
+                self.assertEqual(45, timeout_seconds)
+                if path.startswith("/workspaces/workspace-1/projects"):
+                    return [{"id": "project-123456"}]
+                if path.startswith("/workspaces/workspace-1/tags"):
+                    return [{"id": "tag-654321"}]
+                return readbacks.pop(0)
+
+            with (
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
+                }),
+                mock.patch.object(poster, "_paged", side_effect=paged),
+                mock.patch.object(
+                    poster, "_request", side_effect=poster.PortfolioPostError("write uncertain")
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    poster.PortfolioPostError, "multiple exact Clockify entries"
+                ):
+                    poster.run(args)
+            interrupted = json.loads(args.receipt.read_text(encoding="utf-8"))
+
+        self.assertEqual("interrupted", interrupted["status"])
+        self.assertEqual([], interrupted["created"])
+
     def test_run_rejects_prior_candidate_when_fresh_blockers_change_derived_bounds(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
