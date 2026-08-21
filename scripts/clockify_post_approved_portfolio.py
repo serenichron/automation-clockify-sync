@@ -9,6 +9,7 @@ overlap blocks the run before another entry is created.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import datetime as dt
 import hashlib
 import json
@@ -16,7 +17,7 @@ import os
 from pathlib import Path
 import sys
 import time
-from typing import Any, Iterable, Mapping
+from typing import AbstractSet, Any, Iterable, Mapping, Sequence
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -40,6 +41,17 @@ POST_HTTP_TIMEOUT_MAX_SECONDS = 120
 
 class PortfolioPostError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class PriorReceiptCandidate:
+    review_id: str
+    segment_index: int
+    clockify_entry_id: str
+    disposition: str
+    recorded_start: str | None
+    recorded_end: str | None
+    recorded_duration_seconds: int | None
 
 
 def post_http_timeout_seconds(environment: Mapping[str, Any]) -> int:
@@ -526,6 +538,136 @@ def _same_instant(left: Any, right: Any) -> bool:
         return False
 
 
+def _prior_receipt_candidates(
+    path: Path,
+    portfolio_sha: str,
+    approved_keys: AbstractSet[tuple[str, int]],
+) -> Sequence[PriorReceiptCandidate]:
+    prior = _read(path)
+    if not isinstance(prior, Mapping) or prior.get("portfolio_sha256") != portfolio_sha:
+        raise PortfolioPostError("prior posting receipt does not match the approved portfolio")
+    candidates: list[PriorReceiptCandidate] = []
+    seen_keys: set[tuple[str, int]] = set()
+    seen_ids: set[str] = set()
+    for disposition in ("created", "already_existing"):
+        items = prior.get(disposition, [])
+        if not isinstance(items, list):
+            raise PortfolioPostError("prior posting receipt items must be a list")
+        for item in items:
+            if not isinstance(item, Mapping):
+                raise PortfolioPostError("prior posting receipt contains an invalid item")
+            key = _receipt_key(item, kind="receipt")
+            if key in seen_keys:
+                raise PortfolioPostError("prior posting receipt contains a duplicate receipt key")
+            if key not in approved_keys:
+                raise PortfolioPostError("prior posting receipt contains an unknown approved key")
+            entry_id = str(item.get("clockify_entry_id") or "").strip()
+            if not entry_id:
+                raise PortfolioPostError("prior posting receipt lacks a Clockify entry ID")
+            if entry_id in seen_ids:
+                raise PortfolioPostError(
+                    "prior posting receipt contains a duplicate Clockify entry ID"
+                )
+            try:
+                recorded_start = _utc(str(item["start"])) if "start" in item else None
+                recorded_end = _utc(str(item["end"])) if "end" in item else None
+            except (TypeError, ValueError, PortfolioPostError) as error:
+                raise PortfolioPostError(
+                    "prior posting receipt contains an invalid audit timestamp"
+                ) from error
+            raw_duration = item.get("duration_seconds")
+            if raw_duration is not None and (
+                isinstance(raw_duration, bool)
+                or not isinstance(raw_duration, int)
+                or raw_duration <= 0
+            ):
+                raise PortfolioPostError("prior posting receipt contains invalid duration seconds")
+            candidates.append(PriorReceiptCandidate(
+                key[0], key[1], entry_id, disposition,
+                recorded_start, recorded_end, raw_duration,
+            ))
+            seen_keys.add(key)
+            seen_ids.add(entry_id)
+    return tuple(candidates)
+
+
+def _resolve_prior_candidates(
+    candidates: Iterable[PriorReceiptCandidate],
+    live: Iterable[Mapping[str, Any]],
+    approved_by_key: Mapping[tuple[str, int], Mapping[str, Any]],
+) -> tuple[dict[tuple[str, int], dict[str, Any]], list[dict[str, Any]]]:
+    live_rows = [dict(entry) for entry in live]
+    live_by_id: dict[str, dict[str, Any]] = {}
+    for entry in live_rows:
+        entry_id = str(entry.get("id") or "").strip()
+        if not entry_id:
+            raise PortfolioPostError("fresh Clockify readback contains an empty entry ID")
+        if entry_id in live_by_id:
+            raise PortfolioPostError("fresh Clockify readback contains a duplicate entry ID")
+        live_by_id[entry_id] = entry
+    resolved: dict[tuple[str, int], dict[str, Any]] = {}
+    removed_ids: set[str] = set()
+    for candidate in candidates:
+        key = (candidate.review_id, candidate.segment_index)
+        if key in resolved:
+            raise PortfolioPostError("prior posting receipt contains a duplicate receipt key")
+        entry = live_by_id.get(candidate.clockify_entry_id)
+        if entry is None:
+            raise PortfolioPostError("prior Clockify entry is absent from fresh readback")
+        approved = approved_by_key[key]
+        semantic_match = (
+            str(entry.get("project_id") or "") == str(approved.get("project_id") or "")
+            and sorted(str(value) for value in entry.get("tag_ids", []))
+            == sorted(str(value) for value in approved.get("tag_ids", []))
+            and str(entry.get("description") or "").strip()
+            == str(approved.get("description") or "").strip()
+        )
+        if not semantic_match:
+            raise PortfolioPostError("prior Clockify entry semantic fields differ from approval")
+        resolved[key] = entry
+        removed_ids.add(candidate.clockify_entry_id)
+    return resolved, [entry for entry in live_rows if entry["id"] not in removed_ids]
+
+
+def _validate_prior_candidates(
+    candidates_by_key: Mapping[tuple[str, int], Mapping[str, Any]],
+    derived_by_key: Mapping[tuple[str, int], Mapping[str, Any]],
+    receipt_candidates: Mapping[tuple[str, int], PriorReceiptCandidate],
+) -> dict[tuple[str, int], dict[str, Any]]:
+    accepted: dict[tuple[str, int], dict[str, Any]] = {}
+    if set(candidates_by_key) != set(receipt_candidates):
+        raise PortfolioPostError("prior candidate identity sets do not match")
+    for key, receipt_candidate in receipt_candidates.items():
+        live = candidates_by_key[key]
+        derived = derived_by_key.get(key)
+        if derived is None:
+            raise PortfolioPostError("prior candidate has no freshly derived plan")
+        if not _exact(derived, live):
+            raise PortfolioPostError(
+                "prior Clockify entry differs from its freshly derived plan"
+            )
+        live_seconds = int(
+            (_parse(str(live["end"])) - _parse(str(live["start"]))).total_seconds()
+        )
+        if live_seconds <= 0 or live_seconds != int(derived["duration_seconds"]):
+            raise PortfolioPostError("prior Clockify entry duration differs from derivation")
+        if (
+            receipt_candidate.recorded_start is not None
+            and not _same_instant(receipt_candidate.recorded_start, live["start"])
+        ) or (
+            receipt_candidate.recorded_end is not None
+            and not _same_instant(receipt_candidate.recorded_end, live["end"])
+        ):
+            raise PortfolioPostError("prior receipt audit bounds contradict fresh readback")
+        if (
+            receipt_candidate.recorded_duration_seconds is not None
+            and receipt_candidate.recorded_duration_seconds != live_seconds
+        ):
+            raise PortfolioPostError("prior receipt audit duration contradicts fresh readback")
+        accepted[key] = dict(live)
+    return accepted
+
+
 def _adjustment_digest(
     portfolio_sha: str, adjustments: Iterable[Mapping[str, Any]]
 ) -> str:
@@ -551,104 +693,6 @@ def _adjustment_digest(
     return hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
-
-
-def _apply_prior_receipt(
-    plans: list[dict[str, Any]],
-    path: Path,
-    portfolio_sha: str,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    prior = _read(path)
-    if not isinstance(prior, Mapping) or prior.get("portfolio_sha256") != portfolio_sha:
-        raise PortfolioPostError("prior posting receipt does not match the approved portfolio")
-    approved_by_key = {
-        _receipt_key(plan, kind="approved plan"): plan for plan in plans
-    }
-    if len(approved_by_key) != len(plans):
-        raise PortfolioPostError("approved portfolio contains duplicate posting keys")
-
-    by_key: dict[tuple[str, int], Mapping[str, Any]] = {}
-    for name in ("created", "already_existing"):
-        raw_items = prior.get(name, [])
-        if not isinstance(raw_items, list):
-            raise PortfolioPostError("prior posting receipt items must be a list")
-        for item in raw_items:
-            if not isinstance(item, Mapping):
-                raise PortfolioPostError("prior posting receipt contains an invalid item")
-            key = _receipt_key(item, kind="receipt")
-            if key in by_key:
-                raise PortfolioPostError("prior posting receipt contains a duplicate receipt key")
-            if key not in approved_by_key:
-                raise PortfolioPostError("prior posting receipt contains an unknown approved key")
-            by_key[key] = item
-
-    raw_adjustments = prior.get("boundary_adjustments", [])
-    if not isinstance(raw_adjustments, list):
-        raise PortfolioPostError("prior posting receipt boundary adjustments must be a list")
-    adjustments: list[dict[str, Any]] = []
-    adjustments_by_key: dict[tuple[str, int], dict[str, Any]] = {}
-    for raw in raw_adjustments:
-        if not isinstance(raw, Mapping):
-            raise PortfolioPostError("prior posting receipt contains an invalid boundary adjustment")
-        adjustment = dict(raw)
-        key = _receipt_key(adjustment, kind="boundary adjustment")
-        if key in adjustments_by_key:
-            raise PortfolioPostError("prior posting receipt contains a duplicate boundary adjustment key")
-        if key not in approved_by_key:
-            raise PortfolioPostError("prior posting receipt contains an unknown approved key")
-        adjustments.append(adjustment)
-        adjustments_by_key[key] = adjustment
-    if adjustments:
-        digest = prior.get("boundary_adjustments_sha256")
-        if not isinstance(digest, str) or digest != _adjustment_digest(portfolio_sha, adjustments):
-            raise PortfolioPostError("prior posting receipt adjustment digest is invalid")
-
-    restored: list[dict[str, Any]] = []
-    for original in plans:
-        plan = dict(original)
-        key = _receipt_key(plan, kind="approved plan")
-        item = by_key.get(key)
-        adjustment = adjustments_by_key.get(key)
-        if adjustment is not None:
-            if (
-                adjustment.get("algorithm") != BOUNDARY_ADJUSTMENT_ALGORITHM
-                or not _same_instant(original["start"], adjustment.get("original_start"))
-                or not _same_instant(original["end"], adjustment.get("original_end"))
-            ):
-                raise PortfolioPostError(
-                    "prior posting receipt adjustment does not match the approved window"
-                )
-            posted_start = str(adjustment.get("posted_start") or "")
-            posted_end = str(adjustment.get("posted_end") or "")
-            try:
-                start_delta = abs(int((_parse(posted_start) - _parse(original["start"])).total_seconds()))
-                end_delta = abs(int((_parse(posted_end) - _parse(original["end"])).total_seconds()))
-            except (TypeError, ValueError, PortfolioPostError) as error:
-                raise PortfolioPostError("prior posting receipt contains an invalid boundary adjustment") from error
-            if start_delta >= 60 or end_delta >= 60 or _parse(posted_end) <= _parse(posted_start):
-                raise PortfolioPostError("prior posting receipt adjustment is outside the permitted sub-minute window")
-            if item is not None and (
-                not _same_instant(item.get("start"), posted_start)
-                or not _same_instant(item.get("end"), posted_end)
-            ):
-                raise PortfolioPostError(
-                    "prior posting receipt item does not match its adjustment"
-                )
-            plan["start"] = _utc(posted_start)
-            plan["end"] = _utc(posted_end)
-        elif item is not None:
-            if (
-                not _same_instant(item.get("start"), original["start"])
-                or not _same_instant(item.get("end"), original["end"])
-            ):
-                raise PortfolioPostError(
-                    "prior posting receipt bounds do not match the approved window"
-                )
-        if adjustment is not None:
-            _recompute_duration_fields(plan)
-        restored.append(plan)
-    _verify_approved_duration_seconds(restored)
-    return restored, adjustments
 
 
 def _verify_approved_artifacts(
@@ -732,10 +776,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     prior_path = args.prior_receipt
     if prior_path is None and args.receipt.exists():
         prior_path = args.receipt
-    prior_adjustments: list[dict[str, Any]] | None = None
     if prior_path is not None:
-        plans, prior_adjustments = _apply_prior_receipt(
-            plans, prior_path.resolve(), portfolio_sha
+        raise PortfolioPostError(
+            "prior receipt candidate validation requires fresh derivation"
         )
     live = _live_entries(
         workspace, user, api_key, plans, timeout_seconds=timeout_seconds
@@ -747,10 +790,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise PortfolioPostError("multiple exact Clockify entries match one approved block")
         if matches:
             exact[(plan["review_id"], plan["segment_index"])] = matches[0]
-    if prior_adjustments is None:
-        plans, boundary_adjustments = _align_subminute_boundaries(plans, live, set(exact))
-    else:
-        boundary_adjustments = prior_adjustments
+    plans, boundary_adjustments = _align_subminute_boundaries(plans, live, set(exact))
     for plan in plans:
         key = (plan["review_id"], plan["segment_index"])
         if key in exact:

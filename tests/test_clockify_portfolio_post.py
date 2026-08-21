@@ -114,337 +114,294 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
         self.assertEqual(613, receipt["duration_seconds"])
         self.assertEqual(10, receipt["duration_minutes"])
 
-    def test_prior_receipt_recomputes_duration_fields_from_restored_bounds(self) -> None:
-        plans = [
-            {
-                "review_id": "pvi-0123456789abcdef01234567",
-                "segment_index": 1,
-                "start": "2026-08-14T10:00:00Z",
-                "end": "2026-08-14T10:10:30Z",
-                "duration_minutes": 10,
-                "duration_seconds": 630,
-            },
-            {
-                "review_id": "pvi-0123456789abcdef01234567",
-                "segment_index": 2,
-                "start": "2026-08-14T10:10:30Z",
-                "end": "2026-08-14T10:20:30Z",
-                "duration_minutes": 10,
-                "duration_seconds": 600,
-            },
-        ]
+    def _prior_candidates(self, receipt: dict[str, object], approved: set[tuple[str, int]]):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receipt.json"
+            path.write_text(json.dumps(receipt), encoding="utf-8")
+            return poster._prior_receipt_candidates(path, "approved-sha", approved)
+
+    def test_prior_candidate_parser_rejects_duplicate_clockify_entry_id(self) -> None:
+        approved = {("review-a", 1), ("review-b", 1)}
         receipt = {
             "portfolio_sha256": "approved-sha",
             "created": [
-                {
-                    "review_id": "pvi-0123456789abcdef01234567",
-                    "segment_index": 1,
-                    "start": "2026-08-14T10:00:17Z",
-                    "end": "2026-08-14T10:10:30Z",
-                    "duration_minutes": 10,
-                    "duration_seconds": 630,
-                },
-                {
-                    "review_id": "pvi-0123456789abcdef01234567",
-                    "segment_index": 2,
-                    "start": "2026-08-14T10:10:30Z",
-                    "end": "2026-08-14T10:20:47Z",
-                    "duration_minutes": 10,
-                    "duration_seconds": 600,
-                },
+                {"review_id": "review-a", "segment_index": 1, "clockify_entry_id": "entry-1"},
+                {"review_id": "review-b", "segment_index": 1, "clockify_entry_id": "entry-1"},
             ],
             "already_existing": [],
-            "boundary_adjustments": [
-                {
-                    "review_id": "pvi-0123456789abcdef01234567",
-                    "segment_index": 1,
-                    "original_start": "2026-08-14T10:00:00Z",
-                    "original_end": "2026-08-14T10:10:30Z",
-                    "posted_start": "2026-08-14T10:00:17Z",
-                    "posted_end": "2026-08-14T10:10:30Z",
-                    "algorithm": poster.BOUNDARY_ADJUSTMENT_ALGORITHM,
-                },
-                {
-                    "review_id": "pvi-0123456789abcdef01234567",
-                    "segment_index": 2,
-                    "original_start": "2026-08-14T10:10:30Z",
-                    "original_end": "2026-08-14T10:20:30Z",
-                    "posted_start": "2026-08-14T10:10:30Z",
-                    "posted_end": "2026-08-14T10:20:47Z",
-                    "algorithm": poster.BOUNDARY_ADJUSTMENT_ALGORITHM,
-                },
-            ],
         }
-        receipt["boundary_adjustments_sha256"] = poster._adjustment_digest(
-            "approved-sha", receipt["boundary_adjustments"]
+        with self.assertRaisesRegex(poster.PortfolioPostError, "duplicate Clockify entry ID"):
+            self._prior_candidates(receipt, approved)
+
+    def test_prior_candidate_parser_rejects_duplicate_posting_key(self) -> None:
+        receipt = {
+            "portfolio_sha256": "approved-sha",
+            "created": [{"review_id": "review-a", "segment_index": 1, "clockify_entry_id": "entry-1"}],
+            "already_existing": [{"review_id": "review-a", "segment_index": 1, "clockify_entry_id": "entry-2"}],
+        }
+        with self.assertRaisesRegex(poster.PortfolioPostError, "duplicate receipt key"):
+            self._prior_candidates(receipt, {("review-a", 1)})
+
+    def test_prior_candidate_parser_rejects_unknown_key(self) -> None:
+        receipt = {
+            "portfolio_sha256": "approved-sha",
+            "created": [{"review_id": "review-other", "segment_index": 1, "clockify_entry_id": "entry-1"}],
+            "already_existing": [],
+        }
+        with self.assertRaisesRegex(poster.PortfolioPostError, "unknown approved key"):
+            self._prior_candidates(receipt, {("review-a", 1)})
+
+    def test_prior_candidate_parser_rejects_missing_or_blank_clockify_entry_id(self) -> None:
+        for entry_id in (None, "   "):
+            with self.subTest(entry_id=entry_id):
+                receipt = {
+                    "portfolio_sha256": "approved-sha",
+                    "created": [{"review_id": "review-a", "segment_index": 1, "clockify_entry_id": entry_id}],
+                    "already_existing": [],
+                }
+                with self.assertRaisesRegex(poster.PortfolioPostError, "lacks a Clockify entry ID"):
+                    self._prior_candidates(receipt, {("review-a", 1)})
+
+    def test_prior_candidate_parser_rejects_non_list_disposition(self) -> None:
+        receipt = {"portfolio_sha256": "approved-sha", "created": {}, "already_existing": []}
+        with self.assertRaisesRegex(poster.PortfolioPostError, "items must be a list"):
+            self._prior_candidates(receipt, {("review-a", 1)})
+
+    def test_prior_candidate_parser_rejects_non_object_item(self) -> None:
+        receipt = {"portfolio_sha256": "approved-sha", "created": ["invalid"], "already_existing": []}
+        with self.assertRaisesRegex(poster.PortfolioPostError, "invalid item"):
+            self._prior_candidates(receipt, {("review-a", 1)})
+
+    def test_prior_candidate_parser_rejects_wrong_portfolio_digest(self) -> None:
+        receipt = {"portfolio_sha256": "other-sha", "created": [], "already_existing": []}
+        with self.assertRaisesRegex(poster.PortfolioPostError, "does not match the approved portfolio"):
+            self._prior_candidates(receipt, set())
+
+    def test_prior_candidate_parser_wraps_invalid_optional_timestamp_as_domain_error(self) -> None:
+        for field in ("start", "end"):
+            with self.subTest(field=field):
+                receipt = {
+                    "portfolio_sha256": "approved-sha",
+                    "created": [{
+                        "review_id": "review-a", "segment_index": 1,
+                        "clockify_entry_id": "entry-1", field: "not-a-timestamp",
+                    }],
+                    "already_existing": [],
+                }
+                with self.assertRaisesRegex(poster.PortfolioPostError, "invalid audit timestamp"):
+                    self._prior_candidates(receipt, {("review-a", 1)})
+
+    def test_prior_candidate_parser_rejects_invalid_optional_duration_seconds(self) -> None:
+        for duration in (True, 0, -1, "60"):
+            with self.subTest(duration=duration):
+                receipt = {
+                    "portfolio_sha256": "approved-sha",
+                    "created": [{
+                        "review_id": "review-a", "segment_index": 1, "clockify_entry_id": "entry-1",
+                        "duration_seconds": duration,
+                    }],
+                    "already_existing": [],
+                }
+                with self.assertRaisesRegex(poster.PortfolioPostError, "invalid duration seconds"):
+                    self._prior_candidates(receipt, {("review-a", 1)})
+
+    def test_prior_candidate_parser_preserves_audit_fields_without_authorization(self) -> None:
+        receipt = {
+            "portfolio_sha256": "approved-sha",
+            "created": [{
+                "review_id": "review-a", "segment_index": 1, "clockify_entry_id": "entry-1",
+                "start": "2026-08-14T10:00:00+03:00", "end": "2026-08-14T10:10:00+03:00",
+                "duration_seconds": 600,
+            }],
+            "already_existing": [],
+            "boundary_adjustments": "not interpreted",
+        }
+
+        candidates = self._prior_candidates(receipt, {("review-a", 1)})
+
+        self.assertEqual((
+            poster.PriorReceiptCandidate(
+                "review-a", 1, "entry-1", "created",
+                "2026-08-14T07:00:00Z", "2026-08-14T07:10:00Z", 600,
+            ),
+        ), candidates)
+
+    def _approved_prior_candidate_plan(self) -> dict[tuple[str, int], dict[str, object]]:
+        return {("review-a", 1): {
+            "review_id": "review-a", "segment_index": 1,
+            "project_id": "project-a", "tag_ids": ["tag-a"],
+            "description": "AA — Approved work",
+        }}
+
+    def _matching_prior_candidate_live_entry(self) -> dict[str, object]:
+        return {
+            "id": "entry-1", "start": "2026-08-14T10:00:00Z",
+            "end": "2026-08-14T10:10:00Z", "project_id": "project-a",
+            "tag_ids": ["tag-a"], "description": "AA — Approved work",
+        }
+
+    def _prior_candidate(self) -> poster.PriorReceiptCandidate:
+        return poster.PriorReceiptCandidate(
+            "review-a", 1, "entry-1", "created", None, None, None
         )
 
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "receipt.json"
-            path.write_text(json.dumps(receipt), encoding="utf-8")
-            restored, _adjustments = poster._apply_prior_receipt(
-                plans, path, "approved-sha"
-            )
-
-        self.assertEqual([613, 617], [item["duration_seconds"] for item in restored])
-        self.assertEqual([10, 10], [item["duration_minutes"] for item in restored])
-
-    def test_prior_dry_run_adjustments_restore_adjusted_bounds(self) -> None:
-        plans = [{
-            "review_id": "pvi-0123456789abcdef01234567",
-            "segment_index": 1,
-            "start": "2026-08-14T10:00:00Z",
-            "end": "2026-08-14T10:10:30Z",
-            "duration_minutes": 10,
-            "duration_seconds": 630,
+    def test_prior_candidate_cannot_remove_unrelated_blocker_by_id(self) -> None:
+        candidate = poster.PriorReceiptCandidate(
+            "review-a", 1, "blocker-1", "created", None, None, None
+        )
+        approved = self._approved_prior_candidate_plan()
+        live = [{
+            "id": "blocker-1", "start": "2026-08-14T10:00:30Z",
+            "end": "2026-08-14T10:01:30Z", "project_id": "project-other",
+            "tag_ids": ["tag-a"], "description": "AA — Approved work",
         }]
-        receipt = {
-            "portfolio_sha256": "approved-sha",
-            "created": [],
-            "already_existing": [],
-            "boundary_adjustments": [{
-                "review_id": "pvi-0123456789abcdef01234567",
-                "segment_index": 1,
-                "original_start": "2026-08-14T10:00:00Z",
-                "original_end": "2026-08-14T10:10:30Z",
-                "posted_start": "2026-08-14T10:00:17Z",
-                "posted_end": "2026-08-14T10:10:30Z",
-                "algorithm": poster.BOUNDARY_ADJUSTMENT_ALGORITHM,
-            }],
-        }
-        receipt["boundary_adjustments_sha256"] = poster._adjustment_digest(
-            "approved-sha", receipt["boundary_adjustments"]
+
+        with self.assertRaisesRegex(poster.PortfolioPostError, "semantic fields"):
+            poster._resolve_prior_candidates([candidate], live, approved)
+
+    def test_prior_candidate_resolver_rejects_duplicate_live_id(self) -> None:
+        live = [self._matching_prior_candidate_live_entry(), self._matching_prior_candidate_live_entry()]
+
+        with self.assertRaisesRegex(poster.PortfolioPostError, "duplicate entry ID"):
+            poster._resolve_prior_candidates([self._prior_candidate()], live, self._approved_prior_candidate_plan())
+
+    def test_prior_candidate_resolver_rejects_empty_live_id(self) -> None:
+        live = [self._matching_prior_candidate_live_entry()]
+        live[0]["id"] = " "
+
+        with self.assertRaisesRegex(poster.PortfolioPostError, "empty entry ID"):
+            poster._resolve_prior_candidates([self._prior_candidate()], live, self._approved_prior_candidate_plan())
+
+    def test_prior_candidate_resolver_rejects_absent_receipt_id(self) -> None:
+        live = [self._matching_prior_candidate_live_entry()]
+        candidate = poster.PriorReceiptCandidate(
+            "review-a", 1, "missing-entry", "created", None, None, None
         )
 
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "receipt.json"
-            path.write_text(json.dumps(receipt), encoding="utf-8")
-            restored, adjustments = poster._apply_prior_receipt(
-                plans, path, "approved-sha"
-            )
+        with self.assertRaisesRegex(poster.PortfolioPostError, "absent from fresh readback"):
+            poster._resolve_prior_candidates([candidate], live, self._approved_prior_candidate_plan())
 
-        self.assertEqual("2026-08-14T10:00:17Z", restored[0]["start"])
-        self.assertEqual("2026-08-14T10:10:30Z", restored[0]["end"])
-        self.assertEqual(613, restored[0]["duration_seconds"])
-        self.assertEqual(10, restored[0]["duration_minutes"])
-        self.assertEqual(receipt["boundary_adjustments"], adjustments)
+    def test_prior_candidate_resolver_rejects_semantic_mismatches(self) -> None:
+        for field, changed in (
+            ("project_id", "project-other"),
+            ("tag_ids", ["tag-other"]),
+            ("description", "AA — Other work"),
+        ):
+            with self.subTest(field=field):
+                live = [self._matching_prior_candidate_live_entry()]
+                live[0][field] = changed
+                with self.assertRaisesRegex(poster.PortfolioPostError, "semantic fields"):
+                    poster._resolve_prior_candidates(
+                        [self._prior_candidate()], live, self._approved_prior_candidate_plan()
+                    )
 
-    def test_prior_executed_receipt_confirms_adjusted_bounds(self) -> None:
-        plans = [{
-            "review_id": "pvi-0123456789abcdef01234567",
-            "segment_index": 1,
-            "start": "2026-08-14T10:00:00Z",
-            "end": "2026-08-14T10:10:30Z",
-            "duration_minutes": 10,
-            "duration_seconds": 630,
-        }]
-        receipt = {
-            "portfolio_sha256": "approved-sha",
-            "created": [{
-                "review_id": "pvi-0123456789abcdef01234567",
-                "segment_index": 1,
-                "start": "2026-08-14T10:00:17Z",
-                "end": "2026-08-14T10:10:30Z",
-            }],
-            "already_existing": [],
-            "boundary_adjustments": [{
-                "review_id": "pvi-0123456789abcdef01234567",
-                "segment_index": 1,
-                "original_start": "2026-08-14T10:00:00Z",
-                "original_end": "2026-08-14T10:10:30Z",
-                "posted_start": "2026-08-14T10:00:17Z",
-                "posted_end": "2026-08-14T10:10:30Z",
-                "algorithm": poster.BOUNDARY_ADJUSTMENT_ALGORITHM,
-            }],
+    def test_prior_candidate_resolver_removes_only_matching_candidate_from_blockers(self) -> None:
+        matching = self._matching_prior_candidate_live_entry()
+        unrelated = {
+            "id": "blocker-1", "start": "2026-08-14T11:00:00Z",
+            "end": "2026-08-14T11:10:00Z", "project_id": "project-other",
+            "tag_ids": ["tag-other"], "description": "Unrelated blocker",
         }
-        receipt["boundary_adjustments_sha256"] = poster._adjustment_digest(
-            "approved-sha", receipt["boundary_adjustments"]
+        trailing = {
+            "id": "blocker-2", "start": "2026-08-14T12:00:00Z",
+            "end": "2026-08-14T12:10:00Z", "project_id": "project-other",
+            "tag_ids": [], "description": "Second blocker",
+        }
+
+        resolved, blockers = poster._resolve_prior_candidates(
+            [self._prior_candidate()], [unrelated, matching, trailing],
+            self._approved_prior_candidate_plan(),
         )
 
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "receipt.json"
-            path.write_text(json.dumps(receipt), encoding="utf-8")
-            restored, _adjustments = poster._apply_prior_receipt(
-                plans, path, "approved-sha"
-            )
+        self.assertEqual({("review-a", 1): matching}, resolved)
+        self.assertEqual([unrelated, trailing], blockers)
 
-        self.assertEqual("2026-08-14T10:00:17Z", restored[0]["start"])
-        self.assertEqual(613, restored[0]["duration_seconds"])
+    def _derived_prior_candidate_plan(self) -> dict[tuple[str, int], dict[str, object]]:
+        return {("review-a", 1): {
+            "review_id": "review-a", "segment_index": 1,
+            "start": "2026-08-14T10:00:00Z", "end": "2026-08-14T10:10:00Z",
+            "duration_seconds": 600, "project_id": "project-a",
+            "tag_ids": ["tag-a"], "description": "AA — Approved work",
+        }}
 
-    def test_legacy_receipt_replay_rejects_changed_timestamp_seconds(self) -> None:
-        portfolio = {
-            "activities": [{
-                "review_id": "pvi-0123456789abcdef01234567",
-                "client_project": "Example Level 2",
-                "tag_names": ["Technical development"],
-                "description": "EX — Preserve recorded meeting time",
-                "duration_minutes": 1,
-                "allocation_segments": [{
-                    "start": "2026-08-14T10:00:00+03:00",
-                    "end": "2026-08-14T10:01:00+03:00",
-                    "duration_minutes": 1,
-                }],
-            }],
-        }
-        routes = {
-            ("Example Level 2", ("Technical development",)): {
-                "project_id": "project-1", "tag_ids": ["tag-1"], "billable": True,
-            },
-        }
-        plans = poster._plans(portfolio, routes)
-        receipt = {
-            "portfolio_sha256": "approved-sha",
-            "created": [{
-                "review_id": "pvi-0123456789abcdef01234567",
-                "segment_index": 1,
-                "start": "2026-08-14T07:00:00Z",
-                "end": "2026-08-14T07:01:01Z",
-            }],
-            "already_existing": [],
-        }
+    def test_prior_candidate_accepts_exact_freshly_derived_live_entry(self) -> None:
+        key = ("review-a", 1)
+        live = {key: self._matching_prior_candidate_live_entry()}
+        receipts = {key: self._prior_candidate()}
 
-        self.assertEqual(60, plans[0]["approved_duration_seconds"])
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "receipt.json"
-            path.write_text(json.dumps(receipt), encoding="utf-8")
-            with self.assertRaisesRegex(
-                poster.PortfolioPostError, "bounds do not match"
-            ):
-                poster._apply_prior_receipt(plans, path, "approved-sha")
+        accepted = poster._validate_prior_candidates(
+            live, self._derived_prior_candidate_plan(), receipts
+        )
 
-    def test_prior_receipt_rejects_exact_same_duration_relocation(self) -> None:
-        plans = [{
-            "review_id": "pvi-0123456789abcdef01234567",
-            "segment_index": 1,
-            "start": "2026-08-14T10:00:00Z",
-            "end": "2026-08-14T10:01:00Z",
-            "duration_minutes": 1,
-            "duration_seconds": 60,
-            "approved_duration_seconds": 60,
-        }]
-        receipt = {
-            "portfolio_sha256": "approved-sha",
-            "created": [{
-                "review_id": plans[0]["review_id"],
-                "segment_index": 1,
-                "start": "2026-08-14T17:00:00Z",
-                "end": "2026-08-14T17:01:00Z",
-            }],
-            "already_existing": [],
-        }
+        self.assertEqual(live, accepted)
+        self.assertIsNot(live[key], accepted[key])
 
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "receipt.json"
-            path.write_text(json.dumps(receipt), encoding="utf-8")
-            with self.assertRaisesRegex(
-                poster.PortfolioPostError, "bounds do not match"
-            ):
-                poster._apply_prior_receipt(plans, path, "approved-sha")
+    def test_prior_candidate_rejects_same_duration_relocation_after_derivation(self) -> None:
+        key = ("review-a", 1)
+        live = {key: self._matching_prior_candidate_live_entry()}
+        live[key]["start"] = "2026-08-14T10:01:00Z"
+        live[key]["end"] = "2026-08-14T10:11:00Z"
+        receipts = {key: self._prior_candidate()}
 
-    def test_prior_receipt_rejects_legacy_same_duration_relocation(self) -> None:
-        portfolio = {
-            "activities": [{
-                "review_id": "pvi-0123456789abcdef01234567",
-                "client_project": "Example Level 2",
-                "tag_names": ["Technical development"],
-                "description": "EX — Preserve recorded meeting time",
-                "duration_minutes": 1,
-                "allocation_segments": [{
-                    "start": "2026-08-14T10:00:00+03:00",
-                    "end": "2026-08-14T10:01:00+03:00",
-                    "duration_minutes": 1,
-                }],
-            }],
-        }
-        routes = {
-            ("Example Level 2", ("Technical development",)): {
-                "project_id": "project-1", "tag_ids": ["tag-1"], "billable": True,
-            },
-        }
-        plans = poster._plans(portfolio, routes)
-        receipt = {
-            "portfolio_sha256": "approved-sha",
-            "created": [{
-                "review_id": plans[0]["review_id"],
-                "segment_index": 1,
-                "start": "2026-08-14T17:00:00Z",
-                "end": "2026-08-14T17:01:00Z",
-            }],
-            "already_existing": [],
-        }
+        with self.assertRaisesRegex(poster.PortfolioPostError, "freshly derived plan"):
+            poster._validate_prior_candidates(live, self._derived_prior_candidate_plan(), receipts)
 
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "receipt.json"
-            path.write_text(json.dumps(receipt), encoding="utf-8")
-            with self.assertRaisesRegex(
-                poster.PortfolioPostError, "bounds do not match"
-            ):
-                poster._apply_prior_receipt(plans, path, "approved-sha")
+    def test_prior_candidate_rejects_same_duration_backward_relocation_after_derivation(self) -> None:
+        key = ("review-a", 1)
+        live = {key: self._matching_prior_candidate_live_entry()}
+        live[key]["start"] = "2026-08-14T09:59:00Z"
+        live[key]["end"] = "2026-08-14T10:09:00Z"
+        receipts = {key: self._prior_candidate()}
 
-    def test_prior_receipt_rejects_duplicate_receipt_key(self) -> None:
-        plans = [{
-            "review_id": "pvi-0123456789abcdef01234567",
-            "segment_index": 1,
-            "start": "2026-08-14T10:00:00Z",
-            "end": "2026-08-14T10:01:00Z",
-            "duration_minutes": 1,
-            "duration_seconds": 60,
-            "approved_duration_seconds": 60,
-        }]
-        item = {
-            "review_id": plans[0]["review_id"],
-            "segment_index": 1,
-            "start": plans[0]["start"],
-            "end": plans[0]["end"],
-        }
-        receipt = {
-            "portfolio_sha256": "approved-sha",
-            "created": [item],
-            "already_existing": [item],
-        }
+        with self.assertRaisesRegex(poster.PortfolioPostError, "freshly derived plan"):
+            poster._validate_prior_candidates(live, self._derived_prior_candidate_plan(), receipts)
 
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "receipt.json"
-            path.write_text(json.dumps(receipt), encoding="utf-8")
-            with self.assertRaisesRegex(poster.PortfolioPostError, "duplicate receipt key"):
-                poster._apply_prior_receipt(plans, path, "approved-sha")
+    def test_prior_candidate_rejects_when_changed_blocker_state_changes_derived_bounds(self) -> None:
+        key = ("review-a", 1)
+        live = {key: self._matching_prior_candidate_live_entry()}
+        changed_derivation = self._derived_prior_candidate_plan()
+        changed_derivation[key]["start"] = "2026-08-14T10:00:30Z"
+        changed_derivation[key]["end"] = "2026-08-14T10:10:30Z"
+        receipts = {key: self._prior_candidate()}
 
-    def test_prior_receipt_rejects_changed_bounds_without_bound_adjustment(self) -> None:
-        plans = [{
-            "review_id": "pvi-0123456789abcdef01234567",
-            "segment_index": 1,
-            "start": "2026-08-14T10:00:00Z",
-            "end": "2026-08-14T10:01:00Z",
-            "duration_minutes": 1,
-            "duration_seconds": 60,
-            "approved_duration_seconds": 60,
-        }]
-        receipt = {
-            "portfolio_sha256": "approved-sha",
-            "created": [{
-                "review_id": plans[0]["review_id"],
-                "segment_index": 1,
-                "start": "2026-08-14T10:00:17Z",
-                "end": "2026-08-14T10:01:17Z",
-            }],
-            "already_existing": [],
-            "boundary_adjustments": [{
-                "review_id": plans[0]["review_id"],
-                "segment_index": 1,
-                "original_start": plans[0]["start"],
-                "original_end": plans[0]["end"],
-                "posted_start": "2026-08-14T10:00:17Z",
-                "posted_end": "2026-08-14T10:01:17Z",
-            }],
-        }
+        with self.assertRaisesRegex(poster.PortfolioPostError, "freshly derived plan"):
+            poster._validate_prior_candidates(live, changed_derivation, receipts)
 
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "receipt.json"
-            path.write_text(json.dumps(receipt), encoding="utf-8")
-            with self.assertRaisesRegex(
-                poster.PortfolioPostError, "adjustment digest"
-            ):
-                poster._apply_prior_receipt(plans, path, "approved-sha")
+    def test_prior_candidate_rejects_receipt_audit_bounds_contradicting_live_readback(self) -> None:
+        key = ("review-a", 1)
+        live = {key: self._matching_prior_candidate_live_entry()}
+        receipts = {key: poster.PriorReceiptCandidate(
+            "review-a", 1, "entry-1", "created",
+            "2026-08-14T10:01:00Z", "2026-08-14T10:10:00Z", None,
+        )}
+
+        with self.assertRaisesRegex(poster.PortfolioPostError, "audit bounds contradict"):
+            poster._validate_prior_candidates(live, self._derived_prior_candidate_plan(), receipts)
+
+    def test_prior_candidate_rejects_receipt_audit_duration_contradicting_live_readback(self) -> None:
+        key = ("review-a", 1)
+        live = {key: self._matching_prior_candidate_live_entry()}
+        receipts = {key: poster.PriorReceiptCandidate(
+            "review-a", 1, "entry-1", "created", None, None, 599,
+        )}
+
+        with self.assertRaisesRegex(poster.PortfolioPostError, "audit duration contradicts"):
+            poster._validate_prior_candidates(live, self._derived_prior_candidate_plan(), receipts)
+
+    def test_prior_candidate_rejects_missing_freshly_derived_key(self) -> None:
+        key = ("review-a", 1)
+        live = {key: self._matching_prior_candidate_live_entry()}
+        receipts = {key: self._prior_candidate()}
+
+        with self.assertRaisesRegex(poster.PortfolioPostError, "no freshly derived plan"):
+            poster._validate_prior_candidates(live, {}, receipts)
+
+    def test_prior_candidate_rejects_different_candidate_and_receipt_identity_sets(self) -> None:
+        key = ("review-a", 1)
+        live = {key: self._matching_prior_candidate_live_entry()}
+
+        with self.assertRaisesRegex(poster.PortfolioPostError, "identity sets do not match"):
+            poster._validate_prior_candidates(live, self._derived_prior_candidate_plan(), {})
 
     def test_posting_plan_rejects_malformed_allocation_segment_as_domain_error(self) -> None:
         portfolio = {
