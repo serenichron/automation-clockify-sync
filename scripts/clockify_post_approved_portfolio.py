@@ -378,8 +378,9 @@ def _align_subminute_boundaries(
     """Shift minute-rounded starts past live second-level endings.
 
     Durations remain exact. A shift may cascade through directly contiguous
-    approved blocks, but any adjustment of 60 seconds or more remains a hard
-    conflict.
+    approved blocks. Individual boundary shifts and trims remain sub-minute,
+    while their restoration within one approved review row may total 60 seconds
+    or more.
     """
     adjusted: list[dict[str, Any]] = []
     original_times = {

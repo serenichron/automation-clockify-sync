@@ -7,6 +7,7 @@ import re
 import tempfile
 import unittest
 from unittest import mock
+import urllib.error
 from datetime import datetime, timezone
 
 from scripts import calendly_collector as calendly
@@ -215,6 +216,63 @@ class CalendlyRecordingContractTests(unittest.TestCase):
 
 
 class CalendlyCollectionTests(unittest.TestCase):
+    def test_http_json_never_forwards_bearer_token_to_cross_origin_or_http_redirects(self):
+        """Redirects must fail at the gateway boundary before a second request is sent."""
+        original_url = "https://gateway.example.test/calendly/recordings"
+        for redirect_url in (
+            "https://attacker.example.test/collect",
+            "http://gateway.example.test/collect",
+        ):
+            with self.subTest(redirect_url=redirect_url):
+                requests = []
+
+                class RedirectingOpener:
+                    def __init__(self, *handlers):
+                        self.handlers = handlers
+
+                    def open(self, request, data=None, timeout=None):
+                        requests.append(request)
+                        if self.handlers:
+                            self.handlers[0].redirect_request(
+                                request, None, 302, "Found", {"Location": redirect_url}, redirect_url
+                            )
+                        raise urllib.error.HTTPError(
+                            original_url, 302, "Found", {"Location": redirect_url}, None
+                        )
+
+                with mock.patch.object(
+                    calendly.urllib.request, "build_opener", side_effect=RedirectingOpener
+                ) as build_opener, mock.patch.object(calendly.urllib.request, "_opener", None):
+                    with self.assertRaises(urllib.error.HTTPError) as raised:
+                        calendly._http_json(original_url, {"Authorization": "Bearer private-token"})
+                raised.exception.close()
+
+                self.assertEqual(1, len(build_opener.call_args.args))
+                self.assertIsInstance(
+                    build_opener.call_args.args[0], urllib.request.HTTPRedirectHandler
+                )
+                self.assertEqual([original_url], [request.full_url for request in requests])
+                self.assertEqual(
+                    "Bearer private-token", requests[0].get_header("Authorization")
+                )
+
+    def test_fetch_fails_closed_when_pagination_is_missing_or_lacks_terminal_token(self):
+        """A missing pagination contract must not masquerade as a terminal page."""
+        for envelope in (
+            {"collection": [collection_recording("missing")]},
+            {"collection": [collection_recording("malformed")], "pagination": {}},
+            {"collection": [collection_recording("malformed")], "pagination": {"next_page_token": " "}},
+        ):
+            with self.subTest(envelope=envelope):
+                result = calendly.fetch_calendly(
+                    COLLECTION_ENV, COLLECTION_SINCE, COLLECTION_UNTIL,
+                    http_json=lambda _url, _headers, value=envelope: value,
+                )
+
+                self.assertFalse(result["complete"])
+                self.assertEqual([], result["recordings"])
+                self.assertEqual("capability_unavailable", result["status"])
+
     def test_fetch_resumes_at_saved_cursor_and_exposes_only_complete_results(self):
         """A failed page must resume from its saved cursor without exposing partial rows."""
         with tempfile.TemporaryDirectory() as directory:
@@ -235,7 +293,7 @@ class CalendlyCollectionTests(unittest.TestCase):
             def resumed_response(url, _headers):
                 calls.append(url)
                 self.assertIn("page_token=private-next", url)
-                return {"collection": [collection_recording("two")], "pagination": {}}
+                return {"collection": [collection_recording("two")], "pagination": {"next_page_token": None}}
 
             resumed = calendly.fetch_calendly(
                 COLLECTION_ENV, COLLECTION_SINCE, COLLECTION_UNTIL,
@@ -280,7 +338,7 @@ class CalendlyCollectionTests(unittest.TestCase):
         result = calendly.fetch_calendly(
             COLLECTION_ENV, COLLECTION_SINCE, COLLECTION_UNTIL,
             http_json=lambda _url, _headers: {
-                "collection": [], "scheduled_without_recording": [event], "pagination": {},
+                "collection": [], "scheduled_without_recording": [event], "pagination": {"next_page_token": None},
             },
         )
 
@@ -326,7 +384,7 @@ class CalendlyCollectionTests(unittest.TestCase):
                     "uri": "recordings/no-window", "event_uri": "events/no-window",
                     "start_time": "2026-08-04T10:00:00Z", "end_time": "2026-08-04T11:00:00Z",
                 }],
-                "pagination": {},
+                "pagination": {"next_page_token": None},
             },
         )
 
@@ -401,7 +459,7 @@ class CalendlyCliContractTests(unittest.TestCase):
                 mock.patch.object(
                     calendly,
                     "_http_json",
-                    return_value={"collection": [collection_recording("cli")], "pagination": {}},
+                    return_value={"collection": [collection_recording("cli")], "pagination": {"next_page_token": None}},
                 ) as http_json,
             ):
                 self.assertEqual(0, calendly.run(args))
@@ -434,7 +492,7 @@ class CalendlyCliContractTests(unittest.TestCase):
                 mock.patch.object(
                     calendly,
                     "_http_json",
-                    return_value={"collection": [collection_recording("file")], "pagination": {}},
+                    return_value={"collection": [collection_recording("file")], "pagination": {"next_page_token": None}},
                 ),
             ):
                 self.assertEqual(0, calendly.run(args))

@@ -93,8 +93,8 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
             },
         ]
         reordered = [
-            {**entries[0], "tag_ids": ["tag-a", "tag-z"]},
             entries[1],
+            {**entries[0], "tag_ids": ["tag-a", "tag-z"]},
         ]
 
         baseline = poster._normalized_snapshot_sha256(entries)
@@ -174,6 +174,70 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
             "boundary_adjustments", "boundary_adjustments_sha256",
         ):
             self.assertEqual(first[field], second[field])
+
+    def test_run_retry_rederives_and_restores_aggregate_subminute_trims(self) -> None:
+        """A retry excludes its provisional receipt, then restores 30+40 seconds exactly."""
+        segments = [
+            {"start": "2026-08-14T10:00:00Z", "end": "2026-08-14T10:10:00Z", "duration_minutes": 10},
+            {"start": "2026-08-14T10:20:00Z", "end": "2026-08-14T10:30:00Z", "duration_minutes": 10},
+            {"start": "2026-08-14T10:40:00Z", "end": "2026-08-14T10:50:00Z", "duration_minutes": 10},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = self._write_posting_fixture(root, allocation_segments=segments)
+            prior_path = root / "prior.json"
+            prior_path.write_text(json.dumps({
+                "portfolio_sha256": args.expected_portfolio_sha256,
+                "created": [{
+                    "review_id": "review-a", "segment_index": 1,
+                    "clockify_entry_id": "entry-prior",
+                    "start": "2026-08-14T10:00:30Z",
+                    "end": "2026-08-14T10:10:00Z", "duration_seconds": 570,
+                }], "already_existing": [],
+            }), encoding="utf-8")
+            args.prior_receipt = prior_path
+            live = [
+                self._clockify_entry(
+                    "entry-prior", "2026-08-14T10:00:30Z", "2026-08-14T10:10:00Z"
+                ),
+                self._clockify_entry(
+                    "blocker-30-before", "2026-08-14T09:59:00Z", "2026-08-14T10:00:30Z",
+                    project_id="project-other", description="Unrelated blocker",
+                ),
+                self._clockify_entry(
+                    "blocker-30-end", "2026-08-14T10:10:00Z", "2026-08-14T10:10:30Z",
+                    project_id="project-other", description="Unrelated blocker",
+                ),
+                self._clockify_entry(
+                    "blocker-40-before", "2026-08-14T10:19:00Z", "2026-08-14T10:20:40Z",
+                    project_id="project-other", description="Unrelated blocker",
+                ),
+                self._clockify_entry(
+                    "blocker-40-end", "2026-08-14T10:30:00Z", "2026-08-14T10:30:40Z",
+                    project_id="project-other", description="Unrelated blocker",
+                ),
+            ]
+            with (
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
+                }),
+                mock.patch.object(poster, "_paged", side_effect=self._paged_with_live(live)),
+            ):
+                first = poster.run(args)
+                second = poster.run(args)
+
+        self.assertEqual(["entry-prior"], [
+            item["clockify_entry_id"] for item in first["already_existing"]
+        ])
+        self.assertEqual([
+            ("2026-08-14T10:00:30Z", "2026-08-14T10:10:00Z"),
+            ("2026-08-14T10:20:40Z", "2026-08-14T10:30:00Z"),
+            ("2026-08-14T10:40:00Z", "2026-08-14T10:51:10Z"),
+        ], [(item["posted_start"], item["posted_end"]) for item in first["boundary_adjustments"]])
+        self.assertEqual(1800, first["planned_seconds"])
+        self.assertEqual(first["boundary_adjustments"], second["boundary_adjustments"])
+        self.assertEqual(first["boundary_adjustments_sha256"], second["boundary_adjustments_sha256"])
+        self.assertEqual(first["blocker_snapshot_sha256"], second["blocker_snapshot_sha256"])
 
     def test_run_accepts_nonreceipt_exact_entry_without_posting(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

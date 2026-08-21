@@ -239,9 +239,25 @@ def _headers(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
 
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    """Fail before urllib can replay credentials to a redirect target."""
+
+    def redirect_request(
+        self,
+        request: urllib.request.Request,
+        file_pointer: Any,
+        code: int,
+        message: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request:
+        raise urllib.error.HTTPError(request.full_url, code, message, headers, file_pointer)
+
+
 def _http_json(url: str, headers: Mapping[str, str]) -> Any:
     request = urllib.request.Request(url, headers=dict(headers))
-    with urllib.request.urlopen(request, timeout=30) as response:
+    opener = urllib.request.build_opener(_RejectRedirects())
+    with opener.open(request, timeout=30) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -254,8 +270,8 @@ def _page_response(data: Any) -> tuple[list[Mapping[str, Any]], list[Mapping[str
     scheduled = data.get("scheduled_without_recording", data.get("scheduled_events", []))
     if not isinstance(scheduled, (list, tuple)) or not all(isinstance(item, Mapping) for item in scheduled):
         raise CalendlyCollectorError("Calendly scheduled event collection is invalid")
-    pagination = data.get("pagination", {})
-    if not isinstance(pagination, Mapping):
+    pagination = data.get("pagination")
+    if not isinstance(pagination, Mapping) or "next_page_token" not in pagination:
         raise CalendlyCollectorError("Calendly pagination is invalid")
     next_cursor = pagination.get("next_page_token")
     if next_cursor is not None and (not isinstance(next_cursor, str) or not next_cursor.strip()):
