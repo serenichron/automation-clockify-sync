@@ -451,13 +451,24 @@ def _receipt_ids(post_receipt: Mapping[str, Any]) -> list[str]:
                 found.append(_text(entry_id, "post receipt entry ID"))
             else:
                 raise ClockifyReadbackError("post receipt entry must identify a Clockify entry")
+    terminal_entries = post_receipt.get("entries")
+    if terminal_entries is not None:
+        if not isinstance(terminal_entries, list):
+            raise ClockifyReadbackError("post receipt entries must be a list")
+        for item in terminal_entries:
+            if not isinstance(item, Mapping):
+                raise ClockifyReadbackError("post receipt entry must identify a Clockify entry")
+            disposition = item.get("disposition")
+            if disposition in {"created", "already_existing", "recovered_after_ambiguous_response"}:
+                entry_id = item.get("clockify_entry_id", item.get("entry_id", item.get("id")))
+                found.append(_text(entry_id, "post receipt entry ID"))
     return found
 
 
 def verify_readback(
     api_readback: ClockifyPeriodReadback | Mapping[str, Any],
     shared_report: ClockifyPeriodReadback | Mapping[str, Any],
-    *, post_receipt: Mapping[str, Any] | None = None,
+    post_receipt: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Require exact scope, freshness, entries, duration, and native costs."""
     api = normalize_readback(api_readback)

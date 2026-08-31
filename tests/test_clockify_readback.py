@@ -178,6 +178,13 @@ class ClockifyReadbackContractTests(unittest.TestCase):
             readback.verify_readback(api, api, post_receipt={"created": ["unknown"]})
         with self.assertRaisesRegex(readback.ClockifyReadbackError, "exactly once"):
             readback.verify_readback(api, api, post_receipt={"created": ["entry-001", "entry-001"]})
+        self.assertEqual(
+            "verified",
+            readback.verify_readback(
+                api, api,
+                {"entries": [{"disposition": "created", "clockify_entry_id": "entry-001"}]},
+            )["status"],
+        )
 
 
 class ClockifyReadbackCliTests(unittest.TestCase):
