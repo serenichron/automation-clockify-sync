@@ -17,7 +17,13 @@
   "$defs": {
     "safe_payload": {
       "type": "object",
-      "propertyNames": {"not": {"enum": ["api_key", "credential", "cursor", "raw_payload", "transcript"]}},
+      "propertyNames": {"not": {"anyOf": [
+        {"pattern": "^[Aa][Pp][Ii]_[Kk][Ee][Yy]$"},
+        {"pattern": "^[Cc][Rr][Ee][Dd][Ee][Nn][Tt][Ii][Aa][Ll]$"},
+        {"pattern": "^[Cc][Uu][Rr][Ss][Oo][Rr]$"},
+        {"pattern": "^[Rr][Aa][Ww]_[Pp][Aa][Yy][Ll][Oo][Aa][Dd]$"},
+        {"pattern": "^[Tt][Rr][Aa][Nn][Ss][Cc][Rr][Ii][Pp][Tt]$"}
+      ]}},
       "additionalProperties": {"$ref": "#/$defs/safe_value"}
     },
     "safe_value": {

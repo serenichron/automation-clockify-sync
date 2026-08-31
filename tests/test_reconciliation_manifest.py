@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from zoneinfo import ZoneInfo
@@ -40,6 +42,34 @@ def write_jsonl(path: Path, documents: list[dict[str, object]]) -> None:
         "".join(json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n" for document in documents),
         encoding="utf-8",
     )
+
+
+def event_schema_validation(document: dict[str, object]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["jsonschema", str(Path(__file__).parents[1] / "schemas/reconciliation-event-v1.json")],
+        input=json.dumps(document), text=True, capture_output=True, check=False,
+    )
+
+
+def schema_event(payload: dict[str, object]) -> dict[str, object]:
+    return {
+        "sequence": 1,
+        "period_id": "rperiod-" + "a" * 64,
+        "event_type": "slice_completed",
+        "payload": payload,
+        "previous_digest": "sha256:" + "0" * 64,
+        "occurred_at": "2026-08-16T00:00:00Z",
+        "event_digest": "sha256:" + "a" * 64,
+    }
+
+
+def event_digest(document: dict[str, object]) -> str:
+    unsigned = {
+        key: document[key]
+        for key in ("sequence", "period_id", "event_type", "payload", "previous_digest", "occurred_at")
+    }
+    canonical = json.dumps(unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(canonical).hexdigest()
 
 
 class PeriodIdentityTests(unittest.TestCase):
@@ -163,10 +193,13 @@ class CoordinatorEventStoreTests(unittest.TestCase):
         with self.assertRaises(ManifestError):
             store.verify(self.identity)
 
-        store = CoordinatorEventStore(self.path)
         self.path.unlink()
-        store.append(self.identity, "period_opened", {"revision": 1}, occurred_at=LATER)
-        store.append(self.identity, "slice_completed", {"slice_id": "s1"}, occurred_at=NOW)
+        store.append(self.identity, "period_opened", {"revision": 1}, occurred_at=NOW)
+        store.append(self.identity, "slice_completed", {"slice_id": "s1"}, occurred_at=LATER)
+        documents = read_jsonl(self.path)
+        documents[1]["occurred_at"] = "2026-08-16T08:59:00Z"
+        documents[1]["event_digest"] = event_digest(documents[1])
+        write_jsonl(self.path, documents)
         with self.assertRaises(ManifestError):
             store.verify(self.identity)
 
@@ -191,6 +224,30 @@ class CoordinatorEventStoreTests(unittest.TestCase):
                 {"confidence": float("nan")},
                 occurred_at=NOW,
             )
+
+    def test_append_rejects_timestamp_before_head_without_writing(self) -> None:
+        store = CoordinatorEventStore(self.path)
+        store.append(self.identity, "period_opened", {"revision": 1}, occurred_at=LATER)
+        before = self.path.read_bytes()
+
+        with self.assertRaises(ManifestError):
+            store.append(self.identity, "slice_completed", {"slice_id": "s1"}, occurred_at=NOW)
+
+        self.assertEqual(before, self.path.read_bytes())
+        self.assertEqual(1, len(store.verify(self.identity)))
+
+
+class ReconciliationEventSchemaTests(unittest.TestCase):
+    def test_schema_rejects_uppercase_or_mixed_case_private_payload_keys_recursively(self) -> None:
+        for key in ("TRANSCRIPT", "Api_Key"):
+            with self.subTest(key=key):
+                result = event_schema_validation(schema_event({"nested": {key: "private"}}))
+                self.assertNotEqual(0, result.returncode, result.stderr)
+
+    def test_schema_accepts_safe_nested_payload(self) -> None:
+        result = event_schema_validation(schema_event({"artifact": {"digest": "sha256:" + "a" * 64}}))
+
+        self.assertEqual(0, result.returncode, result.stderr)
 
 
 if __name__ == "__main__":

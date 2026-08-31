@@ -256,6 +256,9 @@ class CoordinatorEventStore:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX)
             events = self._read_from_descriptor(descriptor, identity)
+            occurred = _parse_timestamp(_utc_timestamp(occurred_at, "occurred_at"), "occurred_at")
+            if events and occurred < events[-1].occurred_at:
+                raise ManifestError("event timestamps must be monotonic")
             previous_digest = events[-1].event_digest if events else ZERO_DIGEST
             event = CoordinatorEvent.from_document(_event_document(
                 len(events) + 1, identity.period_id, event_type, payload,
