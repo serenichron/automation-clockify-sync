@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "post-event-v1.json",
+  "title": "Clockify post event ledger v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "sequence", "previous_digest", "event_digest", "disposition", "operation_identity", "period_id", "workspace_id", "member_id", "review_id", "segment_index", "recorded_at", "clockify_entry_id", "live_readback_digest"],
+  "properties": {
+    "schema_version": {"const": "post-event/v1"}, "sequence": {"type": "integer", "minimum": 0},
+    "previous_digest": {"type": ["string", "null"], "pattern": "^sha256:[a-f0-9]{64}$"}, "event_digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "disposition": {"enum": ["planned", "created", "already_existing", "recovered_after_ambiguous_response", "interrupted"]},
+    "operation_identity": {"type": "string", "minLength": 1}, "period_id": {"type": "string", "minLength": 1}, "workspace_id": {"type": "string", "minLength": 1}, "member_id": {"type": "string", "minLength": 1},
+    "review_id": {"type": "string", "minLength": 1}, "segment_index": {"type": "integer", "minimum": 0}, "recorded_at": {"type": "string", "format": "date-time"},
+    "clockify_entry_id": {"type": ["string", "null"]}, "live_readback_digest": {"type": ["string", "null"], "pattern": "^sha256:.+$"}
+  },
+  "allOf": [
+    {"if": {"properties": {"disposition": {"enum": ["created", "recovered_after_ambiguous_response"]}}}, "then": {"properties": {"clockify_entry_id": {"type": "string", "minLength": 1}, "live_readback_digest": {"type": "string", "pattern": "^sha256:.+"}}}},
+    {"if": {"properties": {"disposition": {"const": "already_existing"}}}, "then": {"properties": {"clockify_entry_id": {"type": "string", "minLength": 1}}}},
+    {"if": {"properties": {"disposition": {"enum": ["planned", "interrupted"]}}}, "then": {"properties": {"clockify_entry_id": {"type": "null"}, "live_readback_digest": {"type": "null"}}}}
+  ]
+}
