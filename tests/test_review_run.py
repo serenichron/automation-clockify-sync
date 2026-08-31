@@ -113,6 +113,10 @@ class ReviewRunResultTests(unittest.TestCase):
                 "incomplete_sources": ["sessions/macbook", "repositories/desktop"],
             }
             (run_dir / "run-report.json").write_text(json.dumps({
+                "collection_mode": {
+                    "calendly_optional": True,
+                    "coordinator": "omarchy-precision",
+                },
                 "evidence": {
                     "calendly": {"status": "excluded", "complete": True},
                 },

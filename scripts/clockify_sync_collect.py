@@ -90,6 +90,7 @@ FATHOM_CHECKPOINT_COMPATIBILITY_VERSION = "fathom-cursor-pagination/v2"
 MULTICA_PAGE_SIZE = 100
 MULTICA_CHECKPOINT_COMPATIBILITY_VERSION = "multica-offset-pagination/v1"
 BACKLOG_COMPATIBILITY_VERSION = "collector-slice-bundles/v1"
+_MACHINE_NAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
 CANONICAL_EXPORT_TIMEOUT_SECONDS = 900
 CANONICAL_EXPORT_TIMEOUT_MIN_SECONDS = 60
 CANONICAL_EXPORT_TIMEOUT_MAX_SECONDS = 1800
@@ -3594,15 +3595,36 @@ def cleanup_checkpoints(args: argparse.Namespace) -> int:
     return 0
 
 
+def _machine_name_is_valid(value: object) -> bool:
+    return isinstance(value, str) and _MACHINE_NAME_RE.fullmatch(value) is not None
+
+
+def _current_coordinator_identity() -> str:
+    coordinator = os.environ.get(
+        "CLOCKIFY_AUTOPILOT_COORDINATOR", "omarchy-precision"
+    ).strip() or "omarchy-precision"
+    if not _machine_name_is_valid(coordinator):
+        raise ValueError("collector coordinator identity is invalid")
+    return coordinator
+
+
 def _backlog_compatibility_version(
-    routing: Mapping[str, Any], fleet: Mapping[str, Any], *, calendly_optional: bool = False,
+    routing: Mapping[str, Any],
+    fleet: Mapping[str, Any],
+    *,
+    calendly_optional: bool = False,
+    coordinator: str | None = None,
 ) -> str:
+    coordinator = coordinator or _current_coordinator_identity()
+    if not _machine_name_is_valid(coordinator):
+        raise ValueError("collector coordinator identity is invalid")
     payload = {
         "contract": BACKLOG_COMPATIBILITY_VERSION,
         "collector_sha256": collector_script_sha256(),
         "routing": routing,
         "fleet": fleet,
         "calendly_optional": calendly_optional,
+        "coordinator": coordinator,
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return f"{BACKLOG_COMPATIBILITY_VERSION}:{hashlib.sha256(encoded.encode()).hexdigest()}"
@@ -3630,6 +3652,7 @@ def _verified_existing_slice_bundle(
     reason: str,
     *,
     calendly_optional: bool,
+    coordinator: str,
 ) -> tuple[Path, dict[str, object]]:
     report_path = run_dir / "run-report.md"
     report_json_path = run_dir / "run-report.json"
@@ -3654,11 +3677,26 @@ def _verified_existing_slice_bundle(
         "reason": reason,
     }:
         raise BacklogError("existing slice bundle identity does not match")
-    if report.get("collection_mode") != {"calendly_optional": calendly_optional}:
+    collection_mode = report.get("collection_mode")
+    legacy_mode = {"calendly_optional": calendly_optional}
+    expected_mode = {**legacy_mode, "coordinator": coordinator}
+    completeness = (
+        report.get("evidence_ledger", {}).get("source_completeness")
+        if isinstance(report.get("evidence_ledger"), Mapping)
+        else None
+    )
+    no_gap_legacy = (
+        isinstance(completeness, Mapping)
+        and completeness.get("status") == "complete"
+        and completeness.get("incomplete_sources") == []
+    )
+    if collection_mode != expected_mode and not (
+        no_gap_legacy and collection_mode == legacy_mode
+    ):
         raise BacklogError("existing slice bundle collection mode does not match")
     manifest = ledger.get("manifest")
-    completeness = manifest.get("source_completeness") if isinstance(manifest, dict) else None
-    if not isinstance(completeness, Mapping):
+    manifest_completeness = manifest.get("source_completeness") if isinstance(manifest, dict) else None
+    if not isinstance(manifest_completeness, Mapping):
         raise BacklogError("existing slice bundle is not complete")
     reported_ledger = report.get("evidence_ledger")
     if not isinstance(reported_ledger, Mapping):
@@ -3667,7 +3705,7 @@ def _verified_existing_slice_bundle(
         "manifest_id": manifest.get("manifest_id"),
         "event_count": manifest.get("event_count"),
         "events_digest": manifest.get("events_digest"),
-        "source_completeness": completeness,
+        "source_completeness": manifest_completeness,
         "ledger_digest": _file_digest(ledger_path),
     }
     if any(reported_ledger.get(key) != value for key, value in expected_ledger.items()):
@@ -3684,9 +3722,7 @@ def _is_tolerated_peer_gap(source: str, coordinator: str) -> bool:
     return (
         category in {"sessions", "repositories"}
         and separator == "/"
-        and "/" not in peer
-        and bool(peer)
-        and peer == peer.strip()
+        and _machine_name_is_valid(peer)
         and peer != coordinator
     )
 
@@ -3703,11 +3739,16 @@ def _slice_is_complete(report: Mapping[str, object]) -> bool:
         isinstance(source, str) and source for source in incomplete
     ):
         return False
-    coordinator = os.environ.get(
-        "CLOCKIFY_AUTOPILOT_COORDINATOR", "omarchy-precision"
-    ).strip() or "omarchy-precision"
+    collection_mode = report.get("collection_mode")
+    coordinator = (
+        collection_mode.get("coordinator")
+        if isinstance(collection_mode, Mapping)
+        else None
+    )
     tolerated_peer_gaps = all(
-        _is_tolerated_peer_gap(source, coordinator)
+        isinstance(coordinator, str)
+        and _machine_name_is_valid(coordinator)
+        and _is_tolerated_peer_gap(source, coordinator)
         for source in incomplete
     )
     complete = (
@@ -3767,15 +3808,20 @@ def _collect_slice(
     owned_run_dirs: set[Path] | None = None,
     *,
     calendly_env: dict[str, str] | None = None,
+    coordinator: str | None = None,
 ) -> tuple[Path, dict[str, object]]:
     requested_slices = plan_slices(since, until, zone=BUCHAREST)
     if len(requested_slices) != 1:
         raise ValueError("_collect_slice requires one bounded collection slice")
     calendly_optional = getattr(args, "calendly_optional", False) is True
+    coordinator = coordinator or _current_coordinator_identity()
+    if not _machine_name_is_valid(coordinator):
+        raise ValueError("collector coordinator identity is invalid")
     claimed_run_dir = _claim_slice_run_dir(run_dir)
     if not claimed_run_dir:
         return _verified_existing_slice_bundle(
-            run_dir, since, until, reason, calendly_optional=calendly_optional
+            run_dir, since, until, reason,
+            calendly_optional=calendly_optional, coordinator=coordinator,
         )
     if owned_run_dirs is not None:
         owned_run_dirs.add(run_dir)
@@ -3854,7 +3900,10 @@ def _collect_slice(
         "run_id": run_id,
         "runtime_identity": runtime_identity,
         "date_range": {"since": local_dt_string(since), "until": local_dt_string(until), "reason": reason},
-        "collection_mode": {"calendly_optional": calendly_optional},
+        "collection_mode": {
+            "calendly_optional": calendly_optional,
+            "coordinator": coordinator,
+        },
         "safety": {"dry_run": True, "clockify_posted": False},
         "paths": {
             "run_dir": str(run_dir),
@@ -3992,6 +4041,7 @@ def run(args: argparse.Namespace) -> int:
         ],
     )
     since, until, reason = compute_range(args, routing, cenv)
+    coordinator = _current_coordinator_identity()
     slices = plan_slices(since, until, zone=BUCHAREST)
     identity = BacklogIdentity(
         since_utc=iso_utc(since),
@@ -3999,7 +4049,10 @@ def run(args: argparse.Namespace) -> int:
         timezone=BUCHAREST.key,
         max_days=2,
         compatibility_version=_backlog_compatibility_version(
-            routing, fleet, calendly_optional=getattr(args, "calendly_optional", False) is True
+            routing,
+            fleet,
+            calendly_optional=getattr(args, "calendly_optional", False) is True,
+            coordinator=coordinator,
         ),
     )
     backlog_store = BacklogStore(collector_checkpoint_root())
@@ -4027,6 +4080,7 @@ def run(args: argparse.Namespace) -> int:
                     slice_.until,
                     reason,
                     calendly_optional=getattr(args, "calendly_optional", False) is True,
+                    coordinator=coordinator,
                 )
             except (BacklogError, OSError, ValueError):
                 print("collector slice receipt is not safe to reuse", file=sys.stderr)
@@ -4053,6 +4107,7 @@ def run(args: argparse.Namespace) -> int:
                 run_dir,
                 owned_run_dirs,
                 calendly_env=calendly_env,
+                coordinator=coordinator,
             )
         except (BacklogError, CheckpointError, OSError, ValueError):
             _preserve_incomplete_run(

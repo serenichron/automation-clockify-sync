@@ -97,6 +97,10 @@ class ProcessIntegrationTests(unittest.TestCase):
 
     def test_slice_completeness_accepts_only_non_coordinator_peer_gaps(self) -> None:
         report = {
+            "collection_mode": {
+                "calendly_optional": True,
+                "coordinator": "omarchy-precision",
+            },
             "evidence": {"calendly": {"status": "excluded", "complete": True}},
             "evidence_ledger": {
                 "source_completeness": {
@@ -112,7 +116,7 @@ class ProcessIntegrationTests(unittest.TestCase):
 
         with mock.patch.dict(
             collector.os.environ,
-            {"CLOCKIFY_AUTOPILOT_COORDINATOR": "omarchy-precision"},
+            {"CLOCKIFY_AUTOPILOT_COORDINATOR": "macbook"},
         ):
             self.assertTrue(collector._slice_is_complete(report))
 
@@ -123,6 +127,11 @@ class ProcessIntegrationTests(unittest.TestCase):
         report["evidence_ledger"]["source_completeness"]["incomplete_sources"] = [
             "sessions/omarchy-precision"
         ]
+        self.assertFalse(collector._slice_is_complete(report))
+        report["evidence_ledger"]["source_completeness"]["incomplete_sources"] = [
+            "sessions/macbook"
+        ]
+        report.pop("collection_mode")
         self.assertFalse(collector._slice_is_complete(report))
 
     def test_slice_completeness_rejects_contradictory_or_malformed_gaps(self) -> None:
@@ -145,6 +154,30 @@ class ProcessIntegrationTests(unittest.TestCase):
             with self.subTest(completeness=completeness):
                 report["evidence_ledger"]["source_completeness"] = completeness
                 self.assertFalse(collector._slice_is_complete(report))
+
+    def test_slice_completeness_accepts_only_well_formed_peer_machine_names(self) -> None:
+        """Peer-debt tolerance permits only safe machine identifiers."""
+        report = {
+            "collection_mode": {
+                "calendly_optional": True,
+                "coordinator": "omarchy-precision",
+            },
+            "evidence": {"calendly": {"status": "ok", "complete": True}},
+            "evidence_ledger": {
+                "source_completeness": {"status": "incomplete", "incomplete_sources": []},
+            },
+        }
+        for peer in (".", "..", "macbook\x00desktop"):
+            with self.subTest(peer=peer):
+                report["evidence_ledger"]["source_completeness"]["incomplete_sources"] = [
+                    f"sessions/{peer}"
+                ]
+                self.assertFalse(collector._slice_is_complete(report))
+
+        report["evidence_ledger"]["source_completeness"]["incomplete_sources"] = [
+            "sessions/macbook-2",
+        ]
+        self.assertTrue(collector._slice_is_complete(report))
 
     def test_existing_slice_bundle_with_peer_coverage_debt_is_reusable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -196,6 +229,16 @@ class ProcessIntegrationTests(unittest.TestCase):
                 self.fail(f"peer-debt bundle was not reusable: {error}")
             self.assertEqual(run_dir / "run-report.md", report_path)
             self.assertTrue(collector._slice_is_complete(report))
+
+            with mock.patch.dict(
+                collector.os.environ,
+                {"CLOCKIFY_AUTOPILOT_COORDINATOR": "different-coordinator"},
+            ), self.assertRaisesRegex(collector.BacklogError, "mode"):
+                collector._collect_slice(
+                    args, routing, fleet, {"_missing": True}, {"_missing": True},
+                    SINCE, UNTIL, "fixture",
+                    collector.PageCheckpointStore(Path(tmp) / "checkpoints"), run_dir,
+                )
 
     def test_incomplete_calendly_result_never_records_a_completed_slice_receipt(self) -> None:
         """Calendly capability and pagination failures block the current slice before receipt creation."""
