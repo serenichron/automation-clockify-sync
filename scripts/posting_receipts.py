@@ -329,6 +329,9 @@ class ApprovalReceipt:
     correction_log_digest: str
     coverage_digest: str
     residual_exception_digest: str
+    manifest_digest: str
+    event_history_digest: str
+    historical_receipt_digest: str
     single_use: bool = True
 
     @property
@@ -359,7 +362,10 @@ class ApprovalReceipt:
             raise PostingReceiptError("approval expiry must follow approval")
         if end <= start:
             raise PostingReceiptError("period end must follow period start")
-        for field in ARTIFACT_DIGEST_FIELDS + ("residual_exception_digest",):
+        for field in ARTIFACT_DIGEST_FIELDS + (
+            "residual_exception_digest", "manifest_digest", "event_history_digest",
+            "historical_receipt_digest",
+        ):
             _digest_text(getattr(self, field), field)
         if not isinstance(self.single_use, bool):
             raise PostingReceiptError("single_use must be a boolean")

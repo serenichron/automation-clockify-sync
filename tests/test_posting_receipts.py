@@ -37,6 +37,9 @@ def approval_receipt(**changes: object) -> posting_receipts.ApprovalReceipt:
         "correction_log_digest": "sha256:corrections",
         "coverage_digest": "sha256:coverage",
         "residual_exception_digest": "sha256:exceptions",
+        "manifest_digest": "sha256:manifest",
+        "event_history_digest": "sha256:events",
+        "historical_receipt_digest": "sha256:historical",
         "single_use": True,
     }
     values.update(changes)

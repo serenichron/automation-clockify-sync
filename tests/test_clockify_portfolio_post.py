@@ -17,6 +17,7 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
     def _write_posting_fixture(
         self, root: Path, *, allocation_segments: list[dict[str, object]] | None = None,
         validation_status: str = "flash_validated",
+        historical_entries: list[dict[str, object]] | None = None,
     ) -> argparse.Namespace:
         portfolio_path = root / "portfolio.json"
         quality_path = root / "quality.json"
@@ -58,8 +59,16 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
         correction_path = root / "corrections.json"
         coverage_path = root / "coverage.json"
         residual_path = root / "residual-exceptions.json"
+        historical_path = root / "historical-receipt.json"
         for path in (correction_path, coverage_path, residual_path):
             path.write_text("{}\n", encoding="utf-8")
+        historical_path.write_text(
+            json.dumps({
+                "schema_version": "clockify-historical-receipt/v1",
+                "entries": historical_entries or [],
+            }),
+            encoding="utf-8",
+        )
         identity = reconciliation_manifest.PeriodIdentity(
             member_id="user-1", workspace_id="workspace-1", timezone="Europe/Bucharest",
             since=dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc),
@@ -72,13 +81,24 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
             )
             for path in (
                 portfolio_path, quality_path, replay_path, routing_path,
-                correction_path, coverage_path, residual_path,
+                correction_path, coverage_path, residual_path, historical_path,
             )
         )
+        events_path = root / "period-events.jsonl"
+        coordinator_store = reconciliation_manifest.CoordinatorEventStore(events_path)
+        event_time = dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc)
+        for sequence, event_type in enumerate((
+            "period_opened", "collection_complete", "reconciliation_complete", "review_approved",
+        )):
+            coordinator_store.append(
+                identity,
+                event_type,
+                {"artifacts": [artifact.document() for artifact in artifacts]} if sequence == 0 else {},
+                occurred_at=event_time + dt.timedelta(minutes=sequence),
+            )
         manifest_path = root / "period-manifest.json"
-        manifest_path.write_text(json.dumps(
-            reconciliation_manifest._manifest(identity, "approved", (), artifacts, set()).document()
-        ), encoding="utf-8")
+        manifest = reconciliation_manifest.ReconciliationCoordinator(identity, coordinator_store).derive()
+        manifest_path.write_text(json.dumps(manifest.document()), encoding="utf-8")
         approval_events = root / "approval-events.jsonl"
         approval_id = "approval-1"
         operation_identity = posting_receipts.derive_operation_identity(
@@ -96,6 +116,8 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
             replay_digest=digest(replay_path), routing_digest=digest(routing_path),
             correction_log_digest=digest(correction_path), coverage_digest=digest(coverage_path),
             residual_exception_digest=digest(residual_path),
+            manifest_digest=manifest.manifest_digest, event_history_digest=manifest.events_digest,
+            historical_receipt_digest=digest(historical_path),
         ))
         return argparse.Namespace(
             portfolio=portfolio_path, quality_report=quality_path,
@@ -105,6 +127,7 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
             execute=False,
             approval_receipt=approval_id, approval_events=approval_events,
             post_events=root / "post-events.jsonl", period_manifest=manifest_path,
+            period_events=events_path, historical_receipt=historical_path,
         )
 
     def _clockify_entry(
@@ -114,7 +137,7 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
         return {
             "id": entry_id, "timeInterval": {"start": start, "end": end},
             "projectId": project_id, "tagIds": tag_ids or ["tag-654321"],
-            "description": description,
+            "description": description, "billable": True,
         }
 
     def _paged_with_live(self, live_entries: list[dict[str, object]]):
@@ -144,6 +167,159 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
 
         credentials.assert_not_called()
         request.assert_not_called()
+
+    def test_execute_requires_period_event_history_before_credentials_or_network(self) -> None:
+        """Removing the event-history gate must never allow a standalone manifest to authorize a POST."""
+        with tempfile.TemporaryDirectory() as directory:
+            args = self._write_posting_fixture(Path(directory))
+            args.execute = True
+            args.period_events = None
+            with (
+                mock.patch.object(poster, "load_env_file") as credentials,
+                mock.patch.object(poster, "_request") as request,
+            ):
+                with self.assertRaisesRegex(poster.PortfolioPostError, "period event"):
+                    poster.run(args)
+
+        credentials.assert_not_called()
+        request.assert_not_called()
+
+    def test_execute_rejects_manifest_without_matching_verified_event_history(self) -> None:
+        """Replacing the immutable coordinator history must invalidate the standalone manifest."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = self._write_posting_fixture(root)
+            args.execute = True
+            args.period_events = root / "period-events.jsonl"
+            args.period_events.write_text("", encoding="utf-8")
+            live = [self._clockify_entry(
+                "entry-exact", "2026-08-14T10:00:00Z", "2026-08-14T10:10:00Z"
+            )]
+            with (
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
+                }),
+                mock.patch.object(poster, "_paged", side_effect=self._paged_with_live(live)),
+            ):
+                with self.assertRaisesRegex(poster.PortfolioPostError, "verified event history"):
+                    poster.run(args)
+
+    def test_execute_rejects_verified_history_that_changed_after_approval(self) -> None:
+        """An approval must bind the exact manifest and event-chain digest, not just its artifacts."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = self._write_posting_fixture(root)
+            args.execute = True
+            manifest = reconciliation_manifest.ReconciliationManifest.from_document(
+                json.loads(args.period_manifest.read_text(encoding="utf-8"))
+            )
+            event_store = reconciliation_manifest.CoordinatorEventStore(args.period_events)
+            event_store.append(
+                manifest.identity,
+                "fathom_repair_complete",
+                {},
+                occurred_at=dt.datetime(2026, 8, 2, tzinfo=dt.timezone.utc),
+            )
+            changed_manifest = reconciliation_manifest.ReconciliationCoordinator(
+                manifest.identity, event_store
+            ).derive()
+            args.period_manifest.write_text(
+                json.dumps(changed_manifest.document()), encoding="utf-8"
+            )
+            live = [self._clockify_entry(
+                "entry-exact", "2026-08-14T10:00:00Z", "2026-08-14T10:10:00Z"
+            )]
+            with (
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
+                }),
+                mock.patch.object(poster, "_paged", side_effect=self._paged_with_live(live)),
+            ):
+                with self.assertRaisesRegex(poster.PortfolioPostError, "history binding"):
+                    poster.run(args)
+
+    def test_execute_rejects_loaded_workspace_drift_before_network(self) -> None:
+        """Changing the environment target must fail before any Clockify discovery request."""
+        with tempfile.TemporaryDirectory() as directory:
+            args = self._write_posting_fixture(Path(directory))
+            args.execute = True
+            with (
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-other",
+                }),
+                mock.patch.object(poster, "_paged") as paged,
+            ):
+                with self.assertRaisesRegex(poster.PortfolioPostError, "workspace"):
+                    poster.run(args)
+
+        paged.assert_not_called()
+
+    def test_execute_consumes_single_use_approval_only_after_complete_receipt(self) -> None:
+        """Removing final consumption would leave a completed approval reusable for another POST."""
+        with tempfile.TemporaryDirectory() as directory:
+            args = self._write_posting_fixture(Path(directory))
+            args.execute = True
+            live = [self._clockify_entry(
+                "entry-exact", "2026-08-14T10:00:00Z", "2026-08-14T10:10:00Z"
+            )]
+            with (
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
+                }),
+                mock.patch.object(poster, "_paged", side_effect=self._paged_with_live(live)),
+            ):
+                receipt = poster.run(args)
+
+            self.assertEqual("complete", receipt["status"])
+            approval = posting_receipts.ApprovalReceiptStore(args.approval_events)
+            issued = approval._state()[0][args.approval_receipt]
+            with self.assertRaisesRegex(posting_receipts.PostingReceiptError, "consumed"):
+                approval.require(
+                    args.approval_receipt,
+                    operation_identity=issued.operation_identity,
+                    now=dt.datetime(2026, 8, 2, tzinfo=dt.timezone.utc),
+                )
+
+    def test_execute_recognizes_bound_historical_entry_with_description_drift_and_31_second_shift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            args = self._write_posting_fixture(Path(directory), historical_entries=[{
+                "review_id": "review-a", "segment_index": 1, "clockify_entry_id": "entry-history",
+            }])
+            args.execute = True
+            live = [self._clockify_entry(
+                "entry-history", "2026-08-14T10:00:31Z", "2026-08-14T10:10:31Z",
+                description="legacy August wording",
+            )]
+            with (
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
+                }),
+                mock.patch.object(poster, "_paged", side_effect=self._paged_with_live(live)),
+                mock.patch.object(poster, "_request") as request,
+            ):
+                receipt = poster.run(args)
+
+        self.assertEqual(["entry-history"], [item["clockify_entry_id"] for item in receipt["already_existing"]])
+        request.assert_not_called()
+
+    def test_execute_rejects_bound_historical_entry_with_30_second_shift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            args = self._write_posting_fixture(Path(directory), historical_entries=[{
+                "review_id": "review-a", "segment_index": 1, "clockify_entry_id": "entry-history",
+            }])
+            args.execute = True
+            live = [self._clockify_entry(
+                "entry-history", "2026-08-14T10:00:30Z", "2026-08-14T10:10:30Z",
+                description="legacy August wording",
+            )]
+            with (
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
+                }),
+                mock.patch.object(poster, "_paged", side_effect=self._paged_with_live(live)),
+            ):
+                with self.assertRaisesRegex(poster.PortfolioPostError, "bounds or duration"):
+                    poster.run(args)
 
     def test_exact_approval_permits_the_august_sheet_review_migration_exception(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -209,7 +385,7 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
 
         self.assertEqual("complete", receipt["status"])
 
-    def test_resume_does_not_duplicate_terminal_post_events(self) -> None:
+    def test_consumed_approval_cannot_repeat_terminal_post_events(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             args = self._write_posting_fixture(Path(directory))
             args.execute = True
@@ -223,7 +399,8 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
                 mock.patch.object(poster, "_paged", side_effect=self._paged_with_live(live)),
             ):
                 poster.run(args)
-                poster.run(args)
+                with self.assertRaisesRegex(poster.PortfolioPostError, "consumed"):
+                    poster.run(args)
 
             events = posting_receipts.PostEventStore(args.post_events).verify()
 
@@ -292,6 +469,8 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
             "--receipt", "receipt.json", "--expected-portfolio-sha256", "digest", "--execute",
             "--approval-receipt", "approval-1", "--approval-events", "approvals.jsonl",
             "--post-events", "posts.jsonl", "--period-manifest", "period.json",
+            "--period-events", "period-events.jsonl",
+            "--historical-receipt", "historical.json",
         ])
 
         self.assertEqual("approval-1", args.approval_receipt)
