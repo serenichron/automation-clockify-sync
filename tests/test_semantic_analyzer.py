@@ -3532,6 +3532,46 @@ class SemanticAnalyzerTests(unittest.TestCase):
         self.assertEqual("ok", result["status"])
         self.assertNotIn("events", json.dumps(captured))
 
+    def test_probe_retries_one_malformed_json_response_then_succeeds(self):
+        calls = 0
+
+        def transport(_endpoint, _body):
+            nonlocal calls
+            calls += 1
+            content = (
+                '{"probe":"first"} trailing'
+                if calls == 1
+                else '{"probe":"ok"}'
+            )
+            return {"choices": [{"message": {"content": content}}]}
+
+        result = semantic.probe_endpoint(
+            semantic.AnalyzerEndpoint("primary", "http://primary", "cheap"),
+            transport=transport,
+        )
+
+        self.assertEqual("ok", result["status"])
+        self.assertEqual({"probe": "ok"}, result["response"])
+        self.assertEqual(2, calls)
+
+    def test_probe_stops_after_two_malformed_json_responses(self):
+        calls = 0
+
+        def transport(_endpoint, _body):
+            nonlocal calls
+            calls += 1
+            return {
+                "choices": [{"message": {"content": '{"probe":"bad"} trailing'}}]
+            }
+
+        with self.assertRaisesRegex(semantic.AnalyzerError, "invalid JSON"):
+            semantic.probe_endpoint(
+                semantic.AnalyzerEndpoint("primary", "http://primary", "cheap"),
+                transport=transport,
+            )
+
+        self.assertEqual(2, calls)
+
     def test_local_only_exact_correction_is_rejected_before_request_projection(self):
         with self.assertRaisesRegex(semantic.AnalyzerError, "local-only"):
             semantic._project_corrections([

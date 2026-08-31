@@ -2935,8 +2935,19 @@ def probe_endpoint(endpoint: AnalyzerEndpoint, transport: Transport = http_trans
             {"role": "user", "content": canonical_json({"probe": PROMPT_VERSION})},
         ],
     }
-    raw = transport(endpoint, body)
-    response = raw if isinstance(raw, dict) and "choices" not in raw else _json_object_from_response(raw)
+    for attempt in range(2):
+        raw = transport(endpoint, body)
+        try:
+            response = (
+                raw
+                if isinstance(raw, dict) and "choices" not in raw
+                else _json_object_from_response(raw)
+            )
+        except AnalyzerError:
+            if attempt == 0:
+                continue
+            raise
+        break
     return {
         "status": "ok",
         "endpoint": endpoint.name,

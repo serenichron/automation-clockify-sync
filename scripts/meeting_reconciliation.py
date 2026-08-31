@@ -90,6 +90,12 @@ def _parse_local_minute(value: str, timezone: ZoneInfo) -> dt.datetime:
 def _identity(value: object) -> str:
     return value.strip().casefold() if isinstance(value, str) else ""
 
+def _provider_identity(value: object) -> str:
+    """Normalize provider-issued textual or integer identifiers without guessing."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    return _identity(value)
+
 
 def _identity_set(value: object) -> frozenset[str]:
     if not isinstance(value, (list, tuple, set, frozenset)):
@@ -391,7 +397,7 @@ def _candidate(provider: str, record: Mapping[str, Any], vlad: frozenset[str]) -
         source_ref = _mapping(source.get("source_ref"), "event source reference")
         span = _mapping(source.get("raw_source_span"), "event source span")
         source = {**attributes, "recording_id": attributes.get("recording_id") or source_ref.get("source_id"), "start": span.get("start"), "end": span.get("end"), "source_digest": attributes.get("source_digest") or source.get("evidence_id")}
-    identifier = _text(source.get("recording_id") or source.get("id") or source.get("source_id"))
+    identifier = _provider_identity(source.get("recording_id") or source.get("id") or source.get("source_id"))
     if not identifier:
         raise MeetingReconciliationError("recording identity is required")
     start, end = _parse_utc(source.get("start")), _parse_utc(source.get("end"))
@@ -401,10 +407,10 @@ def _candidate(provider: str, record: Mapping[str, Any], vlad: frozenset[str]) -
     if not _SHA256.fullmatch(digest):
         digest = _digest({key: value for key, value in source.items() if key != "source_digest"})
     provider_ids = frozenset(
-        item for item in (_identity(source.get(key)) for key in ("recording_id", "id", "provider_recording_id")) if item
+        item for item in (_provider_identity(source.get(key)) for key in ("recording_id", "id", "provider_recording_id")) if item
     )
     meeting_ids = frozenset(
-        item for item in (_identity(source.get(key)) for key in ("meeting_id", "event_id", "calendar_event_id", "cross_provider_meeting_id")) if item
+        item for item in (_provider_identity(source.get(key)) for key in ("meeting_id", "event_id", "calendar_event_id", "cross_provider_meeting_id")) if item
     )
     join_urls = frozenset(
         item for item in (_identity(source.get(key)) for key in ("join_url", "share_url", "url")) if item

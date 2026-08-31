@@ -43,6 +43,7 @@ def source_document(description: str) -> dict:
             "review_prompt_version": semantic.PORTFOLIO_REVIEW_PROMPT_VERSION,
             "semantic_reviewer_model": semantic.DEFAULT_PRIMARY_MODEL,
             "semantic_reviewer_revision": repair.APPROVED_FLASH_REVISION,
+            "validation_status": "flash_validated",
         }],
         "exceptions": [],
         "omissions": [],
@@ -165,6 +166,37 @@ class PortfolioRepairTests(unittest.TestCase):
 
         self.assertEqual("pass", result["repair"]["status"])
         self.assertEqual([], result["repair"]["unresolved_wording"])
+
+    def test_carried_row_is_revalidated_even_when_wording_is_already_clean(self):
+        source = source_document(
+            "SC — Rebuilt Clockify review into invoice-ready July entries"
+        )
+        source["activities"][0]["validation_status"] = (
+            "source_semantic_review_carried_after_flash_contract_failure"
+        )
+        stages: list[str] = []
+
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            stages.append(payload["review_scope"])
+            return partition_response(payload)
+
+        with tempfile.TemporaryDirectory() as directory:
+            result = repair.repair_document(
+                source,
+                ledger(),
+                endpoint=self.endpoint(),
+                cache=semantic.AnalyzerResponseCache(Path(directory) / "cache.jsonl"),
+                transport=transport,
+            )
+
+        self.assertEqual(["portfolio", "portfolio_validation"], stages)
+        self.assertEqual(
+            "flash_validated", result["activities"][0]["validation_status"]
+        )
+        self.assertEqual(["pvi-one"], result["repair"]["repaired_review_ids"])
 
     def test_flash_repair_runs_structured_and_separate_validation_and_preserves_rows(self):
         source = source_document(
@@ -892,16 +924,24 @@ class PortfolioRepairTests(unittest.TestCase):
         source = source_document(
             "SC — Rebuilt Clockify review into a complete invoice-ready July package with too many secondary details across every client workstream and meeting across all three machines"
         )
+        source["activities"][0]["duration_seconds"] = 1800
+        source["activities"][0]["allocation_segments"][0]["duration_seconds"] = 1800
         source.update({
             "source_minutes": 30,
             "review_minutes": 30,
             "excluded_minutes": 0,
+            "source_seconds": 1800,
+            "review_seconds": 1800,
+            "excluded_seconds": 0,
             "review_activity_count": 1,
             "groups": [{
                 "review_ids": ["pvi-one"],
                 "source_minutes": 30,
                 "review_minutes": 30,
                 "excluded_minutes": 0,
+                "source_seconds": 1800,
+                "review_seconds": 1800,
+                "excluded_seconds": 0,
                 "reviewed_activities": 1,
                 "exceptions": 0,
                 "omissions": 0,
@@ -941,11 +981,15 @@ class PortfolioRepairTests(unittest.TestCase):
         self.assertEqual(0, result["review_minutes"])
         self.assertEqual(30, result["excluded_minutes"])
         self.assertEqual(0, result["review_activity_count"])
+        self.assertEqual(0, result["review_seconds"])
+        self.assertEqual(1800, result["excluded_seconds"])
         self.assertEqual(["pvi-one"], result["repair"]["excluded_review_ids"])
         self.assertEqual(1, len(result["omissions"]))
         self.assertEqual(0, result["groups"][0]["review_minutes"])
         self.assertEqual(30, result["groups"][0]["excluded_minutes"])
 
+        self.assertEqual(0, result["groups"][0]["review_seconds"])
+        self.assertEqual(1800, result["groups"][0]["excluded_seconds"])
     def test_flash_trims_noise_evidence_without_changing_row_minutes(self):
         source = source_document(
             "SC — Rebuilt Clockify review into a complete invoice-ready July package with too many secondary details across every client workstream and meeting across all three machines"

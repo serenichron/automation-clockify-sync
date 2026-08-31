@@ -1108,6 +1108,8 @@ def repair_document(
         reasons = repair_reasons(row.get("description"))
         if _route_missing(row):
             reasons.append("missing client project or tag route")
+        if row.get("validation_status") != "flash_validated":
+            reasons.append("missing successful Flash portfolio validation")
         if reasons:
             repairs.append({
                 "review_id": review_id,
@@ -1186,7 +1188,7 @@ def repair_document(
                 "prefix": prefix,
                 "tag_names": [str(value) for value in row.get("tag_names", [])],
             }
-        return review_id, _review_replacement(
+        replacement = _review_replacement(
             row,
             events_by_id=events_by_id,
             endpoint=endpoint,
@@ -1197,6 +1199,9 @@ def repair_document(
             full_taxonomy=full_taxonomy,
             repair_route=bool(item["repair_route"]),
         )
+        if replacement.get("disposition") == "activity":
+            replacement["validation_status"] = "flash_validated"
+        return review_id, replacement
 
     replacements: dict[str, dict[str, Any]] = {}
     unresolved: dict[str, str] = {}
@@ -1246,6 +1251,8 @@ def repair_document(
             replacement = replacements[review_id]
             row["description"] = replacement["description"]
             row["evidence_ids"] = replacement["evidence_ids"]
+            if replacement.get("validation_status") == "flash_validated":
+                row["validation_status"] = "flash_validated"
             if any(
                 item["review_id"] == review_id and item["repair_route"]
                 for item in repairs
@@ -1269,6 +1276,10 @@ def repair_document(
                     group[disposition] = int(group[disposition]) + len(items)
         kept_rows.append(row)
     result["activities"] = kept_rows
+    exact_accounting = any(
+        field in result
+        for field in ("source_seconds", "review_seconds", "excluded_seconds")
+    )
 
     for review_id, replacement in excluded_rows.items():
         source_row = rows_by_id[review_id]
@@ -1276,6 +1287,13 @@ def repair_document(
         if minutes <= 0:
             raise PortfolioRepairError(
                 f"review {review_id} exclusion has no positive allocated minutes"
+            )
+        seconds = source_row.get("duration_seconds")
+        if exact_accounting and (
+            isinstance(seconds, bool) or not isinstance(seconds, int) or seconds <= 0
+        ):
+            raise PortfolioRepairError(
+                f"review {review_id} exclusion has no positive allocated seconds"
             )
         matching_groups = [
             group
@@ -1292,6 +1310,15 @@ def repair_document(
         ]
         group["review_minutes"] = int(group["review_minutes"]) - minutes
         group["excluded_minutes"] = int(group["excluded_minutes"]) + minutes
+        if exact_accounting:
+            for field in ("source_seconds", "review_seconds", "excluded_seconds"):
+                value = group.get(field)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise PortfolioRepairError(
+                        f"review {review_id} exclusion lacks group second accounting"
+                    )
+            group["review_seconds"] -= seconds
+            group["excluded_seconds"] += seconds
         group["reviewed_activities"] = int(group["reviewed_activities"]) - 1
         for disposition in ("exceptions", "omissions"):
             items = replacement[disposition]
@@ -1306,12 +1333,25 @@ def repair_document(
             raise PortfolioRepairError(
                 f"review {review_id} exclusion broke group minute accounting"
             )
+        if exact_accounting and group["source_seconds"] != (
+            group["review_seconds"] + group["excluded_seconds"]
+        ):
+            raise PortfolioRepairError(
+                f"review {review_id} exclusion broke group second accounting"
+            )
         result["review_minutes"] = int(result["review_minutes"]) - minutes
         result["excluded_minutes"] = int(result["excluded_minutes"]) + minutes
+        if exact_accounting:
+            result["review_seconds"] = int(result["review_seconds"]) - seconds
+            result["excluded_seconds"] = int(result["excluded_seconds"]) + seconds
     if excluded_rows:
         result["review_activity_count"] = len(result["activities"])
         if result["source_minutes"] != result["review_minutes"] + result["excluded_minutes"]:
             raise PortfolioRepairError("repair broke portfolio minute accounting")
+        if exact_accounting and result["source_seconds"] != (
+            result["review_seconds"] + result["excluded_seconds"]
+        ):
+            raise PortfolioRepairError("repair broke portfolio second accounting")
     carried_fathom_ids = _carry_fathom_exceptions(result, fathom_reconciliation)
     result["repair"] = {
         "schema_version": REPAIR_SCHEMA_VERSION,
@@ -1405,7 +1445,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     rows = document.get("activities")
     needs_repair = isinstance(rows, list) and any(
         isinstance(row, Mapping)
-        and (repair_reasons(row.get("description")) or _route_missing(row))
+        and (
+            repair_reasons(row.get("description"))
+            or _route_missing(row)
+            or row.get("validation_status") != "flash_validated"
+        )
         for row in rows
     )
     endpoint = (

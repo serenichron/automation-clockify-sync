@@ -622,6 +622,11 @@ required `--checkpoint-root`; it resumes or creates a checkpointed collection
 and emits recordings only after pagination is complete. Any unavailable or
 partial result has `complete: false` and no partial recording output.
 
+For a bounded operator-requested review that cannot wait for gateway setup,
+`clockify_sync_collect.py run --calendly-optional` records Calendly as explicitly
+excluded and does not contact the gateway. The default remains required and
+fail-closed; the override does not change scheduled autopilot configuration.
+
 Portfolio quality reports canonical `recording_coverage` while preserving the
 read-only `fathom_coverage` alias for historical artifacts. New replay seals
 bind the canonical reconciliation digest, deduplication version and tolerance,

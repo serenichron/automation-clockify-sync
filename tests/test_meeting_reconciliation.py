@@ -69,6 +69,15 @@ VLAD_IDS = {"vlad@example.test", "Vlad"}
 
 
 class CanonicalMeetingTests(unittest.TestCase):
+    def test_numeric_fathom_recording_identity_is_canonicalized_as_text(self):
+        try:
+            result = reconcile_meetings(
+                [fathom(recording_id=12345)], [], vlad_identities=VLAD_IDS
+            )
+        except MeetingReconciliationError as error:
+            self.fail(f"numeric provider identity was rejected: {error}")
+        self.assertEqual(("fathom:12345",), result.meetings[0].source_ids)
+
     def test_calendly_only_recording_remains_full_duration(self):
         result = reconcile_meetings([], [calendly()], vlad_identities=VLAD_IDS)
         self.assertEqual(1, len(result.meetings))
