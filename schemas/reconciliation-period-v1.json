@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "reconciliation-period-v1.json",
+  "title": "Canonical reconciliation period v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["compatibility_version", "member_id", "workspace_id", "timezone", "since_utc", "until_utc", "revision"],
+  "properties": {
+    "compatibility_version": {"const": "reconciliation-period/v1"},
+    "member_id": {"type": "string", "minLength": 1},
+    "workspace_id": {"type": "string", "minLength": 1},
+    "timezone": {"type": "string", "minLength": 1},
+    "since_utc": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{6})?Z$"},
+    "until_utc": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{6})?Z$"},
+    "revision": {"type": "integer", "minimum": 1}
+  }
+}

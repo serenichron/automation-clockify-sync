@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "reconciliation-event-v1.json",
+  "title": "Append-only reconciliation coordinator event v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["sequence", "period_id", "event_type", "payload", "previous_digest", "occurred_at", "event_digest"],
+  "properties": {
+    "sequence": {"type": "integer", "minimum": 1},
+    "period_id": {"type": "string", "pattern": "^rperiod-[a-f0-9]{64}$"},
+    "event_type": {"type": "string", "minLength": 1},
+    "payload": {"$ref": "#/$defs/safe_payload"},
+    "previous_digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+    "occurred_at": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{6})?Z$"},
+    "event_digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}
+  },
+  "$defs": {
+    "safe_payload": {
+      "type": "object",
+      "propertyNames": {"not": {"enum": ["api_key", "credential", "cursor", "raw_payload", "transcript"]}},
+      "additionalProperties": {"$ref": "#/$defs/safe_value"}
+    },
+    "safe_value": {
+      "oneOf": [
+        {"type": ["null", "string", "number", "boolean"]},
+        {"type": "array", "items": {"$ref": "#/$defs/safe_value"}},
+        {"$ref": "#/$defs/safe_payload"}
+      ]
+    }
+  }
+}
