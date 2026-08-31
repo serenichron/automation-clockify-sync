@@ -93,7 +93,20 @@ class CurrencyContractTests(unittest.TestCase):
         ).to_dict()
         summary["usd_equivalent_total"] = "10.99"
         with self.assertRaisesRegex(currency.CurrencyContractError, "total"):
-            currency.CurrencySummary.from_dict(summary)
+            currency.CurrencySummary.from_dict(
+                summary, quote=QUOTE, publication_date=date(2026, 8, 18)
+            )
+
+    def test_serialized_summary_rejects_a_tampered_converted_bucket(self):
+        summary = currency.convert_native_buckets(
+            {"EUR": Decimal("10")}, QUOTE, publication_date=date(2026, 8, 18)
+        ).to_dict()
+        summary["usd_buckets"]["EUR"] = "10.99"
+        summary["usd_equivalent_total"] = "10.99"
+        with self.assertRaisesRegex(currency.CurrencyContractError, "USD bucket"):
+            currency.CurrencySummary.from_dict(
+                summary, quote=QUOTE, publication_date=date(2026, 8, 18)
+            )
 
     def test_quote_rejects_invalid_provider_base_rate_and_digest(self):
         invalid = {
@@ -133,30 +146,23 @@ class FetchEcbCliTests(unittest.TestCase):
             calls.append((request.get_method(), request.full_url, timeout))
             return Response()
 
-        quote = currency.fetch_ecb_quote(
-            publication_date=date(2026, 8, 18), fetched_at=NOW,
-            url="https://ecb.fixture.test/eurofxref.xml", opener=opener,
-        )
-        self.assertEqual([( "GET", "https://ecb.fixture.test/eurofxref.xml", 20)], calls)
-        self.assertEqual(date(2026, 8, 17), quote.effective_date)
-
         with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / "ecb.xml"
             output = Path(directory) / "fx-receipt.json"
-            source.write_bytes(payload)
             stdout = StringIO()
             with redirect_stdout(stdout):
                 status = currency.main(
-                [
-                    "fetch-ecb",
-                    "--publication-date-from-clock", "Europe/Bucharest",
-                    "--now", "2026-08-18T10:30:00+00:00",
-                    "--output", str(output), "--ecb-url", source.as_uri(),
-                ]
+                    [
+                        "fetch-ecb",
+                        "--publication-date-from-clock", "Europe/Bucharest",
+                        "--now", "2026-08-18T10:30:00+00:00",
+                        "--output", str(output), "--ecb-url", "https://ecb.fixture.test/eurofxref.xml",
+                    ],
+                    opener=opener,
                 )
             self.assertEqual(0, status)
             receipt = json.loads(output.read_text(encoding="utf-8"))
 
+        self.assertEqual([("GET", "https://ecb.fixture.test/eurofxref.xml", 20)], calls)
         self.assertEqual("fx-quote-receipt/v1", receipt["schema_version"])
         self.assertEqual("ECB", receipt["provider"])
         self.assertEqual("EUR", receipt["base_currency"])

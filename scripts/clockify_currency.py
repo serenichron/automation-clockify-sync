@@ -127,14 +127,24 @@ class CurrencySummary:
         }
 
     @classmethod
-    def from_dict(cls, value: Any) -> CurrencySummary:
+    def from_dict(
+        cls, value: Any, *, quote: FxQuoteReceipt, publication_date: date
+    ) -> CurrencySummary:
         if not isinstance(value, Mapping) or set(value) != {"native_buckets", "usd_buckets", "usd_equivalent_total"}:
             raise CurrencyContractError("currency summary has unexpected fields")
-        return cls(
+        supplied = cls(
             native_buckets=_deserialize_buckets(value["native_buckets"], "native bucket"),
             usd_buckets=_deserialize_buckets(value["usd_buckets"], "USD bucket"),
             usd_equivalent_total=_receipt_decimal(value["usd_equivalent_total"], "USD equivalent total"),
         )
+        expected = convert_native_buckets(
+            supplied.native_buckets, quote, publication_date=publication_date
+        )
+        if supplied.usd_buckets != expected.usd_buckets:
+            raise CurrencyContractError("USD buckets do not match the FX quote")
+        if supplied.usd_equivalent_total != expected.usd_equivalent_total:
+            raise CurrencyContractError("USD equivalent total does not match the FX quote")
+        return supplied
 
 
 def _validate_buckets(value: Any, field: str, *, require_cent: bool = False) -> dict[str, Decimal]:
@@ -251,13 +261,17 @@ def _parse_now(value: str | None, zone: ZoneInfo) -> datetime:
     return parsed.astimezone(zone)
 
 
-def _fetch_ecb_command(args: argparse.Namespace) -> int:
+def _fetch_ecb_command(
+    args: argparse.Namespace, *, opener: Callable[..., Any] = urlopen
+) -> int:
     try:
         zone = ZoneInfo(args.publication_date_from_clock)
     except ZoneInfoNotFoundError as exc:
         raise CurrencyContractError("publication clock timezone is invalid") from exc
     now = _parse_now(args.now, zone)
-    quote = fetch_ecb_quote(publication_date=now.date(), fetched_at=now, url=args.ecb_url)
+    quote = fetch_ecb_quote(
+        publication_date=now.date(), fetched_at=now, url=args.ecb_url, opener=opener
+    )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(quote.to_dict(), sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
@@ -265,7 +279,9 @@ def _fetch_ecb_command(args: argparse.Namespace) -> int:
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None, *, opener: Callable[..., Any] = urlopen
+) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     fetch = subparsers.add_parser("fetch-ecb", help="fetch a read-only ECB FX quote receipt")
@@ -275,7 +291,7 @@ def main(argv: list[str] | None = None) -> int:
     fetch.add_argument("--now", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     try:
-        return _fetch_ecb_command(args)
+        return _fetch_ecb_command(args, opener=opener)
     except CurrencyContractError as exc:
         print(f"currency contract error: {exc}", file=sys.stderr)
         return 2
