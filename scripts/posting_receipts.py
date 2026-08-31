@@ -523,6 +523,22 @@ class ApprovalReceiptStore:
             raise PostingReceiptError("approval receipt is consumed")
         return receipt
 
+    def require_consumed(
+        self, receipt_id: str, *, operation_identity: str, now: datetime,
+    ) -> ApprovalReceipt:
+        """Return one approval only when its verified ledger records its consumption."""
+        if now.tzinfo is None:
+            raise PostingReceiptError("approval check time must include an offset")
+        approvals, consumed = self._state()
+        receipt = approvals.get(receipt_id)
+        if receipt is None:
+            raise PostingReceiptError("approval receipt is missing")
+        if receipt.operation_identity != operation_identity:
+            raise PostingReceiptError("approval receipt operation identity does not match")
+        if receipt_id not in consumed:
+            raise PostingReceiptError("approval receipt is not consumed")
+        return receipt
+
     def consume(self, receipt_id: str, *, operation_identity: str, consumed_at: str) -> None:
         try:
             consumed_time = _parse_timestamp(consumed_at, "consumed_at")

@@ -192,7 +192,10 @@ class PublicationContract:
     manifest_digest: str
     event_history_digest: str
     post_receipt_digest: str
-    clockify_readback_digest: str
+    api_readback_digest: str
+    shared_report_readback_digest: str
+    api_readback_refreshed_at: str
+    shared_report_readback_refreshed_at: str
     duration_seconds: int
     native_buckets: Mapping[str, Decimal]
     usd_buckets: Mapping[str, Decimal]
@@ -212,8 +215,13 @@ class PublicationContract:
             timezone_name=self.timezone, period_start=self.period_start, period_end=self.period_end,
             revision=self.revision,
         )
-        for field in ("manifest_digest", "event_history_digest", "post_receipt_digest", "clockify_readback_digest", "contract_digest"):
+        for field in (
+            "manifest_digest", "event_history_digest", "post_receipt_digest", "api_readback_digest",
+            "shared_report_readback_digest", "contract_digest",
+        ):
             _digest_text(getattr(self, field), field)
+        _timestamp(self.api_readback_refreshed_at, "api_readback_refreshed_at")
+        _timestamp(self.shared_report_readback_refreshed_at, "shared_report_readback_refreshed_at")
         if isinstance(self.duration_seconds, bool) or not isinstance(self.duration_seconds, int) or self.duration_seconds < 0:
             raise PublicationGateError("duration_seconds is invalid")
         summary = clockify_currency.CurrencySummary(
@@ -225,8 +233,8 @@ class PublicationContract:
         expected_key = publication_idempotency_key(identity)
         if self.idempotency_key != expected_key:
             raise PublicationGateError("idempotency key does not match publication target")
-        if self.report_target != f"shared-report:{self.workspace_id}:{self.member_id}" or self.slack_target != f"slack:finance-report:{self.workspace_id}:{self.member_id}":
-            raise PublicationGateError("publication target is invalid")
+        _text(self.report_target, "report_target")
+        _text(self.slack_target, "slack_target")
         object.__setattr__(self, "native_buckets", dict(summary.native_buckets))
         object.__setattr__(self, "usd_buckets", dict(summary.usd_buckets))
 
@@ -236,7 +244,10 @@ class PublicationContract:
             "workspace_id": self.workspace_id, "member_id": self.member_id, "timezone": self.timezone,
             "period_start": self.period_start, "period_end": self.period_end, "revision": self.revision,
             "manifest_digest": self.manifest_digest, "event_history_digest": self.event_history_digest,
-            "post_receipt_digest": self.post_receipt_digest, "clockify_readback_digest": self.clockify_readback_digest,
+            "post_receipt_digest": self.post_receipt_digest, "api_readback_digest": self.api_readback_digest,
+            "shared_report_readback_digest": self.shared_report_readback_digest,
+            "api_readback_refreshed_at": self.api_readback_refreshed_at,
+            "shared_report_readback_refreshed_at": self.shared_report_readback_refreshed_at,
             "duration_seconds": self.duration_seconds,
             "native_buckets": {code: format(amount, "f") for code, amount in sorted(self.native_buckets.items())},
             "usd_buckets": {code: format(amount, "f") for code, amount in sorted(self.usd_buckets.items())},
@@ -252,7 +263,9 @@ class PublicationContract:
     def from_document(cls, value: object) -> "PublicationContract":
         required = {
             "schema_version", "state", "period_id", "workspace_id", "member_id", "timezone", "period_start", "period_end", "revision",
-            "manifest_digest", "event_history_digest", "post_receipt_digest", "clockify_readback_digest", "duration_seconds",
+            "manifest_digest", "event_history_digest", "post_receipt_digest", "api_readback_digest",
+            "shared_report_readback_digest", "api_readback_refreshed_at", "shared_report_readback_refreshed_at",
+            "duration_seconds",
             "native_buckets", "usd_buckets", "usd_equivalent_total", "fx_quote", "report_target", "slack_target", "idempotency_key", "contract_digest",
         }
         if not isinstance(value, Mapping) or set(value) != required or value.get("schema_version") != SCHEMA_VERSION:
@@ -269,7 +282,9 @@ class PublicationContract:
             period_id=value["period_id"], workspace_id=value["workspace_id"], member_id=value["member_id"], timezone=value["timezone"],
             period_start=value["period_start"], period_end=value["period_end"], revision=value["revision"],
             manifest_digest=value["manifest_digest"], event_history_digest=value["event_history_digest"], post_receipt_digest=value["post_receipt_digest"],
-            clockify_readback_digest=value["clockify_readback_digest"], duration_seconds=value["duration_seconds"],
+            api_readback_digest=value["api_readback_digest"], shared_report_readback_digest=value["shared_report_readback_digest"],
+            api_readback_refreshed_at=value["api_readback_refreshed_at"], shared_report_readback_refreshed_at=value["shared_report_readback_refreshed_at"],
+            duration_seconds=value["duration_seconds"],
             native_buckets=summary.native_buckets, usd_buckets=summary.usd_buckets, usd_equivalent_total=summary.usd_equivalent_total,
             fx_quote=quote, report_target=value["report_target"], slack_target=value["slack_target"],
             idempotency_key=value["idempotency_key"], contract_digest=value["contract_digest"], state=value["state"],
@@ -356,6 +371,52 @@ def _manifest(value: reconciliation_manifest.ReconciliationManifest | Mapping[st
     return manifest
 
 
+def _verified_manifest(
+    value: reconciliation_manifest.ReconciliationManifest | Mapping[str, object], events: Path | str,
+) -> reconciliation_manifest.ReconciliationManifest:
+    """Re-derive one supplied manifest from its canonical append-only history."""
+    supplied = _manifest(value)
+    if not isinstance(events, (Path, str)):
+        raise PublicationGateError("period events path is invalid")
+    try:
+        derived = reconciliation_manifest.ReconciliationCoordinator(
+            supplied.identity, reconciliation_manifest.CoordinatorEventStore(Path(events)),
+        ).derive()
+    except reconciliation_manifest.ManifestError as exc:
+        raise PublicationGateError(f"period event history is invalid: {exc}") from exc
+    if supplied.document() != derived.document():
+        raise PublicationGateError("supplied manifest does not match canonical period event history")
+    return _manifest(derived)
+
+
+def _approved_manifest_prefix(
+    identity: reconciliation_manifest.PeriodIdentity,
+    history: Sequence[reconciliation_manifest.CoordinatorEvent],
+    approval: posting_receipts.ApprovalReceipt,
+) -> reconciliation_manifest.ReconciliationManifest:
+    """Find the one approved coordinator prefix bound into a consumed post approval."""
+    matches: list[reconciliation_manifest.ReconciliationManifest] = []
+    try:
+        for end in range(1, len(history) + 1):
+            candidate = reconciliation_manifest.derive_manifest_from_verified_events(
+                identity, history[:end],
+            )
+            if candidate.events_digest == approval.event_history_digest:
+                matches.append(candidate)
+    except reconciliation_manifest.ManifestError as exc:
+        raise PublicationGateError(f"approval history prefix is unverifiable: {exc}") from exc
+    if not matches:
+        raise PublicationGateError("approval history prefix is absent from canonical events")
+    if len(matches) != 1:
+        raise PublicationGateError("approval history prefix is ambiguous")
+    prefix = matches[0]
+    if prefix.state != "approved":
+        raise PublicationGateError("approval history prefix is not in the approved state")
+    if prefix.manifest_digest != approval.manifest_digest:
+        raise PublicationGateError("approval manifest digest does not match its approved history prefix")
+    return prefix
+
+
 def _load_json(path: Path, field: str) -> Mapping[str, object]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -364,6 +425,23 @@ def _load_json(path: Path, field: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise PublicationGateError(f"{field} is not an object")
     return value
+
+
+def _require_bound_evidence(
+    manifest: reconciliation_manifest.ReconciliationManifest, value: object, label: str,
+) -> None:
+    """Require a supplied pure-gate document to be one of the manifest's verified artifacts."""
+    if not isinstance(value, Mapping):
+        raise PublicationGateError(f"{label} evidence is invalid")
+    candidate = _canonical(value)
+    for reference in manifest.artifacts:
+        try:
+            artifact = _load_json(Path(str(reference["path"])), "manifest artifact")
+        except PublicationGateError:
+            continue
+        if _canonical(artifact) == candidate:
+            return
+    raise PublicationGateError(f"{label} artifact is absent from the verified manifest")
 
 
 def _slice_bundles(manifest: reconciliation_manifest.ReconciliationManifest) -> tuple[Mapping[str, object], ...]:
@@ -381,8 +459,59 @@ def _slice_bundles(manifest: reconciliation_manifest.ReconciliationManifest) -> 
     return tuple(bundles)
 
 
-def _require_slices(manifest: reconciliation_manifest.ReconciliationManifest) -> None:
+def _interval(value: object, field: str) -> tuple[datetime, datetime]:
+    if not isinstance(value, Mapping):
+        raise PublicationGateError(f"{field} is invalid")
+    start = _timestamp(value.get("since"), f"{field} since")
+    end = _timestamp(value.get("until"), f"{field} until")
+    if start >= end:
+        raise PublicationGateError(f"{field} must be half-open")
+    return start, end
+
+
+def _required_slices(
+    coverage: Mapping[str, object], identity: reconciliation_manifest.PeriodIdentity,
+) -> tuple[tuple[str, datetime, datetime], ...]:
+    value = coverage.get("required_slices")
+    if not isinstance(value, list) or not value:
+        raise PublicationGateError("coverage must enumerate required slices")
+    required: list[tuple[str, datetime, datetime]] = []
+    for item in value:
+        if not isinstance(item, Mapping) or set(item) != {"slice_id", "since", "until"}:
+            raise PublicationGateError("required slice is invalid")
+        interval = _interval(item, "required slice")
+        required.append((_text(item.get("slice_id"), "required slice ID"), *interval))
+    if len({item[0] for item in required}) != len(required):
+        raise PublicationGateError("required slice IDs must be unique")
+    ordered = sorted(required, key=lambda item: item[1])
+    expected_start = identity.since.astimezone(timezone.utc)
+    expected_end = identity.until.astimezone(timezone.utc)
+    if ordered[0][1] != expected_start or ordered[-1][2] != expected_end:
+        raise PublicationGateError("required slices do not cover the publication period")
+    if any(previous[2] != current[1] for previous, current in zip(ordered, ordered[1:])):
+        raise PublicationGateError("required slices are not a contiguous non-overlapping union")
+    return tuple(required)
+
+
+def _require_slices(
+    manifest: reconciliation_manifest.ReconciliationManifest,
+    required: tuple[tuple[str, datetime, datetime], ...],
+) -> None:
+    identity = manifest.identity
+    expected_target = {
+        "period_id": identity.period_id, "workspace_id": identity.workspace_id, "member_id": identity.member_id,
+    }
+    expected = set(required)
+    completed: list[tuple[str, datetime, datetime]] = []
     for bundle in _slice_bundles(manifest):
+        target = bundle.get("target")
+        if not isinstance(target, Mapping) or dict(target) != expected_target:
+            raise PublicationGateError("slice target does not match the publication target")
+        slice_id = _text(bundle.get("slice_id"), "slice ID")
+        interval = _interval(bundle.get("date_range"), "slice date range")
+        candidate = (slice_id, *interval)
+        if candidate not in expected:
+            raise PublicationGateError("slice interval is not required by bound coverage")
         ledger = bundle.get("evidence_ledger")
         completeness = ledger.get("source_completeness") if isinstance(ledger, Mapping) else None
         if not isinstance(completeness, Mapping) or completeness.get("status") != "complete" or completeness.get("incomplete_sources") != []:
@@ -400,9 +529,15 @@ def _require_slices(manifest: reconciliation_manifest.ReconciliationManifest) ->
         ):
             if bundle.get(field, []) != []:
                 raise PublicationGateError(f"unresolved {label} exceptions block publication")
+        completed.append(candidate)
+    if len(completed) != len(set(completed)) or set(completed) != expected:
+        raise PublicationGateError("completed slices do not exactly cover the required intervals")
 
 
-def _require_coverage(value: object) -> None:
+def _require_coverage(
+    value: object, identity: reconciliation_manifest.PeriodIdentity,
+    events: Sequence[reconciliation_manifest.CoordinatorEvent],
+) -> tuple[tuple[str, datetime, datetime], ...]:
     if not isinstance(value, Mapping):
         raise PublicationGateError("coverage evidence is invalid")
     completeness = value.get("source_completeness", value)
@@ -412,19 +547,43 @@ def _require_coverage(value: object) -> None:
     limitations = value.get("limitations", [])
     if not isinstance(incomplete, list) or not isinstance(limitations, list):
         raise PublicationGateError("coverage evidence is invalid")
-    approved: set[str] = set()
-    for limitation in limitations:
-        if not isinstance(limitation, Mapping):
-            raise PublicationGateError("coverage limitation is invalid")
-        source = _text(limitation.get("source"), "coverage limitation source").lower()
-        if limitation.get("approved") is not True:
-            raise PublicationGateError("coverage limitation lacks explicit approval")
-        approved.add(source)
+    required = _required_slices(value, identity)
     status = completeness.get("status", value.get("status"))
     if status == "complete" and not incomplete:
-        return
-    if not incomplete or any(not isinstance(source, str) or source.lower() not in approved for source in incomplete):
+        if limitations:
+            raise PublicationGateError("complete coverage cannot carry limitations")
+        return required
+    if status != "incomplete" or not incomplete:
         raise PublicationGateError("coverage is incomplete")
+    sources = {_text(source, "coverage incomplete source").lower() for source in incomplete}
+    expected_fields = {
+        "approval_id", "approver", "approved_at", "period_id", "period_start", "period_end", "source", "coverage_digest",
+    }
+    approved: set[str] = set()
+    period = identity.document()
+    for limitation in limitations:
+        if not isinstance(limitation, Mapping) or set(limitation) != expected_fields:
+            raise PublicationGateError("coverage limitation lacks immutable approval binding")
+        source = _text(limitation.get("source"), "coverage limitation source").lower()
+        _text(limitation.get("approval_id"), "coverage approval_id")
+        _text(limitation.get("approver"), "coverage approver")
+        _timestamp(limitation.get("approved_at"), "coverage approval timestamp")
+        _digest_text(limitation.get("coverage_digest"), "coverage digest")
+        if (
+            limitation.get("period_id") != identity.period_id
+            or _timestamp(limitation.get("period_start"), "coverage period_start") != identity.since.astimezone(timezone.utc)
+            or _timestamp(limitation.get("period_end"), "coverage period_end") != identity.until.astimezone(timezone.utc)
+        ):
+            raise PublicationGateError("coverage limitation does not bind the exact half-open period")
+        if not any(
+            event.event_type == "coverage_limitation_approved" and dict(event.payload) == dict(limitation)
+            for event in events
+        ):
+            raise PublicationGateError("coverage limitation lacks matching verified approval event")
+        approved.add(source)
+    if sources != approved:
+        raise PublicationGateError("coverage is incomplete")
+    return required
 
 
 def _require_pass(value: object, name: str) -> None:
@@ -438,7 +597,7 @@ def _require_pass(value: object, name: str) -> None:
 
 
 def _readback(
-    value: object, identity: reconciliation_manifest.PeriodIdentity,
+    value: object, identity: reconciliation_manifest.PeriodIdentity, *, evidence_kind: str, now: datetime,
 ) -> clockify_period_readback.ClockifyPeriodReadback:
     try:
         readback = clockify_period_readback.normalize_readback(value)
@@ -447,52 +606,78 @@ def _readback(
     expected_start = identity.since.astimezone(timezone.utc)
     expected_end = identity.until.astimezone(timezone.utc)
     if (
-        readback.evidence_kind != "ledger" or readback.workspace_id != identity.workspace_id or readback.member_id != identity.member_id
+        readback.evidence_kind != evidence_kind or readback.workspace_id != identity.workspace_id or readback.member_id != identity.member_id
         or readback.timezone != identity.timezone or readback.period_start.astimezone(timezone.utc) != expected_start
         or readback.period_end.astimezone(timezone.utc) != expected_end or readback.include_running or readback.include_deleted
     ):
         raise PublicationGateError("Clockify readback target does not match the manifest")
-    if not readback.native_costs:
+    now_utc = now.astimezone(timezone.utc)
+    age_seconds = (now_utc - readback.refreshed_at).total_seconds()
+    if age_seconds < 0:
+        raise PublicationGateError("Clockify readback freshness is in the future")
+    if age_seconds > 900:
+        raise PublicationGateError("Clockify readback freshness is stale")
+    if evidence_kind == "report" and (not readback.request_receipt or not readback.native_costs):
+        raise PublicationGateError("shared-report readback has no native currency evidence")
+    if evidence_kind == "ledger" and not readback.entry_ids:
         raise PublicationGateError("Clockify readback has no native currency buckets")
     return readback
 
 
-def _require_post_receipt(
-    value: object, identity: reconciliation_manifest.PeriodIdentity, readback: clockify_period_readback.ClockifyPeriodReadback,
-) -> None:
+def _require_post_provenance(
+    value: object, *, approval_receipt_id: object, approval_events: Path | str, post_events: Path | str,
+    identity: reconciliation_manifest.PeriodIdentity,
+    history: Sequence[reconciliation_manifest.CoordinatorEvent], now: datetime,
+) -> Mapping[str, object]:
     if not isinstance(value, Mapping) or value.get("status") != "complete":
         raise PublicationGateError("Clockify post receipt is incomplete")
     _digest_text(value.get("final_live_readback_sha256"), "Clockify post receipt final readback")
-    post_events = value.get("post_events")
-    if not isinstance(post_events, Mapping):
+    supplied_post_events = value.get("post_events")
+    if not isinstance(supplied_post_events, Mapping):
         raise PublicationGateError("Clockify post receipt has no verified post events")
     expected_operation = posting_receipts.derive_operation_identity(
         operation="clockify_post", period_id=identity.period_id, workspace_id=identity.workspace_id, member_id=identity.member_id,
     )
-    if post_events.get("operation_identity") != expected_operation:
-        raise PublicationGateError("Clockify post receipt approval target does not match the manifest")
-    entries = post_events.get("entries")
-    if not isinstance(entries, list):
-        raise PublicationGateError("Clockify post receipt entries are invalid")
-    seen: set[str] = set()
-    for entry in entries:
-        if not isinstance(entry, Mapping):
-            raise PublicationGateError("Clockify post receipt entries are invalid")
-        disposition = entry.get("disposition")
-        if disposition not in {"created", "already_existing", "recovered_after_ambiguous_response"}:
-            raise PublicationGateError("Clockify post receipt contains an unfinished entry")
-        entry_id = _text(entry.get("clockify_entry_id"), "Clockify post receipt entry ID")
-        if entry_id in seen or readback.entry_ids.count(entry_id) != 1:
-            raise PublicationGateError("Clockify post receipt readback does not match final ledger")
-        seen.add(entry_id)
+    if not isinstance(approval_events, (Path, str)) or not isinstance(post_events, (Path, str)):
+        raise PublicationGateError("post provenance paths are invalid")
+    try:
+        approval = posting_receipts.ApprovalReceiptStore(Path(approval_events)).require_consumed(
+            _text(approval_receipt_id, "post approval receipt ID"), operation_identity=expected_operation, now=now,
+        )
+        events = posting_receipts.PostEventStore(Path(post_events))
+        verified_events = events.verify()
+        derived = events.derive_receipt(expected_operation)
+    except posting_receipts.PostingReceiptError as exc:
+        raise PublicationGateError(f"Clockify post approval or event history is invalid: {exc}") from exc
+    period = identity.document()
+    if (
+        approval.operation != "clockify_post" or approval.period_id != identity.period_id
+        or approval.workspace_id != identity.workspace_id or approval.member_id != identity.member_id
+        or _timestamp(approval.period_start, "post approval period_start") != identity.since.astimezone(timezone.utc)
+        or _timestamp(approval.period_end, "post approval period_end") != identity.until.astimezone(timezone.utc)
+    ):
+        raise PublicationGateError("Clockify post approval target does not match the manifest")
+    _approved_manifest_prefix(identity, history, approval)
+    for event in verified_events:
+        if (
+            event.operation != "clockify_post" or event.operation_identity != expected_operation
+            or event.period_id != identity.period_id or event.workspace_id != identity.workspace_id
+            or event.member_id != identity.member_id
+        ):
+            raise PublicationGateError("Clockify post event target does not match the manifest")
+    if _canonical(supplied_post_events) != _canonical(derived):
+        raise PublicationGateError("Clockify post receipt post_events do not match verified history")
+    return derived
 
 
 def _new_contract(
     manifest: reconciliation_manifest.ReconciliationManifest, post_receipt: Mapping[str, object],
-    readback: clockify_period_readback.ClockifyPeriodReadback, quote: clockify_currency.FxQuoteReceipt,
-    summary: clockify_currency.CurrencySummary,
+    api_readback: clockify_period_readback.ClockifyPeriodReadback,
+    shared_report_readback: clockify_period_readback.ClockifyPeriodReadback,
+    quote: clockify_currency.FxQuoteReceipt, summary: clockify_currency.CurrencySummary,
+    *, report_target: str, slack_target: str,
 ) -> PublicationContract:
-    native, usd, total = _contract_currency(readback.native_costs, summary)
+    native, usd, total = _contract_currency(shared_report_readback.native_costs, summary)
     identity = manifest.identity
     period = identity.document()
     unsigned = {
@@ -500,54 +685,95 @@ def _new_contract(
         "workspace_id": identity.workspace_id, "member_id": identity.member_id, "timezone": identity.timezone,
         "period_start": period["since_utc"], "period_end": period["until_utc"], "revision": identity.revision,
         "manifest_digest": manifest.manifest_digest, "event_history_digest": manifest.events_digest,
-        "post_receipt_digest": _digest(post_receipt), "clockify_readback_digest": readback.digest,
-        "duration_seconds": readback.duration_seconds,
+        "post_receipt_digest": _digest(post_receipt), "api_readback_digest": api_readback.digest,
+        "shared_report_readback_digest": shared_report_readback.digest,
+        "api_readback_refreshed_at": _utc(api_readback.refreshed_at),
+        "shared_report_readback_refreshed_at": _utc(shared_report_readback.refreshed_at),
+        "duration_seconds": shared_report_readback.duration_seconds,
         "native_buckets": {code: format(amount, "f") for code, amount in sorted(native.items())},
         "usd_buckets": {code: format(amount, "f") for code, amount in sorted(usd.items())},
         "usd_equivalent_total": format(total, "f"), "fx_quote": quote.to_dict(),
-        "report_target": f"shared-report:{identity.workspace_id}:{identity.member_id}",
-        "slack_target": f"slack:finance-report:{identity.workspace_id}:{identity.member_id}",
+        "report_target": report_target, "slack_target": slack_target,
         "idempotency_key": publication_idempotency_key(identity),
     }
     return PublicationContract(
         period_id=identity.period_id, workspace_id=identity.workspace_id, member_id=identity.member_id, timezone=identity.timezone,
         period_start=period["since_utc"], period_end=period["until_utc"], revision=identity.revision,
         manifest_digest=manifest.manifest_digest, event_history_digest=manifest.events_digest,
-        post_receipt_digest=unsigned["post_receipt_digest"], clockify_readback_digest=readback.digest,
-        duration_seconds=readback.duration_seconds, native_buckets=native, usd_buckets=usd, usd_equivalent_total=total,
-        fx_quote=quote, report_target=unsigned["report_target"], slack_target=unsigned["slack_target"],
+        post_receipt_digest=unsigned["post_receipt_digest"], api_readback_digest=api_readback.digest,
+        shared_report_readback_digest=shared_report_readback.digest,
+        api_readback_refreshed_at=unsigned["api_readback_refreshed_at"],
+        shared_report_readback_refreshed_at=unsigned["shared_report_readback_refreshed_at"],
+        duration_seconds=shared_report_readback.duration_seconds, native_buckets=native, usd_buckets=usd, usd_equivalent_total=total,
+        fx_quote=quote, report_target=report_target, slack_target=slack_target,
         idempotency_key=unsigned["idempotency_key"], contract_digest=_digest(unsigned),
     )
 
 
 def prepare_publication(
-    manifest: reconciliation_manifest.ReconciliationManifest | Mapping[str, object], *, post_receipt: Mapping[str, object],
-    clockify_readback: clockify_period_readback.ClockifyPeriodReadback | Mapping[str, object],
+    manifest: reconciliation_manifest.ReconciliationManifest | Mapping[str, object], *, events: Path | str,
+    approval_receipt_id: str, approval_events: Path | str, post_events: Path | str,
+    post_receipt: Mapping[str, object],
+    api_readback: clockify_period_readback.ClockifyPeriodReadback | Mapping[str, object],
+    shared_report_readback: clockify_period_readback.ClockifyPeriodReadback | Mapping[str, object],
     currency_summary: clockify_currency.CurrencySummary | Mapping[str, object] | None = None,
     fx_quote: clockify_currency.FxQuoteReceipt | Mapping[str, object] | None = None,
     quality: Mapping[str, object] | None = None, replay: Mapping[str, object] | None = None,
-    coverage: Mapping[str, object] | None = None, now: datetime | None = None,
+    coverage: Mapping[str, object] | None = None, slack_target: str | None = None,
+    now: datetime | None = None,
 ) -> PublicationContract:
     """Produce a complete immutable prepared contract without external mutation."""
-    ready_manifest = _manifest(manifest)
-    _require_slices(ready_manifest)
-    _require_coverage(coverage)
+    check_now = now or datetime.now(timezone.utc)
+    if check_now.tzinfo is None or check_now.utcoffset() is None:
+        raise PublicationGateError("publication clock must include a timezone")
+    ready_manifest = _verified_manifest(manifest, events)
+    try:
+        history = reconciliation_manifest.CoordinatorEventStore(Path(events)).verify(ready_manifest.identity)
+    except reconciliation_manifest.ManifestError as exc:
+        raise PublicationGateError(f"period event history is invalid: {exc}") from exc
+    _bound_input_artifacts(ready_manifest, (Path(approval_events), Path(post_events)))
+    _require_bound_evidence(ready_manifest, coverage, "coverage")
+    required_slices = _require_coverage(coverage, ready_manifest.identity, history)
+    _require_slices(ready_manifest, required_slices)
+    _require_bound_evidence(ready_manifest, quality, "quality")
+    _require_bound_evidence(ready_manifest, replay, "replay")
     _require_pass(quality, "quality")
     _require_pass(replay, "replay")
-    readback = _readback(clockify_readback, ready_manifest.identity)
-    _require_post_receipt(post_receipt, ready_manifest.identity, readback)
+    api = _readback(api_readback, ready_manifest.identity, evidence_kind="ledger", now=check_now)
+    report = _readback(shared_report_readback, ready_manifest.identity, evidence_kind="report", now=check_now)
+    _require_bound_evidence(ready_manifest, api.to_dict(), "Clockify API readback")
+    _require_bound_evidence(ready_manifest, report.to_dict(), "shared-report readback")
+    derived_post_events = _require_post_provenance(
+        post_receipt, approval_receipt_id=approval_receipt_id, approval_events=approval_events,
+        post_events=post_events, identity=ready_manifest.identity, history=history, now=check_now,
+    )
+    _require_bound_evidence(ready_manifest, post_receipt, "post receipt")
+    if ready_manifest.identity.since < ready_manifest.identity.until and not derived_post_events.get("entries"):
+        raise PublicationGateError("nonzero period has no terminal Clockify post entries")
+    try:
+        clockify_period_readback.verify_readback(api, report, post_receipt=derived_post_events)
+    except clockify_period_readback.ClockifyReadbackError as exc:
+        raise PublicationGateError(f"Clockify readbacks do not verify: {exc}") from exc
+    if not isinstance(report.request_receipt, Mapping):
+        raise PublicationGateError("shared-report request receipt is required")
+    report_target = "shared-report:" + _text(report.request_receipt.get("shared_report_id"), "shared-report ID")
+    slack = _text(slack_target, "slack_target")
     quote = _quote_from_document(fx_quote)
-    clock = (now or datetime.now(timezone.utc)).astimezone(ZoneInfo(ready_manifest.identity.timezone))
+    _require_bound_evidence(ready_manifest, quote.to_dict(), "FX quote")
+    clock = check_now.astimezone(ZoneInfo(ready_manifest.identity.timezone))
     try:
         expected_summary = clockify_currency.convert_native_buckets(
-            readback.native_costs, quote, publication_date=clock.date(),
+            report.native_costs, quote, publication_date=clock.date(),
         )
     except clockify_currency.CurrencyContractError as exc:
         raise PublicationGateError(f"currency evidence is invalid: {exc}") from exc
     summary = expected_summary if currency_summary is None else _summary_from_value(currency_summary, quote, clock.date())
     if summary != expected_summary:
         raise PublicationGateError("currency summary does not match Clockify readback and FX quote")
-    return _new_contract(ready_manifest, post_receipt, readback, quote, summary)
+    return _new_contract(
+        ready_manifest, post_receipt, api, report, quote, summary,
+        report_target=report_target, slack_target=slack,
+    )
 
 
 def _approval(value: object) -> Mapping[str, object]:
@@ -564,11 +790,27 @@ def authorize_publication(
     prepared: PublicationContract | Mapping[str, object], publication_approval: Mapping[str, object], *, now: datetime,
 ) -> AuthorizedPublication:
     """Bind a separate, still-valid publication approval to one prepared contract."""
-    contract = prepared if isinstance(prepared, PublicationContract) else PublicationContract.from_document(prepared)
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise PublicationGateError("publication authorization clock must include a timezone")
+    document = prepared.document() if isinstance(prepared, PublicationContract) else prepared
+    contract = PublicationContract.from_document(document)
+    try:
+        publication_date = now.astimezone(ZoneInfo(contract.timezone)).date()
+        clockify_currency.convert_native_buckets(
+            contract.native_buckets, contract.fx_quote, publication_date=publication_date,
+        )
+    except (ZoneInfoNotFoundError, clockify_currency.CurrencyContractError) as exc:
+        raise PublicationGateError(f"publication currency evidence is invalid: {exc}") from exc
+    now_utc = now.astimezone(timezone.utc)
+    if (
+        _timestamp(contract.api_readback_refreshed_at, "api_readback_refreshed_at") > now_utc
+        or _timestamp(contract.shared_report_readback_refreshed_at, "shared_report_readback_refreshed_at") > now_utc
+    ):
+        raise PublicationGateError("prepared readback freshness is in the future")
     approval = _approval(publication_approval)
     approved_at = _timestamp(approval["approved_at"], "publication approval timestamp")
     expires_at = _timestamp(approval["expires_at"], "publication approval expiry")
-    if expires_at <= approved_at or expires_at <= now.astimezone(timezone.utc):
+    if expires_at <= approved_at or expires_at <= now_utc:
         raise PublicationGateError("publication approval is expired")
     if tuple(approval["operations"]) != OPERATIONS:
         raise PublicationGateError("publication approval operations do not name the report and Slack bundle")
@@ -623,12 +865,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     commands = parser.add_subparsers(dest="command", required=True)
     prepare = commands.add_parser("prepare")
     prepare.add_argument("--manifest", type=Path, required=True)
+    prepare.add_argument("--events", type=Path, required=True)
     prepare.add_argument("--post-receipt", type=Path, required=True)
-    prepare.add_argument("--clockify-readback", type=Path, required=True)
+    prepare.add_argument("--approval-receipt-id", required=True)
+    prepare.add_argument("--approval-events", type=Path, required=True)
+    prepare.add_argument("--post-events", type=Path, required=True)
+    prepare.add_argument("--api-readback", type=Path, required=True)
+    prepare.add_argument("--shared-report-readback", type=Path, required=True)
     prepare.add_argument("--fx-quote", type=Path, required=True)
     prepare.add_argument("--quality", type=Path, required=True)
     prepare.add_argument("--replay", type=Path, required=True)
     prepare.add_argument("--coverage", type=Path, required=True)
+    prepare.add_argument("--slack-target", required=True)
     prepare.add_argument("--output", type=Path, required=True)
     authorize = commands.add_parser("authorize")
     authorize.add_argument("--prepared", type=Path, required=True)
@@ -640,13 +888,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def run(args: argparse.Namespace, *, now: datetime | None = None) -> int:
     if args.command == "prepare":
         manifest = _manifest(_load_json(args.manifest, "period manifest"))
-        input_paths = (args.post_receipt, args.clockify_readback, args.fx_quote, args.quality, args.replay, args.coverage)
+        input_paths = (
+            args.post_receipt, args.approval_events, args.post_events, args.api_readback,
+            args.shared_report_readback, args.fx_quote, args.quality, args.replay, args.coverage,
+        )
         _bound_input_artifacts(manifest, input_paths)
         contract = prepare_publication(
-            manifest, post_receipt=_load_json(args.post_receipt, "post receipt"),
-            clockify_readback=_load_json(args.clockify_readback, "Clockify readback"),
+            manifest, events=args.events, approval_receipt_id=args.approval_receipt_id,
+            approval_events=args.approval_events, post_events=args.post_events,
+            post_receipt=_load_json(args.post_receipt, "post receipt"),
+            api_readback=_load_json(args.api_readback, "Clockify API readback"),
+            shared_report_readback=_load_json(args.shared_report_readback, "shared-report readback"),
             fx_quote=_load_json(args.fx_quote, "FX quote"), quality=_load_json(args.quality, "quality"),
-            replay=_load_json(args.replay, "replay"), coverage=_load_json(args.coverage, "coverage"), now=now,
+            replay=_load_json(args.replay, "replay"), coverage=_load_json(args.coverage, "coverage"),
+            slack_target=args.slack_target, now=now,
         )
         _output(args.output, contract.document())
         print(_canonical({"state": contract.state, "contract_digest": contract.contract_digest}))

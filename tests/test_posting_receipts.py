@@ -252,6 +252,33 @@ class ApprovalReceiptStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(posting_receipts.PostingReceiptError, "digest"):
                 store.append(approval_receipt(approval_id="approval-4", routing_digest=""))
 
+    def test_require_consumed_requires_the_exact_bound_approval_consumption(self) -> None:
+        """Removing consumed-ledger validation would accept an unconsumed approval."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = posting_receipts.ApprovalReceiptStore(Path(directory) / "approvals.jsonl")
+            receipt = approval_receipt()
+            store.append(receipt)
+
+            with self.assertRaisesRegex(posting_receipts.PostingReceiptError, "consumed"):
+                store.require_consumed(
+                    receipt.approval_id, operation_identity=OPERATION, now=NOW,
+                )
+
+            store.consume(
+                receipt.approval_id, operation_identity=OPERATION,
+                consumed_at="2026-08-18T12:01:00Z",
+            )
+            self.assertEqual(
+                receipt,
+                store.require_consumed(
+                    receipt.approval_id, operation_identity=OPERATION, now=NOW,
+                ),
+            )
+            with self.assertRaisesRegex(posting_receipts.PostingReceiptError, "operation identity"):
+                store.require_consumed(
+                    receipt.approval_id, operation_identity="other-operation", now=NOW,
+                )
+
     def test_approval_chain_rejects_digest_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "approvals.jsonl"

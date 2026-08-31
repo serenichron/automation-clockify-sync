@@ -531,6 +531,40 @@ def _manifest(
     )
 
 
+def derive_manifest_from_verified_events(
+    identity: PeriodIdentity, events: Sequence[CoordinatorEvent],
+) -> ReconciliationManifest:
+    """Derive coordinator state from one already-verified immutable event sequence."""
+    if not isinstance(identity, PeriodIdentity) or any(
+        not isinstance(event, CoordinatorEvent) for event in events
+    ):
+        raise ManifestError("manifest derivation requires a period identity and verified events")
+    history = tuple(events)
+    CoordinatorEventStore._verify_chain(identity, list(history))
+    if not history or history[0].event_type != "period_opened":
+        raise ManifestError("first event must be period_opened")
+    state = "collecting"
+    blockers: set[str] = set()
+    artifacts: list[ArtifactIdentity] = []
+    context = {
+        "readback_verified": False, "prepared_publication": None,
+        "authorization": None, "report_verified": False,
+    }
+    for index, event in enumerate(history):
+        if state == "published":
+            raise ManifestError("event is not legal after publication_complete")
+        references = event.payload.get("artifacts")
+        if references is not None:
+            if not isinstance(references, list):
+                raise ManifestError("event artifacts must be a list")
+            artifacts.extend(_artifact_from_document(reference) for reference in references)
+        state = ReconciliationCoordinator._apply_transition(
+            state, event, index, context, blockers,
+        )
+    unique_artifacts = {_canonical(artifact.document()): artifact for artifact in artifacts}
+    return _manifest(identity, state, history, tuple(unique_artifacts.values()), blockers)
+
+
 class ReconciliationCoordinator:
     def __init__(self, identity: PeriodIdentity, store: CoordinatorEventStore):
         if not isinstance(identity, PeriodIdentity) or not isinstance(store, CoordinatorEventStore):
@@ -540,22 +574,9 @@ class ReconciliationCoordinator:
 
     def derive(self) -> ReconciliationManifest:
         events = self.store.verify(self.identity)
-        if not events or events[0].event_type != "period_opened":
-            raise ManifestError("first event must be period_opened")
-        state = "collecting"
-        blockers: set[str] = set()
-        artifacts: list[ArtifactIdentity] = []
-        context = {
-            "readback_verified": False, "prepared_publication": None,
-            "authorization": None, "report_verified": False,
-        }
-        for index, event in enumerate(events):
-            if state == "published":
-                raise ManifestError("event is not legal after publication_complete")
-            artifacts.extend(_verify_artifact_refs(event.payload.get("artifacts")))
-            state = self._apply_transition(state, event, index, context, blockers)
-        unique_artifacts = { _canonical(artifact.document()): artifact for artifact in artifacts }
-        return _manifest(self.identity, state, events, tuple(unique_artifacts.values()), blockers)
+        for event in events:
+            _verify_artifact_refs(event.payload.get("artifacts"))
+        return derive_manifest_from_verified_events(self.identity, events)
 
     @staticmethod
     def _apply_transition(

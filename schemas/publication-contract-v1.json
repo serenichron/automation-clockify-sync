@@ -26,14 +26,16 @@
       "type": "object", "additionalProperties": false,
       "required": [
         "schema_version", "state", "period_id", "workspace_id", "member_id", "timezone", "period_start", "period_end", "revision",
-        "manifest_digest", "event_history_digest", "post_receipt_digest", "clockify_readback_digest", "duration_seconds",
+        "manifest_digest", "event_history_digest", "post_receipt_digest", "api_readback_digest", "shared_report_readback_digest",
+        "api_readback_refreshed_at", "shared_report_readback_refreshed_at", "duration_seconds",
         "native_buckets", "usd_buckets", "usd_equivalent_total", "fx_quote", "report_target", "slack_target", "idempotency_key", "contract_digest"
       ],
       "properties": {
         "schema_version": {"const": "publication-contract/v1"}, "state": {"const": "publication_prepared"},
         "period_id": {"type": "string", "minLength": 1}, "workspace_id": {"type": "string", "minLength": 1}, "member_id": {"type": "string", "minLength": 1},
         "timezone": {"type": "string", "minLength": 1}, "period_start": {"type": "string", "format": "date-time"}, "period_end": {"type": "string", "format": "date-time"}, "revision": {"type": "integer", "minimum": 1},
-        "manifest_digest": {"$ref": "#/$defs/digest"}, "event_history_digest": {"$ref": "#/$defs/digest"}, "post_receipt_digest": {"$ref": "#/$defs/digest"}, "clockify_readback_digest": {"$ref": "#/$defs/digest"},
+        "manifest_digest": {"$ref": "#/$defs/digest"}, "event_history_digest": {"$ref": "#/$defs/digest"}, "post_receipt_digest": {"$ref": "#/$defs/digest"}, "api_readback_digest": {"$ref": "#/$defs/digest"}, "shared_report_readback_digest": {"$ref": "#/$defs/digest"},
+        "api_readback_refreshed_at": {"type": "string", "format": "date-time"}, "shared_report_readback_refreshed_at": {"type": "string", "format": "date-time"},
         "duration_seconds": {"type": "integer", "minimum": 0}, "native_buckets": {"$ref": "#/$defs/amounts"}, "usd_buckets": {"$ref": "#/$defs/amounts"}, "usd_equivalent_total": {"type": "string", "pattern": "^[0-9]+(?:\\.[0-9]{2})?$"},
         "fx_quote": {"$ref": "#/$defs/quote"}, "report_target": {"type": "string", "minLength": 1}, "slack_target": {"type": "string", "minLength": 1}, "idempotency_key": {"type": "string", "minLength": 1}, "contract_digest": {"$ref": "#/$defs/digest"}
       }

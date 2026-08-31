@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -18,6 +19,7 @@ from scripts.reconciliation_manifest import (
     PeriodIdentity,
     ReconciliationCoordinator,
     ReconciliationManifest,
+    derive_manifest_from_verified_events,
     _write_canonical,
 )
 
@@ -208,6 +210,25 @@ class CoordinatorEventStoreTests(unittest.TestCase):
         self.assertEqual(first.event_digest, second.previous_digest)
         self.assertEqual((first, second), store.load(self.identity))
         self.assertEqual((first, second), store.verify(self.identity))
+
+    def test_derives_a_manifest_from_a_verified_event_prefix_without_store_io(self) -> None:
+        store = CoordinatorEventStore(self.path)
+        append_events(store, self.identity, [
+            "period_opened", "collection_complete", "reconciliation_complete", "review_approved",
+        ])
+        verified = store.verify(self.identity)
+
+        manifest = derive_manifest_from_verified_events(self.identity, verified)
+
+        self.assertEqual("approved", manifest.state)
+        self.assertEqual(4, manifest.event_count)
+        with self.assertRaisesRegex(ManifestError, "first event"):
+            derive_manifest_from_verified_events(self.identity, ())
+        with self.assertRaisesRegex(ManifestError, "predecessor"):
+            derive_manifest_from_verified_events(
+                self.identity,
+                (replace(verified[0], previous_digest="sha256:" + "f" * 64), *verified[1:]),
+            )
 
     def test_verify_rejects_reordered_events(self) -> None:
         store = CoordinatorEventStore(self.path)
