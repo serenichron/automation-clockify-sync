@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "clockify-period-readback-v1.json",
+  "title": "Clockify full-period readback v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "workspace_id", "member_id", "timezone",
+    "period_start", "period_end", "filters", "refreshed_at",
+    "include_running", "include_deleted", "entry_ids", "entry_count",
+    "duration_seconds", "entry_durations", "native_costs", "digest"
+  ],
+  "properties": {
+    "schema_version": {"const": "clockify-period-readback/v1"},
+    "workspace_id": {"type": "string", "minLength": 1},
+    "member_id": {"type": "string", "minLength": 1},
+    "timezone": {"type": "string", "minLength": 1},
+    "period_start": {"type": "string", "format": "date-time"},
+    "period_end": {"type": "string", "format": "date-time"},
+    "filters": {"type": "object"},
+    "refreshed_at": {"type": "string", "format": "date-time"},
+    "include_running": {"type": "boolean"},
+    "include_deleted": {"type": "boolean"},
+    "entry_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+    "entry_count": {"type": "integer", "minimum": 0},
+    "duration_seconds": {"type": "integer", "minimum": 0},
+    "entry_durations": {
+      "type": "object",
+      "propertyNames": {"minLength": 1},
+      "additionalProperties": {"type": "integer", "minimum": 0}
+    },
+    "native_costs": {
+      "type": "object",
+      "propertyNames": {"pattern": "^[A-Z]{3}$"},
+      "additionalProperties": {"type": "string", "pattern": "^-?[0-9]+(\\.[0-9]+)?$"}
+    },
+    "digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}
+  }
+}
