@@ -42,6 +42,19 @@ def _digest(value: Mapping[str, Any]) -> str:
     return "sha256:" + hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def derive_operation_identity(
+    *, operation: str, period_id: str, workspace_id: str, member_id: str
+) -> str:
+    """Derive the only valid identity for an externally mutating operation."""
+    target = {
+        "operation": _required_text(operation, "operation"),
+        "period_id": _required_text(period_id, "period_id"),
+        "workspace_id": _required_text(workspace_id, "workspace_id"),
+        "member_id": _required_text(member_id, "member_id"),
+    }
+    return "opid-" + hashlib.sha256(canonical_json(target).encode("utf-8")).hexdigest()
+
+
 def _parse_timestamp(value: str, label: str) -> datetime:
     if not isinstance(value, str) or not value:
         raise PostingReceiptError(f"{label} must be a timestamp")
@@ -75,6 +88,10 @@ def _append_jsonl(path: Path, record: Mapping[str, Any]) -> None:
         os.fsync(handle.fileno())
 
 
+def _anchor_path(path: Path) -> Path:
+    return path.with_name(path.name + ".anchor.jsonl")
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -104,6 +121,53 @@ def _verify_chain(records: list[dict[str, Any]], schema_version: str) -> None:
         if record.get("event_digest") != expected:
             raise PostingReceiptError("receipt ledger integrity digest failure")
         previous = expected
+
+
+def _verify_anchor(path: Path, records: list[dict[str, Any]], schema_version: str) -> None:
+    anchors = _read_jsonl(_anchor_path(path))
+    if not anchors:
+        if records:
+            raise PostingReceiptError("receipt ledger anchor is missing")
+        return
+    previous: str | None = None
+    for sequence, anchor in enumerate(anchors):
+        payload = {key: value for key, value in anchor.items() if key != "anchor_digest"}
+        expected = _digest(payload)
+        if (
+            set(anchor) != {
+                "anchor_schema_version", "ledger_schema_version", "sequence", "previous_anchor_digest",
+                "ledger_count", "ledger_head", "anchor_digest",
+            }
+            or anchor.get("anchor_schema_version") != "receipt-ledger-anchor/v1"
+            or anchor.get("ledger_schema_version") != schema_version
+            or anchor.get("sequence") != sequence
+            or anchor.get("previous_anchor_digest") != previous
+            or not isinstance(anchor.get("ledger_count"), int)
+            or anchor.get("ledger_count") < 1
+            or not isinstance(anchor.get("ledger_head"), str)
+            or anchor.get("anchor_digest") != expected
+        ):
+            raise PostingReceiptError("receipt ledger anchor integrity failure")
+        previous = expected
+    latest = anchors[-1]
+    actual_head = records[-1]["event_digest"] if records else None
+    if latest["ledger_count"] != len(records) or latest["ledger_head"] != actual_head:
+        raise PostingReceiptError("receipt ledger anchor does not match ledger head")
+
+
+def _append_anchor(path: Path, records: list[dict[str, Any]], schema_version: str) -> None:
+    anchors = _read_jsonl(_anchor_path(path))
+    previous = anchors[-1]["anchor_digest"] if anchors else None
+    record: dict[str, Any] = {
+        "anchor_schema_version": "receipt-ledger-anchor/v1",
+        "ledger_schema_version": schema_version,
+        "sequence": len(anchors),
+        "previous_anchor_digest": previous,
+        "ledger_count": len(records),
+        "ledger_head": records[-1]["event_digest"],
+    }
+    record["anchor_digest"] = _digest(record)
+    _append_jsonl(_anchor_path(path), record)
 
 
 @dataclass(frozen=True)
@@ -160,6 +224,13 @@ class ApprovalReceipt:
             _digest_text(getattr(self, field), field)
         if not isinstance(self.single_use, bool):
             raise PostingReceiptError("single_use must be a boolean")
+        if self.operation_identity != derive_operation_identity(
+            operation=self.operation,
+            period_id=self.period_id,
+            workspace_id=self.workspace_id,
+            member_id=self.member_id,
+        ):
+            raise PostingReceiptError("approval operation identity does not bind its operation and target")
 
 
 class ApprovalReceiptStore:
@@ -169,6 +240,7 @@ class ApprovalReceiptStore:
     def _records(self) -> list[dict[str, Any]]:
         records = _read_jsonl(self.path)
         _verify_chain(records, APPROVAL_SCHEMA_VERSION)
+        _verify_anchor(self.path, records, APPROVAL_SCHEMA_VERSION)
         approvals: dict[str, ApprovalReceipt] = {}
         consumed: set[str] = set()
         for record in records:
@@ -200,7 +272,7 @@ class ApprovalReceiptStore:
                     raise PostingReceiptError("approval consumption does not bind its approval")
                 if approval_id in consumed:
                     raise PostingReceiptError("approval receipt has duplicate consumption")
-                if consumed_at > _parse_timestamp(receipt.expires_at, "expires_at"):
+                if consumed_at >= _parse_timestamp(receipt.expires_at, "expires_at"):
                     raise PostingReceiptError("approval consumption is expired")
                 consumed.add(approval_id)
             else:
@@ -234,6 +306,7 @@ class ApprovalReceiptStore:
         }
         record["event_digest"] = _digest(record)
         _append_jsonl(self.path, record)
+        _append_anchor(self.path, records + [record], APPROVAL_SCHEMA_VERSION)
 
     def require(self, receipt_id: str, *, operation_identity: str, now: datetime) -> ApprovalReceipt:
         if now.tzinfo is None:
@@ -244,7 +317,7 @@ class ApprovalReceiptStore:
             raise PostingReceiptError("approval receipt is missing")
         if receipt.operation_identity != operation_identity:
             raise PostingReceiptError("approval receipt operation identity does not match")
-        if _parse_timestamp(receipt.expires_at, "expires_at") < now.astimezone(timezone.utc):
+        if _parse_timestamp(receipt.expires_at, "expires_at") <= now.astimezone(timezone.utc):
             raise PostingReceiptError("approval receipt is expired")
         if receipt.single_use and receipt_id in consumed:
             raise PostingReceiptError("approval receipt is consumed")
@@ -265,6 +338,7 @@ class ApprovalReceiptStore:
         }
         record["event_digest"] = _digest(record)
         _append_jsonl(self.path, record)
+        _append_anchor(self.path, records + [record], APPROVAL_SCHEMA_VERSION)
 
     def verify(self) -> None:
         self._records()
@@ -273,6 +347,7 @@ class ApprovalReceiptStore:
 @dataclass(frozen=True)
 class PostEvent:
     disposition: str
+    operation: str
     operation_identity: str
     period_id: str
     workspace_id: str
@@ -296,7 +371,7 @@ class PostEvent:
     def validate(self) -> None:
         if self.disposition not in POST_DISPOSITIONS:
             raise PostingReceiptError("post event disposition is invalid")
-        for field in ("operation_identity", "period_id", "workspace_id", "member_id", "review_id"):
+        for field in ("operation", "operation_identity", "period_id", "workspace_id", "member_id", "review_id"):
             _required_text(getattr(self, field), field)
         if not isinstance(self.segment_index, int) or isinstance(self.segment_index, bool) or self.segment_index < 0:
             raise PostingReceiptError("segment_index must be a non-negative integer")
@@ -311,6 +386,13 @@ class PostEvent:
         elif self.disposition in {"planned", "interrupted"}:
             if self.clockify_entry_id is not None or self.live_readback_digest is not None:
                 raise PostingReceiptError(f"{self.disposition} event cannot claim Clockify readback")
+        if self.operation_identity != derive_operation_identity(
+            operation=self.operation,
+            period_id=self.period_id,
+            workspace_id=self.workspace_id,
+            member_id=self.member_id,
+        ):
+            raise PostingReceiptError("post event operation identity does not bind its operation and target")
 
 
 class PostEventStore:
@@ -320,6 +402,7 @@ class PostEventStore:
     def _events(self, *, complete: bool) -> tuple[PostEvent, ...]:
         records = _read_jsonl(self.path)
         _verify_chain(records, POST_EVENT_SCHEMA_VERSION)
+        _verify_anchor(self.path, records, POST_EVENT_SCHEMA_VERSION)
         events: list[PostEvent] = []
         target: tuple[str, str, str, str] | None = None
         planned: set[tuple[str, int]] = set()
@@ -380,6 +463,7 @@ class PostEventStore:
         }
         record["event_digest"] = _digest(record)
         _append_jsonl(self.path, record)
+        _append_anchor(self.path, records + [record], POST_EVENT_SCHEMA_VERSION)
 
     def verify(self) -> tuple[PostEvent, ...]:
         return self._events(complete=True)

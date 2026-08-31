@@ -15,8 +15,17 @@
       "required": ["approval_id", "approver", "approved_at", "expires_at", "operation", "operation_identity", "period_id", "period_start", "period_end", "workspace_id", "member_id", "portfolio_digest", "quality_digest", "replay_digest", "routing_digest", "correction_log_digest", "coverage_digest", "residual_exception_digest", "single_use"],
       "properties": {
         "approval_id": {"type": "string", "minLength": 1}, "approver": {"type": "string", "minLength": 1}, "approved_at": {"type": "string", "format": "date-time"}, "expires_at": {"type": "string", "format": "date-time"},
-        "operation": {"type": "string", "minLength": 1}, "operation_identity": {"type": "string", "minLength": 1}, "period_id": {"type": "string", "minLength": 1}, "period_start": {"type": "string", "format": "date-time"}, "period_end": {"type": "string", "format": "date-time"},
+        "operation": {"type": "string", "minLength": 1}, "operation_identity": {"type": "string", "pattern": "^opid-[a-f0-9]{64}$"}, "period_id": {"type": "string", "minLength": 1}, "period_start": {"type": "string", "format": "date-time"}, "period_end": {"type": "string", "format": "date-time"},
         "workspace_id": {"type": "string", "minLength": 1}, "member_id": {"type": "string", "minLength": 1}, "portfolio_digest": {"$ref": "#/$defs/digest"}, "quality_digest": {"$ref": "#/$defs/digest"}, "replay_digest": {"$ref": "#/$defs/digest"}, "routing_digest": {"$ref": "#/$defs/digest"}, "correction_log_digest": {"$ref": "#/$defs/digest"}, "coverage_digest": {"$ref": "#/$defs/digest"}, "residual_exception_digest": {"$ref": "#/$defs/digest"}, "single_use": {"type": "boolean"}
+      }
+    },
+    "anchor": {
+      "type": "object", "additionalProperties": false,
+      "required": ["anchor_schema_version", "ledger_schema_version", "sequence", "previous_anchor_digest", "ledger_count", "ledger_head", "anchor_digest"],
+      "properties": {
+        "anchor_schema_version": {"const": "receipt-ledger-anchor/v1"}, "ledger_schema_version": {"const": "approval-receipt/v1"}, "sequence": {"type": "integer", "minimum": 0},
+        "previous_anchor_digest": {"type": ["string", "null"], "pattern": "^sha256:[a-f0-9]{64}$"}, "ledger_count": {"type": "integer", "minimum": 1},
+        "ledger_head": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}, "anchor_digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}
       }
     }
   },
@@ -29,7 +38,8 @@
     {
       "type": "object", "additionalProperties": false,
       "required": ["schema_version", "record_type", "sequence", "previous_digest", "approval_id", "operation_identity", "consumed_at", "event_digest"],
-      "properties": {"schema_version": {"$ref": "#/$defs/integrity/schema_version"}, "record_type": {"const": "consumed"}, "sequence": {"$ref": "#/$defs/integrity/sequence"}, "previous_digest": {"$ref": "#/$defs/integrity/previous_digest"}, "approval_id": {"type": "string", "minLength": 1}, "operation_identity": {"type": "string", "minLength": 1}, "consumed_at": {"type": "string", "format": "date-time"}, "event_digest": {"$ref": "#/$defs/integrity/event_digest"}}
-    }
+      "properties": {"schema_version": {"$ref": "#/$defs/integrity/schema_version"}, "record_type": {"const": "consumed"}, "sequence": {"$ref": "#/$defs/integrity/sequence"}, "previous_digest": {"$ref": "#/$defs/integrity/previous_digest"}, "approval_id": {"type": "string", "minLength": 1}, "operation_identity": {"type": "string", "pattern": "^opid-[a-f0-9]{64}$"}, "consumed_at": {"type": "string", "format": "date-time"}, "event_digest": {"$ref": "#/$defs/integrity/event_digest"}}
+    },
+    {"$ref": "#/$defs/anchor"}
   ]
 }

@@ -10,7 +10,9 @@ from scripts import posting_receipts
 
 
 NOW = datetime(2026, 8, 18, 12, 0, tzinfo=timezone.utc)
-OPERATION = "clockify_post:period-1:workspace-1:member-1"
+OPERATION = posting_receipts.derive_operation_identity(
+    operation="clockify_post", period_id="period-1", workspace_id="workspace-1", member_id="member-1"
+)
 
 
 def approval_receipt(**changes: object) -> posting_receipts.ApprovalReceipt:
@@ -42,6 +44,7 @@ def approval_receipt(**changes: object) -> posting_receipts.ApprovalReceipt:
 def post_event(disposition: str, **changes: object) -> posting_receipts.PostEvent:
     values: dict[str, object] = {
         "disposition": disposition,
+        "operation": "clockify_post",
         "operation_identity": OPERATION,
         "period_id": "period-1",
         "workspace_id": "workspace-1",
@@ -57,6 +60,26 @@ def post_event(disposition: str, **changes: object) -> posting_receipts.PostEven
 
 
 class ApprovalReceiptStoreTests(unittest.TestCase):
+    def test_approval_anchor_rejects_truncated_consumption_and_deleted_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "approvals.jsonl"
+            store = posting_receipts.ApprovalReceiptStore(path)
+            receipt = approval_receipt()
+            store.append(receipt)
+            store.consume(
+                receipt.approval_id,
+                operation_identity=OPERATION,
+                consumed_at="2026-08-18T12:01:00Z",
+            )
+            first_record = path.read_text(encoding="utf-8").splitlines()[0]
+            path.write_text(first_record + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(posting_receipts.PostingReceiptError, "anchor"):
+                store.require(receipt.approval_id, operation_identity=OPERATION, now=NOW)
+
+            path.unlink()
+            with self.assertRaisesRegex(posting_receipts.PostingReceiptError, "anchor"):
+                store.verify()
+
     def test_approval_is_bound_to_target_period_operation_and_artifact_digests(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = posting_receipts.ApprovalReceiptStore(Path(directory) / "approvals.jsonl")
@@ -85,6 +108,17 @@ class ApprovalReceiptStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(posting_receipts.PostingReceiptError, "expired"):
                 store.require(expired.approval_id, operation_identity=OPERATION, now=NOW)
 
+            expires_now = approval_receipt(approval_id="approval-expires-now", expires_at="2026-08-18T12:00:00Z")
+            store.append(expires_now)
+            with self.assertRaisesRegex(posting_receipts.PostingReceiptError, "expired"):
+                store.require(expires_now.approval_id, operation_identity=OPERATION, now=NOW)
+            with self.assertRaisesRegex(posting_receipts.PostingReceiptError, "expired"):
+                store.consume(
+                    expires_now.approval_id,
+                    operation_identity=OPERATION,
+                    consumed_at="2026-08-18T12:00:00Z",
+                )
+
             valid = approval_receipt(approval_id="approval-offset")
             store.append(valid)
             with self.assertRaisesRegex(posting_receipts.PostingReceiptError, "offset"):
@@ -112,8 +146,37 @@ class ApprovalReceiptStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(posting_receipts.PostingReceiptError, "integrity"):
                 store.verify()
 
+    def test_approval_identity_canonically_binds_operation_and_target(self) -> None:
+        canonical = posting_receipts.derive_operation_identity(
+            operation="clockify_post",
+            period_id="period-1",
+            workspace_id="workspace-1",
+            member_id="member-1",
+        )
+        self.assertNotEqual(canonical, posting_receipts.derive_operation_identity(
+            operation="other_operation",
+            period_id="period-1",
+            workspace_id="workspace-1",
+            member_id="member-1",
+        ))
+        with tempfile.TemporaryDirectory() as directory:
+            store = posting_receipts.ApprovalReceiptStore(Path(directory) / "approvals.jsonl")
+            with self.assertRaisesRegex(posting_receipts.PostingReceiptError, "operation identity"):
+                store.append(approval_receipt(operation_identity=canonical, workspace_id="other-workspace"))
+
 
 class PostEventStoreTests(unittest.TestCase):
+    def test_post_anchor_rejects_removal_of_completed_plan_and_terminal_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = posting_receipts.PostEventStore(Path(directory) / "post-events.jsonl")
+            store.append(post_event("planned"))
+            store.append(post_event(
+                "created", clockify_entry_id="entry-1", live_readback_digest="sha256:live-1"
+            ))
+            store.path.write_text("", encoding="utf-8")
+            with self.assertRaisesRegex(posting_receipts.PostingReceiptError, "anchor"):
+                store.verify()
+
     def test_post_history_derives_terminal_receipt_and_rejects_reorder(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = posting_receipts.PostEventStore(Path(directory) / "post-events.jsonl")
@@ -140,7 +203,7 @@ class PostEventStoreTests(unittest.TestCase):
             ))
             lines = store.path.read_text(encoding="utf-8").splitlines()
             store.path.write_text(lines[0] + "\n", encoding="utf-8")
-            with self.assertRaisesRegex(posting_receipts.PostingReceiptError, "terminal"):
+            with self.assertRaisesRegex(posting_receipts.PostingReceiptError, "anchor"):
                 store.verify()
 
             store = posting_receipts.PostEventStore(Path(directory) / "second-events.jsonl")
@@ -176,6 +239,18 @@ class PostEventStoreTests(unittest.TestCase):
                 store.append(post_event("created", operation_identity="other", clockify_entry_id="entry-1", live_readback_digest="sha256:live"))
             with self.assertRaisesRegex(posting_receipts.PostingReceiptError, "target"):
                 store.append(post_event("created", workspace_id="other", clockify_entry_id="entry-1", live_readback_digest="sha256:live"))
+
+    def test_post_event_rejects_identity_that_contradicts_its_target(self) -> None:
+        identity = posting_receipts.derive_operation_identity(
+            operation="clockify_post",
+            period_id="period-1",
+            workspace_id="workspace-1",
+            member_id="member-1",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            store = posting_receipts.PostEventStore(Path(directory) / "post-events.jsonl")
+            with self.assertRaisesRegex(posting_receipts.PostingReceiptError, "operation identity"):
+                store.append(post_event("planned", operation_identity=identity, member_id="other-member"))
 
 
 if __name__ == "__main__":
