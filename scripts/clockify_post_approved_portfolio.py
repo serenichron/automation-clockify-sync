@@ -28,6 +28,7 @@ if str(ROOT) not in sys.path:
 
 from scripts.clockify_sync_collect import clockify_env_candidates, load_env_file
 from scripts import clockify_portfolio_replay as portfolio_replay
+from scripts import posting_receipts, reconciliation_manifest
 
 
 API = "https://api.clockify.me/api/v1"
@@ -506,6 +507,27 @@ def _live_entries(
     return [value for row in rows if (value := _live_entry(row)) is not None]
 
 
+def _period_live_entries(
+    workspace: str,
+    user: str,
+    api_key: str,
+    *,
+    period_start: str,
+    period_end: str,
+    timeout_seconds: int,
+) -> list[dict[str, Any]]:
+    query = urllib.parse.urlencode({
+        "start": _utc(period_start),
+        "end": _utc(period_end),
+    })
+    rows = _paged(
+        f"/workspaces/{workspace}/user/{user}/time-entries?{query}",
+        api_key,
+        timeout_seconds=timeout_seconds,
+    )
+    return [value for row in rows if (value := _live_entry(row)) is not None]
+
+
 def _receipt_item(plan: Mapping[str, Any], entry_id: str, disposition: str) -> dict[str, Any]:
     return {
         "review_id": plan["review_id"],
@@ -725,6 +747,8 @@ def _verify_approved_artifacts(
     portfolio: Mapping[str, Any],
     quality: Mapping[str, Any],
     replay: Mapping[str, Any],
+    *,
+    require_flash_validation: bool = True,
 ) -> None:
     """Require one clean, Flash-validated, replay-bound posting package."""
     activities = portfolio.get("activities")
@@ -741,7 +765,9 @@ def _verify_approved_artifacts(
         or repair.get("unresolved_wording") != []
     ):
         raise PortfolioPostError("portfolio repair has not cleanly completed")
-    if any(row.get("validation_status") != "flash_validated" for row in activities):
+    if require_flash_validation and any(
+        row.get("validation_status") != "flash_validated" for row in activities
+    ):
         raise PortfolioPostError(
             "portfolio activity lacks successful Flash portfolio validation"
         )
@@ -757,18 +783,121 @@ def _verify_approved_artifacts(
         raise PortfolioPostError("portfolio replay is not bound to the quality report")
 
 
+def _approval_digest(path: Path) -> str:
+    return "sha256:" + _sha256(path)
+
+
+def _approval_context(
+    args: argparse.Namespace,
+    *,
+    portfolio_path: Path,
+    quality_path: Path,
+    replay_path: Path,
+    routing_path: Path,
+    routing: Mapping[str, Any],
+) -> tuple[posting_receipts.ApprovalReceipt, posting_receipts.PostEventStore]:
+    if not all(getattr(args, name, None) for name in (
+        "approval_receipt", "approval_events", "post_events", "period_manifest",
+    )):
+        raise PortfolioPostError("approval receipt, event ledgers, and period manifest are required for execution")
+    try:
+        manifest = reconciliation_manifest.ReconciliationManifest.from_document(
+            _read(Path(args.period_manifest).resolve())
+        )
+        reconciliation_manifest._verify_artifact_refs(list(manifest.artifacts))
+        identity = manifest.identity
+        member_id = str(routing.get("clockify_user_id") or "")
+        if not member_id or member_id != identity.member_id:
+            raise PortfolioPostError("routing does not match the period manifest member")
+        operation_identity = posting_receipts.derive_operation_identity(
+            operation="clockify_post", period_id=identity.period_id,
+            workspace_id=identity.workspace_id, member_id=identity.member_id,
+        )
+        receipt = posting_receipts.ApprovalReceiptStore(
+            Path(args.approval_events).resolve()
+        ).require(
+            str(args.approval_receipt), operation_identity=operation_identity,
+            now=dt.datetime.now(dt.timezone.utc),
+        )
+        expected = {
+            "portfolio_digest": _approval_digest(portfolio_path),
+            "quality_digest": _approval_digest(quality_path),
+            "replay_digest": _approval_digest(replay_path),
+            "routing_digest": _approval_digest(routing_path),
+        }
+        if any(getattr(receipt, field) != value for field, value in expected.items()):
+            raise PortfolioPostError("approval receipt artifact digest does not match execution inputs")
+        period = identity.document()
+        if (
+            receipt.operation != "clockify_post"
+            or receipt.period_id != identity.period_id
+            or receipt.workspace_id != identity.workspace_id
+            or receipt.member_id != identity.member_id
+            or receipt.period_start != period["since_utc"]
+            or receipt.period_end != period["until_utc"]
+        ):
+            raise PortfolioPostError("approval receipt target or period does not match period manifest")
+        artifact_digests = {str(value.get("digest")) for value in manifest.artifacts}
+        if any(getattr(receipt, field) not in artifact_digests for field in (
+            "correction_log_digest", "coverage_digest", "residual_exception_digest",
+        )):
+            raise PortfolioPostError("approval receipt correction, coverage, or residual digest is absent from period manifest")
+        store = posting_receipts.PostEventStore(Path(args.post_events).resolve())
+        store.derive_receipt(operation_identity)
+        return receipt, store
+    except (OSError, json.JSONDecodeError, posting_receipts.PostingReceiptError,
+            reconciliation_manifest.ManifestError) as error:
+        raise PortfolioPostError(f"approval receipt validation failed: {error}") from error
+
+
+def _append_post_event(
+    store: posting_receipts.PostEventStore,
+    approval: posting_receipts.ApprovalReceipt,
+    plan: Mapping[str, Any],
+    disposition: str,
+    *,
+    entry_id: str | None = None,
+    live_readback_digest: str | None = None,
+) -> None:
+    try:
+        store.append(posting_receipts.PostEvent(
+            disposition=disposition, operation=approval.operation,
+            operation_identity=approval.operation_identity, period_id=approval.period_id,
+            workspace_id=approval.workspace_id, member_id=approval.member_id,
+            review_id=str(plan["review_id"]), segment_index=int(plan["segment_index"]),
+            recorded_at=dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            clockify_entry_id=entry_id, live_readback_digest=live_readback_digest,
+        ))
+    except posting_receipts.PostingReceiptError as error:
+        raise PortfolioPostError(f"post event validation failed: {error}") from error
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    if args.execute and not getattr(args, "approval_receipt", None):
+        raise PortfolioPostError("approval receipt is required for execution")
     portfolio_path = args.portfolio.resolve()
     quality_path = args.quality_report.resolve()
+    replay_path = args.replay_integrity.resolve()
+    routing_path = args.routing.resolve()
     portfolio_sha = _sha256(portfolio_path)
     if portfolio_sha != args.expected_portfolio_sha256:
         raise PortfolioPostError("approved portfolio digest does not match")
     quality = _read(quality_path)
     portfolio = _read(portfolio_path)
-    replay = _read(args.replay_integrity.resolve())
-    if not all(isinstance(value, Mapping) for value in (portfolio, quality, replay)):
+    replay = _read(replay_path)
+    routing = _read(routing_path)
+    if not all(isinstance(value, Mapping) for value in (portfolio, quality, replay, routing)):
         raise PortfolioPostError("approved posting artifacts are invalid")
-    _verify_approved_artifacts(portfolio, quality, replay)
+    approval: posting_receipts.ApprovalReceipt | None = None
+    post_event_store: posting_receipts.PostEventStore | None = None
+    if args.execute:
+        approval, post_event_store = _approval_context(
+            args, portfolio_path=portfolio_path, quality_path=quality_path,
+            replay_path=replay_path, routing_path=routing_path, routing=routing,
+        )
+    _verify_approved_artifacts(
+        portfolio, quality, replay, require_flash_validation=approval is None
+    )
     environment = load_env_file(
         clockify_env_candidates(), ["CLOCKIFY_API_KEY", "CLOCKIFY_WORKSPACE_ID"]
     )
@@ -777,7 +906,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     timeout_seconds = post_http_timeout_seconds(environment)
     api_key = str(environment["CLOCKIFY_API_KEY"])
     workspace = str(environment["CLOCKIFY_WORKSPACE_ID"])
-    routing = _read(args.routing.resolve())
     user = str(routing.get("clockify_user_id") or "")
     if not user:
         raise PortfolioPostError("Clockify user ID is missing from routing")
@@ -806,8 +934,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     }
     if len(approved_by_key) != len(approved_plans):
         raise PortfolioPostError("approved portfolio contains duplicate posting keys")
-    prior_path = args.prior_receipt
-    if prior_path is None and args.receipt.exists():
+    prior_path = None if args.execute else args.prior_receipt
+    if not args.execute and prior_path is None and args.receipt.exists():
         prior_path = args.receipt
     live = _live_entries(
         workspace, user, api_key, approved_plans, timeout_seconds=timeout_seconds
@@ -889,6 +1017,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             f"{len(conflicts)} approved blocks conflict with live Clockify entries: {detail}"
         )
 
+    post_history: dict[tuple[str, int], dict[str, Any]] = {}
+    if args.execute:
+        if approval is None or post_event_store is None:
+            raise AssertionError("execution approval context is missing")
+        try:
+            post_history = {
+                _receipt_key(entry, kind="post event"): dict(entry)
+                for entry in post_event_store.derive_receipt(approval.operation_identity)["entries"]
+            }
+        except (KeyError, TypeError, posting_receipts.PostingReceiptError) as error:
+            raise PortfolioPostError(f"post event history is invalid: {error}") from error
+        if set(post_history) - set(approved_by_key):
+            raise PortfolioPostError("post event history contains an unknown approved key")
+
     planned_seconds = sum(plan["duration_seconds"] for plan in plans)
     receipt = {
         "schema_version": SCHEMA_VERSION,
@@ -917,6 +1059,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             receipt["already_existing"].append(
                 _receipt_item(plan, exact[key]["id"], "already_existing")
             )
+            if args.execute:
+                if approval is None or post_event_store is None:
+                    raise AssertionError("execution approval context is missing")
+                historical = post_history.get(key)
+                if historical is None:
+                    _append_post_event(post_event_store, approval, plan, "planned")
+                elif historical.get("clockify_entry_id") not in {None, str(exact[key]["id"])}:
+                    raise PortfolioPostError("post event Clockify entry does not match fresh readback")
+                if historical is None or historical.get("clockify_entry_id") is None:
+                    _append_post_event(
+                        post_event_store, approval, plan, "already_existing",
+                        entry_id=str(exact[key]["id"]),
+                        live_readback_digest="sha256:" + live_snapshot_sha256,
+                    )
     if not args.execute:
         _atomic_write(args.receipt.resolve(), receipt)
         return receipt
@@ -925,6 +1081,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         key = (plan["review_id"], plan["segment_index"])
         if key in exact:
             continue
+        if key in post_history:
+            raise PortfolioPostError(
+                "planned post has no exact fresh Clockify readback; refusing to repeat POST"
+            )
+        if approval is None or post_event_store is None:
+            raise AssertionError("execution approval context is missing")
+        _append_post_event(post_event_store, approval, plan, "planned")
         payload = {
             "start": plan["start"],
             "end": plan["end"],
@@ -955,15 +1118,70 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     )
                 raise
             recovered = recovered_matches[0]
-            receipt["created"].append(_receipt_item(plan, recovered["id"], "recovered"))
+            readback_digest = "sha256:" + _normalized_snapshot_sha256(refreshed)
+            _append_post_event(
+                post_event_store, approval, plan, "recovered_after_ambiguous_response",
+                entry_id=str(recovered["id"]), live_readback_digest=readback_digest,
+            )
+            receipt["created"].append(
+                _receipt_item(plan, recovered["id"], "recovered_after_ambiguous_response")
+            )
         else:
             if not isinstance(created, Mapping) or not created.get("id"):
                 receipt["status"] = "interrupted"
                 _atomic_write(args.receipt.resolve(), receipt)
                 raise PortfolioPostError("Clockify create response lacks an entry ID")
+            refreshed = _live_entries(
+                workspace, user, api_key, plans, timeout_seconds=timeout_seconds
+            )
+            created_matches = [entry for entry in refreshed if _exact(plan, entry)]
+            if len(created_matches) != 1 or str(created_matches[0]["id"]) != str(created["id"]):
+                receipt["status"] = "interrupted"
+                _atomic_write(args.receipt.resolve(), receipt)
+                if len(created_matches) > 1:
+                    raise PortfolioPostError(
+                        "multiple exact Clockify entries match POST readback"
+                    )
+                raise PortfolioPostError("Clockify create response is absent from exact live readback")
+            readback_digest = "sha256:" + _normalized_snapshot_sha256(refreshed)
+            _append_post_event(
+                post_event_store, approval, plan, "created",
+                entry_id=str(created["id"]), live_readback_digest=readback_digest,
+            )
             receipt["created"].append(_receipt_item(plan, str(created["id"]), "created"))
-        _atomic_write(args.receipt.resolve(), receipt)
 
+    if approval is None or post_event_store is None:
+        raise AssertionError("execution approval context is missing")
+    final_live = _period_live_entries(
+        workspace, user, api_key, period_start=approval.period_start,
+        period_end=approval.period_end, timeout_seconds=timeout_seconds,
+    )
+    final_ids = {str(entry["id"]) for entry in final_live}
+    try:
+        final_events = post_event_store.verify()
+    except posting_receipts.PostingReceiptError as error:
+        raise PortfolioPostError(f"post event history is incomplete: {error}") from error
+    if any(event.disposition == "interrupted" for event in final_events):
+        raise PortfolioPostError("post event history contains an interrupted entry")
+    for event in final_events:
+        if event.clockify_entry_id and event.clockify_entry_id not in final_ids:
+            raise PortfolioPostError("post event Clockify entry is absent from final live readback")
+    receipt["post_events"] = post_event_store.derive_receipt(approval.operation_identity)
+    outcomes = {
+        _receipt_key(entry, kind="post event"): entry
+        for entry in receipt["post_events"]["entries"]
+    }
+    receipt["created"] = []
+    receipt["already_existing"] = []
+    for plan in plans:
+        outcome = outcomes[(plan["review_id"], plan["segment_index"])]
+        disposition = str(outcome["disposition"])
+        entry_id = str(outcome.get("clockify_entry_id") or "")
+        if disposition == "already_existing":
+            receipt["already_existing"].append(_receipt_item(plan, entry_id, disposition))
+        else:
+            receipt["created"].append(_receipt_item(plan, entry_id, disposition))
+    receipt["final_live_readback_sha256"] = "sha256:" + _normalized_snapshot_sha256(final_live)
     receipt["status"] = "complete"
     _atomic_write(args.receipt.resolve(), receipt)
     return receipt
@@ -977,9 +1195,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--routing", type=Path, default=Path("routing.json"))
     parser.add_argument("--receipt", type=Path, required=True)
     parser.add_argument("--prior-receipt", type=Path)
+    parser.add_argument("--approval-receipt")
+    parser.add_argument("--approval-events", type=Path)
+    parser.add_argument("--post-events", type=Path)
+    parser.add_argument("--period-manifest", type=Path)
     parser.add_argument("--expected-portfolio-sha256", required=True)
     parser.add_argument("--execute", action="store_true")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.execute and not all((
+        args.approval_receipt, args.approval_events, args.post_events, args.period_manifest,
+    )):
+        parser.error(
+            "--execute requires --approval-receipt, --approval-events, --post-events, and --period-manifest"
+        )
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:

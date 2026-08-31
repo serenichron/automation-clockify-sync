@@ -96,22 +96,23 @@ python3 scripts/clockify_post_approved_portfolio.py \
   --replay-integrity /absolute/path/to/replay-integrity.json \
   --routing /absolute/path/to/routing.json \
   --receipt /absolute/path/to/private-receipt.json \
+  --approval-receipt <board-approval-id> \
+  --approval-events /absolute/path/to/approval-events.jsonl \
+  --post-events /absolute/path/to/post-events.jsonl \
+  --period-manifest /absolute/path/to/period-manifest.json \
   --expected-portfolio-sha256 <approved-sha256> \
   --execute
 ```
 
-Omit `--execute` for a no-create preflight. The poster rejects warning-bearing
-repairs, rows without successful Flash portfolio validation, replay or quality
-drift, non-identical live overlaps, and portfolio digest mismatches. A failed or
-ambiguous POST is reconciled through a fresh exact live readback before the run
-can continue; it is never blindly retried after a server-side 5xx response.
-
-`--prior-receipt` identifies candidate live entries but never authorizes receipt
-timestamps. Every retry reads Clockify again, excludes candidates provisionally,
-re-derives approved bounds, and fails if the live readback differs. Receipt audit
-evidence includes `boundary_adjustment_algorithm`, `live_snapshot_sha256`,
-`blocker_snapshot_sha256`, and `boundary_adjustments_sha256`. An interrupted
-receipt is safe to retry, but is not proof that its entries remain valid.
+Omit `--execute` for a read-only preflight. Execution validates one unexpired
+approval ledger entry before credentials are loaded, binding the exact portfolio,
+quality, replay, routing, correction, coverage, residual-exception, target, and
+period evidence. Its append-only post-event ledger writes `planned` before a
+POST and one terminal result only after exact live readback; a mutable receipt
+is compatibility output, never execution history. Ambiguous responses and
+interrupted plans are resolved through fresh exact readback and are never
+blindly reposted. The final compatibility receipt includes a full-period live
+readback digest.
 
 Outputs:
 

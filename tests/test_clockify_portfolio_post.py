@@ -1,4 +1,5 @@
 import argparse
+import datetime as dt
 import hashlib
 import json
 from pathlib import Path
@@ -8,11 +9,14 @@ from unittest import mock
 
 from scripts import clockify_post_approved_portfolio as poster
 from scripts import clockify_portfolio_replay as portfolio_replay
+from scripts import posting_receipts
+from scripts import reconciliation_manifest
 
 
 class ClockifyPortfolioPostTests(unittest.TestCase):
     def _write_posting_fixture(
-        self, root: Path, *, allocation_segments: list[dict[str, object]] | None = None
+        self, root: Path, *, allocation_segments: list[dict[str, object]] | None = None,
+        validation_status: str = "flash_validated",
     ) -> argparse.Namespace:
         portfolio_path = root / "portfolio.json"
         quality_path = root / "quality.json"
@@ -32,7 +36,7 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
                 "description": "EX — Approved work", "duration_minutes": sum(
                     int(segment["duration_minutes"]) for segment in segments
                 ),
-                "validation_status": "flash_validated", "allocation_segments": segments,
+                "validation_status": validation_status, "allocation_segments": segments,
             }],
         }
         quality = {"status": "pass"}
@@ -51,12 +55,56 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
                 "tag_suffixes": ["654321"],
             }],
         }), encoding="utf-8")
+        correction_path = root / "corrections.json"
+        coverage_path = root / "coverage.json"
+        residual_path = root / "residual-exceptions.json"
+        for path in (correction_path, coverage_path, residual_path):
+            path.write_text("{}\n", encoding="utf-8")
+        identity = reconciliation_manifest.PeriodIdentity(
+            member_id="user-1", workspace_id="workspace-1", timezone="Europe/Bucharest",
+            since=dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc),
+            until=dt.datetime(2026, 8, 16, tzinfo=dt.timezone.utc), revision=1,
+        )
+        artifacts = tuple(
+            reconciliation_manifest.ArtifactIdentity(
+                path=path.resolve(), schema_version="fixture/v1", compatibility_version="fixture/v1",
+                digest="sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+            for path in (
+                portfolio_path, quality_path, replay_path, routing_path,
+                correction_path, coverage_path, residual_path,
+            )
+        )
+        manifest_path = root / "period-manifest.json"
+        manifest_path.write_text(json.dumps(
+            reconciliation_manifest._manifest(identity, "approved", (), artifacts, set()).document()
+        ), encoding="utf-8")
+        approval_events = root / "approval-events.jsonl"
+        approval_id = "approval-1"
+        operation_identity = posting_receipts.derive_operation_identity(
+            operation="clockify_post", period_id=identity.period_id,
+            workspace_id=identity.workspace_id, member_id=identity.member_id,
+        )
+        digest = lambda path: "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+        posting_receipts.ApprovalReceiptStore(approval_events).append(posting_receipts.ApprovalReceipt(
+            approval_id=approval_id, approver="board", approved_at="2026-08-01T00:00:00Z",
+            expires_at="2030-08-01T00:00:00Z", operation="clockify_post",
+            operation_identity=operation_identity, period_id=identity.period_id,
+            period_start=identity.document()["since_utc"], period_end=identity.document()["until_utc"],
+            workspace_id=identity.workspace_id, member_id=identity.member_id,
+            portfolio_digest=digest(portfolio_path), quality_digest=digest(quality_path),
+            replay_digest=digest(replay_path), routing_digest=digest(routing_path),
+            correction_log_digest=digest(correction_path), coverage_digest=digest(coverage_path),
+            residual_exception_digest=digest(residual_path),
+        ))
         return argparse.Namespace(
             portfolio=portfolio_path, quality_report=quality_path,
             replay_integrity=replay_path, routing=routing_path, receipt=receipt_path,
             prior_receipt=None,
             expected_portfolio_sha256=hashlib.sha256(portfolio_path.read_bytes()).hexdigest(),
             execute=False,
+            approval_receipt=approval_id, approval_events=approval_events,
+            post_events=root / "post-events.jsonl", period_manifest=manifest_path,
         )
 
     def _clockify_entry(
@@ -78,6 +126,176 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
                 return [{"id": "tag-654321"}]
             return live_entries
         return paged
+
+    def test_execute_requires_approval_receipt_before_credentials_or_network(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            args = self._write_posting_fixture(Path(directory))
+            args.execute = True
+            args.approval_receipt = None
+            args.approval_events = None
+            args.post_events = None
+            args.period_manifest = None
+            with (
+                mock.patch.object(poster, "load_env_file") as credentials,
+                mock.patch.object(poster, "_request") as request,
+            ):
+                with self.assertRaisesRegex(poster.PortfolioPostError, "approval receipt"):
+                    poster.run(args)
+
+        credentials.assert_not_called()
+        request.assert_not_called()
+
+    def test_exact_approval_permits_the_august_sheet_review_migration_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            args = self._write_posting_fixture(
+                Path(directory), validation_status="sheet_reviewed_after_flash"
+            )
+            args.execute = True
+            live = [self._clockify_entry(
+                "entry-exact", "2026-08-14T10:00:00Z", "2026-08-14T10:10:00Z"
+            )]
+            with (
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
+                }),
+                mock.patch.object(poster, "_paged", side_effect=self._paged_with_live(live)),
+            ):
+                receipt = poster.run(args)
+
+        self.assertEqual("complete", receipt["status"])
+
+    def test_execute_records_exact_existing_entry_in_append_only_post_events(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            args = self._write_posting_fixture(Path(directory))
+            args.execute = True
+            live = [self._clockify_entry(
+                "entry-exact", "2026-08-14T10:00:00Z", "2026-08-14T10:10:00Z"
+            )]
+            with (
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
+                }),
+                mock.patch.object(poster, "_paged", side_effect=self._paged_with_live(live)),
+                mock.patch.object(poster, "_request") as request,
+            ):
+                receipt = poster.run(args)
+
+            events = posting_receipts.PostEventStore(args.post_events).verify()
+
+        self.assertEqual(["planned", "already_existing"], [event.disposition for event in events])
+        self.assertEqual("entry-exact", events[-1].clockify_entry_id)
+        self.assertEqual(["entry-exact"], [
+            item["clockify_entry_id"] for item in receipt["already_existing"]
+        ])
+        request.assert_not_called()
+
+    def test_execute_never_trusts_mutable_prior_receipt_as_history(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = self._write_posting_fixture(root)
+            args.execute = True
+            args.prior_receipt = root / "forged-prior-receipt.json"
+            args.prior_receipt.write_text('{"portfolio_sha256":"forged"}', encoding="utf-8")
+            live = [self._clockify_entry(
+                "entry-exact", "2026-08-14T10:00:00Z", "2026-08-14T10:10:00Z"
+            )]
+            with (
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
+                }),
+                mock.patch.object(poster, "_paged", side_effect=self._paged_with_live(live)),
+            ):
+                receipt = poster.run(args)
+
+        self.assertEqual("complete", receipt["status"])
+
+    def test_resume_does_not_duplicate_terminal_post_events(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            args = self._write_posting_fixture(Path(directory))
+            args.execute = True
+            live = [self._clockify_entry(
+                "entry-exact", "2026-08-14T10:00:00Z", "2026-08-14T10:10:00Z"
+            )]
+            with (
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
+                }),
+                mock.patch.object(poster, "_paged", side_effect=self._paged_with_live(live)),
+            ):
+                poster.run(args)
+                poster.run(args)
+
+            events = posting_receipts.PostEventStore(args.post_events).verify()
+
+        self.assertEqual(2, len(events))
+
+    def test_post_terminal_event_requires_exact_live_readback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            args = self._write_posting_fixture(Path(directory))
+            args.execute = True
+            created_live = [self._clockify_entry(
+                "entry-created", "2026-08-14T10:00:00Z", "2026-08-14T10:10:00Z"
+            )]
+            readbacks = [[], created_live, created_live]
+
+            def paged(path: str, _api_key: str, *, timeout_seconds: int):
+                if path.startswith("/workspaces/workspace-1/projects"):
+                    return [{"id": "project-123456"}]
+                if path.startswith("/workspaces/workspace-1/tags"):
+                    return [{"id": "tag-654321"}]
+                return readbacks.pop(0)
+
+            with (
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
+                }),
+                mock.patch.object(poster, "_paged", side_effect=paged),
+                mock.patch.object(poster, "_request", return_value={"id": "entry-created"}),
+            ):
+                poster.run(args)
+
+            events = posting_receipts.PostEventStore(args.post_events).verify()
+
+        self.assertEqual(["planned", "created"], [event.disposition for event in events])
+        self.assertEqual("entry-created", events[-1].clockify_entry_id)
+        self.assertTrue(events[-1].live_readback_digest.startswith("sha256:"))
+
+    def test_execute_emits_final_full_period_live_readback_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            args = self._write_posting_fixture(Path(directory))
+            args.execute = True
+            live = [self._clockify_entry(
+                "entry-exact", "2026-08-14T10:00:00Z", "2026-08-14T10:10:00Z"
+            )]
+            readbacks = [live, live]
+
+            def paged(path: str, _api_key: str, *, timeout_seconds: int):
+                if path.startswith("/workspaces/workspace-1/projects"):
+                    return [{"id": "project-123456"}]
+                if path.startswith("/workspaces/workspace-1/tags"):
+                    return [{"id": "tag-654321"}]
+                return readbacks.pop(0)
+
+            with (
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
+                }),
+                mock.patch.object(poster, "_paged", side_effect=paged),
+            ):
+                receipt = poster.run(args)
+
+        self.assertTrue(receipt["final_live_readback_sha256"].startswith("sha256:"))
+
+    def test_cli_requires_approval_and_post_ledger_arguments_for_execution(self) -> None:
+        args = poster.parse_args([
+            "portfolio.json", "--quality-report", "quality.json", "--replay-integrity", "replay.json",
+            "--receipt", "receipt.json", "--expected-portfolio-sha256", "digest", "--execute",
+            "--approval-receipt", "approval-1", "--approval-events", "approvals.jsonl",
+            "--post-events", "posts.jsonl", "--period-manifest", "period.json",
+        ])
+
+        self.assertEqual("approval-1", args.approval_receipt)
+        self.assertEqual(Path("approvals.jsonl"), args.approval_events)
 
     def test_normalized_snapshot_digest_is_order_independent_and_covers_live_identity(self) -> None:
         entries = [
@@ -331,7 +549,7 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
                 ):
                     poster.run(args)
 
-    def test_run_retry_posts_only_unfulfilled_plan_after_interruption(self) -> None:
+    def test_run_resume_never_blindly_reposts_an_ambiguous_planned_entry(self) -> None:
         segments = [
             {"start": "2026-08-14T10:00:00Z", "end": "2026-08-14T10:10:00Z", "duration_minutes": 10},
             {"start": "2026-08-14T10:20:00Z", "end": "2026-08-14T10:30:00Z", "duration_minutes": 10},
@@ -339,11 +557,23 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             args = self._write_posting_fixture(Path(directory), allocation_segments=segments)
             args.execute = True
+            first_live = [self._clockify_entry(
+                "entry-first", "2026-08-14T10:00:00Z", "2026-08-14T10:10:00Z"
+            )]
+            readbacks = [[], first_live, first_live]
+
+            def paged(path: str, _api_key: str, *, timeout_seconds: int):
+                if path.startswith("/workspaces/workspace-1/projects"):
+                    return [{"id": "project-123456"}]
+                if path.startswith("/workspaces/workspace-1/tags"):
+                    return [{"id": "tag-654321"}]
+                return readbacks.pop(0)
+
             with (
                 mock.patch.object(poster, "load_env_file", return_value={
                     "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
                 }),
-                mock.patch.object(poster, "_paged", side_effect=self._paged_with_live([])),
+                mock.patch.object(poster, "_paged", side_effect=paged),
                 mock.patch.object(poster, "_request", side_effect=[
                     {"id": "entry-first"}, poster.PortfolioPostError("write uncertain"),
                 ]),
@@ -352,9 +582,6 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
                     poster.run(args)
             interrupted = json.loads(args.receipt.read_text(encoding="utf-8"))
 
-            first_live = [self._clockify_entry(
-                "entry-first", "2026-08-14T10:00:00Z", "2026-08-14T10:10:00Z"
-            )]
             with (
                 mock.patch.object(poster, "load_env_file", return_value={
                     "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
@@ -362,14 +589,13 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
                 mock.patch.object(poster, "_paged", side_effect=self._paged_with_live(first_live)),
                 mock.patch.object(poster, "_request", return_value={"id": "entry-second"}) as retry_post,
             ):
-                completed = poster.run(args)
+                with self.assertRaisesRegex(poster.PortfolioPostError, "refusing to repeat POST"):
+                    poster.run(args)
 
         self.assertEqual(["entry-first"], [
             item["clockify_entry_id"] for item in interrupted["created"]
         ])
-        self.assertEqual(1, retry_post.call_count)
-        self.assertEqual("complete", completed["status"])
-        self.assertEqual(2, len(completed["created"] + completed["already_existing"]))
+        retry_post.assert_not_called()
 
     def test_ambiguous_post_recovery_rejects_multiple_exact_live_entries(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
