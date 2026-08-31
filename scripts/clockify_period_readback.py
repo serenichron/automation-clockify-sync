@@ -229,8 +229,8 @@ def _inclusion_values(payload: Mapping[str, Any]) -> tuple[bool, bool]:
     running = _scope_value(payload, "include_running", "includeRunning")
     deleted = _scope_value(payload, "include_deleted", "includeDeleted")
     return (
-        _as_bool(running if running is not None else filters.get("include_running", filters.get("includeRunning")), "include_running"),
-        _as_bool(deleted if deleted is not None else filters.get("include_deleted", filters.get("includeDeleted")), "include_deleted"),
+        _as_bool(running if running is not None else filters.get("include_running", filters.get("includeRunning")), "include_running", False),
+        _as_bool(deleted if deleted is not None else filters.get("include_deleted", filters.get("includeDeleted")), "include_deleted", False),
     )
 
 
@@ -252,10 +252,13 @@ class ClockifyPeriodReadback:
     digest: str
     entry_durations: Mapping[str, int] | None = None
     schema_version: str = SCHEMA_VERSION
+    evidence_kind: str = "ledger"
+    request_receipt: Mapping[str, Any] | None = None
 
     def document(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
+            "evidence_kind": self.evidence_kind,
             "workspace_id": self.workspace_id,
             "member_id": self.member_id,
             "timezone": self.timezone,
@@ -272,6 +275,7 @@ class ClockifyPeriodReadback:
                 key: self.entry_durations[key] for key in self.entry_ids
             } if self.entry_durations else {},
             "native_costs": {key: str(value) for key, value in sorted(self.native_costs.items())},
+            **({"request_receipt": dict(self.request_receipt)} if self.request_receipt else {}),
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -345,6 +349,31 @@ def _normalize_summary(payload: Mapping[str, Any], zone: ZoneInfo) -> ClockifyPe
         entry_durations[entry_id] = seconds
     if entry_durations and set(entry_durations) != set(ids):
         raise ClockifyReadbackError("entry_durations must cover every entry ID")
+    explicit_kind = "evidence_kind" in payload
+    evidence_kind = payload.get("evidence_kind", "report" if "request_receipt" in payload or "entries" not in payload else "ledger")
+    if evidence_kind not in {"ledger", "report"}:
+        raise ClockifyReadbackError("evidence_kind must be ledger or report")
+    receipt = payload.get("request_receipt")
+    if explicit_kind and evidence_kind == "ledger":
+        if not ids or not entry_durations or set(entry_durations) != set(ids) or sum(entry_durations.values()) != seconds_raw or count_raw != len(ids):
+            raise ClockifyReadbackError("ledger entry_durations must cover every entry and sum to duration_seconds")
+    elif explicit_kind and evidence_kind == "report":
+        if not isinstance(receipt, Mapping):
+            raise ClockifyReadbackError("report request receipt is required")
+        if _text(receipt.get("workspace_id"), "report receipt workspace_id") != workspace or _text(receipt.get("member_id"), "report receipt member_id") != member or not _text(receipt.get("shared_report_id"), "report receipt shared_report_id"):
+            raise ClockifyReadbackError("report request receipt scope mismatch")
+        if _timestamp(receipt.get("period_start"), "report receipt period_start").astimezone(timezone.utc) != period_start.astimezone(timezone.utc) or _timestamp(receipt.get("period_end"), "report receipt period_end").astimezone(timezone.utc) != period_end.astimezone(timezone.utc):
+            raise ClockifyReadbackError("report request receipt period mismatch")
+        if _canonical(receipt.get("filters")) != _canonical(filters):
+            raise ClockifyReadbackError("report request receipt filter mismatch")
+        raw_digest = receipt.get("raw_response_digest")
+        if not isinstance(raw_digest, str) or not _DIGEST.fullmatch(raw_digest):
+            raise ClockifyReadbackError("report request receipt raw response digest is required")
+        raw_response = payload.get("raw_response")
+        if raw_response is not None and _digest(raw_response) != raw_digest:
+            raise ClockifyReadbackError("report raw response digest does not match receipt")
+        if not costs or any(not amount.is_finite() for amount in costs.values()):
+            raise ClockifyReadbackError("report native costs are required")
     unsigned = {
         "schema_version": SCHEMA_VERSION,
         "workspace_id": workspace, "member_id": member, "timezone": zone.key,
@@ -362,7 +391,7 @@ def _normalize_summary(payload: Mapping[str, Any], zone: ZoneInfo) -> ClockifyPe
     return ClockifyPeriodReadback(
         workspace, member, zone.key, period_start, period_end, filters, refreshed,
         include_running, include_deleted, ids, count_raw, seconds_raw, costs, digest,
-        entry_durations,
+        entry_durations, SCHEMA_VERSION, evidence_kind, dict(receipt) if isinstance(receipt, Mapping) else None,
     )
 
 
@@ -499,6 +528,8 @@ def verify_readback(
     """Require exact scope, freshness, entries, duration, and native costs."""
     api = normalize_readback(api_readback)
     report = normalize_readback(shared_report)
+    if api.evidence_kind != "ledger" or (report.request_receipt is not None and report.evidence_kind != "report"):
+        raise ClockifyReadbackError("evidence kind roles must be ledger and report")
     if (api.workspace_id, api.member_id) != (report.workspace_id, report.member_id):
         if api.member_id != report.member_id:
             raise ClockifyReadbackError("member mismatch between readbacks")
@@ -516,7 +547,7 @@ def verify_readback(
     delta = api.duration_seconds - report.duration_seconds
     if delta:
         raise ClockifyReadbackError(f"duration mismatch: {abs(delta)} seconds")
-    if dict(api.native_costs) != dict(report.native_costs):
+    if api.native_costs and report.native_costs and dict(api.native_costs) != dict(report.native_costs):
         raise ClockifyReadbackError("native currency totals mismatch")
     if post_receipt is not None:
         ids = _receipt_ids(post_receipt)
@@ -528,17 +559,17 @@ def verify_readback(
     return {
         "status": "verified", "api_digest": api.digest, "report_digest": report.digest,
         "entry_count": api.entry_count, "duration_seconds": api.duration_seconds,
-        "native_costs": {key: str(value) for key, value in sorted(api.native_costs.items())},
+        "native_costs": {key: str(value) for key, value in sorted(report.native_costs.items())},
     }
 
 
 class ClockifyApiGateway:
     """Read-only Clockify time-entry and Reports API adapter."""
 
-    def __init__(self, api_key: str, base_url: str = "https://api.clockify.me/api/v1", *, supports_inclusion_filters: bool = False):
+    def __init__(self, api_key: str, base_url: str = "https://api.clockify.me/api/v1", *, reports_base_url: str = "https://reports.api.clockify.me/v1"):
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
-        self._supports_inclusion_filters = supports_inclusion_filters
+        self._reports_base_url = reports_base_url.rstrip("/")
 
     def _get(self, path: str) -> Any:
         request = Request(self._base_url + path, headers={"X-Api-Key": self._api_key, "Content-Type": "application/json"}, method="GET")
@@ -550,7 +581,7 @@ class ClockifyApiGateway:
 
     def _post_report(self, path: str, payload: Mapping[str, Any]) -> Any:
         request = Request(
-            self._base_url + path,
+            self._reports_base_url + path,
             data=_canonical(payload).encode("utf-8"),
             headers={"X-Api-Key": self._api_key, "Content-Type": "application/json"},
             method="POST",
@@ -562,8 +593,8 @@ class ClockifyApiGateway:
             raise ClockifyReadbackError("Clockify report read-only request failed") from exc
 
     def read_period(self, *, workspace_id: str, member_id: str, start: datetime, end: datetime, filters: Mapping[str, Any]) -> ClockifyPeriodReadback:
-        if not self._supports_inclusion_filters and any(key in filters for key in ("include_running", "include_deleted")):
-            raise ClockifyReadbackError("running/deleted inclusion filters are not supported by this gateway")
+        if any(filters.get(key, False) is True for key in ("include_running", "include_deleted")):
+            raise ClockifyReadbackError("true running/deleted inclusion filters are not supported by this gateway")
         page_size = 200
         entries: list[Mapping[str, Any]] = []
         seen_ids: set[str] = set()
@@ -573,8 +604,7 @@ class ClockifyApiGateway:
             query = urlencode({
                 "start": start.isoformat(), "end": end.isoformat(),
                 "page-size": page_size, "page": page,
-                "include-running": str(bool(filters.get("include_running", True))).lower(),
-                "include-deleted": str(bool(filters.get("include_deleted", True))).lower(),
+                "include-running": "false", "include-deleted": "false",
             })
             response = self._get(f"/workspaces/{workspace_id}/user/{member_id}/time-entries?{query}")
             if isinstance(response, Mapping):
@@ -605,7 +635,7 @@ class ClockifyApiGateway:
         return normalize_readback({
             "workspace_id": workspace_id, "member_id": member_id, "timezone": str(filters.get("timezone", "Europe/Bucharest")),
             "period_start": start.isoformat(), "period_end": end.isoformat(), "filters": dict(filters),
-            "include_running": bool(filters.get("include_running", True)), "include_deleted": bool(filters.get("include_deleted", True)),
+            "include_running": False, "include_deleted": False,
             "refreshed_at": datetime.now(timezone.utc).isoformat(), "entries": entries,
         })
 
@@ -618,9 +648,31 @@ class ClockifyApiGateway:
             "sharedReportId": report_id,
         }
         result = self._post_report(f"/workspaces/{workspace_id}/reports/summary", payload)
-        if not isinstance(result, Mapping) or not (result.get("totals") or result.get("results") or result.get("native_costs")):
+        if not isinstance(result, Mapping) or not result.get("totals"):
             raise ClockifyReadbackError("shared report result is missing results")
-        return result
+        costs: dict[str, str] = {}
+        for total in result.get("totals", []):
+            if not isinstance(total, Mapping):
+                continue
+            for group in total.get("amounts", []):
+                if not isinstance(group, Mapping):
+                    continue
+                for item in group.get("amountByCurrency", []):
+                    if isinstance(item, Mapping) and item.get("currency") and item.get("amount") is not None:
+                        costs[str(item["currency"]).upper()] = format(Decimal(str(item["amount"])) / Decimal("100"), ".2f")
+        if not costs:
+            raise ClockifyReadbackError("shared report result is missing native costs")
+        receipt = {"workspace_id": workspace_id, "member_id": member_id,
+                   "period_start": _utc(start), "period_end": _utc(end),
+                   "filters": dict(filters), "shared_report_id": report_id,
+                   "raw_response_digest": _digest(result)}
+        return {"evidence_kind": "report", "workspace_id": workspace_id, "member_id": member_id,
+                "timezone": str(filters.get("timezone", "Europe/Bucharest")),
+                "period_start": _utc(start), "period_end": _utc(end), "filters": dict(filters),
+                "include_running": False, "include_deleted": False,
+                "refreshed_at": datetime.now(timezone.utc).isoformat(),
+                "entry_count": result.get("entriesCount"), "duration_seconds": result.get("totalTime"),
+                "native_costs": costs, "request_receipt": receipt, "raw_response": dict(result)}
 
 
 def _json(path: Path) -> Any:
@@ -694,7 +746,7 @@ def _capture(args: argparse.Namespace) -> int:
     if not isinstance(routing, Mapping):
         raise ClockifyReadbackError("routing must be an object")
     timezone_name, workspace, member, start, end = _period_args(args, routing)
-    filters = {"workspace_id": workspace, "member_id": member, "timezone": timezone_name, "include_running": True, "include_deleted": True}
+    filters = {"workspace_id": workspace, "member_id": member, "timezone": timezone_name, "include_running": False, "include_deleted": False}
     if args.api_fixture:
         api = normalize_readback(_json(args.api_fixture), timezone_name=timezone_name)
         if not workspace:
@@ -704,15 +756,12 @@ def _capture(args: argparse.Namespace) -> int:
         api_key = os.environ.get("CLOCKIFY_API_KEY")
         if not api_key:
             raise ClockifyReadbackError("Clockify API key is required for live read-only capture")
-        api = ClockifyApiGateway(
-            api_key,
-            supports_inclusion_filters=os.environ.get("CLOCKIFY_READBACK_SUPPORTS_INCLUSION_FILTERS") == "1",
-        ).read_period(workspace_id=workspace, member_id=member, start=start, end=end, filters=filters)
+        api = ClockifyApiGateway(api_key).read_period(workspace_id=workspace, member_id=member, start=start, end=end, filters=filters)
     if (api.workspace_id, api.member_id, api.timezone) != (workspace, member, timezone_name):
         raise ClockifyReadbackError("captured API scope does not match requested period")
     if api.period_start.astimezone(timezone.utc) != start.astimezone(timezone.utc) or api.period_end.astimezone(timezone.utc) != end.astimezone(timezone.utc):
         raise ClockifyReadbackError("captured API period does not match requested period")
-    if _canonical(dict(api.filters)) != _canonical(filters) or api.include_running is not True or api.include_deleted is not True:
+    if _canonical(dict(api.filters)) != _canonical(filters) or api.include_running is not False or api.include_deleted is not False:
         raise ClockifyReadbackError("captured API filters do not match requested filters")
     if args.report_fixture:
         report = normalize_readback(_json(args.report_fixture), timezone_name=timezone_name)
@@ -722,10 +771,7 @@ def _capture(args: argparse.Namespace) -> int:
         api_key = os.environ.get("CLOCKIFY_API_KEY")
         if not api_key:
             raise ClockifyReadbackError("Clockify API key is required for live read-only capture")
-        gateway = ClockifyApiGateway(
-            api_key,
-            supports_inclusion_filters=os.environ.get("CLOCKIFY_READBACK_SUPPORTS_INCLUSION_FILTERS") == "1",
-        )
+        gateway = ClockifyApiGateway(api_key)
         raw_report = gateway.read_report_result(
             report_id=args.shared_report_id, workspace_id=workspace, member_id=member,
             start=start, end=end, filters=filters,
@@ -733,9 +779,11 @@ def _capture(args: argparse.Namespace) -> int:
         report = normalize_readback(raw_report, timezone_name=timezone_name)
     if (report.workspace_id, report.member_id, report.timezone) != (workspace, member, timezone_name):
         raise ClockifyReadbackError("captured report scope does not match requested period")
+    if report.evidence_kind != "report" or not report.request_receipt or report.request_receipt.get("shared_report_id") != args.shared_report_id:
+        raise ClockifyReadbackError("captured report request receipt does not match requested report")
     if report.period_start.astimezone(timezone.utc) != start.astimezone(timezone.utc) or report.period_end.astimezone(timezone.utc) != end.astimezone(timezone.utc):
         raise ClockifyReadbackError("captured report period does not match requested period")
-    if _canonical(dict(report.filters)) != _canonical(filters) or report.include_running is not True or report.include_deleted is not True:
+    if _canonical(dict(report.filters)) != _canonical(filters) or report.include_running is not False or report.include_deleted is not False:
         raise ClockifyReadbackError("captured report filters do not match requested filters")
     _write(args.api_output, api.to_dict(), root=args.output_root)
     _write(args.report_output, report.to_dict(), root=args.output_root)

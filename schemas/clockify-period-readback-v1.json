@@ -5,13 +5,14 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "schema_version", "workspace_id", "member_id", "timezone",
+    "schema_version", "evidence_kind", "workspace_id", "member_id", "timezone",
     "period_start", "period_end", "filters", "refreshed_at",
     "include_running", "include_deleted", "entry_ids", "entry_count",
     "duration_seconds", "entry_durations", "native_costs", "digest"
   ],
   "properties": {
     "schema_version": {"const": "clockify-period-readback/v1"},
+    "evidence_kind": {"enum": ["ledger", "report"]},
     "workspace_id": {"type": "string", "minLength": 1},
     "member_id": {"type": "string", "minLength": 1},
     "timezone": {"type": "string", "minLength": 1},
@@ -34,6 +35,24 @@
       "propertyNames": {"pattern": "^[A-Z]{3}$"},
       "additionalProperties": {"type": "string", "pattern": "^-?[0-9]+(\\.[0-9]+)?$"}
     },
+    "request_receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workspace_id", "member_id", "period_start", "period_end", "filters", "shared_report_id", "raw_response_digest"],
+      "properties": {
+        "workspace_id": {"type": "string", "minLength": 1},
+        "member_id": {"type": "string", "minLength": 1},
+        "period_start": {"type": "string", "format": "date-time"},
+        "period_end": {"type": "string", "format": "date-time"},
+        "filters": {"type": "object"},
+        "shared_report_id": {"type": "string", "minLength": 1},
+        "raw_response_digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}
+      }
+    },
     "digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}
-  }
+  },
+  "allOf": [{
+    "if": {"properties": {"evidence_kind": {"const": "report"}}},
+    "then": {"required": ["request_receipt"]}
+  }]
 }

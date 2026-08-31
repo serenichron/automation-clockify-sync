@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from unittest import mock
 
 from scripts import clockify_period_readback as readback
@@ -74,8 +75,8 @@ def _report_from(api: dict, *, seconds: int | None = None, **changes: object) ->
         "period_start": api["period_start"],
         "period_end": api["period_end"],
         "filters": dict(api["filters"]),
-        "include_running": True,
-        "include_deleted": True,
+        "include_running": api.get("include_running", False),
+        "include_deleted": api.get("include_deleted", False),
         "refreshed_at": api["refreshed_at"],
         "entry_ids": [entry["id"] for entry in api["entries"]],
         "entry_count": 172,
@@ -238,6 +239,8 @@ class ClockifyReadbackCliTests(unittest.TestCase):
 
     def test_capture_fixture_is_read_only_and_writes_normalized_api(self):
         fixture = _api_fixture()
+        fixture["include_running"] = fixture["include_deleted"] = False
+        fixture["filters"]["include_running"] = fixture["filters"]["include_deleted"] = False
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "api-fixture.json"
             report_source = Path(directory) / "report-fixture.json"
@@ -245,7 +248,12 @@ class ClockifyReadbackCliTests(unittest.TestCase):
             report = Path(directory) / "report.json"
             routing = Path(directory) / "routing.json"
             source.write_text(json.dumps(fixture), encoding="utf-8")
-            report_source.write_text(json.dumps(_report_from(fixture)), encoding="utf-8")
+            report_document = _report_from(fixture)
+            report_document["evidence_kind"] = "report"
+            raw_response = {"entriesCount": 172, "totalTime": 132217, "totals": [{"amounts": [{"amountByCurrency": [{"currency": "USD", "amount": 98370}, {"currency": "EUR", "amount": 731}]}]}]}
+            report_document["raw_response"] = raw_response
+            report_document["request_receipt"] = {"workspace_id": "workspace-1", "member_id": "member-1", "period_start": START, "period_end": END, "filters": dict(fixture["filters"]), "shared_report_id": "report-1", "raw_response_digest": readback._digest(raw_response)}
+            report_source.write_text(json.dumps(report_document), encoding="utf-8")
             routing.write_text(json.dumps({"timezone": "Europe/Bucharest", "workspace_id": "workspace-1", "clockify_user_id": "member-1"}), encoding="utf-8")
             result = self._run(
                 "capture", "--routing", str(routing), "--timezone", "Europe/Bucharest",
@@ -312,8 +320,86 @@ class ClockifyReadbackCliTests(unittest.TestCase):
 
 
 class ClockifyGatewayTests(unittest.TestCase):
+    def test_gateway_uses_separate_reports_api_host(self):
+        gateway = readback.ClockifyApiGateway("fixture-key")
+        self.assertEqual("https://api.clockify.me/api/v1", gateway._base_url)
+        self.assertEqual("https://reports.api.clockify.me/v1", gateway._reports_base_url)
+
+    def test_true_inclusion_requests_are_rejected_without_environment_bypass(self):
+        gateway = readback.ClockifyApiGateway("fixture-key")
+        with self.assertRaisesRegex(readback.ClockifyReadbackError, "inclusion"):
+            gateway.read_period(
+                workspace_id="workspace-1", member_id="member-1",
+                start=datetime.fromisoformat(START), end=datetime.fromisoformat(END),
+                filters={"include_running": True, "include_deleted": True},
+            )
+
+    def test_realistic_report_result_parses_totals_and_cent_amounts(self):
+        gateway = readback.ClockifyApiGateway("fixture-key")
+        gateway._post_report = mock.Mock(return_value={
+            "entriesCount": 172,
+            "totalTime": 132217,
+            "totals": [{"amounts": [{"amountByCurrency": [
+                {"currency": "USD", "amount": 98370},
+                {"currency": "EUR", "amount": 731},
+            ]}]}],
+        })
+        result = gateway.read_report_result(
+            report_id="report-1", workspace_id="workspace-1", member_id="member-1",
+            start=datetime.fromisoformat(START), end=datetime.fromisoformat(END),
+            filters={"timezone": "Europe/Bucharest", "include_running": False, "include_deleted": False},
+        )
+        self.assertEqual("report", result["evidence_kind"])
+        self.assertEqual(172, result["entry_count"])
+        self.assertEqual("983.70", result["native_costs"]["USD"])
+        self.assertEqual("report-1", result["request_receipt"]["shared_report_id"])
+
+    def test_report_result_rejects_missing_costs(self):
+        gateway = readback.ClockifyApiGateway("fixture-key")
+        gateway._post_report = mock.Mock(return_value={"entriesCount": 1, "totalTime": 60, "totals": [{"amounts": []}]})
+        with self.assertRaisesRegex(readback.ClockifyReadbackError, "cost"):
+            gateway.read_report_result(
+                report_id="report-1", workspace_id="workspace-1", member_id="member-1",
+                start=datetime.fromisoformat(START), end=datetime.fromisoformat(END), filters={"include_running": False, "include_deleted": False},
+            )
+
+
+class ClockifyEvidenceKindTests(unittest.TestCase):
+    def test_ledger_requires_entry_durations_and_matching_sum(self):
+        ledger = _api_fixture()
+        ledger["evidence_kind"] = "ledger"
+        ledger.pop("native_costs")
+        ledger.pop("entries")
+        ledger["entry_ids"] = ["entry-1"]
+        ledger["entry_count"] = 1
+        ledger["duration_seconds"] = 60
+        with self.assertRaisesRegex(readback.ClockifyReadbackError, "entry_durations"):
+            readback.normalize_readback(ledger)
+
+    def test_report_receipt_digest_drift_fails_closed(self):
+        report = _report_from(_api_fixture())
+        report["evidence_kind"] = "report"
+        report["request_receipt"] = {"workspace_id": "workspace-1", "member_id": "member-1", "period_start": START, "period_end": END, "filters": dict(report["filters"]), "shared_report_id": "report-1", "raw_response_digest": "sha256:" + "0" * 64}
+        report["raw_response"] = {"entriesCount": 172, "totalTime": 132217, "totals": [{"amounts": [{"amountByCurrency": [{"currency": "USD", "amount": 98370}]}]}]}
+        with self.assertRaisesRegex(readback.ClockifyReadbackError, "digest"):
+            readback.normalize_readback(report)
+
+    def test_report_costs_verify_without_ledger_costs(self):
+        api = _api_fixture()
+        api.pop("native_costs")
+        report = _report_from(_api_fixture())
+        report["evidence_kind"] = "report"
+        report["request_receipt"] = {"workspace_id": "workspace-1", "member_id": "member-1", "period_start": START, "period_end": END, "filters": dict(report["filters"]), "shared_report_id": "report-1", "raw_response_digest": "sha256:" + "0" * 64}
+        verified = readback.verify_readback(api, report)
+        self.assertEqual({"USD": "983.70", "EUR": "7.31"}, verified["native_costs"])
+
+    def test_verify_requires_ledger_and_report_evidence_roles(self):
+        api = _api_fixture()
+        report = replace(readback.normalize_readback(_report_from(api)), evidence_kind="ledger", request_receipt={"shared_report_id": "report-1"})
+        with self.assertRaisesRegex(readback.ClockifyReadbackError, "evidence kind"):
+            readback.verify_readback(api, report)
     def test_period_gateway_paginates_beyond_two_hundred_and_stops_at_exhaustion(self):
-        gateway = readback.ClockifyApiGateway("fixture-key", supports_inclusion_filters=True)
+        gateway = readback.ClockifyApiGateway("fixture-key")
         def page_entry(index: int) -> dict:
             entry = {**_entry(index), "cost": None}
             entry["timeInterval"] = {"start": "2026-08-01T09:00:00+03:00", "end": "2026-08-01T09:10:00+03:00", "duration": 600}
@@ -323,21 +409,21 @@ class ClockifyGatewayTests(unittest.TestCase):
         result = gateway.read_period(
             workspace_id="workspace-1", member_id="member-1",
             start=datetime.fromisoformat(START), end=datetime.fromisoformat(END),
-            filters={"timezone": "Europe/Bucharest", "include_running": True, "include_deleted": True},
+            filters={"timezone": "Europe/Bucharest", "include_running": False, "include_deleted": False},
         )
         self.assertEqual(201, result.entry_count)
         self.assertEqual(3, gateway._get.call_count)
         self.assertLessEqual(gateway._get.call_args_list[0].args[0].count("page-size=200"), 1)
 
     def test_period_gateway_rejects_duplicate_page_ids(self):
-        gateway = readback.ClockifyApiGateway("fixture-key", supports_inclusion_filters=True)
+        gateway = readback.ClockifyApiGateway("fixture-key")
         page = [{**_entry(1), "cost": None, "timeInterval": {"start": "2026-08-01T09:00:00+03:00", "end": "2026-08-01T09:10:00+03:00", "duration": 600}}]
         gateway._get = mock.Mock(side_effect=[page, page])
         with self.assertRaisesRegex(readback.ClockifyReadbackError, "duplicate"):
             gateway.read_period(
             workspace_id="workspace-1", member_id="member-1",
             start=datetime.fromisoformat(START), end=datetime.fromisoformat(END),
-                filters={"timezone": "Europe/Bucharest", "include_running": True, "include_deleted": True},
+                filters={"timezone": "Europe/Bucharest", "include_running": False, "include_deleted": False},
             )
 
     def test_report_config_without_results_is_not_report_evidence(self):
