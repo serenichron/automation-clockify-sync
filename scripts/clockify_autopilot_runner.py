@@ -14,16 +14,17 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 from typing import Mapping
 
 try:
     from scripts import source_coverage
     from scripts import collector_receipts
+    from scripts.autopilot_process import ChildTimeoutConfig, run_child_bounded
 except ModuleNotFoundError:  # direct script execution
     import source_coverage  # type: ignore[no-redef]
     import collector_receipts  # type: ignore[no-redef]
+    from autopilot_process import ChildTimeoutConfig, run_child_bounded  # type: ignore[no-redef]
 
 
 SCHEMA_VERSION = "clockify-autopilot-runner/v1"
@@ -54,6 +55,30 @@ def _positive_int(environment: Mapping[str, str], name: str, default: int) -> in
     if value < 0:
         raise ConfigurationError(f"{name} must be non-negative")
     return value
+
+
+def _timeout_config(
+    environment: Mapping[str, str], *, has_coverage_debt: bool
+) -> ChildTimeoutConfig:
+    """Select the validated routine or backlog execution budget."""
+    slice_seconds = _positive_int(
+        environment, "CLOCKIFY_AUTOPILOT_SLICE_TIMEOUT_SECONDS", 2700
+    )
+    total_seconds = _positive_int(
+        environment, "CLOCKIFY_AUTOPILOT_TOTAL_TIMEOUT_SECONDS", 7200
+    )
+    grace_seconds = _positive_int(
+        environment, "CLOCKIFY_AUTOPILOT_TERMINATE_GRACE_SECONDS", 30
+    )
+    if not all((slice_seconds, total_seconds, grace_seconds)):
+        raise ConfigurationError("autopilot timeout values must be positive integers")
+    if total_seconds < slice_seconds:
+        raise ConfigurationError("autopilot total timeout must be at least the slice timeout")
+    budget = total_seconds if has_coverage_debt else slice_seconds
+    try:
+        return ChildTimeoutConfig(total_seconds=budget, grace_seconds=grace_seconds)
+    except ValueError as exc:
+        raise ConfigurationError("autopilot termination grace must be below its execution budget") from exc
 
 
 def _atomic_write(path: Path, value: Mapping[str, object]) -> None:
@@ -335,6 +360,7 @@ def run(environment: Mapping[str, str] | None = None) -> int:
         max_retries = _positive_int(
             environment, "CLOCKIFY_AUTOPILOT_MAX_COVERAGE_RETRIES", 2
         )
+        _timeout_config(environment, has_coverage_debt=False)
         if not (root / "scripts" / "clockify_review_run.py").is_file():
             raise ConfigurationError("Clockify review entrypoint is unavailable")
     except ConfigurationError as exc:
@@ -365,6 +391,9 @@ def run(environment: Mapping[str, str] | None = None) -> int:
             str(environment.get("CLOCKIFY_AUTOPILOT_SINCE") or "").strip() or None,
             coverage,
         )
+        timeout = _timeout_config(
+            environment, has_coverage_debt=bool(store.active())
+        )
         started_at = _iso_now()
         _atomic_write(status_path, {
             "schema_version": SCHEMA_VERSION,
@@ -373,13 +402,51 @@ def run(environment: Mapping[str, str] | None = None) -> int:
             "updated_at": started_at,
             "pid": os.getpid(),
         })
-        completed = subprocess.run(
+        completed = run_child_bounded(
             _command(environment, root, effective_since=effective_since),
             cwd=root,
-            text=True,
-            capture_output=True,
-            check=False,
+            timeout=timeout,
+            environment=dict(environment),
         )
+        if completed.timed_out:
+            attempted_at = _iso_now()
+            recorded_debt = []
+            for item in store.eligible(attempted_at):
+                if not item.resume_state_digest:
+                    continue
+                recorded_debt.append(store.record_failure(
+                    item.interval,
+                    failure_class="runner_timeout",
+                    retryable=True,
+                    resume_state_digest=item.resume_state_digest,
+                    attempted_at=attempted_at,
+                ))
+            for item in recorded_debt:
+                if item.retry_count > max_retries:
+                    store.exhaust(item.debt_id, terminal_reason="retry_limit")
+            coverage = store.document(migration_warnings=migration_warnings)
+            if recorded_debt:
+                source_coverage.write(coverage_path, coverage)
+            debt = source_coverage.active_debt(coverage)
+            debt_items = store.active()
+            retrying = bool(recorded_debt) and any(
+                item.retryable and item.status == "active" for item in debt_items
+            )
+            exit_code = TEMPORARY_COVERAGE_EXIT if retrying else 1
+            _atomic_write(status_path, {
+                "schema_version": SCHEMA_VERSION,
+                "state": "retry_scheduled" if retrying else "timeout_unresolved",
+                "started_at": started_at,
+                "updated_at": _iso_now(),
+                "exit_code": exit_code,
+                "reason": "owned review child timed out",
+                "timeout_seconds": timeout.total_seconds,
+                "coverage_debt": debt,
+                "coverage_debts": _debt_status(debt_items),
+                "coverage_state": str(coverage_path),
+                "effective_since": effective_since,
+            })
+            return exit_code
         try:
             result_paths = _result_paths(completed.stdout, root)
             results = []
@@ -476,8 +543,6 @@ def run(environment: Mapping[str, str] | None = None) -> int:
             "coverage_state": str(coverage_path),
             "effective_since": effective_since,
         })
-        if completed.stderr and exit_code not in {0, TEMPORARY_COVERAGE_EXIT}:
-            print(completed.stderr.strip()[:500], file=sys.stderr)
         return int(exit_code)
 
 

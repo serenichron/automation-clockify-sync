@@ -10,9 +10,14 @@ from unittest import mock
 from scripts import clockify_autopilot_runner as runner
 from scripts import clockify_review_run as review_run
 from scripts import collector_receipts, collector_slices, source_coverage
+from scripts.autopilot_process import ChildResult
 
 
 class AutopilotRunnerTests(unittest.TestCase):
+    @staticmethod
+    def child_result(command, returncode, stdout="", stderr=""):
+        return ChildResult(returncode, stdout, stderr, False, 0.01)
+
     def test_verified_bundle_resolves_only_matching_exact_active_debt(self):
         """Adjacent debt remains active when a verified bundle covers only its own slice."""
         with tempfile.TemporaryDirectory() as directory:
@@ -69,14 +74,19 @@ class AutopilotRunnerTests(unittest.TestCase):
             coverage_path = Path(directory) / "state" / "source-coverage.json"
             source_coverage.write(coverage_path, store.document())
             environment["CLOCKIFY_AUTOPILOT_COVERAGE_STATE"] = str(coverage_path)
-            completed = subprocess.CompletedProcess(["review"], 0, stdout=str(result) + "\n", stderr="")
+            completed = self.child_result(["review"], 0, stdout=str(result) + "\n", stderr="")
 
-            with mock.patch.object(runner.subprocess, "run", return_value=completed):
+            timed_out = ChildResult(None, "", "child stderr suppressed", True, 0.01)
+            with mock.patch.object(runner, "run_child_bounded", return_value=timed_out):
+                self.assertEqual(runner.TEMPORARY_COVERAGE_EXIT, runner.run(environment))
+            self.assertTrue((run_dir / "completion-bundle.json").is_file())
+
+            with mock.patch.object(runner, "run_child_bounded", return_value=completed):
                 self.assertEqual(0, runner.run(environment))
 
             resolved = source_coverage.SourceDebtStore.from_document(source_coverage.read(coverage_path))
             self.assertEqual((second.debt_id,), tuple(item.debt_id for item in resolved.active()))
-            with mock.patch.object(runner.subprocess, "run", return_value=completed):
+            with mock.patch.object(runner, "run_child_bounded", return_value=completed):
                 self.assertEqual(0, runner.run(environment))
             replayed = source_coverage.SourceDebtStore.from_document(source_coverage.read(coverage_path))
             self.assertEqual((second.debt_id,), tuple(item.debt_id for item in replayed.active()))
@@ -156,12 +166,12 @@ class AutopilotRunnerTests(unittest.TestCase):
             coverage_path = root / "state" / "source-coverage.json"
             source_coverage.write(coverage_path, debt_store.document())
             environment["CLOCKIFY_AUTOPILOT_COVERAGE_STATE"] = str(coverage_path)
-            completed = subprocess.CompletedProcess(
+            completed = self.child_result(
                 ["review"], 0, stdout=str(result) + "\n", stderr=""
             )
 
             with (
-                mock.patch.object(runner.subprocess, "run", return_value=completed),
+                mock.patch.object(runner, "run_child_bounded", return_value=completed),
                 mock.patch.object(runner.source_coverage, "write", side_effect=RuntimeError("interrupt")),
             ):
                 with self.assertRaisesRegex(RuntimeError, "interrupt"):
@@ -171,7 +181,7 @@ class AutopilotRunnerTests(unittest.TestCase):
             )
             self.assertEqual((interval.debt_id,), tuple(item.debt_id for item in interrupted.active()))
 
-            with mock.patch.object(runner.subprocess, "run", return_value=completed):
+            with mock.patch.object(runner, "run_child_bounded", return_value=completed):
                 self.assertEqual(0, runner.run(environment))
             recovered = source_coverage.SourceDebtStore.from_document(
                 source_coverage.read(coverage_path)
@@ -205,13 +215,98 @@ class AutopilotRunnerTests(unittest.TestCase):
         }
         return environment, result
 
+    @staticmethod
+    def record_active_debt(environment: dict[str, str]) -> source_coverage.SourceInterval:
+        interval = source_coverage.SourceInterval(
+            source="sessions/macbook",
+            since_utc="2026-08-01T00:00:00Z",
+            until_utc="2026-08-02T00:00:00Z",
+            slice_id="slice-timeout",
+            compatibility_version="source-debt/v1",
+        )
+        store = source_coverage.SourceDebtStore()
+        store.record_failure(
+            interval,
+            failure_class="coverage_incomplete",
+            retryable=True,
+            resume_state_digest="sha256:" + "a" * 64,
+            attempted_at="2026-08-02T00:00:00Z",
+        )
+        path = Path(environment["CLOCKIFY_AUTOPILOT_ROOT"]) / "state" / "source-coverage.json"
+        source_coverage.write(path, store.document())
+        environment["CLOCKIFY_AUTOPILOT_COVERAGE_STATE"] = str(path)
+        return interval
+
+    def test_routine_run_uses_slice_timeout_budget(self):
+        """Catches debt-free runs accidentally receiving the backlog budget."""
+        with tempfile.TemporaryDirectory() as directory:
+            environment, result = self.fixture(directory, "review_delta")
+            seen = []
+            completed = self.child_result(["review"], 0, stdout=str(result) + "\n")
+            with mock.patch.object(
+                runner,
+                "run_child_bounded",
+                side_effect=lambda *args, **kwargs: seen.append(kwargs["timeout"]) or completed,
+            ):
+                self.assertEqual(0, runner.run(environment))
+
+        self.assertEqual(2700, seen[0].total_seconds)
+        self.assertEqual(30, seen[0].grace_seconds)
+
+    def test_existing_coverage_debt_uses_total_timeout_budget(self):
+        """Catches backlog retries being stopped at the routine slice budget."""
+        with tempfile.TemporaryDirectory() as directory:
+            environment, result = self.fixture(directory, "review_delta")
+            self.record_active_debt(environment)
+            seen = []
+            completed = self.child_result(["review"], 0, stdout=str(result) + "\n")
+            with mock.patch.object(
+                runner,
+                "run_child_bounded",
+                side_effect=lambda *args, **kwargs: seen.append(kwargs["timeout"]) or completed,
+            ):
+                self.assertEqual(0, runner.run(environment))
+
+        self.assertEqual(7200, seen[0].total_seconds)
+
+    def test_invalid_timeout_configuration_blocks_before_child_spawn(self):
+        """Catches zero or inconsistent budgets reaching the review child."""
+        with tempfile.TemporaryDirectory() as directory:
+            environment, _result = self.fixture(directory, "review_delta")
+            environment["CLOCKIFY_AUTOPILOT_SLICE_TIMEOUT_SECONDS"] = "0"
+            spawned = []
+            with mock.patch.object(
+                runner,
+                "run_child_bounded",
+                side_effect=lambda *args, **kwargs: spawned.append(True),
+            ):
+                self.assertEqual(2, runner.run(environment))
+
+        self.assertEqual([], spawned)
+
+    def test_timeout_releases_lock_and_retains_exact_debt_for_resume(self):
+        """Catches timeout paths that retain the flock or fabricate a new interval."""
+        with tempfile.TemporaryDirectory() as directory:
+            environment, _result = self.fixture(directory, "review_delta")
+            interval = self.record_active_debt(environment)
+            timed_out = ChildResult(None, "", "child stderr suppressed", True, 0.01)
+            with mock.patch.object(runner, "run_child_bounded", return_value=timed_out):
+                self.assertEqual(runner.TEMPORARY_COVERAGE_EXIT, runner.run(environment))
+                self.assertEqual(1, runner.run(environment))
+            store = source_coverage.SourceDebtStore.from_document(
+                source_coverage.read(Path(environment["CLOCKIFY_AUTOPILOT_COVERAGE_STATE"]))
+            )
+
+        self.assertEqual((interval.debt_id,), tuple(item.debt_id for item in store.active()))
+        self.assertEqual(3, store.active()[0].retry_count)
+
     def test_complete_run_records_compact_status(self):
         with tempfile.TemporaryDirectory() as directory:
             environment, result = self.fixture(directory, "review_delta")
-            completed = subprocess.CompletedProcess(
+            completed = self.child_result(
                 ["review"], 0, stdout=str(result) + "\n", stderr=""
             )
-            with mock.patch.object(runner.subprocess, "run", return_value=completed):
+            with mock.patch.object(runner, "run_child_bounded", return_value=completed):
                 self.assertEqual(0, runner.run(environment))
             status = json.loads(Path(environment["CLOCKIFY_AUTOPILOT_STATUS"]).read_text())
         self.assertEqual("complete", status["state"])
@@ -233,10 +328,10 @@ class AutopilotRunnerTests(unittest.TestCase):
                 "date_range": {"since": "2026-08-02T00:00:00Z", "until": "2026-08-03T00:00:00Z"},
                 "source_completeness": {"status": "complete", "incomplete_sources": []},
             }) + "\n")
-            completed = subprocess.CompletedProcess(
+            completed = self.child_result(
                 ["review"], 2, stdout=f"{first}\n{second}\n", stderr="later slice incomplete"
             )
-            with mock.patch.object(runner.subprocess, "run", return_value=completed):
+            with mock.patch.object(runner, "run_child_bounded", return_value=completed):
                 self.assertEqual(
                     runner.TEMPORARY_COVERAGE_EXIT,
                     runner.run(environment),
@@ -271,10 +366,10 @@ class AutopilotRunnerTests(unittest.TestCase):
                     "incomplete_sources": ["sessions/macbook"],
                 },
             }) + "\n")
-            completed = subprocess.CompletedProcess(
+            completed = self.child_result(
                 ["review"], 2, stdout=f"{first}\n{second}\n", stderr="collection incomplete"
             )
-            with mock.patch.object(runner.subprocess, "run", return_value=completed):
+            with mock.patch.object(runner, "run_child_bounded", return_value=completed):
                 self.assertEqual(2, runner.run(environment))
             status = json.loads(Path(environment["CLOCKIFY_AUTOPILOT_STATUS"]).read_text())
 
@@ -300,10 +395,10 @@ class AutopilotRunnerTests(unittest.TestCase):
                 "coverage_warning",
                 date_range={"since": "2026-08-01T00:00:00Z", "until": "2026-08-02T00:00:00Z"},
             )
-            completed = subprocess.CompletedProcess(
+            completed = self.child_result(
                 ["review"], 0, stdout=str(result) + "\n", stderr=""
             )
-            with mock.patch.object(runner.subprocess, "run", return_value=completed):
+            with mock.patch.object(runner, "run_child_bounded", return_value=completed):
                 self.assertEqual(runner.TEMPORARY_COVERAGE_EXIT, runner.run(environment))
                 self.assertEqual(runner.TEMPORARY_COVERAGE_EXIT, runner.run(environment))
                 self.assertEqual(0, runner.run(environment))
@@ -323,10 +418,10 @@ class AutopilotRunnerTests(unittest.TestCase):
                     "incomplete_sources": ["sessions/macbook"],
                 },
             )
-            completed = subprocess.CompletedProcess(
+            completed = self.child_result(
                 ["review"], 0, stdout=str(result) + "\n", stderr=""
             )
-            with mock.patch.object(runner.subprocess, "run", return_value=completed):
+            with mock.patch.object(runner, "run_child_bounded", return_value=completed):
                 self.assertEqual(runner.TEMPORARY_COVERAGE_EXIT, runner.run(environment))
                 result.write_text(json.dumps({
                     "action": "coverage_warning",
@@ -353,10 +448,10 @@ class AutopilotRunnerTests(unittest.TestCase):
                     "incomplete_sources": ["sessions/macbook"],
                 },
             )
-            completed = subprocess.CompletedProcess(
+            completed = self.child_result(
                 ["review"], 0, stdout=str(result) + "\n", stderr=""
             )
-            with mock.patch.object(runner.subprocess, "run", return_value=completed):
+            with mock.patch.object(runner, "run_child_bounded", return_value=completed):
                 self.assertEqual(2, runner.run(environment))
             status = json.loads(Path(environment["CLOCKIFY_AUTOPILOT_STATUS"]).read_text())
 
@@ -376,10 +471,10 @@ class AutopilotRunnerTests(unittest.TestCase):
                     "incomplete_sources": ["sessions/macbook"],
                 },
             )
-            completed = subprocess.CompletedProcess(
+            completed = self.child_result(
                 ["review"], 0, stdout=str(result) + "\n", stderr=""
             )
-            with mock.patch.object(runner.subprocess, "run", return_value=completed):
+            with mock.patch.object(runner, "run_child_bounded", return_value=completed):
                 self.assertEqual(2, runner.run(environment))
             status = json.loads(Path(environment["CLOCKIFY_AUTOPILOT_STATUS"]).read_text())
 
@@ -393,10 +488,10 @@ class AutopilotRunnerTests(unittest.TestCase):
                 "coverage_warning",
                 date_range={"since": "2026-08-01T00:00:00Z", "until": "2026-08-02T00:00:00Z"},
             )
-            completed = subprocess.CompletedProcess(
+            completed = self.child_result(
                 ["review"], 0, stdout=str(result) + "\n", stderr=""
             )
-            with mock.patch.object(runner.subprocess, "run", return_value=completed):
+            with mock.patch.object(runner, "run_child_bounded", return_value=completed):
                 runner.run(environment)
                 runner.run(environment)
                 self.assertEqual(0, runner.run(environment))
@@ -431,11 +526,11 @@ class AutopilotRunnerTests(unittest.TestCase):
                     },
                 }},
             }))
-            completed = subprocess.CompletedProcess(
+            completed = self.child_result(
                 ["review"], 0, stdout=str(result) + "\n", stderr=""
             )
             with mock.patch.object(
-                runner.subprocess, "run", return_value=completed
+                runner, "run_child_bounded", return_value=completed
             ) as invoked:
                 runner.run(environment)
 
@@ -460,10 +555,10 @@ class AutopilotRunnerTests(unittest.TestCase):
                 },
             )
             environment["CLOCKIFY_AUTOPILOT_COORDINATOR"] = "omarchy-precision"
-            completed = subprocess.CompletedProcess(
+            completed = self.child_result(
                 ["review"], 2, stdout=str(result) + "\n", stderr="coverage incomplete"
             )
-            with mock.patch.object(runner.subprocess, "run", return_value=completed):
+            with mock.patch.object(runner, "run_child_bounded", return_value=completed):
                 self.assertEqual(runner.TEMPORARY_COVERAGE_EXIT, runner.run(environment))
             status = json.loads(Path(environment["CLOCKIFY_AUTOPILOT_STATUS"]).read_text())
         self.assertEqual("retry_scheduled", status["state"])
@@ -480,10 +575,10 @@ class AutopilotRunnerTests(unittest.TestCase):
                 },
             )
             environment["CLOCKIFY_AUTOPILOT_COORDINATOR"] = "omarchy-precision"
-            completed = subprocess.CompletedProcess(
+            completed = self.child_result(
                 ["review"], 2, stdout=str(result) + "\n", stderr="coverage incomplete"
             )
-            with mock.patch.object(runner.subprocess, "run", return_value=completed):
+            with mock.patch.object(runner, "run_child_bounded", return_value=completed):
                 self.assertEqual(2, runner.run(environment))
             status = json.loads(Path(environment["CLOCKIFY_AUTOPILOT_STATUS"]).read_text())
         self.assertEqual("blocked", status["state"])
@@ -492,10 +587,10 @@ class AutopilotRunnerTests(unittest.TestCase):
     def test_mark_reported_accepts_only_current_result(self):
         with tempfile.TemporaryDirectory() as directory:
             environment, result = self.fixture(directory, "review_delta")
-            completed = subprocess.CompletedProcess(
+            completed = self.child_result(
                 ["review"], 0, stdout=str(result) + "\n", stderr=""
             )
-            with mock.patch.object(runner.subprocess, "run", return_value=completed):
+            with mock.patch.object(runner, "run_child_bounded", return_value=completed):
                 self.assertEqual(0, runner.run(environment))
             self.assertEqual(0, runner.mark_reported(environment, result))
             status = json.loads(Path(environment["CLOCKIFY_AUTOPILOT_STATUS"]).read_text())
