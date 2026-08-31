@@ -1,0 +1,23 @@
+{
+  "scenario": "routine-two-day",
+  "period": {
+    "member_id": "member-routine",
+    "workspace_id": "workspace-routine",
+    "timezone": "Europe/Bucharest",
+    "since_utc": "2026-08-01T00:00:00Z",
+    "until_utc": "2026-08-03T00:00:00Z",
+    "revision": 1
+  },
+  "slices": [
+    {
+      "slice_id": "routine-two-day-1",
+      "since_utc": "2026-08-01T00:00:00Z",
+      "until_utc": "2026-08-03T00:00:00Z",
+      "source_coverage": "complete",
+      "completion": "verified"
+    }
+  ],
+  "source_debt": [],
+  "timeout": {"slice_seconds": 2700, "total_seconds": 10800, "grace_seconds": 30},
+  "publication": "deferred"
+}

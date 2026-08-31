@@ -21,12 +21,13 @@ from typing import Any
 
 try:
     from scripts import clockify_sync_collect, review_acceptance, semantic_analyzer
-    from scripts import collector_receipts
+    from scripts import collector_receipts, reconciliation_manifest
 except ModuleNotFoundError:  # direct script execution
     import clockify_sync_collect  # type: ignore[no-redef]
     import review_acceptance  # type: ignore[no-redef]
     import semantic_analyzer  # type: ignore[no-redef]
     import collector_receipts  # type: ignore[no-redef]
+    import reconciliation_manifest  # type: ignore[no-redef]
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,6 +37,18 @@ DEFAULT_STATE = ROOT / "state" / "review-items.json"
 DEFAULT_CORRECTIONS = ROOT / "state" / "review-corrections.jsonl"
 DEFAULT_ACCEPTANCE_LEDGER = ROOT / "state" / "review-acceptance.jsonl"
 REVIEW_MODES = {"shadow_all", "exceptions_only"}
+_RECONCILIATION_INPUTS = {
+    "period_manifest": "period-manifest.json",
+    "routing": "routing.json",
+    "corrections": "review-corrections.jsonl",
+    "acceptance": "review-acceptance.jsonl",
+}
+_CANONICAL_MEETING_RECONCILIATION = "fathom-reconciliation.json"
+_COMPLETION_BUNDLE_SCHEMA = "collector-completion-bundle/v1"
+
+
+class ReviewRunError(ValueError):
+    """A replay cannot prove that its reconciliation inputs are identical."""
 
 
 def _read_json(path: Path) -> Any:
@@ -500,6 +513,120 @@ def _accounting_identity(run_dir: Path) -> dict[str, str]:
     return {"file_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
 
+def _file_sha256(path: Path, *, label: str) -> str:
+    path = Path(path)
+    if not path.is_file() or path.is_symlink():
+        raise ReviewRunError(f"{label} is missing or unsafe")
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _reconciliation_binding(
+    run_dir: Path,
+    *,
+    period_manifest: Path,
+    routing: Path,
+    corrections: Path,
+    acceptance: Path,
+) -> dict[str, str]:
+    """Return only stable identities required to replay a reconciled period.
+
+    The period manifest names every completed slice.  We validate its artifact
+    references and each completion bundle before emitting digests, so neither
+    raw artifact paths nor source evidence reach the replay receipt.
+    """
+    run_dir = Path(run_dir).resolve()
+    if not run_dir.is_dir() or run_dir.is_symlink():
+        raise ReviewRunError("reconciliation run is missing or unsafe")
+    inputs = {
+        "period_manifest": Path(period_manifest), "routing": Path(routing),
+        "corrections": Path(corrections), "acceptance": Path(acceptance),
+    }
+    digests = {
+        name: _file_sha256(path, label=f"reconciliation {name.replace('_', ' ')}")
+        for name, path in inputs.items()
+    }
+    try:
+        manifest_document = _read_json(inputs["period_manifest"])
+        manifest = reconciliation_manifest.ReconciliationManifest.from_document(
+            manifest_document
+        )
+    except (
+        OSError, json.JSONDecodeError, reconciliation_manifest.ManifestError,
+    ) as exc:
+        raise ReviewRunError("reconciliation period manifest is invalid") from exc
+
+    bundle_records: list[dict[str, str]] = []
+    for reference in manifest.artifacts:
+        if reference["schema_version"] != _COMPLETION_BUNDLE_SCHEMA:
+            continue
+        try:
+            bundle_path = Path(str(reference["path"]))
+            if _file_sha256(bundle_path, label="reconciliation completion bundle") != reference["digest"]:
+                raise ReviewRunError("reconciliation completion bundle artifact differs from its manifest")
+            bundle = collector_receipts.load_completion_bundle(
+                bundle_path, run_dir=bundle_path.parent,
+            )
+        except (OSError, ValueError, collector_receipts.CollectorReceiptError) as exc:
+            raise ReviewRunError("reconciliation completion bundle is invalid") from exc
+        bundle_records.append({
+            "slice_id": bundle.slice_id,
+            "since_utc": bundle.since_utc,
+            "until_utc": bundle.until_utc,
+            "bundle_digest": bundle.bundle_digest,
+            "artifact_sha256": str(reference["digest"]),
+        })
+    if not bundle_records:
+        raise ReviewRunError("reconciliation period manifest has no completion bundles")
+    if len({record["slice_id"] for record in bundle_records}) != len(bundle_records):
+        raise ReviewRunError("reconciliation period manifest repeats a completion bundle slice")
+
+    meeting_path = run_dir / _CANONICAL_MEETING_RECONCILIATION
+    meeting_digest = _file_sha256(
+        meeting_path, label="canonical meeting reconciliation"
+    )
+    try:
+        meeting = _read_json(meeting_path)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ReviewRunError("canonical meeting reconciliation is invalid") from exc
+    if not isinstance(meeting, list):
+        raise ReviewRunError("canonical meeting reconciliation must be a list")
+
+    manifest_identity = {
+        "schema_version": manifest_document["schema_version"],
+        "compatibility_version": manifest_document["compatibility_version"],
+        "period": manifest_document["period"],
+        "state": manifest_document["state"],
+        "event_count": manifest_document["event_count"],
+        "events_digest": manifest_document["events_digest"],
+        "artifacts": [
+            {
+                "schema_version": reference["schema_version"],
+                "compatibility_version": reference["compatibility_version"],
+                "digest": reference["digest"],
+            }
+            for reference in manifest.artifacts
+        ],
+        "blockers": manifest_document["blockers"],
+    }
+    bundle_digest = "sha256:" + hashlib.sha256(
+        json.dumps(bundle_records, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        "period_manifest_sha256": "sha256:" + hashlib.sha256(
+            json.dumps(manifest_identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+        "period_id": manifest.identity.period_id,
+        "period_revision": str(manifest.identity.revision),
+        "period_events_digest": manifest.events_digest,
+        "routing_sha256": digests["routing"],
+        "corrections_sha256": digests["corrections"],
+        "acceptance_sha256": digests["acceptance"],
+        "canonical_meeting_reconciliation_sha256": meeting_digest,
+        "slice_completion_bundle_count": str(len(bundle_records)),
+        "slice_completion_bundles_sha256": bundle_digest,
+    }
+
+
 def _prepare_replay_run(source: Path) -> Path:
     """Create a distinct run with immutable ledger and semantic fixture copies."""
     source = _run_child(source, label="replay source")
@@ -528,6 +655,10 @@ def _prepare_replay_run(source: Path) -> Path:
         fixture_path = target / "replay-fixture" / "semantic-analysis.json"
         fixture_path.parent.mkdir(parents=True)
         shutil.copyfile(source_analysis_path, fixture_path)
+        for filename in (*_RECONCILIATION_INPUTS.values(), _CANONICAL_MEETING_RECONCILIATION):
+            source_path = source / filename
+            if source_path.is_file() and not source_path.is_symlink():
+                shutil.copyfile(source_path, target / filename)
         report = _read_json(source / "run-report.json")
         if not isinstance(report, dict):
             raise ValueError("replay source run report must be an object")
@@ -741,6 +872,19 @@ def _verify_replay_integrity(source: Path, replay: Path) -> dict[str, Any]:
         failures.append("semantic evidence bundle manifest differs")
     if source_accounting_identity != replay_accounting_identity:
         failures.append("work accounting result differs")
+    source_reconciliation_binding: dict[str, str] | None = None
+    replay_reconciliation_binding: dict[str, str] | None = None
+    if not failures:
+        source_reconciliation_binding = _reconciliation_binding(
+            source,
+            **{name: source / filename for name, filename in _RECONCILIATION_INPUTS.items()},
+        )
+        replay_reconciliation_binding = _reconciliation_binding(
+            replay,
+            **{name: replay / filename for name, filename in _RECONCILIATION_INPUTS.items()},
+        )
+        if source_reconciliation_binding != replay_reconciliation_binding:
+            failures.append("reconciliation period binding differs")
     report: dict[str, Any] = {
         "schema_version": 1,
         "status": "pass" if not failures else "blocked",
@@ -752,6 +896,7 @@ def _verify_replay_integrity(source: Path, replay: Path) -> dict[str, Any]:
         "analyzer_cache_records": replay_cache_records,
         "evidence_bundle_manifest": replay_bundle_identity,
         "work_accounting_result": replay_accounting_identity,
+        "reconciliation_binding": replay_reconciliation_binding,
         "failures": failures,
     }
     report["integrity_digest"] = "sha256:" + hashlib.sha256(

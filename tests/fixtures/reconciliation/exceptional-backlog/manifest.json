@@ -1,0 +1,21 @@
+{
+  "scenario": "exceptional-backlog",
+  "period": {
+    "member_id": "member-exceptional",
+    "workspace_id": "workspace-exceptional",
+    "timezone": "Europe/Bucharest",
+    "since_utc": "2026-08-01T00:00:00Z",
+    "until_utc": "2026-08-05T00:00:00Z",
+    "revision": 2
+  },
+  "slices": [
+    {"slice_id": "exceptional-1", "since_utc": "2026-08-01T00:00:00Z", "until_utc": "2026-08-03T00:00:00Z", "completion": "reused_after_timeout"},
+    {"slice_id": "exceptional-2", "since_utc": "2026-08-03T00:00:00Z", "until_utc": "2026-08-05T00:00:00Z", "completion": "verified"}
+  ],
+  "source_debt": [
+    {"source": "sessions/macbook", "slice_id": "exceptional-1", "failure_class": "offline", "retryable": true, "retry_count": 1, "resolution": "verified_exact_bundle"},
+    {"source": "repositories/omarchy-desktop", "slice_id": "exceptional-2", "failure_class": "desktop_limited", "retryable": false, "approval_id": "desktop-limitation-1", "resolution": "approved_limitation_no_invented_time"}
+  ],
+  "timeout": {"slice_seconds": 2700, "total_seconds": 10800, "grace_seconds": 30},
+  "publication": "deferred"
+}

@@ -1,11 +1,18 @@
 import copy
+import datetime as dt
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
 import tempfile
 import unittest
 
-from scripts import meeting_reconciliation
+from scripts import (
+    clockify_sync_collect,
+    collector_receipts,
+    meeting_reconciliation,
+    reconciliation_manifest,
+)
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "clockify_portfolio_replay.py"
@@ -31,8 +38,41 @@ class PortfolioReplayTests(unittest.TestCase):
             },
             "proposals.json": [{"id": "P001"}],
             "fathom-reconciliation.json": [],
+            "quality_report.json": {"status": "pass"},
+            "review-snapshot.json": {"summary": {}},
+            "run-report.json": {
+                "runtime_identity": {"git_sha": "fixture"},
+                "date_range": {
+                    "since": "2026-08-01T00:00:00Z",
+                    "until": "2026-08-02T00:00:00Z",
+                },
+                "evidence_ledger": {
+                    "source_completeness": {"status": "complete", "incomplete_sources": []},
+                },
+            },
         }.items():
             write(run / relative, value)
+        ledger = json.loads((run / "evidence/evidence-ledger.json").read_text(encoding="utf-8"))
+        ledger["manifest"]["source_completeness"] = {
+            "status": "complete", "incomplete_sources": [],
+        }
+        write(run / "evidence/evidence-ledger.json", ledger)
+        slice_ = clockify_sync_collect.plan_slices(
+            dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc),
+            dt.datetime(2026, 8, 2, tzinfo=dt.timezone.utc),
+            zone=clockify_sync_collect.BUCHAREST,
+        )[0]
+        slice_run = root / "completed-slice"
+        for relative in (
+            "evidence/evidence-ledger.json", "semantic-analysis.json",
+            "work-accounting-result.json", "quality_report.json",
+            "review-snapshot.json", "run-report.json",
+        ):
+            destination = slice_run / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes((run / relative).read_bytes())
+        bundle = collector_receipts.build_completion_bundle(slice_run, slice_=slice_)
+        collector_receipts.write_completion_bundle(slice_run / "completion-bundle.json", bundle)
         paths = {"run_dir": run}
         for name, value in {
             "review": {"model": "deepseek-v4-flash:cloud", "revision": "rev", "activities": []},
@@ -43,6 +83,34 @@ class PortfolioReplayTests(unittest.TestCase):
             path = root / f"{name}.json"
             write(path, value)
             paths[name] = path
+        manifest = {
+            "schema_version": reconciliation_manifest.MANIFEST_COMPATIBILITY_VERSION,
+            "compatibility_version": reconciliation_manifest.MANIFEST_COMPATIBILITY_VERSION,
+            "period": {
+                "compatibility_version": reconciliation_manifest.PERIOD_COMPATIBILITY_VERSION,
+                "member_id": "member-fixture", "workspace_id": "workspace-fixture",
+                "timezone": "Europe/Bucharest", "since_utc": "2026-08-01T00:00:00Z",
+                "until_utc": "2026-08-02T00:00:00Z", "revision": 1,
+            },
+            "state": "reconciling", "event_count": 2,
+            "events_digest": "sha256:" + "d" * 64,
+            "artifacts": [{
+                "path": str((slice_run / "completion-bundle.json").resolve()),
+                "schema_version": "collector-completion-bundle/v1",
+                "compatibility_version": "collector-completion-bundle/v1",
+                "digest": "sha256:" + hashlib.sha256((slice_run / "completion-bundle.json").read_bytes()).hexdigest(),
+            }],
+            "blockers": [],
+        }
+        manifest["manifest_digest"] = "sha256:" + hashlib.sha256(
+            json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        paths["period_manifest"] = root / "period-manifest.json"
+        paths["corrections"] = root / "review-corrections.jsonl"
+        paths["acceptance"] = root / "review-acceptance.jsonl"
+        write(paths["period_manifest"], manifest)
+        paths["corrections"].write_text("", encoding="utf-8")
+        paths["acceptance"].write_text("", encoding="utf-8")
         return paths
 
     def recording_ledger(self, *, local_minute=False):
@@ -95,6 +163,16 @@ class PortfolioReplayTests(unittest.TestCase):
             with self.assertRaisesRegex(replay.PortfolioReplayError, "identity differs"):
                 replay.verify(seal, **paths)
             self.assertFalse((root / "portfolio-replay-integrity.json").exists())
+
+    def test_portfolio_replay_rejects_a_bound_routing_snapshot_change(self):
+        """Catches a portfolio seal that omits reconciliation replay binding."""
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self.fixture(Path(tmp))
+            sealed = replay.seal(**paths)
+            write(paths["routing"], {"session_routes": [{"pattern": "changed"}], "meeting_routes": []})
+
+            with self.assertRaisesRegex(replay.PortfolioReplayError, "identity differs"):
+                replay.verify(sealed, **paths)
 
     def test_replay_rejects_dedup_algorithm_or_tolerance_drift(self):
         with tempfile.TemporaryDirectory() as tmp:

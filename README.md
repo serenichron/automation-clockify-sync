@@ -156,6 +156,29 @@ Outputs:
 - `state/review-acceptance.jsonl`: integrity-linked shadow/guarded period
   evidence controlling exceptions-only eligibility, intentionally ignored by Git.
 
+### Reconciliation resilience and replay binding
+
+The period coordinator keeps its manifest and append-only event history at the
+operator-selected local period paths; neither belongs in evidence output or a
+public report. A period uses half-open UTC intervals. Source debt is therefore
+one exact `(source, since, until, slice)` identity: completing an adjacent or
+broader interval never clears it. Retryable failures retain a sanitized receipt
+(identity digests, class, retryability, and time only); credentials, cursors,
+and raw evidence are never retained.
+
+Each completed slice retains `completion-bundle.json`, which verifies all
+downstream artifacts before a backlog/debt entry may be reused. The bounded
+runner defaults to a 2,700-second slice timeout, a 10,800-second backlog total,
+and a 30-second termination grace; environment configuration may tighten or
+extend those documented budgets. A replay binds the normalized period/revision
+and event digest, routing snapshot, correction and acceptance journals,
+canonical meeting reconciliation, and ordered completion-bundle identities.
+Missing, extra, reordered, or drifted bundles fail closed. Portfolio replay
+sealing now requires `--period-manifest`, `--corrections`, and `--acceptance`
+in addition to its existing inputs; this is intentionally pre-release
+backward-incompatible. Publication remains deferred to its separate approved
+gate and is never performed by collection or replay.
+
 Flash analysis and a separate Flash reviewer own semantic classification,
 project/task recommendations, consolidation boundaries, effort judgment, and
 human-readable wording. Deterministic code owns evidence identity, exact taxonomy

@@ -17,9 +17,10 @@ import sys
 from typing import Any, Mapping
 
 try:
-    from scripts import clockify_portfolio_quality, meeting_reconciliation
+    from scripts import clockify_portfolio_quality, clockify_review_run, meeting_reconciliation
 except ImportError:  # pragma: no cover - direct execution fallback
     import clockify_portfolio_quality  # type: ignore[no-redef]
+    import clockify_review_run  # type: ignore[no-redef]
     import meeting_reconciliation  # type: ignore[no-redef]
 
 
@@ -184,6 +185,7 @@ def _meeting_identity(
 
 def _identity(
     *, run_dir: Path, review: Path, repair: Path, quality: Path, routing: Path,
+    period_manifest: Path, corrections: Path, acceptance: Path,
     derive_meetings: bool = True,
 ) -> dict[str, Any]:
     run_dir = run_dir.resolve()
@@ -223,6 +225,13 @@ def _identity(
         "artifacts": artifact_digests,
         "cache_decisions": _cache_decisions(analysis),
         "model_revision": _normal(model_revision),
+        "reconciliation_binding": clockify_review_run._reconciliation_binding(
+            run_dir,
+            period_manifest=period_manifest,
+            routing=routing,
+            corrections=corrections,
+            acceptance=acceptance,
+        ),
         **_meeting_identity(
             accounting_document,
             documents["fathom_reconciliation"],
@@ -232,19 +241,30 @@ def _identity(
     }
 
 
-def seal(*, run_dir: Path, review: Path, repair: Path, quality: Path, routing: Path) -> dict[str, Any]:
-    identity = _identity(run_dir=run_dir, review=review, repair=repair, quality=quality, routing=routing)
+def seal(
+    *, run_dir: Path, review: Path, repair: Path, quality: Path, routing: Path,
+    period_manifest: Path, corrections: Path, acceptance: Path,
+) -> dict[str, Any]:
+    identity = _identity(
+        run_dir=run_dir, review=review, repair=repair, quality=quality, routing=routing,
+        period_manifest=period_manifest, corrections=corrections, acceptance=acceptance,
+    )
     return {"schema_version": 1, "status": "sealed", "identity": identity, "seal_digest": _digest(identity)}
 
 
-def verify(sealed: Mapping[str, Any], *, run_dir: Path, review: Path, repair: Path, quality: Path, routing: Path) -> dict[str, Any]:
+def verify(
+    sealed: Mapping[str, Any], *, run_dir: Path, review: Path, repair: Path,
+    quality: Path, routing: Path, period_manifest: Path, corrections: Path,
+    acceptance: Path,
+) -> dict[str, Any]:
     if sealed.get("status") != "sealed" or not isinstance(sealed.get("identity"), Mapping):
         raise PortfolioReplayError("invalid portfolio replay seal")
     sealed_identity = sealed["identity"]
     if not _MEETING_IDENTITY_FIELDS.issubset(sealed_identity):
         candidate = _identity(
             run_dir=run_dir, review=review, repair=repair, quality=quality,
-            routing=routing, derive_meetings=False,
+            routing=routing, period_manifest=period_manifest, corrections=corrections,
+            acceptance=acceptance, derive_meetings=False,
         )
         # A v1 Fathom-only seal was already immutable at the artifact layer.
         # Compare exactly the fields it knew, preserving read-only replay.
@@ -254,7 +274,11 @@ def verify(sealed: Mapping[str, Any], *, run_dir: Path, review: Path, repair: Pa
         }
         candidate["schema_version"] = sealed_identity.get("schema_version")
     else:
-        candidate = _identity(run_dir=run_dir, review=review, repair=repair, quality=quality, routing=routing)
+        candidate = _identity(
+            run_dir=run_dir, review=review, repair=repair, quality=quality,
+            routing=routing, period_manifest=period_manifest,
+            corrections=corrections, acceptance=acceptance,
+        )
     if _normal(sealed_identity) != _normal(candidate):
         raise PortfolioReplayError("portfolio replay identity differs from seal")
     return {
@@ -269,6 +293,9 @@ def _arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--repair", type=Path, required=True)
     parser.add_argument("--quality", type=Path, required=True)
     parser.add_argument("--routing", type=Path, required=True)
+    parser.add_argument("--period-manifest", type=Path, required=True)
+    parser.add_argument("--corrections", type=Path, required=True)
+    parser.add_argument("--acceptance", type=Path, required=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -284,10 +311,20 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "seal":
-            result = seal(run_dir=args.run_dir, review=args.review, repair=args.repair, quality=args.quality, routing=args.routing)
+            result = seal(
+                run_dir=args.run_dir, review=args.review, repair=args.repair,
+                quality=args.quality, routing=args.routing,
+                period_manifest=args.period_manifest, corrections=args.corrections,
+                acceptance=args.acceptance,
+            )
             _write(args.output, result)
         else:
-            result = verify(_read(args.seal), run_dir=args.run_dir, review=args.review, repair=args.repair, quality=args.quality, routing=args.routing)
+            result = verify(
+                _read(args.seal), run_dir=args.run_dir, review=args.review,
+                repair=args.repair, quality=args.quality, routing=args.routing,
+                period_manifest=args.period_manifest, corrections=args.corrections,
+                acceptance=args.acceptance,
+            )
             _write(args.output, result)
     except (OSError, ValueError, json.JSONDecodeError, PortfolioReplayError) as exc:
         print(f"clockify portfolio replay: {exc}", file=sys.stderr)

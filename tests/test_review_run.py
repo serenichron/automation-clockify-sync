@@ -14,6 +14,8 @@ import csv
 from contextlib import redirect_stdout
 from unittest import mock
 
+from scripts import collector_receipts, reconciliation_manifest
+
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "clockify_review_run.py"
 SPEC = importlib.util.spec_from_file_location("clockify_review_run", SCRIPT)
@@ -52,6 +54,11 @@ def accounting_result(*, proposal_id: str = "P001") -> dict:
         "correction_regression": {},
         "external_writes": False,
     }
+
+
+def write_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
 
 
 class ReviewRunResultTests(unittest.TestCase):
@@ -582,6 +589,108 @@ class ReviewRunResultTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "work accounting result differs"):
                     review_run._verify_replay_integrity(source, replay)
             self.assertEqual("blocked", json.loads((replay / "replay-integrity.json").read_text())["status"])
+
+    def test_replay_rejects_reconciliation_input_or_slice_bundle_drift(self):
+        """Catches replay accepting a changed period contract or completed slice."""
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            source, replay = self._complete_replay_fixture(runs)
+
+            with mock.patch.object(review_run, "RUNS", runs):
+                integrity = review_run._verify_replay_integrity(source, replay)
+                self.assertEqual("pass", integrity["status"])
+                for name in (
+                    "period-manifest.json", "routing.json", "review-corrections.jsonl",
+                    "review-acceptance.jsonl", "fathom-reconciliation.json",
+                    "completion-bundle.json",
+                ):
+                    path = replay / name
+                    original = path.read_bytes()
+                    if name == "period-manifest.json":
+                        manifest = json.loads(original)
+                        manifest["period"]["revision"] = 2
+                        unsigned = dict(manifest)
+                        unsigned.pop("manifest_digest")
+                        manifest["manifest_digest"] = "sha256:" + hashlib.sha256(
+                            json.dumps(unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                        ).hexdigest()
+                        write_json(path, manifest)
+                    else:
+                        path.write_bytes(original + b"\n")
+                    with self.assertRaises(ValueError, msg=name):
+                        review_run._verify_replay_integrity(source, replay)
+                    path.write_bytes(original)
+
+    @staticmethod
+    def _complete_replay_fixture(runs: Path) -> tuple[Path, Path]:
+        """Create two isolated, complete synthetic slices with equal identities."""
+        source, replay = runs / "source-run", runs / "replay-run"
+        slice_ = review_run.clockify_sync_collect.plan_slices(
+            dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc),
+            dt.datetime(2026, 8, 2, tzinfo=dt.timezone.utc),
+            zone=review_run.clockify_sync_collect.BUCHAREST,
+        )[0]
+        ledger = {
+            "schema_version": "evidence-ledger/v1",
+            "manifest": {
+                "manifest_id": "elm-" + "a" * 64,
+                "events_digest": "b" * 64,
+                "source_completeness": {"status": "complete", "incomplete_sources": []},
+            },
+            "events": [],
+        }
+        analysis = {
+            "schema_version": 1,
+            "prompt_version": "prompt-v1",
+            "evidence_bundle_schema_version": "clockify-semantic-evidence-bundle/v1",
+            "evidence_bundle_manifest": bundle_manifest(),
+            "ledger_evidence_digest": "sha256:" + "c" * 64,
+            "activities": [{"analyzer_model": "model-a", "analyzer_tier": "primary"}],
+            "analysis_chunks": [],
+        }
+        manifests: dict[Path, dict] = {}
+        for run_dir in (source, replay):
+            write_json(run_dir / "evidence" / "evidence-ledger.json", ledger)
+            write_json(run_dir / "semantic-analysis.json", analysis)
+            write_json(run_dir / "work-accounting-result.json", accounting_result())
+            write_json(run_dir / "quality_report.json", {"status": "pass"})
+            write_json(run_dir / "review-snapshot.json", {"summary": {}})
+            write_json(run_dir / "run-report.json", {
+                "runtime_identity": {"git_sha": "fixture"},
+                "date_range": {"since": "2026-08-01T00:00:00Z", "until": "2026-08-02T00:00:00Z"},
+                "evidence_ledger": {"source_completeness": {"status": "complete", "incomplete_sources": []}},
+            })
+            write_json(run_dir / "fathom-reconciliation.json", [])
+            bundle = collector_receipts.build_completion_bundle(run_dir, slice_=slice_)
+            collector_receipts.write_completion_bundle(run_dir / "completion-bundle.json", bundle)
+            manifests[run_dir] = {
+                "schema_version": reconciliation_manifest.MANIFEST_COMPATIBILITY_VERSION,
+                "compatibility_version": reconciliation_manifest.MANIFEST_COMPATIBILITY_VERSION,
+                "period": {
+                    "compatibility_version": reconciliation_manifest.PERIOD_COMPATIBILITY_VERSION,
+                    "member_id": "member-fixture", "workspace_id": "workspace-fixture",
+                    "timezone": "Europe/Bucharest", "since_utc": "2026-08-01T00:00:00Z",
+                    "until_utc": "2026-08-02T00:00:00Z", "revision": 1,
+                },
+                "state": "reconciling", "event_count": 2,
+                "events_digest": "sha256:" + "d" * 64,
+                "artifacts": [{
+                    "path": str((run_dir / "completion-bundle.json").resolve()),
+                    "schema_version": "collector-completion-bundle/v1",
+                    "compatibility_version": "collector-completion-bundle/v1",
+                    "digest": "sha256:" + hashlib.sha256((run_dir / "completion-bundle.json").read_bytes()).hexdigest(),
+                }],
+                "blockers": [],
+            }
+            unsigned = dict(manifests[run_dir])
+            manifests[run_dir]["manifest_digest"] = "sha256:" + hashlib.sha256(
+                json.dumps(unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            write_json(run_dir / "period-manifest.json", manifests[run_dir])
+            write_json(run_dir / "routing.json", {"session_routes": [], "meeting_routes": []})
+            (run_dir / "review-corrections.jsonl").write_text("", encoding="utf-8")
+            (run_dir / "review-acceptance.jsonl").write_text("", encoding="utf-8")
+        return source, replay
 
     def test_replay_range_options_are_rejected_before_any_process_runs(self):
         with mock.patch.object(review_run, "_run") as run:

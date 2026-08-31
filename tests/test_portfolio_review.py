@@ -1,4 +1,6 @@
 import argparse
+import datetime as dt
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -11,6 +13,7 @@ from scripts import clockify_portfolio_quality as quality
 from scripts import clockify_portfolio_replay as replay
 from scripts import clockify_post_approved_portfolio as poster
 from scripts import evidence_ledger
+from scripts import clockify_sync_collect, collector_receipts, reconciliation_manifest
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "clockify_portfolio_review.py"
@@ -312,12 +315,67 @@ class PortfolioReviewTests(unittest.TestCase):
             repair_path.write_text(json.dumps({"repair": {
                 "model": quality.REQUIRED_MODEL, "revision": quality.REQUIRED_REVISION,
             }}), encoding="utf-8")
+            slice_dir = root / "completed-slice"
+            coverage = {"status": "complete", "incomplete_sources": []}
+            for relative, value in {
+                "evidence/evidence-ledger.json": {"manifest": {"source_completeness": coverage}},
+                "semantic-analysis.json": {},
+                "work-accounting-result.json": {},
+                "quality_report.json": {"status": "pass"},
+                "review-snapshot.json": {"summary": {}},
+                "run-report.json": {
+                    "runtime_identity": {"git_sha": "fixture"},
+                    "date_range": {"since": "2026-07-01T00:00:00Z", "until": "2026-07-02T21:00:00Z"},
+                    "evidence_ledger": {"source_completeness": coverage},
+                },
+            }.items():
+                path = slice_dir / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(value), encoding="utf-8")
+            slice_ = clockify_sync_collect.plan_slices(
+                dt.datetime(2026, 7, 1, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 7, 3, tzinfo=dt.timezone.utc),
+                zone=clockify_sync_collect.BUCHAREST,
+            )[0]
+            bundle = collector_receipts.build_completion_bundle(slice_dir, slice_=slice_)
+            collector_receipts.write_completion_bundle(slice_dir / "completion-bundle.json", bundle)
+            period_manifest = {
+                "schema_version": reconciliation_manifest.MANIFEST_COMPATIBILITY_VERSION,
+                "compatibility_version": reconciliation_manifest.MANIFEST_COMPATIBILITY_VERSION,
+                "period": {
+                    "compatibility_version": reconciliation_manifest.PERIOD_COMPATIBILITY_VERSION,
+                    "member_id": "member-fixture", "workspace_id": "workspace-fixture",
+                    "timezone": "Europe/Bucharest", "since_utc": "2026-07-01T00:00:00Z",
+                    "until_utc": "2026-07-03T00:00:00Z", "revision": 1,
+                },
+                "state": "reconciling", "event_count": 2,
+                "events_digest": "sha256:" + "a" * 64,
+                "artifacts": [{
+                    "path": str((slice_dir / "completion-bundle.json").resolve()),
+                    "schema_version": "collector-completion-bundle/v1",
+                    "compatibility_version": "collector-completion-bundle/v1",
+                    "digest": "sha256:" + hashlib.sha256((slice_dir / "completion-bundle.json").read_bytes()).hexdigest(),
+                }],
+                "blockers": [],
+            }
+            period_manifest["manifest_digest"] = "sha256:" + hashlib.sha256(
+                json.dumps(period_manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            period_manifest_path = root / "period-manifest.json"
+            period_manifest_path.write_text(json.dumps(period_manifest), encoding="utf-8")
+            corrections_path = root / "review-corrections.jsonl"
+            acceptance_path = root / "review-acceptance.jsonl"
+            corrections_path.write_text("", encoding="utf-8")
+            acceptance_path.write_text("", encoding="utf-8")
             seal = replay.seal(
                 run_dir=run_dir,
                 review=review_path,
                 repair=repair_path,
                 quality=quality_path,
                 routing=routing_path,
+                period_manifest=period_manifest_path,
+                corrections=corrections_path,
+                acceptance=acceptance_path,
             )
             replay_report = replay.verify(
                 seal,
@@ -326,6 +384,9 @@ class PortfolioReviewTests(unittest.TestCase):
                 repair=repair_path,
                 quality=quality_path,
                 routing=routing_path,
+                period_manifest=period_manifest_path,
+                corrections=corrections_path,
+                acceptance=acceptance_path,
             )
             posting_plans = poster._plans(review, {
                 ("Serenichron Level 2", ("Processes",)): {
