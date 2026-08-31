@@ -8,7 +8,9 @@ import json
 import os
 from pathlib import Path
 import re
+import tempfile
 from typing import Mapping
+from zoneinfo import ZoneInfo
 
 
 class CollectorReceiptError(ValueError):
@@ -27,6 +29,7 @@ _ARTIFACT_PATHS = {
 REQUIRED_KINDS = frozenset(_ARTIFACT_PATHS)
 _REPLAY_ARTIFACT = ("replay_integrity", "replay-integrity.json")
 _BUNDLE_SCHEMA_VERSION = "collector-completion-bundle/v1"
+_PERIOD_TIMEZONE = ZoneInfo("Europe/Bucharest")
 
 
 def _canonical(value: object) -> bytes:
@@ -212,9 +215,12 @@ class FailureReceiptStore:
         if not path.is_file() or path.is_symlink():
             raise CollectorReceiptError("failure receipt journal is unsafe")
         try:
-            lines = _safe_read_text(path).splitlines()
+            journal = _safe_read_text(path)
         except OSError as exc:
             raise CollectorReceiptError("failure receipt journal cannot be read") from exc
+        if journal and not journal.endswith("\n"):
+            raise CollectorReceiptError("failure receipt journal must end with a newline")
+        lines = journal.splitlines()
         receipts = []
         for line in lines:
             if not line:
@@ -287,21 +293,20 @@ def _verified_artifact(run_dir: Path, kind: str, expected_digest: str | None = N
     return SliceArtifact(kind, path.resolve(), digest)
 
 
-def _report_utc(value: object, reference: datetime) -> str:
+def _report_utc(value: object) -> str:
     if not isinstance(value, str):
         raise CollectorReceiptError("run-report interval is invalid")
     if value.endswith("Z"):
         return _utc_string(value, "run-report interval")
     try:
-        local = datetime.strptime(value, "%Y-%m-%d %H:%M").replace(tzinfo=reference.tzinfo)
+        local = datetime.strptime(value, "%Y-%m-%d %H:%M").replace(tzinfo=_PERIOD_TIMEZONE)
     except ValueError as exc:
         raise CollectorReceiptError("run-report interval is invalid") from exc
     return _slice_utc(local, "run-report interval")
 
 
 def _completion_identities(
-    run_dir: Path, *, since_utc: str, until_utc: str, reference_since: datetime,
-    reference_until: datetime,
+    run_dir: Path, *, since_utc: str, until_utc: str,
 ) -> tuple[str, str]:
     report_path = _verified_artifact(run_dir, "run_report").path
     ledger_path = _verified_artifact(run_dir, "evidence_ledger").path
@@ -314,8 +319,8 @@ def _completion_identities(
         raise CollectorReceiptError("completion identity artifact must be an object")
     date_range = report.get("date_range")
     if not isinstance(date_range, Mapping) or (
-        _report_utc(date_range.get("since"), reference_since) != since_utc
-        or _report_utc(date_range.get("until"), reference_until) != until_utc
+        _report_utc(date_range.get("since")) != since_utc
+        or _report_utc(date_range.get("until")) != until_utc
     ):
         raise CollectorReceiptError("run-report interval does not match completion slice")
     reported_ledger = report.get("evidence_ledger")
@@ -357,7 +362,6 @@ def build_completion_bundle(run_dir: Path, *, slice_: object, replay: bool = Fal
         raise CollectorReceiptError("completion bundle slice interval is invalid")
     source_coverage_digest, runtime_identity_digest = _completion_identities(
         run_dir, since_utc=since_utc, until_utc=until_utc,
-        reference_since=getattr(slice_, "since"), reference_until=getattr(slice_, "until"),
     )
     kinds = [*_ARTIFACT_PATHS]
     if replay:
@@ -386,8 +390,6 @@ def verify_completion_bundle(bundle: SliceCompletionBundle) -> SliceCompletionBu
     verified = tuple(_verified_artifact(bundle.run_dir, artifact.kind, artifact.digest) for artifact in bundle.artifacts)
     source_coverage_digest, runtime_identity_digest = _completion_identities(
         bundle.run_dir, since_utc=bundle.since_utc, until_utc=bundle.until_utc,
-        reference_since=datetime.fromisoformat(bundle.since_utc[:-1] + "+00:00"),
-        reference_until=datetime.fromisoformat(bundle.until_utc[:-1] + "+00:00"),
     )
     if (
         source_coverage_digest != bundle.source_coverage_digest
@@ -424,9 +426,34 @@ def write_completion_bundle(path: Path, bundle: SliceCompletionBundle) -> None:
     verify_completion_bundle(bundle)
     path = _safe_path(Path(path), run_dir=bundle.run_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_bytes(_canonical(bundle.document()) + b"\n")
-    os.replace(temporary, path)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        payload = _canonical(bundle.document()) + b"\n"
+        written = 0
+        while written < len(payload):
+            progress = os.write(descriptor, payload[written:])
+            if not isinstance(progress, int) or progress <= 0:
+                raise CollectorReceiptError("completion bundle write made no progress")
+            written += progress
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.replace(temporary, path)
+        parent_descriptor = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 
 
 def load_completion_bundle(path: Path, *, run_dir: Path) -> SliceCompletionBundle:

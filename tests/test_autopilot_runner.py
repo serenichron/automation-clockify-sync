@@ -1,5 +1,6 @@
 import json
 import datetime as dt
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -7,6 +8,7 @@ import unittest
 from unittest import mock
 
 from scripts import clockify_autopilot_runner as runner
+from scripts import clockify_review_run as review_run
 from scripts import collector_receipts, collector_slices, source_coverage
 
 
@@ -81,6 +83,103 @@ class AutopilotRunnerTests(unittest.TestCase):
             self.assertEqual(
                 1,
                 sum(event["event"] == "complete" for event in replayed.document()["events"]),
+            )
+
+    def test_runner_recovers_after_backlog_completion_precedes_debt_persistence(self):
+        """A crash after backlog persistence converges to one debt completion on rerun."""
+        with tempfile.TemporaryDirectory() as directory:
+            environment, result = self.fixture(directory, "review_delta")
+            root = Path(directory)
+            run_dir = result.parent
+            slice_ = collector_slices.plan_slices(
+                dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 8, 2, tzinfo=dt.timezone.utc),
+                zone=review_run.clockify_sync_collect.BUCHAREST,
+            )[0]
+            identity = collector_slices.BacklogIdentity(
+                since_utc="2026-08-01T00:00:00Z", until_utc="2026-08-02T00:00:00Z",
+                timezone="Europe/Bucharest", max_days=2, compatibility_version="fixture/v1",
+            )
+            for relative in (
+                "run-report.json", "evidence/evidence-ledger.json", "semantic-analysis.json",
+                "work-accounting-result.json", "quality_report.json", "review-snapshot.json",
+            ):
+                path = run_dir / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({"fixture": relative}) + "\n", encoding="utf-8")
+            coverage = {"status": "complete", "incomplete_sources": []}
+            (run_dir / "evidence" / "evidence-ledger.json").write_text(json.dumps({
+                "manifest": {"source_completeness": coverage},
+            }) + "\n", encoding="utf-8")
+            (run_dir / "run-report.json").write_text(json.dumps({
+                "runtime_identity": {"git_sha": "fixture"},
+                "date_range": {
+                    "since": "2026-08-01T00:00:00Z", "until": "2026-08-02T00:00:00Z",
+                },
+                "evidence_ledger": {"source_completeness": coverage},
+            }) + "\n", encoding="utf-8")
+            (run_dir / "slice-finalization.json").write_text(json.dumps({
+                "schema_version": "collector-slice-finalization/v1",
+                "backlog_identity": identity.document(),
+                "slice_id": slice_.slice_id,
+                "since_utc": "2026-08-01T00:00:00Z",
+                "until_utc": "2026-08-02T00:00:00Z",
+            }) + "\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {
+                "CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT": str(root / "checkpoints"),
+            }):
+                bundle = review_run._finalize_backlog_completion(run_dir)
+                backlog = collector_slices.BacklogStore(root / "checkpoints").open(
+                    identity, (slice_,)
+                )
+            self.assertEqual(1, len(backlog.completed))
+            result.write_text(json.dumps({
+                "action": "review_delta", "run_id": "run-1", "run_dir": str(run_dir),
+                "slice_id": slice_.slice_id,
+                "date_range": {
+                    "since": "2026-08-01T00:00:00Z", "until": "2026-08-02T00:00:00Z",
+                },
+                "source_completeness": coverage,
+                "completion_bundle_digest": bundle.bundle_digest,
+            }) + "\n", encoding="utf-8")
+            interval = source_coverage.SourceInterval(
+                source="sessions/macbook", since_utc="2026-08-01T00:00:00Z",
+                until_utc="2026-08-02T00:00:00Z", slice_id=slice_.slice_id,
+                compatibility_version="source-debt/v1",
+            )
+            debt_store = source_coverage.SourceDebtStore()
+            debt_store.record_failure(
+                interval, failure_class="offline", retryable=True,
+                resume_state_digest="sha256:" + "a" * 64,
+                attempted_at="2026-08-01T00:00:00Z",
+            )
+            coverage_path = root / "state" / "source-coverage.json"
+            source_coverage.write(coverage_path, debt_store.document())
+            environment["CLOCKIFY_AUTOPILOT_COVERAGE_STATE"] = str(coverage_path)
+            completed = subprocess.CompletedProcess(
+                ["review"], 0, stdout=str(result) + "\n", stderr=""
+            )
+
+            with (
+                mock.patch.object(runner.subprocess, "run", return_value=completed),
+                mock.patch.object(runner.source_coverage, "write", side_effect=RuntimeError("interrupt")),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "interrupt"):
+                    runner.run(environment)
+            interrupted = source_coverage.SourceDebtStore.from_document(
+                source_coverage.read(coverage_path)
+            )
+            self.assertEqual((interval.debt_id,), tuple(item.debt_id for item in interrupted.active()))
+
+            with mock.patch.object(runner.subprocess, "run", return_value=completed):
+                self.assertEqual(0, runner.run(environment))
+            recovered = source_coverage.SourceDebtStore.from_document(
+                source_coverage.read(coverage_path)
+            )
+            self.assertEqual((), recovered.active())
+            self.assertEqual(
+                1,
+                sum(event["event"] == "complete" for event in recovered.document()["events"]),
             )
 
     def fixture(
