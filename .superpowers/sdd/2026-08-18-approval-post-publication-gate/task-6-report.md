@@ -6,8 +6,9 @@
   `SharedReportReceipt`, `SlackReceipt`, and `PublicationReceipt` evidence
   types in `/home/blackthorne/Work/automation-clockify-sync-task-f8ea741c/scripts/publication_adapter_contract.py`.
 - Added a canonical JSONL receipt journal with chained record digests and a
-  separate append-only anchor journal. It rejects rehashed receipt-record
-  tampering when the anchor no longer matches.
+  separate append-only consistency journal. It detects one-sided corruption or
+  rewriting, but both files share one local writable trust domain and therefore
+  do not claim protection against a coordinated rewrite.
 - Implemented report refresh/readback before Slack, persisted the verified
   report receipt before Slack, reused it after Slack-only failure, rejected
   contract/target drift, retained prior revision receipts, and returned the
@@ -26,7 +27,8 @@
 - Made the minimal coordinator change required to permit a later verified
   shared-report receipt to clear `publication_deferred`; otherwise an approved
   retry after a deferred run could never derive `published`.
-- Added `/home/blackthorne/Work/automation-clockify-sync-task-f8ea741c/tests/__init__.py` because an installed third-party `tests` package otherwise prevented the task-required `python3 -m unittest tests...` commands from importing repository tests.
+- Kept test discovery local to the repository without adding a package marker
+  that would change import resolution for the entire test tree.
 
 ## RED evidence
 
@@ -43,8 +45,10 @@
 
 ## GREEN verification
 
-- `python3 -m unittest tests.test_publication_adapter_contract tests.test_clockify_finance_report_adapter -v`
-  — **17 tests passed**.
+- `python3 -m unittest discover -s tests -p 'test_publication_adapter_contract.py'`
+  — **14 tests passed**.
+- `python3 -m unittest discover -s tests -p 'test_clockify_finance_report_adapter.py'`
+  — **8 tests passed**.
 - `python3 -m unittest tests.test_reconciliation_manifest -v` — **41 tests
   passed**.
 - `git diff --check` and `git diff --no-index --check` for every new owned file
@@ -86,3 +90,22 @@ imported and executed both modified modules successfully.
 3. This is **not a complete Task 6 delivery**. It is the completed safe core,
    committed separately so a later explicitly approved transport/scheduling
    change can build on audited idempotency and coordinator behavior.
+
+## Review fix evidence
+
+- Cached shared-report receipts now bind the exact authorization digest, and
+  composite publication receipts reject a nested report from another approval.
+- Slack receipts must match a deterministic digest of the approved period,
+  revision, duration, native/USD buckets, USD-equivalent total, and report
+  target; the Slack target remains independently bound.
+- Short `os.write` appends loop until complete and fail closed on zero progress.
+- The local journal is described as integrity-checked within one writable trust
+  domain, not as protection from a coordinated rewrite.
+- Pre-release shared-report receipts without authorization binding fail closed
+  with an explicit instruction to recapture under the current authorization.
+  No production transport has ever been enabled for this receipt version, so
+  there is no live publication journal to migrate.
+- Repository tests remain namespace-package based. Focused verification uses
+  `unittest discover`; the global `tests/__init__.py` package marker was removed.
+- Full verification: `python3 -m unittest discover -s tests` — **931 passed, 2
+  skipped**.

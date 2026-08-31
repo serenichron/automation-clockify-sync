@@ -93,6 +93,7 @@ class SharedReportReceipt:
     """Exact verified projection of the refreshed shared Clockify report."""
 
     contract_digest: str
+    authorization_digest: str
     idempotency_identity: str
     report_target: str
     readback_digest: str
@@ -103,6 +104,7 @@ class SharedReportReceipt:
 
     def __post_init__(self) -> None:
         _digest_text(self.contract_digest, "contract_digest")
+        _digest_text(self.authorization_digest, "authorization_digest")
         _text(self.idempotency_identity, "idempotency_identity")
         _text(self.report_target, "report_target")
         _digest_text(self.readback_digest, "readback_digest")
@@ -119,6 +121,7 @@ class SharedReportReceipt:
             "kind": "shared_report",
             "status": self.status,
             "contract_digest": self.contract_digest,
+            "authorization_digest": self.authorization_digest,
             "idempotency_identity": self.idempotency_identity,
             "report_target": self.report_target,
             "readback_digest": self.readback_digest,
@@ -130,13 +133,24 @@ class SharedReportReceipt:
     @classmethod
     def from_document(cls, value: object) -> "SharedReportReceipt":
         required = {
-            "schema_version", "kind", "status", "contract_digest", "idempotency_identity",
+            "schema_version", "kind", "status", "contract_digest", "authorization_digest", "idempotency_identity",
             "report_target", "readback_digest", "duration_seconds", "native_buckets", "verified_at",
         }
+        if (
+            isinstance(value, Mapping)
+            and set(value) == required - {"authorization_digest"}
+            and value.get("schema_version") == SCHEMA_VERSION
+            and value.get("kind") == "shared_report"
+        ):
+            raise PublicationAdapterError(
+                "legacy shared report receipt lacks authorization binding; "
+                "recapture under the current authorization"
+            )
         if not isinstance(value, Mapping) or set(value) != required or value.get("schema_version") != SCHEMA_VERSION or value.get("kind") != "shared_report":
             raise PublicationAdapterError("shared report receipt has unexpected fields")
         return cls(
-            contract_digest=value["contract_digest"], idempotency_identity=value["idempotency_identity"],
+            contract_digest=value["contract_digest"], authorization_digest=value["authorization_digest"],
+            idempotency_identity=value["idempotency_identity"],
             report_target=value["report_target"], readback_digest=value["readback_digest"],
             duration_seconds=value["duration_seconds"], native_buckets=_buckets(value["native_buckets"], "native_buckets"),
             verified_at=_timestamp(value["verified_at"], "verified_at"), status=value["status"],
@@ -216,6 +230,8 @@ class PublicationReceipt:
         for receipt in (self.report_receipt, self.slack_receipt):
             if (receipt.contract_digest, receipt.idempotency_identity) != (self.contract_digest, self.idempotency_identity):
                 raise PublicationAdapterError("publication receipt does not bind its external receipts")
+        if self.report_receipt.authorization_digest != self.authorization_digest:
+            raise PublicationAdapterError("publication receipt does not bind its report authorization")
         _utc(self.completed_at, "completed_at")
 
     def document(self) -> dict[str, object]:
@@ -261,7 +277,7 @@ class PublicationAdapter(Protocol):
 
 
 class PublicationReceiptStore:
-    """Tamper-evident append-only receipt journal plus append-only head anchors."""
+    """Integrity-checked append-only journal within one local trust domain."""
 
     def __init__(
         self, path: Path | str,
@@ -358,7 +374,12 @@ class PublicationReceiptStore:
         payload = _canonical(dict(document)) + "\n"
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
-            os.write(descriptor, payload.encode("utf-8"))
+            remaining = memoryview(payload.encode("utf-8"))
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise PublicationAdapterError("publication receipt append did not make progress")
+                remaining = remaining[written:]
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
@@ -447,13 +468,42 @@ def _verify_report(
     authorized: publication_gate.AuthorizedPublication, receipt: SharedReportReceipt,
 ) -> SharedReportReceipt:
     contract = authorized.contract
-    if (receipt.contract_digest, receipt.idempotency_identity, receipt.report_target) != (
-        authorized.contract_digest, authorized.idempotency_key, contract.report_target,
+    if (
+        receipt.contract_digest, receipt.authorization_digest,
+        receipt.idempotency_identity, receipt.report_target,
+    ) != (
+        authorized.contract_digest, authorized.authorization_digest,
+        authorized.idempotency_key, contract.report_target,
     ):
         raise PublicationAdapterError("shared report receipt does not bind the authorization")
     if receipt.duration_seconds != contract.duration_seconds or dict(receipt.native_buckets) != dict(contract.native_buckets):
         raise PublicationAdapterError("shared report readback does not exactly match the authorized contract")
     return receipt
+
+
+def expected_slack_content_digest(
+    authorized: publication_gate.AuthorizedPublication,
+) -> str:
+    """Bind the finance facts that an approved Slack correction may publish."""
+    contract = authorized.contract
+    return _digest({
+        "schema_version": "clockify-finance-slack-content/v1",
+        "period_id": contract.period_id,
+        "period_start": contract.period_start,
+        "period_end": contract.period_end,
+        "revision": contract.revision,
+        "duration_seconds": contract.duration_seconds,
+        "native_buckets": {
+            code: format(amount, "f")
+            for code, amount in sorted(contract.native_buckets.items())
+        },
+        "usd_buckets": {
+            code: format(amount, "f")
+            for code, amount in sorted(contract.usd_buckets.items())
+        },
+        "usd_equivalent_total": format(contract.usd_equivalent_total, "f"),
+        "report_target": contract.report_target,
+    })
 
 
 def _verify_slack(
@@ -463,6 +513,8 @@ def _verify_slack(
         authorized.contract_digest, authorized.idempotency_key, authorized.contract.slack_target,
     ):
         raise PublicationAdapterError("Slack receipt does not bind the authorization")
+    if receipt.content_digest != expected_slack_content_digest(authorized):
+        raise PublicationAdapterError("Slack receipt content does not match the authorized contract")
     return receipt
 
 

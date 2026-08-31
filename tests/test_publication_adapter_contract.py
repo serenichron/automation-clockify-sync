@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from scripts import clockify_currency
 from scripts import clockify_publication_gate as publication_gate
@@ -16,6 +17,7 @@ from scripts import publication_adapter_contract
 from scripts import reconciliation_manifest
 from scripts.publication_adapter_contract import (
     PublicationAdapterError,
+    PublicationReceipt,
     PublicationReceiptStore,
     SharedReportReceipt,
     SlackReceipt,
@@ -25,6 +27,10 @@ from scripts.publication_adapter_contract import (
 
 NOW = datetime(2026, 8, 18, 9, 0, tzinfo=timezone.utc)
 LATER = NOW + timedelta(minutes=5)
+CONTENT_DIGESTS = {
+    1: "sha256:75bc30466be656f25de35d6f76f0b84104ccba55832fa8be3c94bfa726b4858d",
+    2: "sha256:305562406391469277a91d3160e5dc8524e2c587e99272515c32b42bfdc6586c",
+}
 
 
 def digest(value: str) -> str:
@@ -104,6 +110,7 @@ class RecordingAdapter:
         contract = authorized.contract
         return SharedReportReceipt(
             contract_digest=authorized.contract_digest,
+            authorization_digest=authorized.authorization_digest,
             idempotency_identity=authorized.idempotency_key,
             report_target=contract.report_target,
             readback_digest=digest(f"report-{self.report_duration}"),
@@ -123,7 +130,7 @@ class RecordingAdapter:
             contract_digest=authorized.contract_digest,
             idempotency_identity=authorized.idempotency_key,
             slack_target=authorized.contract.slack_target,
-            content_digest=digest("finance-report-content"),
+            content_digest=CONTENT_DIGESTS[authorized.contract.revision],
             message_id="message-1",
             verified_at=NOW,
         )
@@ -143,9 +150,27 @@ class FailSlackOnceAdapter(RecordingAdapter):
             contract_digest=authorized.contract_digest,
             idempotency_identity=authorized.idempotency_key,
             slack_target=authorized.contract.slack_target,
-            content_digest=digest("finance-report-content"),
+            content_digest=CONTENT_DIGESTS[authorized.contract.revision],
             message_id="message-1",
             verified_at=LATER,
+        )
+
+
+class DriftedContentAdapter(RecordingAdapter):
+    def upsert_slack(
+        self,
+        authorized: publication_gate.AuthorizedPublication,
+        report_receipt: SharedReportReceipt,
+    ) -> SlackReceipt:
+        self.calls.append("upsert_slack")
+        self.slack_count += 1
+        return SlackReceipt(
+            contract_digest=authorized.contract_digest,
+            idempotency_identity=authorized.idempotency_key,
+            slack_target=authorized.contract.slack_target,
+            content_digest=digest("unapproved-finance-report-content"),
+            message_id="message-1",
+            verified_at=NOW,
         )
 
 
@@ -188,6 +213,58 @@ class PublicationAdapterContractTests(unittest.TestCase):
         self.assertEqual(1, adapter.update_report_count)
         self.assertEqual(2, adapter.slack_count)
 
+    def test_report_retry_rejects_a_different_authorization_before_slack(self) -> None:
+        """Reusing a report proof under another approval would bypass exact approval binding."""
+        with self.assertRaises(PublicationAdapterError):
+            execute_authorized_publication(
+                self.authorized, FailSlackOnceAdapter(), self.store, now=NOW,
+            )
+        changed = replace(
+            self.authorized,
+            approval_id="approval-2",
+            approval_digest=digest("approval-2"),
+            authorization_digest=digest("placeholder-authorization"),
+        )
+        changed = replace(
+            changed,
+            authorization_digest=publication_gate._digest(changed._unsigned_document()),
+        )
+        adapter = RecordingAdapter()
+
+        with self.assertRaises(PublicationAdapterError):
+            execute_authorized_publication(changed, adapter, self.store, now=LATER)
+
+        self.assertEqual([], adapter.calls)
+
+    def test_publication_receipt_rejects_a_report_from_another_authorization(self) -> None:
+        """A composite receipt must not hide a report proof issued under another approval."""
+        published = execute_authorized_publication(
+            self.authorized, RecordingAdapter(), self.store, now=NOW,
+        )
+        drifted_report = replace(
+            published.report_receipt,
+            authorization_digest=digest("different-authorization"),
+        )
+
+        with self.assertRaises(PublicationAdapterError):
+            PublicationReceipt(
+                contract_digest=published.contract_digest,
+                authorization_digest=published.authorization_digest,
+                idempotency_identity=published.idempotency_identity,
+                report_receipt=drifted_report,
+                slack_receipt=published.slack_receipt,
+                completed_at=published.completed_at,
+            )
+
+    def test_slack_content_drift_is_rejected_without_completion_receipt(self) -> None:
+        """Accepting an arbitrary content digest would publish text the contract did not bind."""
+        adapter = DriftedContentAdapter()
+
+        with self.assertRaises(PublicationAdapterError):
+            execute_authorized_publication(self.authorized, adapter, self.store, now=NOW)
+
+        self.assertIsNone(self.store.publication_receipt(self.authorized.idempotency_key))
+
     def test_same_identity_returns_the_persisted_publication_without_external_calls(self) -> None:
         """A rerun that publishes again would create duplicate client-facing Slack updates."""
         adapter = RecordingAdapter()
@@ -212,6 +289,22 @@ class PublicationAdapterContractTests(unittest.TestCase):
 
         with self.assertRaises(PublicationAdapterError):
             self.store.verify()
+
+    def test_receipt_store_completes_short_append_writes(self) -> None:
+        """Assuming one os.write call is complete would leave a valid receipt journal truncated."""
+        report = RecordingAdapter().read_report(self.authorized)
+        original_write = publication_adapter_contract.os.write
+
+        def short_write(descriptor: int, payload: bytes) -> int:
+            return original_write(descriptor, payload[:7])
+
+        with mock.patch.object(publication_adapter_contract.os, "write", side_effect=short_write):
+            self.store.persist_report(report)
+
+        try:
+            self.store.verify()
+        except PublicationAdapterError as exc:
+            self.fail(f"short append writes left an invalid receipt journal: {exc}")
 
     def test_new_revision_keeps_the_prior_published_receipt(self) -> None:
         """Replacing receipt history would erase the audit trail for a corrected reporting period."""
@@ -258,6 +351,17 @@ class PublicationAdapterContractTests(unittest.TestCase):
                     text=True, capture_output=True, check=False,
                 )
                 self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_legacy_report_receipt_requires_fresh_authorized_recapture(self) -> None:
+        """An unbound pre-release report proof must fail with a safe migration action."""
+        document = RecordingAdapter().read_report(self.authorized).document()
+        del document["authorization_digest"]
+
+        with self.assertRaisesRegex(
+            PublicationAdapterError,
+            "legacy shared report receipt lacks authorization binding; recapture under the current authorization",
+        ):
+            SharedReportReceipt.from_document(document)
 
 
 if __name__ == "__main__":

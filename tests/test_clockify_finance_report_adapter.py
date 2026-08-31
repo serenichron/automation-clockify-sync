@@ -13,7 +13,7 @@ from scripts import clockify_publication_gate as publication_gate
 from scripts import reconciliation_manifest
 from scripts import clockify_finance_report_adapter as scheduled_adapter
 from scripts.publication_adapter_contract import PublicationReceiptStore
-from tests.test_publication_adapter_contract import (
+from test_publication_adapter_contract import (
     FailSlackOnceAdapter,
     NOW,
     RecordingAdapter,

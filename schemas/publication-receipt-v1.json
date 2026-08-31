@@ -19,12 +19,13 @@
     "shared_report": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema_version", "kind", "status", "contract_digest", "idempotency_identity", "report_target", "readback_digest", "duration_seconds", "native_buckets", "verified_at"],
+      "required": ["schema_version", "kind", "status", "contract_digest", "authorization_digest", "idempotency_identity", "report_target", "readback_digest", "duration_seconds", "native_buckets", "verified_at"],
       "properties": {
         "schema_version": {"const": "publication-receipt/v1"},
         "kind": {"const": "shared_report"},
         "status": {"const": "verified"},
         "contract_digest": {"$ref": "#/$defs/digest"},
+        "authorization_digest": {"$ref": "#/$defs/digest"},
         "idempotency_identity": {"type": "string", "minLength": 1},
         "report_target": {"type": "string", "minLength": 1},
         "readback_digest": {"$ref": "#/$defs/digest"},
