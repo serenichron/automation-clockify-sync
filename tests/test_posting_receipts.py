@@ -251,6 +251,43 @@ class ApprovalReceiptStoreTests(unittest.TestCase):
 
 
 class PostEventStoreTests(unittest.TestCase):
+    def test_semantically_invalid_pending_post_never_mutates_ledger(self) -> None:
+        # Removing pending semantic validation from recovery would cause this
+        # transaction to be appended and anchored before its missing plan is
+        # detected by normal receipt verification.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "post-events.jsonl"
+            store = posting_receipts.PostEventStore(path)
+            real_append = posting_receipts._append_jsonl
+
+            def interrupt_primary(destination: Path, record: dict) -> None:
+                if destination == path:
+                    raise InterruptedError("stop before primary")
+                real_append(destination, record)
+
+            with mock.patch.object(posting_receipts, "_append_jsonl", side_effect=interrupt_primary):
+                with self.assertRaises(InterruptedError):
+                    store.append(post_event("planned"))
+
+            pending_path = path.with_name(path.name + ".pending.json")
+            pending = json.loads(pending_path.read_text(encoding="utf-8"))
+            pending["record"].update({
+                "disposition": "created",
+                "clockify_entry_id": "entry-1",
+                "live_readback_digest": "sha256:live-1",
+            })
+            event_payload = {key: value for key, value in pending["record"].items() if key != "event_digest"}
+            pending["record"]["event_digest"] = canonical_digest(event_payload)
+            pending["expected_head"] = pending["record"]["event_digest"]
+            pending_payload = {key: value for key, value in pending.items() if key != "pending_digest"}
+            pending["pending_digest"] = canonical_digest(pending_payload)
+            pending_path.write_text(json.dumps(pending) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(posting_receipts.PostingReceiptError, "lacks planned"):
+                posting_receipts.PostEventStore(path).verify()
+            self.assertFalse(path.exists())
+            self.assertFalse(path.with_name(path.name + ".anchor.jsonl").exists())
+
     def test_post_restart_completes_primary_only_pending_commit_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "post-events.jsonl"
