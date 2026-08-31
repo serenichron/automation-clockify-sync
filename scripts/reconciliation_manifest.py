@@ -555,9 +555,7 @@ def derive_manifest_from_verified_events(
             raise ManifestError("event is not legal after publication_complete")
         references = event.payload.get("artifacts")
         if references is not None:
-            if not isinstance(references, list):
-                raise ManifestError("event artifacts must be a list")
-            artifacts.extend(_artifact_from_document(reference) for reference in references)
+            artifacts.extend(_verify_artifact_refs(references))
         state = ReconciliationCoordinator._apply_transition(
             state, event, index, context, blockers,
         )
@@ -574,8 +572,6 @@ class ReconciliationCoordinator:
 
     def derive(self) -> ReconciliationManifest:
         events = self.store.verify(self.identity)
-        for event in events:
-            _verify_artifact_refs(event.payload.get("artifacts"))
         return derive_manifest_from_verified_events(self.identity, events)
 
     @staticmethod

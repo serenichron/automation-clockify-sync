@@ -29,7 +29,7 @@ if str(ROOT) not in sys.path:
 
 from scripts.clockify_sync_collect import clockify_env_candidates, load_env_file
 from scripts import clockify_portfolio_replay as portfolio_replay
-from scripts import posting_receipts, reconciliation_manifest
+from scripts import clockify_snapshot, posting_receipts, reconciliation_manifest
 
 
 API = "https://api.clockify.me/api/v1"
@@ -785,26 +785,8 @@ def _historical_bounds_match(plan: Mapping[str, Any], live: Mapping[str, Any]) -
 
 
 def _normalized_snapshot_sha256(entries: Iterable[Mapping[str, Any]]) -> str:
-    """Return a stable digest for the live fields that affect derivation."""
-    rows = [
-        {
-            "id": str(entry.get("id") or ""),
-            "start": _utc(str(entry.get("start") or "")),
-            "end": _utc(str(entry.get("end") or "")),
-            "project_id": str(entry.get("project_id") or ""),
-            "tag_ids": sorted(str(value) for value in entry.get("tag_ids", [])),
-            "description": str(entry.get("description") or "").strip(),
-            "billable": entry.get("billable"),
-        }
-        for entry in entries
-    ]
-    rows.sort(key=lambda row: (
-        row["start"], row["end"], row["id"], row["project_id"],
-        tuple(row["tag_ids"]), row["description"], row["billable"],
-    ))
-    return hashlib.sha256(
-        json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    """Return the shared stable digest for the live fields that affect derivation."""
+    return clockify_snapshot.normalized_snapshot_sha256(entries)
 
 
 def _adjustment_digest(

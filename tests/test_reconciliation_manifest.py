@@ -390,6 +390,14 @@ class ReconciliationCoordinatorTests(unittest.TestCase):
         with self.assertRaisesRegex(ManifestError, "artifact digest mismatch"):
             self.coordinator().derive()
 
+    def test_direct_manifest_derivation_revalidates_referenced_artifact_digests(self) -> None:
+        append_events(self.store, self.identity, complete_event_types(), self.artifact)
+        verified_events = self.store.verify(self.identity)
+        self.artifact.write_text("changed after event verification\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(ManifestError, "artifact digest mismatch"):
+            derive_manifest_from_verified_events(self.identity, verified_events)
+
     def test_rejects_illegal_and_duplicate_advancing_transitions(self) -> None:
         for event_types in (
             ["period_opened", "posting_started"],

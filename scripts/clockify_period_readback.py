@@ -11,12 +11,19 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 import tempfile
 from typing import Any, Mapping, Protocol, Sequence
 from urllib.parse import urlencode
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts import clockify_snapshot
 
 
 SCHEMA_VERSION = "clockify-period-readback/v1"
@@ -122,6 +129,12 @@ def _duration(value: Any, field: str) -> int:
     if seconds < 0:
         raise ClockifyReadbackError(f"{field} must not be negative")
     return seconds
+
+
+def _snapshot_digest(value: Any) -> str:
+    if not isinstance(value, str) or not _DIGEST.fullmatch(value):
+        raise ClockifyReadbackError("final_live_readback_sha256 must be a SHA-256 digest")
+    return value
 
 
 def _entry_interval(entry: Mapping[str, Any]) -> tuple[datetime | None, datetime | None, int]:
@@ -286,6 +299,7 @@ class ClockifyPeriodReadback:
     duration_seconds: int
     native_costs: Mapping[str, Decimal]
     digest: str
+    final_live_readback_sha256: str
     entry_durations: Mapping[str, int] | None = None
     schema_version: str = SCHEMA_VERSION
     evidence_kind: str = "ledger"
@@ -312,6 +326,7 @@ class ClockifyPeriodReadback:
                 key: self.entry_durations[key] for key in self.entry_ids
             } if self.entry_durations else {},
             "native_costs": {key: str(value) for key, value in sorted(self.native_costs.items())},
+            "final_live_readback_sha256": self.final_live_readback_sha256,
             **({"request_receipt": dict(self.request_receipt)} if self.request_receipt else {}),
             **({"raw_response": dict(self.raw_response)} if self.raw_response else {}),
         }
@@ -397,7 +412,11 @@ def _normalize_summary(payload: Mapping[str, Any], zone: ZoneInfo) -> ClockifyPe
     receipt = payload.get("request_receipt")
     raw_response = payload.get("raw_response")
     if explicit_kind and evidence_kind == "ledger":
-        if not ids or not entry_durations or set(entry_durations) != set(ids) or sum(entry_durations.values()) != seconds_raw or count_raw != len(ids):
+        zero_work = not ids and count_raw == 0 and seconds_raw == 0 and not entry_durations
+        if not zero_work and (
+            not ids or not entry_durations or set(entry_durations) != set(ids)
+            or sum(entry_durations.values()) != seconds_raw or count_raw != len(ids)
+        ):
             raise ClockifyReadbackError("ledger entry_durations must cover every entry and sum to duration_seconds")
     elif explicit_kind and evidence_kind == "report":
         if not isinstance(receipt, Mapping):
@@ -425,6 +444,7 @@ def _normalize_summary(payload: Mapping[str, Any], zone: ZoneInfo) -> ClockifyPe
             raise ClockifyReadbackError("report outer evidence contradicts bound projection")
         if not costs or any(not amount.is_finite() for amount in costs.values()):
             raise ClockifyReadbackError("report native costs are required")
+    final_live_readback_sha256 = _snapshot_digest(payload.get("final_live_readback_sha256"))
     unsigned = {
         "schema_version": SCHEMA_VERSION,
         "evidence_kind": evidence_kind,
@@ -435,6 +455,7 @@ def _normalize_summary(payload: Mapping[str, Any], zone: ZoneInfo) -> ClockifyPe
         "entry_ids": list(ids), "entry_count": count_raw, "duration_seconds": seconds_raw,
         "entry_durations": {key: entry_durations[key] for key in ids} if entry_durations else {},
         "native_costs": {key: str(value) for key, value in sorted(costs.items())},
+        "final_live_readback_sha256": final_live_readback_sha256,
     }
     if receipt:
         unsigned["request_receipt"] = dict(receipt)
@@ -447,6 +468,7 @@ def _normalize_summary(payload: Mapping[str, Any], zone: ZoneInfo) -> ClockifyPe
     return ClockifyPeriodReadback(
         workspace, member, zone.key, period_start, period_end, filters, refreshed,
         include_running, include_deleted, ids, count_raw, seconds_raw, costs, digest,
+        final_live_readback_sha256,
         entry_durations, SCHEMA_VERSION, evidence_kind, dict(receipt) if isinstance(receipt, Mapping) else None,
         dict(raw_response) if isinstance(raw_response, Mapping) else None,
     )
@@ -481,6 +503,7 @@ def normalize_readback(
     include_running, include_deleted = _inclusion_values(payload)
     filters = _filters(payload, include_running, include_deleted)
     ids: list[str] = []
+    snapshot_entries: list[Mapping[str, Any]] = []
     entry_durations: dict[str, int] = {}
     total = 0
     costs: dict[str, Decimal] = {}
@@ -524,8 +547,13 @@ def normalize_readback(
         if entry_id in ids:
             raise ClockifyReadbackError("entry IDs must be unique")
         ids.append(entry_id)
+        snapshot_entries.append(entry)
         entry_durations[entry_id] = seconds
         total += seconds
+    final_live_readback_sha256 = "sha256:" + clockify_snapshot.normalized_snapshot_sha256(snapshot_entries)
+    supplied_snapshot = payload.get("final_live_readback_sha256")
+    if supplied_snapshot is not None and _snapshot_digest(supplied_snapshot) != final_live_readback_sha256:
+        raise ClockifyReadbackError("final_live_readback_sha256 does not match normalized Clockify entries")
     summary = {
         "schema_version": SCHEMA_VERSION, "evidence_kind": "ledger", "workspace_id": workspace, "member_id": member,
         "timezone": zone.key, "period_start": _utc(period_start), "period_end": _utc(period_end),
@@ -534,6 +562,7 @@ def normalize_readback(
         "entry_ids": ids, "entry_count": len(ids), "duration_seconds": total,
         "entry_durations": entry_durations,
         "native_costs": {key: str(value) for key, value in sorted(costs.items())},
+        "final_live_readback_sha256": final_live_readback_sha256,
     }
     supplied_count = payload.get("entry_count", payload.get("entryCount"))
     if supplied_count is not None and supplied_count != len(ids):
@@ -544,6 +573,7 @@ def normalize_readback(
     return ClockifyPeriodReadback(
         workspace, member, zone.key, period_start, period_end, filters, refreshed,
         include_running, include_deleted, tuple(ids), len(ids), total, costs, _digest(summary),
+        final_live_readback_sha256,
         entry_durations,
     )
 
@@ -744,7 +774,8 @@ class ClockifyApiGateway:
                 "include_running": False, "include_deleted": False,
                 "refreshed_at": datetime.now(timezone.utc).isoformat(),
                 "entry_count": entry_count, "duration_seconds": duration_seconds,
-                "native_costs": costs, "request_receipt": receipt, "raw_response": projection}
+                "native_costs": costs, "request_receipt": receipt, "raw_response": projection,
+                "final_live_readback_sha256": "sha256:" + "0" * 64}
 
 
 def _json(path: Path) -> Any:
@@ -813,6 +844,14 @@ def _period_args(args: argparse.Namespace, routing: Mapping[str, Any]) -> tuple[
     return timezone_name, workspace, member, start, end
 
 
+def _bind_final_live_snapshot(
+    readback: ClockifyPeriodReadback, final_live_readback_sha256: str,
+) -> ClockifyPeriodReadback:
+    document = readback.document()
+    document["final_live_readback_sha256"] = _snapshot_digest(final_live_readback_sha256)
+    return normalize_readback(document)
+
+
 def _capture(args: argparse.Namespace) -> int:
     routing = _json(args.routing)
     if not isinstance(routing, Mapping):
@@ -857,6 +896,7 @@ def _capture(args: argparse.Namespace) -> int:
         raise ClockifyReadbackError("captured report period does not match requested period")
     if _canonical(dict(report.filters)) != _canonical(filters) or report.include_running is not False or report.include_deleted is not False:
         raise ClockifyReadbackError("captured report filters do not match requested filters")
+    report = _bind_final_live_snapshot(report, api.final_live_readback_sha256)
     _write(args.api_output, api.to_dict(), root=args.output_root)
     _write(args.report_output, report.to_dict(), root=args.output_root)
     print(_canonical({"status": "captured", "api_digest": api.digest, "report_digest": report.digest, "read_only": True}))

@@ -8,7 +8,7 @@
     "schema_version", "evidence_kind", "workspace_id", "member_id", "timezone",
     "period_start", "period_end", "filters", "refreshed_at",
     "include_running", "include_deleted", "entry_ids", "entry_count",
-    "duration_seconds", "entry_durations", "native_costs", "digest"
+    "duration_seconds", "entry_durations", "native_costs", "final_live_readback_sha256", "digest"
   ],
   "properties": {
     "schema_version": {"const": "clockify-period-readback/v1"},
@@ -35,6 +35,7 @@
       "propertyNames": {"pattern": "^[A-Z]{3}$"},
       "additionalProperties": {"type": "string", "pattern": "^-?[0-9]+(\\.[0-9]+)?$"}
     },
+    "final_live_readback_sha256": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
     "request_receipt": {
       "type": "object",
       "additionalProperties": false,

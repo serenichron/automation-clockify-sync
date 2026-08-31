@@ -74,6 +74,8 @@ class PublicationGateTests(unittest.TestCase):
         slice_target: dict[str, str] | None = None,
         slice_dates: dict[str, str] | None = None,
         post_entries: bool = True,
+        zero_work: bool = False,
+        post_final_digest: str | None = None,
         approval_manifest_digest: str | None = None,
         approval_event_history_digest: str | None = None,
         approval_prefix_state: str = "approved",
@@ -190,12 +192,11 @@ class PublicationGateTests(unittest.TestCase):
             ))
         else:
             post_events_path.touch()
-        post_receipt = {
-            "schema_version": "clockify-portfolio-post/v1",
-            "status": "complete",
-            "final_live_readback_sha256": "sha256:" + "b" * 64,
-            "post_events": post_store.derive_receipt(operation_identity),
-        }
+        entry_ids = ["entry-1"] if post_entries else ([] if zero_work else ["entry-zero"])
+        entry_count = 1 if post_entries or not zero_work else 0
+        entry_durations = {"entry-1": 600} if post_entries else ({} if zero_work else {"entry-zero": 0})
+        duration_seconds = 600 if post_entries else 0
+        native_costs = {"USD": "983.70", "EUR": "7.31"} if not zero_work else {"USD": "0.00"}
         readback = clockify_period_readback.normalize_readback({
             "schema_version": "clockify-period-readback/v1", "evidence_kind": "ledger",
             "workspace_id": self.identity.workspace_id, "member_id": self.identity.member_id,
@@ -205,17 +206,27 @@ class PublicationGateTests(unittest.TestCase):
                 "timezone": self.identity.timezone, "include_running": False, "include_deleted": False,
             },
             "refreshed_at": "2026-08-18T08:55:00Z", "include_running": False, "include_deleted": False,
-            "entry_ids": ["entry-1"] if post_entries else ["entry-zero"], "entry_count": 1,
-            "duration_seconds": 600 if post_entries else 0,
-            "entry_durations": {"entry-1": 600} if post_entries else {"entry-zero": 0}, "native_costs": {"USD": "983.70", "EUR": "7.31"},
+            "entry_ids": entry_ids, "entry_count": entry_count,
+            "duration_seconds": duration_seconds,
+            "entry_durations": entry_durations, "native_costs": native_costs,
+            "final_live_readback_sha256": "sha256:" + "a" * 64,
         })
+        post_receipt = {
+            "schema_version": "clockify-portfolio-post/v1",
+            "status": "complete",
+            "final_live_readback_sha256": post_final_digest or getattr(
+                readback, "final_live_readback_sha256", "sha256:" + "b" * 64,
+            ),
+            "post_events": post_store.derive_receipt(operation_identity),
+        }
         currency_summary = clockify_currency.convert_native_buckets(
             readback.native_costs, quote, publication_date=NOW.date(),
         ) if quote_date >= NOW.date() - timedelta(days=4) else None
         raw_report = {"totals": [{
-            "entriesCount": 1, "totalTime": 600 if post_entries else 0,
+            "entriesCount": entry_count, "totalTime": duration_seconds,
             "amounts": [{"amountByCurrency": [
-                {"currency": "USD", "amount": "98370"}, {"currency": "EUR", "amount": "731"},
+                {"currency": currency, "amount": format(Decimal(amount) * Decimal("100"), "f")}
+                for currency, amount in native_costs.items()
             ]}],
         }]}
         report_receipt = {
@@ -321,6 +332,11 @@ class PublicationGateTests(unittest.TestCase):
 
         with self.assertRaisesRegex(publication_gate.PublicationGateError, "post receipt artifact"):
             self.prepare(inputs)
+
+    def test_prepare_rejects_post_receipt_snapshot_digest_substituted_before_manifest_binding(self) -> None:
+        """A self-consistent receipt must still name the exact fresh API ledger snapshot."""
+        with self.assertRaisesRegex(publication_gate.PublicationGateError, "final.*snapshot"):
+            self.prepare(self.ready_inputs(post_final_digest="sha256:" + "b" * 64))
 
     def test_prepare_rejects_a_forged_in_memory_quality_result(self) -> None:
         inputs = self.ready_inputs(quality_status="fail")
@@ -434,6 +450,72 @@ class PublicationGateTests(unittest.TestCase):
         with self.assertRaisesRegex(publication_gate.PublicationGateError, "artifact"):
             self.prepare(inputs)
 
+    def test_bound_evidence_rejects_an_artifact_replaced_after_manifest_derivation(self) -> None:
+        """Replacing a path after its event reference was verified must not change gate evidence."""
+        inputs = self.ready_inputs()
+        paths = inputs["paths"]
+        assert isinstance(paths, dict)
+        replacement = {"status": "pass", "replacement": True}
+        write_json(paths["quality"], replacement)
+
+        with self.assertRaisesRegex(publication_gate.PublicationGateError, "digest"):
+            publication_gate._require_bound_evidence(inputs["manifest"], replacement, "quality")
+
+    def test_prepare_uses_one_verified_event_history_when_the_path_mutates_after_read(self) -> None:
+        """A second event-ledger read could mix an approved prefix with a different final manifest."""
+        inputs = self.ready_inputs()
+        original_verify = reconciliation_manifest.CoordinatorEventStore.verify
+        mutated = False
+
+        def verify_then_mutate(store: reconciliation_manifest.CoordinatorEventStore, identity: reconciliation_manifest.PeriodIdentity):
+            nonlocal mutated
+            verified = original_verify(store, identity)
+            if store.path == inputs["events"] and not mutated:
+                store.path.write_text("mutated after verified read\n", encoding="utf-8")
+                mutated = True
+            return verified
+
+        with mock.patch.object(
+            reconciliation_manifest.CoordinatorEventStore, "verify", autospec=True,
+            side_effect=verify_then_mutate,
+        ):
+            contract = self.prepare(inputs)
+
+        self.assertTrue(mutated)
+        self.assertEqual("publication_prepared", contract.state)
+
+    def test_prepare_rejects_posting_ledgers_mutated_after_provenance_derivation(self) -> None:
+        """Ledger byte bindings remain valid through contract construction, not merely before parsing."""
+        for ledger in ("approval", "post"):
+            with self.subTest(ledger=ledger):
+                inputs = self.ready_inputs()
+                if ledger == "approval":
+                    original = posting_receipts.ApprovalReceiptStore.require_consumed
+
+                    def mutate_after_approval(store: posting_receipts.ApprovalReceiptStore, *args: object, **kwargs: object):
+                        receipt = original(store, *args, **kwargs)
+                        Path(inputs["approval_events"]).write_text("mutated approval ledger\n", encoding="utf-8")
+                        return receipt
+
+                    patcher = mock.patch.object(
+                        posting_receipts.ApprovalReceiptStore, "require_consumed", autospec=True,
+                        side_effect=mutate_after_approval,
+                    )
+                else:
+                    original = posting_receipts.PostEventStore.derive_receipt
+
+                    def mutate_after_post(store: posting_receipts.PostEventStore, *args: object, **kwargs: object):
+                        receipt = original(store, *args, **kwargs)
+                        Path(inputs["post_events"]).write_text("mutated post ledger\n", encoding="utf-8")
+                        return receipt
+
+                    patcher = mock.patch.object(
+                        posting_receipts.PostEventStore, "derive_receipt", autospec=True,
+                        side_effect=mutate_after_post,
+                    )
+                with patcher, self.assertRaisesRegex(publication_gate.PublicationGateError, "artifact|drift"):
+                    self.prepare(inputs)
+
     def test_incomplete_calendly_blocks_prepare(self) -> None:
         with self.assertRaisesRegex(publication_gate.PublicationGateError, "Calendly"):
             self.prepare(self.ready_inputs(calendly_complete=False))
@@ -492,7 +574,7 @@ class PublicationGateTests(unittest.TestCase):
         assert isinstance(entry, dict)
         entry["clockify_entry_id"] = "missing-entry"
 
-        with self.assertRaisesRegex(publication_gate.PublicationGateError, "post_events"):
+        with self.assertRaisesRegex(publication_gate.PublicationGateError, "post receipt artifact"):
             self.prepare(inputs)
 
     def test_unconsumed_or_unrelated_post_approval_blocks_prepare(self) -> None:
@@ -502,10 +584,15 @@ class PublicationGateTests(unittest.TestCase):
         with self.assertRaisesRegex(publication_gate.PublicationGateError, "approval"):
             self.prepare(inputs)
 
-    def test_nonzero_period_requires_at_least_one_terminal_post_entry(self) -> None:
-        """Changing the guard to use duration rather than period boundaries would admit empty posting history."""
+    def test_nonzero_readbacks_require_at_least_one_terminal_post_entry(self) -> None:
+        """An empty posting history is only safe when both fresh ledgers prove zero work."""
         with self.assertRaisesRegex(publication_gate.PublicationGateError, "terminal"):
             self.prepare(self.ready_inputs(post_entries=False))
+
+    def test_zero_work_period_allows_an_empty_terminal_post_history(self) -> None:
+        contract = self.prepare(self.ready_inputs(post_entries=False, zero_work=True))
+
+        self.assertEqual("publication_prepared", contract.state)
 
     def test_stale_or_future_dual_readback_blocks_prepare(self) -> None:
         for label, key, refreshed_at in (
@@ -566,6 +653,26 @@ class PublicationGateTests(unittest.TestCase):
         approval = self.approval(prepared, expires_at="2026-08-25T08:00:00Z")
         with self.assertRaisesRegex(publication_gate.PublicationGateError, "currency evidence"):
             publication_gate.authorize_publication(prepared, approval, now=future)
+
+    def test_authorization_rejects_stale_prepared_readbacks_and_future_approval_time(self) -> None:
+        prepared = self.prepare(self.ready_inputs())
+        stale_document = prepared.document()
+        stale_document["api_readback_refreshed_at"] = "2026-08-18T08:44:59Z"
+        stale_document["contract_digest"] = publication_gate._digest({
+            key: value for key, value in stale_document.items() if key != "contract_digest"
+        })
+        stale = publication_gate.PublicationContract.from_document(stale_document)
+
+        with self.assertRaisesRegex(publication_gate.PublicationGateError, "stale"):
+            publication_gate.authorize_publication(stale, self.approval(stale), now=NOW)
+        with self.assertRaisesRegex(publication_gate.PublicationGateError, "approval timestamp.*future"):
+            publication_gate.authorize_publication(
+                prepared,
+                self.approval(
+                    prepared, approved_at="2026-08-18T09:01:00Z", expires_at="2026-08-18T10:00:00Z",
+                ),
+                now=NOW,
+            )
 
     def test_cli_prepare_and_authorize_write_only_successful_contracts(self) -> None:
         inputs = self.ready_inputs()

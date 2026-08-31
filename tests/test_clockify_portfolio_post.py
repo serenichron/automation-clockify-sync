@@ -557,7 +557,7 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
         self.assertEqual("approval-1", args.approval_receipt)
         self.assertEqual(Path("approvals.jsonl"), args.approval_events)
 
-    def test_normalized_snapshot_digest_is_order_independent_and_covers_live_identity(self) -> None:
+    def test_shared_snapshot_digest_is_order_independent_and_normalizes_clockify_raw_fields(self) -> None:
         entries = [
             {
                 "id": "entry-b", "start": "2026-08-14T10:10:00+00:00",
@@ -590,6 +590,17 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
                 mutated = [dict(entries[0]), dict(entries[1])]
                 mutated[1][field] = changed
                 self.assertNotEqual(baseline, poster._normalized_snapshot_sha256(mutated))
+
+        raw_clockify_rows = [{
+            "id": "entry-a",
+            "timeInterval": {"start": "2026-08-14T10:00:00+00:00", "end": "2026-08-14T10:10:00Z"},
+            "projectId": "project-a", "tagIds": ["tag-b"], "description": " Work A ", "billable": True,
+        }, {
+            "id": "entry-b",
+            "timeInterval": {"start": "2026-08-14T10:10:00+00:00", "end": "2026-08-14T10:20:00Z"},
+            "projectId": "project-b", "tagIds": ["tag-a", "tag-z"], "description": " Work B ", "billable": True,
+        }]
+        self.assertEqual(baseline, poster._normalized_snapshot_sha256(raw_clockify_rows))
 
     def test_exact_rejects_non_boolean_billable(self) -> None:
         plan = {"start": "2026-08-14T10:00:00Z", "end": "2026-08-14T10:10:00Z", "project_id": "p", "tag_ids": [], "description": "work", "billable": True}

@@ -12,6 +12,7 @@ from dataclasses import replace
 from unittest import mock
 
 from scripts import clockify_period_readback as readback
+from scripts import clockify_post_approved_portfolio as poster
 
 
 TZ = "+03:00"
@@ -82,6 +83,7 @@ def _report_from(api: dict, *, seconds: int | None = None, **changes: object) ->
         "entry_count": 172,
         "duration_seconds": seconds if seconds is not None else 132217,
         "native_costs": {"USD": "983.70", "EUR": "7.31"},
+        "final_live_readback_sha256": "sha256:" + "a" * 64,
     }
     result.update(changes)
     return result
@@ -101,7 +103,23 @@ class ClockifyReadbackContractTests(unittest.TestCase):
         self.assertTrue(result.filters["include_deleted"])
         self.assertTrue(result.digest.startswith("sha256:"))
 
+    def test_ledger_snapshot_digest_matches_poster_and_summary_serialization_binds_it(self):
+        fixture = _api_fixture()
+        result = readback.normalize_readback(fixture)
+
+        self.assertEqual(
+            "sha256:" + poster._normalized_snapshot_sha256(fixture["entries"]),
+            result.final_live_readback_sha256,
+        )
+        serialized = result.to_dict()
+        self.assertEqual(result.final_live_readback_sha256, serialized["final_live_readback_sha256"])
+        self.assertEqual(result, readback.normalize_readback(serialized))
+        serialized["final_live_readback_sha256"] = "sha256:" + "0" * 64
+        with self.assertRaisesRegex(readback.ClockifyReadbackError, "digest"):
+            readback.normalize_readback(serialized)
+
     def test_august_sixteenth_is_outside_half_open_period(self):
+        baseline = readback.normalize_readback(_api_fixture())
         fixture = _api_fixture()
         fixture["entries"].append({
             **_entry(999),
@@ -115,6 +133,7 @@ class ClockifyReadbackContractTests(unittest.TestCase):
         result = readback.normalize_readback(fixture)
         self.assertNotIn("august-16", result.entry_ids)
         self.assertEqual(172, result.entry_count)
+        self.assertEqual(baseline.final_live_readback_sha256, result.final_live_readback_sha256)
 
     def test_ten_minute_report_difference_is_a_blocker_not_rounding(self):
         api = readback.normalize_readback(_api_fixture())

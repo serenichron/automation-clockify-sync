@@ -361,9 +361,8 @@ def _manifest(value: reconciliation_manifest.ReconciliationManifest | Mapping[st
     try:
         document = value.document() if isinstance(value, reconciliation_manifest.ReconciliationManifest) else value
         manifest = reconciliation_manifest.ReconciliationManifest.from_document(document)
-        reconciliation_manifest._verify_artifact_refs(list(manifest.artifacts))
     except reconciliation_manifest.ManifestError as exc:
-        raise PublicationGateError(f"manifest artifact verification failed: {exc}") from exc
+        raise PublicationGateError(f"manifest is invalid: {exc}") from exc
     if manifest.state != "verifying":
         raise PublicationGateError("manifest state is not ready for publication")
     if manifest.blockers:
@@ -373,20 +372,19 @@ def _manifest(value: reconciliation_manifest.ReconciliationManifest | Mapping[st
 
 def _verified_manifest(
     value: reconciliation_manifest.ReconciliationManifest | Mapping[str, object], events: Path | str,
-) -> reconciliation_manifest.ReconciliationManifest:
+) -> tuple[reconciliation_manifest.ReconciliationManifest, tuple[reconciliation_manifest.CoordinatorEvent, ...]]:
     """Re-derive one supplied manifest from its canonical append-only history."""
     supplied = _manifest(value)
     if not isinstance(events, (Path, str)):
         raise PublicationGateError("period events path is invalid")
     try:
-        derived = reconciliation_manifest.ReconciliationCoordinator(
-            supplied.identity, reconciliation_manifest.CoordinatorEventStore(Path(events)),
-        ).derive()
+        history = reconciliation_manifest.CoordinatorEventStore(Path(events)).verify(supplied.identity)
+        derived = reconciliation_manifest.derive_manifest_from_verified_events(supplied.identity, history)
     except reconciliation_manifest.ManifestError as exc:
         raise PublicationGateError(f"period event history is invalid: {exc}") from exc
     if supplied.document() != derived.document():
         raise PublicationGateError("supplied manifest does not match canonical period event history")
-    return _manifest(derived)
+    return _manifest(derived), history
 
 
 def _approved_manifest_prefix(
@@ -427,31 +425,49 @@ def _load_json(path: Path, field: str) -> Mapping[str, object]:
     return value
 
 
+def _bound_manifest_documents(
+    manifest: reconciliation_manifest.ReconciliationManifest,
+) -> tuple[Mapping[str, object], ...]:
+    """Read each referenced JSON artifact once and bind parsing to its hashed bytes."""
+    documents: list[Mapping[str, object]] = []
+    for reference in manifest.artifacts:
+        try:
+            path = Path(str(reference["path"])).resolve()
+            expected_digest = _digest_text(reference["digest"], "manifest artifact digest")
+            content = path.read_bytes()
+        except (KeyError, OSError) as exc:
+            raise PublicationGateError("manifest artifact is unavailable") from exc
+        actual_digest = "sha256:" + hashlib.sha256(content).hexdigest()
+        if actual_digest != expected_digest:
+            raise PublicationGateError("manifest artifact digest drift")
+        if path.suffix == ".jsonl":
+            continue
+        try:
+            document = json.loads(content)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise PublicationGateError("manifest artifact is not valid JSON") from exc
+        if not isinstance(document, Mapping):
+            raise PublicationGateError("manifest artifact is not an object")
+        documents.append(document)
+    return tuple(documents)
+
+
 def _require_bound_evidence(
     manifest: reconciliation_manifest.ReconciliationManifest, value: object, label: str,
-) -> None:
+) -> Mapping[str, object]:
     """Require a supplied pure-gate document to be one of the manifest's verified artifacts."""
     if not isinstance(value, Mapping):
         raise PublicationGateError(f"{label} evidence is invalid")
     candidate = _canonical(value)
-    for reference in manifest.artifacts:
-        try:
-            artifact = _load_json(Path(str(reference["path"])), "manifest artifact")
-        except PublicationGateError:
-            continue
+    for artifact in _bound_manifest_documents(manifest):
         if _canonical(artifact) == candidate:
-            return
+            return artifact
     raise PublicationGateError(f"{label} artifact is absent from the verified manifest")
 
 
 def _slice_bundles(manifest: reconciliation_manifest.ReconciliationManifest) -> tuple[Mapping[str, object], ...]:
     bundles: list[Mapping[str, object]] = []
-    for reference in manifest.artifacts:
-        path = Path(str(reference["path"]))
-        try:
-            document = _load_json(path, "manifest artifact")
-        except PublicationGateError:
-            continue
+    for document in _bound_manifest_documents(manifest):
         if "run_id" in document and "evidence_ledger" in document:
             bundles.append(document)
     if not bundles:
@@ -619,7 +635,9 @@ def _readback(
         raise PublicationGateError("Clockify readback freshness is stale")
     if evidence_kind == "report" and (not readback.request_receipt or not readback.native_costs):
         raise PublicationGateError("shared-report readback has no native currency evidence")
-    if evidence_kind == "ledger" and not readback.entry_ids:
+    if evidence_kind == "ledger" and not readback.entry_ids and (
+        readback.entry_count != 0 or readback.duration_seconds != 0
+    ):
         raise PublicationGateError("Clockify readback has no native currency buckets")
     return readback
 
@@ -628,10 +646,13 @@ def _require_post_provenance(
     value: object, *, approval_receipt_id: object, approval_events: Path | str, post_events: Path | str,
     identity: reconciliation_manifest.PeriodIdentity,
     history: Sequence[reconciliation_manifest.CoordinatorEvent], now: datetime,
+    api_final_live_readback_sha256: str, ledger_digests: Mapping[Path, str],
 ) -> Mapping[str, object]:
     if not isinstance(value, Mapping) or value.get("status") != "complete":
         raise PublicationGateError("Clockify post receipt is incomplete")
-    _digest_text(value.get("final_live_readback_sha256"), "Clockify post receipt final readback")
+    final_snapshot = _digest_text(value.get("final_live_readback_sha256"), "Clockify post receipt final readback")
+    if final_snapshot != api_final_live_readback_sha256:
+        raise PublicationGateError("Clockify post receipt final ledger snapshot does not match fresh API readback")
     supplied_post_events = value.get("post_events")
     if not isinstance(supplied_post_events, Mapping):
         raise PublicationGateError("Clockify post receipt has no verified post events")
@@ -667,6 +688,7 @@ def _require_post_provenance(
             raise PublicationGateError("Clockify post event target does not match the manifest")
     if _canonical(supplied_post_events) != _canonical(derived):
         raise PublicationGateError("Clockify post receipt post_events do not match verified history")
+    _require_paths_unchanged(ledger_digests)
     return derived
 
 
@@ -726,30 +748,44 @@ def prepare_publication(
     check_now = now or datetime.now(timezone.utc)
     if check_now.tzinfo is None or check_now.utcoffset() is None:
         raise PublicationGateError("publication clock must include a timezone")
-    ready_manifest = _verified_manifest(manifest, events)
-    try:
-        history = reconciliation_manifest.CoordinatorEventStore(Path(events)).verify(ready_manifest.identity)
-    except reconciliation_manifest.ManifestError as exc:
-        raise PublicationGateError(f"period event history is invalid: {exc}") from exc
-    _bound_input_artifacts(ready_manifest, (Path(approval_events), Path(post_events)))
-    _require_bound_evidence(ready_manifest, coverage, "coverage")
+    ready_manifest, history = _verified_manifest(manifest, events)
+    approval_events_path = Path(approval_events).resolve()
+    post_events_path = Path(post_events).resolve()
+    ledger_digests = _bound_input_artifacts(ready_manifest, (approval_events_path, post_events_path))
+    coverage = _require_bound_evidence(ready_manifest, coverage, "coverage")
     required_slices = _require_coverage(coverage, ready_manifest.identity, history)
     _require_slices(ready_manifest, required_slices)
-    _require_bound_evidence(ready_manifest, quality, "quality")
-    _require_bound_evidence(ready_manifest, replay, "replay")
+    quality = _require_bound_evidence(ready_manifest, quality, "quality")
+    replay = _require_bound_evidence(ready_manifest, replay, "replay")
     _require_pass(quality, "quality")
     _require_pass(replay, "replay")
-    api = _readback(api_readback, ready_manifest.identity, evidence_kind="ledger", now=check_now)
-    report = _readback(shared_report_readback, ready_manifest.identity, evidence_kind="report", now=check_now)
-    _require_bound_evidence(ready_manifest, api.to_dict(), "Clockify API readback")
-    _require_bound_evidence(ready_manifest, report.to_dict(), "shared-report readback")
-    derived_post_events = _require_post_provenance(
-        post_receipt, approval_receipt_id=approval_receipt_id, approval_events=approval_events,
-        post_events=post_events, identity=ready_manifest.identity, history=history, now=check_now,
+    api = _readback(
+        _require_bound_evidence(
+            ready_manifest,
+            _readback(api_readback, ready_manifest.identity, evidence_kind="ledger", now=check_now).to_dict(),
+            "Clockify API readback",
+        ),
+        ready_manifest.identity, evidence_kind="ledger", now=check_now,
     )
-    _require_bound_evidence(ready_manifest, post_receipt, "post receipt")
-    if ready_manifest.identity.since < ready_manifest.identity.until and not derived_post_events.get("entries"):
-        raise PublicationGateError("nonzero period has no terminal Clockify post entries")
+    report = _readback(
+        _require_bound_evidence(
+            ready_manifest,
+            _readback(shared_report_readback, ready_manifest.identity, evidence_kind="report", now=check_now).to_dict(),
+            "shared-report readback",
+        ),
+        ready_manifest.identity, evidence_kind="report", now=check_now,
+    )
+    post_receipt = _require_bound_evidence(ready_manifest, post_receipt, "post receipt")
+    derived_post_events = _require_post_provenance(
+        post_receipt, approval_receipt_id=approval_receipt_id, approval_events=approval_events_path,
+        post_events=post_events_path, identity=ready_manifest.identity, history=history, now=check_now,
+        api_final_live_readback_sha256=api.final_live_readback_sha256, ledger_digests=ledger_digests,
+    )
+    if not derived_post_events.get("entries") and not (
+        api.entry_count == report.entry_count == 0
+        and api.duration_seconds == report.duration_seconds == 0
+    ):
+        raise PublicationGateError("nonzero Clockify readbacks have no terminal Clockify post entries")
     try:
         clockify_period_readback.verify_readback(api, report, post_receipt=derived_post_events)
     except clockify_period_readback.ClockifyReadbackError as exc:
@@ -758,8 +794,9 @@ def prepare_publication(
         raise PublicationGateError("shared-report request receipt is required")
     report_target = "shared-report:" + _text(report.request_receipt.get("shared_report_id"), "shared-report ID")
     slack = _text(slack_target, "slack_target")
-    quote = _quote_from_document(fx_quote)
-    _require_bound_evidence(ready_manifest, quote.to_dict(), "FX quote")
+    quote = _quote_from_document(_require_bound_evidence(
+        ready_manifest, _quote_from_document(fx_quote).to_dict(), "FX quote",
+    ))
     clock = check_now.astimezone(ZoneInfo(ready_manifest.identity.timezone))
     try:
         expected_summary = clockify_currency.convert_native_buckets(
@@ -802,14 +839,17 @@ def authorize_publication(
     except (ZoneInfoNotFoundError, clockify_currency.CurrencyContractError) as exc:
         raise PublicationGateError(f"publication currency evidence is invalid: {exc}") from exc
     now_utc = now.astimezone(timezone.utc)
-    if (
-        _timestamp(contract.api_readback_refreshed_at, "api_readback_refreshed_at") > now_utc
-        or _timestamp(contract.shared_report_readback_refreshed_at, "shared_report_readback_refreshed_at") > now_utc
-    ):
-        raise PublicationGateError("prepared readback freshness is in the future")
+    for field in ("api_readback_refreshed_at", "shared_report_readback_refreshed_at"):
+        age_seconds = (now_utc - _timestamp(getattr(contract, field), field)).total_seconds()
+        if age_seconds < 0:
+            raise PublicationGateError("prepared readback freshness is in the future")
+        if age_seconds > 900:
+            raise PublicationGateError("prepared readback freshness is stale")
     approval = _approval(publication_approval)
     approved_at = _timestamp(approval["approved_at"], "publication approval timestamp")
     expires_at = _timestamp(approval["expires_at"], "publication approval expiry")
+    if approved_at > now_utc:
+        raise PublicationGateError("publication approval timestamp is in the future")
     if expires_at <= approved_at or expires_at <= now_utc:
         raise PublicationGateError("publication approval is expired")
     if tuple(approval["operations"]) != OPERATIONS:
@@ -837,8 +877,11 @@ def authorize_publication(
     )
 
 
-def _bound_input_artifacts(manifest: reconciliation_manifest.ReconciliationManifest, paths: Sequence[Path]) -> None:
+def _bound_input_artifacts(
+    manifest: reconciliation_manifest.ReconciliationManifest, paths: Sequence[Path],
+) -> dict[Path, str]:
     expected = {str(reference["path"]): str(reference["digest"]) for reference in manifest.artifacts}
+    bound: dict[Path, str] = {}
     for path in paths:
         resolved = path.resolve()
         try:
@@ -847,6 +890,18 @@ def _bound_input_artifacts(manifest: reconciliation_manifest.ReconciliationManif
             raise PublicationGateError("publication input artifact is unavailable") from exc
         if expected.get(str(resolved)) != actual:
             raise PublicationGateError("publication input artifact is absent from or drifted from the manifest")
+        bound[resolved] = actual
+    return bound
+
+
+def _require_paths_unchanged(bound: Mapping[Path, str]) -> None:
+    for path, expected_digest in bound.items():
+        try:
+            actual_digest = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as exc:
+            raise PublicationGateError("publication input artifact is unavailable") from exc
+        if actual_digest != expected_digest:
+            raise PublicationGateError("publication input artifact drifted during provenance derivation")
 
 
 def _output(path: Path, document: Mapping[str, object]) -> None:
@@ -888,11 +943,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def run(args: argparse.Namespace, *, now: datetime | None = None) -> int:
     if args.command == "prepare":
         manifest = _manifest(_load_json(args.manifest, "period manifest"))
-        input_paths = (
-            args.post_receipt, args.approval_events, args.post_events, args.api_readback,
-            args.shared_report_readback, args.fx_quote, args.quality, args.replay, args.coverage,
-        )
-        _bound_input_artifacts(manifest, input_paths)
         contract = prepare_publication(
             manifest, events=args.events, approval_receipt_id=args.approval_receipt_id,
             approval_events=args.approval_events, post_events=args.post_events,
