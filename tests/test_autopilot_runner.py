@@ -63,9 +63,7 @@ class AutopilotRunnerTests(unittest.TestCase):
             completed = subprocess.CompletedProcess(
                 ["review"], 2, stdout=f"{first}\n{second}\n", stderr="later slice incomplete"
             )
-            with mock.patch.object(runner.subprocess, "run", return_value=completed), mock.patch.object(
-                runner.source_coverage, "update", wraps=runner.source_coverage.update
-            ) as update:
+            with mock.patch.object(runner.subprocess, "run", return_value=completed):
                 self.assertEqual(
                     runner.TEMPORARY_COVERAGE_EXIT,
                     runner.run(environment),
@@ -74,11 +72,7 @@ class AutopilotRunnerTests(unittest.TestCase):
 
             self.assertEqual([str(first), str(second)], status["results"])
             self.assertEqual(str(second), status["result"])
-            self.assertEqual(2, update.call_count)
-            self.assertEqual(
-                ["2026-08-01", "2026-08-02"],
-                [call.kwargs["interval_since"] for call in update.call_args_list],
-            )
+            self.assertTrue(status["coverage_debts"])
             self.assertEqual(0, runner.mark_reported(environment, first))
             self.assertEqual(0, runner.mark_reported(environment, second))
             self.assertEqual(2, runner.mark_reported(environment, second.with_name("other.json")))
@@ -137,6 +131,59 @@ class AutopilotRunnerTests(unittest.TestCase):
             status = json.loads(Path(environment["CLOCKIFY_AUTOPILOT_STATUS"]).read_text())
         self.assertEqual("coverage_exhausted", status["state"])
         self.assertEqual(3, status["coverage_retry_attempts"])
+
+    def test_retry_counts_are_independent_for_exact_source_debts(self):
+        """Catches runner state that increments one counter for unrelated sources."""
+        with tempfile.TemporaryDirectory() as directory:
+            environment, result = self.fixture(
+                directory,
+                "coverage_warning",
+                date_range={"since": "2026-08-01T00:00:00Z", "until": "2026-08-03T00:00:00Z"},
+                source_completeness={
+                    "status": "incomplete",
+                    "incomplete_sources": ["sessions/macbook"],
+                },
+            )
+            completed = subprocess.CompletedProcess(
+                ["review"], 0, stdout=str(result) + "\n", stderr=""
+            )
+            with mock.patch.object(runner.subprocess, "run", return_value=completed):
+                self.assertEqual(runner.TEMPORARY_COVERAGE_EXIT, runner.run(environment))
+                result.write_text(json.dumps({
+                    "action": "coverage_warning",
+                    "date_range": {"since": "2026-08-01T00:00:00Z", "until": "2026-08-03T00:00:00Z"},
+                    "source_completeness": {
+                        "status": "incomplete",
+                        "incomplete_sources": ["repositories/omarchy-desktop"],
+                    },
+                }) + "\n")
+                self.assertEqual(runner.TEMPORARY_COVERAGE_EXIT, runner.run(environment))
+            status = json.loads(Path(environment["CLOCKIFY_AUTOPILOT_STATUS"]).read_text())
+
+        retries = {item["source"]: item["retry_count"] for item in status["coverage_debts"]}
+        self.assertEqual({"sessions/macbook": 1, "repositories/omarchy-desktop": 1}, retries)
+
+    def test_invalid_exact_interval_contract_blocks_without_writing_debt(self):
+        """Catches malformed UTC bounds escaping the runner as an uncaught exception."""
+        with tempfile.TemporaryDirectory() as directory:
+            environment, result = self.fixture(
+                directory,
+                "coverage_warning",
+                date_range={"since": "not-a-timestampZ", "until": "2026-08-03T00:00:00Z"},
+                source_completeness={
+                    "status": "incomplete",
+                    "incomplete_sources": ["sessions/macbook"],
+                },
+            )
+            completed = subprocess.CompletedProcess(
+                ["review"], 0, stdout=str(result) + "\n", stderr=""
+            )
+            with mock.patch.object(runner.subprocess, "run", return_value=completed):
+                self.assertEqual(2, runner.run(environment))
+            status = json.loads(Path(environment["CLOCKIFY_AUTOPILOT_STATUS"]).read_text())
+
+        self.assertEqual("blocked", status["state"])
+        self.assertIn("source interval", status["reason"])
 
     def test_next_scheduled_run_retries_debt_after_prior_retry_exhaustion(self):
         with tempfile.TemporaryDirectory() as directory:
