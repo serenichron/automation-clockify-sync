@@ -254,6 +254,7 @@ class ClockifyPeriodReadback:
     schema_version: str = SCHEMA_VERSION
     evidence_kind: str = "ledger"
     request_receipt: Mapping[str, Any] | None = None
+    raw_response: Mapping[str, Any] | None = None
 
     def document(self) -> dict[str, Any]:
         return {
@@ -276,6 +277,7 @@ class ClockifyPeriodReadback:
             } if self.entry_durations else {},
             "native_costs": {key: str(value) for key, value in sorted(self.native_costs.items())},
             **({"request_receipt": dict(self.request_receipt)} if self.request_receipt else {}),
+            **({"raw_response": dict(self.raw_response)} if self.raw_response else {}),
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -306,7 +308,7 @@ def _normalize_summary(payload: Mapping[str, Any], zone: ZoneInfo) -> ClockifyPe
         raise ClockifyReadbackError("entry IDs must be unique")
     count_raw = payload.get("entry_count", payload.get("entryCount", len(ids)))
     seconds_raw = payload.get("duration_seconds", payload.get("durationSeconds", payload.get("totalTime")))
-    if not isinstance(count_raw, int) or isinstance(count_raw, bool) or count_raw < 0 or (ids_supplied and count_raw != len(ids)):
+    if not isinstance(count_raw, int) or isinstance(count_raw, bool) or count_raw < 0 or (ids_supplied and ids and count_raw != len(ids)):
         raise ClockifyReadbackError("entry count does not match entry IDs")
     if not isinstance(seconds_raw, int) or isinstance(seconds_raw, bool) or seconds_raw < 0:
         raise ClockifyReadbackError("duration_seconds must be a non-negative integer")
@@ -354,7 +356,10 @@ def _normalize_summary(payload: Mapping[str, Any], zone: ZoneInfo) -> ClockifyPe
     evidence_kind = payload.get("evidence_kind", "report" if "request_receipt" in payload or "entries" not in payload else "ledger")
     if evidence_kind not in {"ledger", "report"}:
         raise ClockifyReadbackError("evidence_kind must be ledger or report")
+    if ids_supplied and not ids and count_raw != 0 and evidence_kind != "report":
+        raise ClockifyReadbackError("entry count does not match entry IDs")
     receipt = payload.get("request_receipt")
+    raw_response = payload.get("raw_response")
     if explicit_kind and evidence_kind == "ledger":
         if not ids or not entry_durations or set(entry_durations) != set(ids) or sum(entry_durations.values()) != seconds_raw or count_raw != len(ids):
             raise ClockifyReadbackError("ledger entry_durations must cover every entry and sum to duration_seconds")
@@ -370,8 +375,9 @@ def _normalize_summary(payload: Mapping[str, Any], zone: ZoneInfo) -> ClockifyPe
         raw_digest = receipt.get("raw_response_digest")
         if not isinstance(raw_digest, str) or not _DIGEST.fullmatch(raw_digest):
             raise ClockifyReadbackError("report request receipt raw response digest is required")
-        raw_response = payload.get("raw_response")
-        if raw_response is not None and _digest(raw_response) != raw_digest:
+        if not isinstance(raw_response, Mapping):
+            raise ClockifyReadbackError("report raw response is required")
+        if _digest(raw_response) != raw_digest:
             raise ClockifyReadbackError("report raw response digest does not match receipt")
         if not costs or any(not amount.is_finite() for amount in costs.values()):
             raise ClockifyReadbackError("report native costs are required")
@@ -388,6 +394,8 @@ def _normalize_summary(payload: Mapping[str, Any], zone: ZoneInfo) -> ClockifyPe
     }
     if receipt:
         unsigned["request_receipt"] = dict(receipt)
+    if isinstance(raw_response, Mapping):
+        unsigned["raw_response"] = dict(raw_response)
     supplied_digest = payload.get("digest")
     digest = _digest(unsigned)
     if supplied_digest is not None and supplied_digest != digest:
@@ -396,6 +404,7 @@ def _normalize_summary(payload: Mapping[str, Any], zone: ZoneInfo) -> ClockifyPe
         workspace, member, zone.key, period_start, period_end, filters, refreshed,
         include_running, include_deleted, ids, count_raw, seconds_raw, costs, digest,
         entry_durations, SCHEMA_VERSION, evidence_kind, dict(receipt) if isinstance(receipt, Mapping) else None,
+        dict(raw_response) if isinstance(raw_response, Mapping) else None,
     )
 
 
@@ -532,7 +541,7 @@ def verify_readback(
     """Require exact scope, freshness, entries, duration, and native costs."""
     api = normalize_readback(api_readback)
     report = normalize_readback(shared_report)
-    if api.evidence_kind != "ledger" or (report.request_receipt is not None and report.evidence_kind != "report"):
+    if api.evidence_kind != "ledger" or report.evidence_kind != "report":
         raise ClockifyReadbackError("evidence kind roles must be ledger and report")
     if (api.workspace_id, api.member_id) != (report.workspace_id, report.member_id):
         if api.member_id != report.member_id:
@@ -667,6 +676,13 @@ class ClockifyApiGateway:
                         costs[currency] = format(Decimal(costs.get(currency, "0")) + Decimal(str(item["amount"])) / Decimal("100"), ".2f")
         if not costs:
             raise ClockifyReadbackError("shared report result is missing native costs")
+        total = result["totals"][0]
+        if not isinstance(total, Mapping):
+            raise ClockifyReadbackError("shared report result is missing totals metrics")
+        entry_count = total.get("entriesCount", result.get("entriesCount"))
+        duration_seconds = total.get("totalTime", result.get("totalTime"))
+        if not isinstance(entry_count, int) or not isinstance(duration_seconds, int):
+            raise ClockifyReadbackError("shared report result is missing totals metrics")
         receipt = {"workspace_id": workspace_id, "member_id": member_id,
                    "period_start": _utc(start), "period_end": _utc(end),
                    "filters": dict(filters), "shared_report_id": report_id,
@@ -676,7 +692,7 @@ class ClockifyApiGateway:
                 "period_start": _utc(start), "period_end": _utc(end), "filters": dict(filters),
                 "include_running": False, "include_deleted": False,
                 "refreshed_at": datetime.now(timezone.utc).isoformat(),
-                "entry_count": result.get("entriesCount"), "duration_seconds": result.get("totalTime"),
+                "entry_count": entry_count, "duration_seconds": duration_seconds,
                 "native_costs": costs, "request_receipt": receipt, "raw_response": dict(result)}
 
 

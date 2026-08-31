@@ -50,9 +50,10 @@
       }
     },
     "digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}
+    ,"raw_response": {"type": "object"}
   },
   "allOf": [{
     "if": {"properties": {"evidence_kind": {"const": "report"}}},
-    "then": {"required": ["request_receipt"]}
+    "then": {"required": ["request_receipt", "raw_response"]}
   }]
 }

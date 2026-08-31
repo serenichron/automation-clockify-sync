@@ -157,9 +157,10 @@ class ClockifyReadbackContractTests(unittest.TestCase):
 
     def test_explicit_summary_entry_count_binds_even_when_entry_ids_are_empty(self):
         fixture = _report_from(_api_fixture())
+        fixture["evidence_kind"] = "ledger"
         fixture["entry_ids"] = []
         fixture["entry_count"] = 1
-        with self.assertRaisesRegex(readback.ClockifyReadbackError, "entry count"):
+        with self.assertRaisesRegex(readback.ClockifyReadbackError, "entry count|entry_durations"):
             readback.normalize_readback(fixture)
 
     def test_credential_named_filter_is_rejected_without_echoing_value(self):
@@ -214,14 +215,15 @@ class ClockifyReadbackContractTests(unittest.TestCase):
 
     def test_post_receipt_ids_must_exist_exactly_once_in_final_ledger(self):
         api = readback.normalize_readback(_api_fixture())
+        report = readback.normalize_readback(_report_from(_api_fixture()))
         with self.assertRaisesRegex(readback.ClockifyReadbackError, "post receipt"):
-            readback.verify_readback(api, api, post_receipt={"created": ["unknown"]})
+            readback.verify_readback(api, report, post_receipt={"created": ["unknown"]})
         with self.assertRaisesRegex(readback.ClockifyReadbackError, "exactly once"):
-            readback.verify_readback(api, api, post_receipt={"created": ["entry-001", "entry-001"]})
+            readback.verify_readback(api, report, post_receipt={"created": ["entry-001", "entry-001"]})
         self.assertEqual(
             "verified",
             readback.verify_readback(
-                api, api,
+                api, report,
                 {"entries": [{"disposition": "created", "clockify_entry_id": "entry-001"}]},
             )["status"],
         )
@@ -354,6 +356,19 @@ class ClockifyGatewayTests(unittest.TestCase):
         self.assertEqual("983.70", result["native_costs"]["USD"])
         self.assertEqual("report-1", result["request_receipt"]["shared_report_id"])
 
+    def test_report_metrics_are_read_from_totals_item(self):
+        gateway = readback.ClockifyApiGateway("fixture-key")
+        gateway._post_report = mock.Mock(return_value={
+            "totals": [{"entriesCount": 7, "totalTime": 420, "amounts": [{"amountByCurrency": [{"currency": "USD", "amount": 100}]}]}],
+        })
+        result = gateway.read_report_result(
+            report_id="report-1", workspace_id="workspace-1", member_id="member-1",
+            start=datetime.fromisoformat(START), end=datetime.fromisoformat(END),
+            filters={"timezone": "Europe/Bucharest", "include_running": False, "include_deleted": False},
+        )
+        self.assertEqual(7, result["entry_count"])
+        self.assertEqual(420, result["duration_seconds"])
+
     def test_repeated_same_currency_totals_are_aggregated(self):
         gateway = readback.ClockifyApiGateway("fixture-key")
         gateway._post_report = mock.Mock(return_value={
@@ -403,7 +418,8 @@ class ClockifyEvidenceKindTests(unittest.TestCase):
     def test_evidence_metadata_is_bound_into_canonical_digest(self):
         report = _report_from(_api_fixture())
         report["evidence_kind"] = "report"
-        report["request_receipt"] = {"workspace_id": "workspace-1", "member_id": "member-1", "period_start": START, "period_end": END, "filters": dict(report["filters"]), "shared_report_id": "report-1", "raw_response_digest": "sha256:" + "0" * 64}
+        report["raw_response"] = {"totals": [{"entriesCount": 172, "totalTime": 132217, "amounts": []}]}
+        report["request_receipt"] = {"workspace_id": "workspace-1", "member_id": "member-1", "period_start": START, "period_end": END, "filters": dict(report["filters"]), "shared_report_id": "report-1", "raw_response_digest": readback._digest(report["raw_response"])}
         normalized = readback.normalize_readback(report)
         document = normalized.to_dict()
         document["request_receipt"]["shared_report_id"] = "tampered"
@@ -416,7 +432,8 @@ class ClockifyEvidenceKindTests(unittest.TestCase):
         api.pop("native_costs")
         report = _report_from(_api_fixture())
         report["evidence_kind"] = "report"
-        report["request_receipt"] = {"workspace_id": "workspace-1", "member_id": "member-1", "period_start": START, "period_end": END, "filters": dict(report["filters"]), "shared_report_id": "report-1", "raw_response_digest": "sha256:" + "0" * 64}
+        report["raw_response"] = {"totals": [{"entriesCount": 172, "totalTime": 132217, "amounts": []}]}
+        report["request_receipt"] = {"workspace_id": "workspace-1", "member_id": "member-1", "period_start": START, "period_end": END, "filters": dict(report["filters"]), "shared_report_id": "report-1", "raw_response_digest": readback._digest(report["raw_response"])}
         verified = readback.verify_readback(api, report)
         self.assertEqual({"USD": "983.70", "EUR": "7.31"}, verified["native_costs"])
 
@@ -425,6 +442,24 @@ class ClockifyEvidenceKindTests(unittest.TestCase):
         report = replace(readback.normalize_readback(_report_from(api)), evidence_kind="ledger", request_receipt={"shared_report_id": "report-1"})
         with self.assertRaisesRegex(readback.ClockifyReadbackError, "evidence kind"):
             readback.verify_readback(api, report)
+
+    def test_verify_rejects_second_ledger_without_report_receipt(self):
+        api = readback.normalize_readback(_api_fixture())
+        with self.assertRaisesRegex(readback.ClockifyReadbackError, "evidence kind"):
+            readback.verify_readback(api, api)
+
+    def test_report_round_trip_preserves_sanitized_raw_response(self):
+        gateway = readback.ClockifyApiGateway("fixture-key")
+        raw = {"totals": [{"entriesCount": 172, "totalTime": 132217, "amounts": [{"amountByCurrency": [{"currency": "USD", "amount": 98370}]}]}]}
+        gateway._post_report = mock.Mock(return_value=raw)
+        envelope = gateway.read_report_result(report_id="report-1", workspace_id="workspace-1", member_id="member-1", start=datetime.fromisoformat(START), end=datetime.fromisoformat(END), filters={"timezone": "Europe/Bucharest", "include_running": False, "include_deleted": False})
+        normalized = readback.normalize_readback(envelope)
+        persisted = normalized.to_dict()
+        self.assertEqual(raw, persisted["raw_response"])
+        self.assertEqual("report", readback.normalize_readback(persisted).evidence_kind)
+        persisted.pop("raw_response")
+        with self.assertRaisesRegex(readback.ClockifyReadbackError, "raw response"):
+            readback.normalize_readback(persisted)
     def test_period_gateway_paginates_beyond_two_hundred_and_stops_at_exhaustion(self):
         gateway = readback.ClockifyApiGateway("fixture-key")
         def page_entry(index: int) -> dict:
