@@ -460,6 +460,13 @@ class ClockifyEvidenceKindTests(unittest.TestCase):
         persisted.pop("raw_response")
         with self.assertRaisesRegex(readback.ClockifyReadbackError, "raw response"):
             readback.normalize_readback(persisted)
+
+    def test_raw_report_private_fields_are_rejected_before_persistence(self):
+        gateway = readback.ClockifyApiGateway("fixture-key")
+        raw = {"totals": [{"entriesCount": 1, "totalTime": 60, "amounts": [{"amountByCurrency": [{"currency": "USD", "amount": 100}]}]}], "nested": {"token": "secret"}}
+        gateway._post_report = mock.Mock(return_value=raw)
+        with self.assertRaisesRegex(readback.ClockifyReadbackError, "credential"):
+            gateway.read_report_result(report_id="report-1", workspace_id="workspace-1", member_id="member-1", start=datetime.fromisoformat(START), end=datetime.fromisoformat(END), filters={"timezone": "Europe/Bucharest", "include_running": False, "include_deleted": False})
     def test_period_gateway_paginates_beyond_two_hundred_and_stops_at_exhaustion(self):
         gateway = readback.ClockifyApiGateway("fixture-key")
         def page_entry(index: int) -> dict:

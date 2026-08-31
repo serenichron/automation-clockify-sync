@@ -170,17 +170,20 @@ def _filters(payload: Mapping[str, Any], include_running: bool, include_deleted:
         raise ClockifyReadbackError("filters must be an object")
     result = dict(raw)
     private_names = {"api_key", "apikey", "credential", "token", "secret", "password"}
-    def contains_private(value: Any) -> bool:
-        if isinstance(value, Mapping):
-            return any(str(key).lower() in private_names or contains_private(item) for key, item in value.items())
-        if isinstance(value, (list, tuple)):
-            return any(contains_private(item) for item in value)
-        return False
-    if contains_private(result):
+    if _contains_private(result):
         raise ClockifyReadbackError("filters contain prohibited credential fields")
     result.setdefault("include_running", include_running)
     result.setdefault("include_deleted", include_deleted)
     return result
+
+
+def _contains_private(value: Any) -> bool:
+    private_names = {"api_key", "apikey", "credential", "token", "secret", "password"}
+    if isinstance(value, Mapping):
+        return any(str(key).lower() in private_names or _contains_private(item) for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_private(item) for item in value)
+    return False
 
 
 def _scope_value(payload: Mapping[str, Any], *keys: str) -> Any:
@@ -377,6 +380,8 @@ def _normalize_summary(payload: Mapping[str, Any], zone: ZoneInfo) -> ClockifyPe
             raise ClockifyReadbackError("report request receipt raw response digest is required")
         if not isinstance(raw_response, Mapping):
             raise ClockifyReadbackError("report raw response is required")
+        if _contains_private(raw_response):
+            raise ClockifyReadbackError("report raw response contains prohibited credential fields")
         if _digest(raw_response) != raw_digest:
             raise ClockifyReadbackError("report raw response digest does not match receipt")
         if not costs or any(not amount.is_finite() for amount in costs.values()):
@@ -663,6 +668,8 @@ class ClockifyApiGateway:
         result = self._post_report(f"/workspaces/{workspace_id}/reports/summary", payload)
         if not isinstance(result, Mapping) or not result.get("totals"):
             raise ClockifyReadbackError("shared report result is missing results")
+        if _contains_private(result):
+            raise ClockifyReadbackError("report result contains prohibited credential fields")
         costs: dict[str, str] = {}
         for total in result.get("totals", []):
             if not isinstance(total, Mapping):
