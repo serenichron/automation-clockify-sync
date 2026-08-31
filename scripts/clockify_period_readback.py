@@ -211,6 +211,39 @@ def _member_id(payload: Mapping[str, Any]) -> str:
     return _text(direct, "member_id")
 
 
+def _normalize_report_projection(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, Mapping) or set(raw) != {"totals"} or not isinstance(raw.get("totals"), list) or len(raw["totals"]) != 1:
+        raise ClockifyReadbackError("report projection has unexpected shape")
+    total = raw["totals"][0]
+    if not isinstance(total, Mapping) or set(total) != {"entriesCount", "totalTime", "amounts"}:
+        raise ClockifyReadbackError("report projection has unexpected fields")
+    count, seconds, amounts = total["entriesCount"], total["totalTime"], total["amounts"]
+    if not isinstance(count, int) or isinstance(count, bool) or count < 0 or not isinstance(seconds, int) or isinstance(seconds, bool) or seconds < 0:
+        raise ClockifyReadbackError("report projection has invalid totals metrics")
+    if not isinstance(amounts, list) or len(amounts) != 1 or not isinstance(amounts[0], Mapping) or set(amounts[0]) != {"amountByCurrency"}:
+        raise ClockifyReadbackError("report projection has unexpected amounts")
+    items = amounts[0]["amountByCurrency"]
+    if not isinstance(items, list) or not items:
+        raise ClockifyReadbackError("report projection has no currency amounts")
+    canonical: dict[str, Decimal] = {}
+    for item in items:
+        if not isinstance(item, Mapping) or set(item) != {"currency", "amount"}:
+            raise ClockifyReadbackError("report projection has unexpected currency fields")
+        currency, amount = item["currency"], item["amount"]
+        if not isinstance(currency, str) or not _CURRENCY.fullmatch(currency):
+            raise ClockifyReadbackError("report projection has invalid currency")
+        if not isinstance(amount, str):
+            raise ClockifyReadbackError("report projection has invalid amount")
+        try:
+            parsed = Decimal(amount)
+        except InvalidOperation as exc:
+            raise ClockifyReadbackError("report projection has invalid amount") from exc
+        if not parsed.is_finite():
+            raise ClockifyReadbackError("report projection has invalid amount")
+        canonical[currency] = canonical.get(currency, Decimal("0")) + parsed
+    return {"totals": [{"entriesCount": count, "totalTime": seconds, "amounts": [{"amountByCurrency": [{"currency": currency, "amount": format(amount, "f")} for currency, amount in sorted(canonical.items())]}]}]}
+
+
 def _period_values(payload: Mapping[str, Any]) -> tuple[Any, Any]:
     return (
         _scope_value(payload, "period_start", "periodStart", "date_range_start", "dateRangeStart", "start"),
@@ -380,8 +413,7 @@ def _normalize_summary(payload: Mapping[str, Any], zone: ZoneInfo) -> ClockifyPe
             raise ClockifyReadbackError("report request receipt raw response digest is required")
         if not isinstance(raw_response, Mapping):
             raise ClockifyReadbackError("report raw response is required")
-        if _contains_private(raw_response):
-            raise ClockifyReadbackError("report raw response contains prohibited credential fields")
+        raw_response = _normalize_report_projection(raw_response)
         if _digest(raw_response) != raw_digest:
             raise ClockifyReadbackError("report raw response digest does not match receipt")
         if not costs or any(not amount.is_finite() for amount in costs.values()):
@@ -690,11 +722,11 @@ class ClockifyApiGateway:
         duration_seconds = total.get("totalTime", result.get("totalTime"))
         if not isinstance(entry_count, int) or not isinstance(duration_seconds, int):
             raise ClockifyReadbackError("shared report result is missing totals metrics")
-        projection = {"totals": [{"entriesCount": entry_count, "totalTime": duration_seconds,
+        projection = _normalize_report_projection({"totals": [{"entriesCount": entry_count, "totalTime": duration_seconds,
                       "amounts": [{"amountByCurrency": [
                           {"currency": currency, "amount": format(Decimal(value) * Decimal("100"), "f")}
                           for currency, value in sorted(costs.items())
-                      ]}]}]}
+                      ]}]}]})
         receipt = {"workspace_id": workspace_id, "member_id": member_id,
                    "period_start": _utc(start), "period_end": _utc(end),
                    "filters": dict(filters), "shared_report_id": report_id,
