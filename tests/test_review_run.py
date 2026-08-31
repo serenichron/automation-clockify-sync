@@ -77,9 +77,16 @@ class ReviewRunResultTests(unittest.TestCase):
                 path = run_dir / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(json.dumps({"fixture": relative}) + "\n", encoding="utf-8")
+            coverage = {"status": "complete", "incomplete_sources": []}
+            (run_dir / "evidence" / "evidence-ledger.json").write_text(json.dumps({
+                "manifest": {"source_completeness": coverage},
+            }) + "\n", encoding="utf-8")
             (run_dir / "run-report.json").write_text(json.dumps({
                 "runtime_identity": {"git_sha": "fixture"},
-                "evidence_ledger": {"source_completeness": {"status": "complete", "incomplete_sources": []}},
+                "date_range": {
+                    "since": "2026-08-01T00:00:00Z", "until": "2026-08-02T00:00:00Z",
+                },
+                "evidence_ledger": {"source_completeness": coverage},
             }) + "\n", encoding="utf-8")
             (run_dir / "slice-finalization.json").write_text(json.dumps({
                 "schema_version": "collector-slice-finalization/v1",
@@ -91,6 +98,9 @@ class ReviewRunResultTests(unittest.TestCase):
 
             with mock.patch.dict(os.environ, {"CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT": str(root / "checkpoints")}):
                 bundle = review_run._finalize_backlog_completion(run_dir)
+                # Simulate the interruption point before the runner persists
+                # its separate source-debt completion, then replay finalization.
+                replayed_bundle = review_run._finalize_backlog_completion(run_dir)
                 state = review_run.clockify_sync_collect.BacklogStore(root / "checkpoints").open(
                     identity, (slice_,)
                 )
@@ -100,6 +110,8 @@ class ReviewRunResultTests(unittest.TestCase):
                 state.completed[0].result_digest,
             )
             self.assertEqual(run_dir / "completion-bundle.json", state.completed[0].result_path)
+            self.assertEqual(bundle.bundle_digest, replayed_bundle.bundle_digest)
+            self.assertEqual(1, len(state.completed))
 
     def test_collector_run_dirs_rejects_incomplete_report_receipt(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -39,10 +39,49 @@ def _digest(value: object) -> str:
 
 def _file_digest(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    with os.fdopen(descriptor, "rb") as handle:
         for block in iter(lambda: handle.read(65536), b""):
             digest.update(block)
     return "sha256:" + digest.hexdigest()
+
+
+def _absolute(path: Path) -> Path:
+    return Path(os.path.abspath(path))
+
+
+def _reject_symlink_components(path: Path) -> Path:
+    """Reject a path that reaches any target through a symlink component."""
+    absolute = _absolute(path)
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current /= part
+        if current.is_symlink():
+            raise CollectorReceiptError("receipt path contains a symlink")
+    return absolute
+
+
+def _safe_path(path: Path, *, run_dir: Path | None = None) -> Path:
+    absolute = _reject_symlink_components(Path(path))
+    if run_dir is not None:
+        root = _reject_symlink_components(Path(run_dir))
+        try:
+            absolute.relative_to(root)
+        except ValueError as exc:
+            raise CollectorReceiptError("receipt path escapes its run directory") from exc
+    return absolute
+
+
+def _safe_read_text(path: Path) -> str:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            return handle.read()
+    except Exception:
+        # fdopen owns the descriptor after success; retain the original OSError
+        # shape for callers while never following a final symlink.
+        raise
 
 
 def _digest_string(value: object, label: str) -> str:
@@ -142,22 +181,38 @@ class FailureReceiptStore:
         if not isinstance(receipt, FailureReceipt):
             raise CollectorReceiptError("receipt must be a FailureReceipt")
         _receipt_from_document(receipt.document())
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        path = _safe_path(self.path)
+        _reject_symlink_components(path.parent)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Never extend a malformed journal: append-only recovery starts only
+        # from a fully validated history.
+        self.load()
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
         try:
-            os.write(descriptor, _canonical(receipt.document()) + b"\n")
+            payload = _canonical(receipt.document()) + b"\n"
+            written = 0
+            while written < len(payload):
+                progress = os.write(descriptor, payload[written:])
+                if not isinstance(progress, int) or progress <= 0:
+                    raise CollectorReceiptError("failure receipt journal write made no progress")
+                written += progress
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
         return receipt
 
     def load(self) -> tuple[FailureReceipt, ...]:
-        if not self.path.exists():
+        path = _safe_path(self.path)
+        if not path.exists():
             return ()
-        if not self.path.is_file() or self.path.is_symlink():
+        if not path.is_file() or path.is_symlink():
             raise CollectorReceiptError("failure receipt journal is unsafe")
         try:
-            lines = self.path.read_text(encoding="utf-8").splitlines()
+            lines = _safe_read_text(path).splitlines()
         except OSError as exc:
             raise CollectorReceiptError("failure receipt journal cannot be read") from exc
         receipts = []
@@ -223,13 +278,56 @@ def _artifact_path(run_dir: Path, kind: str) -> Path:
 
 
 def _verified_artifact(run_dir: Path, kind: str, expected_digest: str | None = None) -> SliceArtifact:
-    path = _artifact_path(run_dir, kind)
+    path = _safe_path(_artifact_path(run_dir, kind), run_dir=run_dir)
     if not path.is_file() or path.is_symlink():
         raise CollectorReceiptError(f"required {kind.replace('_', '-')} artifact is missing or unsafe")
     digest = _file_digest(path)
     if expected_digest is not None and digest != _digest_string(expected_digest, "artifact"):
         raise CollectorReceiptError(f"{kind.replace('_', '-')} artifact digest does not match")
     return SliceArtifact(kind, path.resolve(), digest)
+
+
+def _report_utc(value: object, reference: datetime) -> str:
+    if not isinstance(value, str):
+        raise CollectorReceiptError("run-report interval is invalid")
+    if value.endswith("Z"):
+        return _utc_string(value, "run-report interval")
+    try:
+        local = datetime.strptime(value, "%Y-%m-%d %H:%M").replace(tzinfo=reference.tzinfo)
+    except ValueError as exc:
+        raise CollectorReceiptError("run-report interval is invalid") from exc
+    return _slice_utc(local, "run-report interval")
+
+
+def _completion_identities(
+    run_dir: Path, *, since_utc: str, until_utc: str, reference_since: datetime,
+    reference_until: datetime,
+) -> tuple[str, str]:
+    report_path = _verified_artifact(run_dir, "run_report").path
+    ledger_path = _verified_artifact(run_dir, "evidence_ledger").path
+    try:
+        report = json.loads(_safe_read_text(report_path))
+        ledger_document = json.loads(_safe_read_text(ledger_path))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CollectorReceiptError("completion identity artifact is not valid JSON") from exc
+    if not isinstance(report, Mapping) or not isinstance(ledger_document, Mapping):
+        raise CollectorReceiptError("completion identity artifact must be an object")
+    date_range = report.get("date_range")
+    if not isinstance(date_range, Mapping) or (
+        _report_utc(date_range.get("since"), reference_since) != since_utc
+        or _report_utc(date_range.get("until"), reference_until) != until_utc
+    ):
+        raise CollectorReceiptError("run-report interval does not match completion slice")
+    reported_ledger = report.get("evidence_ledger")
+    coverage = reported_ledger.get("source_completeness") if isinstance(reported_ledger, Mapping) else None
+    manifest = ledger_document.get("manifest")
+    canonical_coverage = manifest.get("source_completeness") if isinstance(manifest, Mapping) else None
+    runtime = report.get("runtime_identity")
+    if not isinstance(coverage, Mapping) or not isinstance(canonical_coverage, Mapping) or not isinstance(runtime, Mapping):
+        raise CollectorReceiptError("run-report has no completion identities")
+    if dict(coverage) != dict(canonical_coverage):
+        raise CollectorReceiptError("run-report coverage does not match evidence ledger")
+    return _digest(dict(canonical_coverage)), _digest(dict(runtime))
 
 
 def _bundle_unsigned(
@@ -249,7 +347,7 @@ def _bundle_unsigned(
 
 
 def build_completion_bundle(run_dir: Path, *, slice_: object, replay: bool = False) -> SliceCompletionBundle:
-    run_dir = Path(run_dir)
+    run_dir = _safe_path(Path(run_dir))
     if not run_dir.is_dir() or run_dir.is_symlink():
         raise CollectorReceiptError("completion bundle run directory is missing or unsafe")
     slice_id = _safe_identity(getattr(slice_, "slice_id", None), "slice ID")
@@ -257,24 +355,17 @@ def build_completion_bundle(run_dir: Path, *, slice_: object, replay: bool = Fal
     until_utc = _slice_utc(getattr(slice_, "until", None), "until")
     if since_utc >= until_utc:
         raise CollectorReceiptError("completion bundle slice interval is invalid")
-    try:
-        report = json.loads((run_dir / "run-report.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise CollectorReceiptError("run-report artifact is not valid JSON") from exc
-    if not isinstance(report, Mapping):
-        raise CollectorReceiptError("run-report artifact must be an object")
-    ledger = report.get("evidence_ledger")
-    runtime = report.get("runtime_identity")
-    coverage = ledger.get("source_completeness") if isinstance(ledger, Mapping) else None
-    if not isinstance(coverage, Mapping) or not isinstance(runtime, Mapping):
-        raise CollectorReceiptError("run-report has no completion identities")
+    source_coverage_digest, runtime_identity_digest = _completion_identities(
+        run_dir, since_utc=since_utc, until_utc=until_utc,
+        reference_since=getattr(slice_, "since"), reference_until=getattr(slice_, "until"),
+    )
     kinds = [*_ARTIFACT_PATHS]
     if replay:
         kinds.append(_REPLAY_ARTIFACT[0])
     artifacts = tuple(_verified_artifact(run_dir, kind) for kind in kinds)
     unsigned = _bundle_unsigned(
         slice_id=slice_id, since_utc=since_utc, until_utc=until_utc,
-        source_coverage_digest=_digest(dict(coverage)), runtime_identity_digest=_digest(dict(runtime)),
+        source_coverage_digest=source_coverage_digest, runtime_identity_digest=runtime_identity_digest,
         artifacts=artifacts, replay=replay,
     )
     return SliceCompletionBundle(
@@ -293,6 +384,16 @@ def verify_completion_bundle(bundle: SliceCompletionBundle) -> SliceCompletionBu
     if {artifact.kind for artifact in bundle.artifacts} != expected_kinds or len(bundle.artifacts) != len(expected_kinds):
         raise CollectorReceiptError("completion bundle required artifact kinds do not match")
     verified = tuple(_verified_artifact(bundle.run_dir, artifact.kind, artifact.digest) for artifact in bundle.artifacts)
+    source_coverage_digest, runtime_identity_digest = _completion_identities(
+        bundle.run_dir, since_utc=bundle.since_utc, until_utc=bundle.until_utc,
+        reference_since=datetime.fromisoformat(bundle.since_utc[:-1] + "+00:00"),
+        reference_until=datetime.fromisoformat(bundle.until_utc[:-1] + "+00:00"),
+    )
+    if (
+        source_coverage_digest != bundle.source_coverage_digest
+        or runtime_identity_digest != bundle.runtime_identity_digest
+    ):
+        raise CollectorReceiptError("completion bundle identity digest does not match")
     unsigned = _bundle_unsigned(
         slice_id=bundle.slice_id, since_utc=bundle.since_utc, until_utc=bundle.until_utc,
         source_coverage_digest=bundle.source_coverage_digest,
@@ -304,9 +405,24 @@ def verify_completion_bundle(bundle: SliceCompletionBundle) -> SliceCompletionBu
     return bundle
 
 
+def completion_coverage(bundle: SliceCompletionBundle) -> dict[str, object]:
+    """Return coverage only after its bound run-report and ledger have verified."""
+    verify_completion_bundle(bundle)
+    ledger_path = _verified_artifact(bundle.run_dir, "evidence_ledger").path
+    try:
+        ledger_document = json.loads(_safe_read_text(ledger_path))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CollectorReceiptError("evidence ledger is not valid JSON") from exc
+    manifest = ledger_document.get("manifest") if isinstance(ledger_document, Mapping) else None
+    coverage = manifest.get("source_completeness") if isinstance(manifest, Mapping) else None
+    if not isinstance(coverage, Mapping) or _digest(dict(coverage)) != bundle.source_coverage_digest:
+        raise CollectorReceiptError("evidence ledger coverage digest does not match")
+    return dict(coverage)
+
+
 def write_completion_bundle(path: Path, bundle: SliceCompletionBundle) -> None:
     verify_completion_bundle(bundle)
-    path = Path(path)
+    path = _safe_path(Path(path), run_dir=bundle.run_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     temporary.write_bytes(_canonical(bundle.document()) + b"\n")
@@ -315,7 +431,7 @@ def write_completion_bundle(path: Path, bundle: SliceCompletionBundle) -> None:
 
 def load_completion_bundle(path: Path, *, run_dir: Path) -> SliceCompletionBundle:
     try:
-        document = json.loads(Path(path).read_text(encoding="utf-8"))
+        document = json.loads(_safe_read_text(_safe_path(Path(path), run_dir=run_dir)))
     except (OSError, json.JSONDecodeError) as exc:
         raise CollectorReceiptError("completion bundle document is invalid") from exc
     if not isinstance(document, dict) or set(document) != {

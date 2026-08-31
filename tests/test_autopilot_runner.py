@@ -27,9 +27,14 @@ class AutopilotRunnerTests(unittest.TestCase):
                 path = run_dir / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(json.dumps({"fixture": relative}) + "\n")
+            canonical_coverage = {"status": "complete", "incomplete_sources": []}
+            (run_dir / "evidence" / "evidence-ledger.json").write_text(json.dumps({
+                "manifest": {"source_completeness": canonical_coverage},
+            }) + "\n")
             (run_dir / "run-report.json").write_text(json.dumps({
                 "runtime_identity": {"git_sha": "fixture"},
-                "evidence_ledger": {"source_completeness": {"status": "complete", "incomplete_sources": []}},
+                "date_range": {"since": "2026-08-01T00:00:00Z", "until": "2026-08-02T00:00:00Z"},
+                "evidence_ledger": {"source_completeness": canonical_coverage},
             }) + "\n")
             bundle = collector_receipts.build_completion_bundle(run_dir, slice_=slice_)
             collector_receipts.write_completion_bundle(run_dir / "completion-bundle.json", bundle)
@@ -37,7 +42,9 @@ class AutopilotRunnerTests(unittest.TestCase):
                 "action": "review_delta", "run_id": "run-1", "run_dir": str(run_dir),
                 "slice_id": "slice-1",
                 "date_range": {"since": "2026-08-01T00:00:00Z", "until": "2026-08-02T00:00:00Z"},
-                "source_completeness": {"status": "complete", "incomplete_sources": []},
+                # The action contract is deliberately stale; only the verified
+                # run-report/ledger coverage may decide whether debt clears.
+                "source_completeness": {"status": "incomplete", "incomplete_sources": ["sessions/macbook"]},
                 "completion_bundle_digest": bundle.bundle_digest,
             }) + "\n")
             first = source_coverage.SourceInterval(
@@ -67,6 +74,14 @@ class AutopilotRunnerTests(unittest.TestCase):
 
             resolved = source_coverage.SourceDebtStore.from_document(source_coverage.read(coverage_path))
             self.assertEqual((second.debt_id,), tuple(item.debt_id for item in resolved.active()))
+            with mock.patch.object(runner.subprocess, "run", return_value=completed):
+                self.assertEqual(0, runner.run(environment))
+            replayed = source_coverage.SourceDebtStore.from_document(source_coverage.read(coverage_path))
+            self.assertEqual((second.debt_id,), tuple(item.debt_id for item in replayed.active()))
+            self.assertEqual(
+                1,
+                sum(event["event"] == "complete" for event in replayed.document()["events"]),
+            )
 
     def fixture(
         self,

@@ -237,9 +237,10 @@ def _record_verified_completions(
         raise ValueError("completion bundle action contract identity is invalid")
     if (bundle.since_utc, bundle.until_utc, bundle.slice_id) != (since, until, slice_id):
         raise ValueError("completion bundle action contract identity does not match")
-    completeness = result.get("source_completeness")
-    if not isinstance(completeness, Mapping):
-        raise ValueError("completion bundle action contract has no source completeness")
+    try:
+        completeness = collector_receipts.completion_coverage(bundle)
+    except collector_receipts.CollectorReceiptError as exc:
+        raise ValueError("completion bundle coverage cannot be verified") from exc
     incomplete = completeness.get("incomplete_sources")
     if not isinstance(incomplete, list) or not all(isinstance(value, str) for value in incomplete):
         raise ValueError("completion bundle action contract source completeness is invalid")
@@ -266,6 +267,27 @@ def _record_verified_completions(
             interval, completion_bundle_digest=bundle.bundle_digest, completed_at=completed_at,
         ))
     return tuple(resolved)
+
+
+def _trusted_completion_result(
+    result_path: Path, result: Mapping[str, object]
+) -> Mapping[str, object]:
+    """Replace stale action-contract coverage with the verified bundle coverage."""
+    bundle_digest = result.get("completion_bundle_digest")
+    if bundle_digest is None:
+        return result
+    if not isinstance(bundle_digest, str):
+        raise ValueError("completion bundle digest is invalid")
+    try:
+        bundle = collector_receipts.load_completion_bundle(
+            result_path.parent / "completion-bundle.json", run_dir=result_path.parent,
+        )
+        coverage = collector_receipts.completion_coverage(bundle)
+    except collector_receipts.CollectorReceiptError as exc:
+        raise ValueError("completion bundle coverage cannot be verified") from exc
+    if bundle.bundle_digest != bundle_digest:
+        raise ValueError("completion bundle digest does not match action contract")
+    return {**result, "source_completeness": coverage}
 
 
 def _debt_status(items: tuple[source_coverage.DebtItem, ...]) -> list[dict[str, object]]:
@@ -378,6 +400,10 @@ def run(environment: Mapping[str, str] | None = None) -> int:
 
         attempted_at = _iso_now()
         try:
+            results = [
+                _trusted_completion_result(result_path, result)
+                for result_path, result in zip(result_paths, results, strict=True)
+            ]
             recorded_debt = _record_coverage_failures(
                 store, results, coordinator, attempted_at
             )
