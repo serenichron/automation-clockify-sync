@@ -54,7 +54,7 @@ BLOCKER_RESOLUTIONS = {
     "clockify_readback_verified": frozenset({"readback_mismatch"}),
     "publication_prepared": frozenset({"currency_quote_unavailable"}),
     "publication_authorized": frozenset({"publication_deferred"}),
-    "shared_report_verified": frozenset({"report_mismatch"}),
+    "shared_report_verified": frozenset({"report_mismatch", "publication_deferred"}),
     "coverage_limitation_approved": frozenset({"coverage_incomplete"}),
 }
 
