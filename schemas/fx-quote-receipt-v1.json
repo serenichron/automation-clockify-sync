@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "fx-quote-receipt-v1.json",
+  "title": "ECB FX quote receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "provider", "effective_date", "fetched_at",
+    "base_currency", "rates", "payload_digest"
+  ],
+  "properties": {
+    "schema_version": {"const": "fx-quote-receipt/v1"},
+    "provider": {"const": "ECB"},
+    "effective_date": {"type": "string", "format": "date"},
+    "fetched_at": {"type": "string", "format": "date-time"},
+    "base_currency": {"const": "EUR"},
+    "rates": {
+      "type": "object",
+      "propertyNames": {"pattern": "^[A-Z]{3}$"},
+      "additionalProperties": {"type": "string", "pattern": "^[0-9]+(?:\\.[0-9]+)?$"},
+      "required": ["USD"]
+    },
+    "payload_digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}
+  }
+}
