@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -71,6 +72,19 @@ def canonical_digest(value: object) -> str:
 
 
 class ApprovalReceiptStoreTests(unittest.TestCase):
+    def test_execution_lock_rejects_a_precreated_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "approvals.jsonl"
+            target = Path(directory) / "target"
+            target.write_text("unchanged", encoding="utf-8")
+            digest = hashlib.sha256(b"approval-1").hexdigest()
+            os.symlink(target, path.with_name(f"{path.name}.{digest}.execution.lock"))
+
+            with self.assertRaisesRegex(posting_receipts.PostingReceiptError, "lock"):
+                posting_receipts.ApprovalReceiptStore(path).acquire_execution_lock("approval-1")
+
+            self.assertEqual("unchanged", target.read_text(encoding="utf-8"))
+
     def test_execution_lock_excludes_a_second_store_until_released(self) -> None:
         """Removing the nonblocking flock would let two processes post under one approval."""
         with tempfile.TemporaryDirectory() as directory:

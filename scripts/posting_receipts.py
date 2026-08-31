@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 from typing import Any, Mapping
 
 
@@ -426,22 +427,40 @@ class ApprovalReceiptStore:
         self.path = Path(path)
         self._execution_lock_descriptor: int | None = None
 
-    def __del__(self) -> None:
-        self.release_execution_lock()
-
     def acquire_execution_lock(self, receipt_id: str) -> None:
         if self._execution_lock_descriptor is not None:
             raise PostingReceiptError("approval execution lock is already held")
         approval_id = _required_text(receipt_id, "approval_id")
         digest = hashlib.sha256(approval_id.encode("utf-8")).hexdigest()
-        lock_path = self.path.with_name(f"{self.path.name}.{digest}.execution.lock")
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        lock_name = f"{self.path.name}.{digest}.execution.lock"
+        parent = self.path.parent.resolve()
+        parent.mkdir(parents=True, exist_ok=True)
+        parent_descriptor = os.open(
+            parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        )
+        descriptor: int | None = None
+        locked = False
         try:
+            descriptor = os.open(
+                lock_name,
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+                dir_fd=parent_descriptor,
+            )
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise PostingReceiptError("approval execution lock is not a regular file")
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = True
         except BlockingIOError as error:
-            os.close(descriptor)
             raise PostingReceiptError("approval execution is already in progress") from error
+        except OSError as error:
+            raise PostingReceiptError("approval execution lock cannot be opened safely") from error
+        finally:
+            try:
+                os.close(parent_descriptor)
+            finally:
+                if descriptor is not None and not locked:
+                    os.close(descriptor)
         self._execution_lock_descriptor = descriptor
 
     def release_execution_lock(self) -> None:

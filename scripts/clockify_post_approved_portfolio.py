@@ -9,6 +9,7 @@ overlap blocks the run before another entry is created.
 from __future__ import annotations
 
 import argparse
+from contextvars import ContextVar
 from dataclasses import dataclass
 import datetime as dt
 import hashlib
@@ -38,6 +39,9 @@ POST_HTTP_TIMEOUT_NAME = "CLOCKIFY_POST_HTTP_TIMEOUT_SECONDS"
 POST_HTTP_TIMEOUT_DEFAULT_SECONDS = 45
 POST_HTTP_TIMEOUT_MIN_SECONDS = 5
 POST_HTTP_TIMEOUT_MAX_SECONDS = 120
+_execution_approval_store: ContextVar[posting_receipts.ApprovalReceiptStore | None] = ContextVar(
+    "execution_approval_store", default=None
+)
 
 
 class PortfolioPostError(ValueError):
@@ -381,9 +385,12 @@ def _live_entry(entry: Mapping[str, Any]) -> dict[str, Any] | None:
 
 
 def _exact(plan: Mapping[str, Any], live: Mapping[str, Any]) -> bool:
-    return all(plan[key] == live[key] for key in ("start", "end", "project_id", "tag_ids", "description")) and (
-        plan.get("billable") == live.get("billable")
-    )
+    if not all(plan[key] == live[key] for key in ("start", "end", "project_id", "tag_ids", "description")):
+        return False
+    approved_billable = plan.get("billable")
+    if approved_billable is None:
+        return live.get("billable") is None
+    return isinstance(approved_billable, bool) and isinstance(live.get("billable"), bool) and approved_billable == live["billable"]
 
 
 def _overlaps(plan: Mapping[str, Any], live: Mapping[str, Any]) -> bool:
@@ -921,6 +928,7 @@ def _approval_context(
         )
         approval_store = posting_receipts.ApprovalReceiptStore(Path(args.approval_events).resolve())
         approval_store.acquire_execution_lock(str(args.approval_receipt))
+        _execution_approval_store.set(approval_store)
         try:
             receipt = approval_store.require(
                 str(args.approval_receipt), operation_identity=operation_identity,
@@ -998,6 +1006,17 @@ def _append_post_event(
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
+    token = _execution_approval_store.set(None)
+    try:
+        return _run(args)
+    finally:
+        approval_store = _execution_approval_store.get()
+        if approval_store is not None:
+            approval_store.release_execution_lock()
+        _execution_approval_store.reset(token)
+
+
+def _run(args: argparse.Namespace) -> dict[str, Any]:
     if args.execute and not getattr(args, "approval_receipt", None):
         raise PortfolioPostError("approval receipt is required for execution")
     portfolio_path = args.portfolio.resolve()

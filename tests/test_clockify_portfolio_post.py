@@ -591,6 +591,41 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
                 mutated[1][field] = changed
                 self.assertNotEqual(baseline, poster._normalized_snapshot_sha256(mutated))
 
+    def test_exact_rejects_non_boolean_billable(self) -> None:
+        plan = {"start": "2026-08-14T10:00:00Z", "end": "2026-08-14T10:10:00Z", "project_id": "p", "tag_ids": [], "description": "work", "billable": True}
+        live = {**plan, "id": "entry", "billable": 1}
+
+        self.assertFalse(poster._exact(plan, live))
+
+    def test_execution_failure_releases_approval_lock(self) -> None:
+        """An execution error after approval validation must not leave its lock held."""
+        with tempfile.TemporaryDirectory() as directory:
+            args = self._write_posting_fixture(Path(directory))
+            args.execute = True
+            acquired_stores: list[posting_receipts.ApprovalReceiptStore] = []
+            original_context = poster._approval_context
+
+            def capture_context(*context_args: object, **context_kwargs: object):
+                result = original_context(*context_args, **context_kwargs)
+                acquired_stores.append(result[2])
+                return result
+
+            with (
+                mock.patch.object(poster, "_approval_context", side_effect=capture_context),
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "key", "CLOCKIFY_WORKSPACE_ID": "workspace-other",
+                }),
+            ):
+                with self.assertRaisesRegex(poster.PortfolioPostError, "does not match approval"):
+                    poster.run(args)
+
+            self.assertEqual(1, len(acquired_stores))
+            retry = posting_receipts.ApprovalReceiptStore(args.approval_events)
+            try:
+                retry.acquire_execution_lock(args.approval_receipt)
+            finally:
+                retry.release_execution_lock()
+
     def test_adjustment_digest_is_bound_to_blocker_snapshot(self) -> None:
         adjustments = [{
             "review_id": "review-a", "segment_index": 1,
