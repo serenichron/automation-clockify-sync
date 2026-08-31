@@ -416,6 +416,13 @@ def _normalize_summary(payload: Mapping[str, Any], zone: ZoneInfo) -> ClockifyPe
         raw_response = _normalize_report_projection(raw_response)
         if _digest(raw_response) != raw_digest:
             raise ClockifyReadbackError("report raw response digest does not match receipt")
+        projection_total = raw_response["totals"][0]
+        projection_costs = {
+            item["currency"]: Decimal(item["amount"]) / Decimal("100")
+            for item in projection_total["amounts"][0]["amountByCurrency"]
+        }
+        if count_raw != projection_total["entriesCount"] or seconds_raw != projection_total["totalTime"] or costs != projection_costs:
+            raise ClockifyReadbackError("report outer evidence contradicts bound projection")
         if not costs or any(not amount.is_finite() for amount in costs.values()):
             raise ClockifyReadbackError("report native costs are required")
     unsigned = {

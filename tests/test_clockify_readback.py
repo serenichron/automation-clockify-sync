@@ -424,15 +424,15 @@ class ClockifyEvidenceKindTests(unittest.TestCase):
         report = _report_from(_api_fixture())
         report["evidence_kind"] = "report"
         report["request_receipt"] = {"workspace_id": "workspace-1", "member_id": "member-1", "period_start": START, "period_end": END, "filters": dict(report["filters"]), "shared_report_id": "report-1", "raw_response_digest": "sha256:" + "0" * 64}
-        report["raw_response"] = {"totals": [{"entriesCount": 172, "totalTime": 132217, "amounts": [{"amountByCurrency": [{"currency": "USD", "amount": "98370"}]}]}]}
+        report["raw_response"] = {"totals": [{"entriesCount": 172, "totalTime": 132217, "amounts": [{"amountByCurrency": [{"currency": "USD", "amount": "98370"}, {"currency": "EUR", "amount": "731"}]}]}]}
         with self.assertRaisesRegex(readback.ClockifyReadbackError, "digest"):
             readback.normalize_readback(report)
 
     def test_evidence_metadata_is_bound_into_canonical_digest(self):
         report = _report_from(_api_fixture())
         report["evidence_kind"] = "report"
-        report["raw_response"] = {"totals": [{"entriesCount": 172, "totalTime": 132217, "amounts": [{"amountByCurrency": [{"currency": "USD", "amount": "98370"}]}]}]}
-        report["request_receipt"] = {"workspace_id": "workspace-1", "member_id": "member-1", "period_start": START, "period_end": END, "filters": dict(report["filters"]), "shared_report_id": "report-1", "raw_response_digest": readback._digest(report["raw_response"])}
+        report["raw_response"] = {"totals": [{"entriesCount": 172, "totalTime": 132217, "amounts": [{"amountByCurrency": [{"currency": "USD", "amount": "98370"}, {"currency": "EUR", "amount": "731"}]}]}]}
+        report["request_receipt"] = {"workspace_id": "workspace-1", "member_id": "member-1", "period_start": START, "period_end": END, "filters": dict(report["filters"]), "shared_report_id": "report-1", "raw_response_digest": readback._digest(readback._normalize_report_projection(report["raw_response"]))}
         normalized = readback.normalize_readback(report)
         document = normalized.to_dict()
         document["request_receipt"]["shared_report_id"] = "tampered"
@@ -445,8 +445,8 @@ class ClockifyEvidenceKindTests(unittest.TestCase):
         api.pop("native_costs")
         report = _report_from(_api_fixture())
         report["evidence_kind"] = "report"
-        report["raw_response"] = {"totals": [{"entriesCount": 172, "totalTime": 132217, "amounts": [{"amountByCurrency": [{"currency": "USD", "amount": "98370"}]}]}]}
-        report["request_receipt"] = {"workspace_id": "workspace-1", "member_id": "member-1", "period_start": START, "period_end": END, "filters": dict(report["filters"]), "shared_report_id": "report-1", "raw_response_digest": readback._digest(report["raw_response"])}
+        report["raw_response"] = {"totals": [{"entriesCount": 172, "totalTime": 132217, "amounts": [{"amountByCurrency": [{"currency": "USD", "amount": "98370"}, {"currency": "EUR", "amount": "731"}]}]}]}
+        report["request_receipt"] = {"workspace_id": "workspace-1", "member_id": "member-1", "period_start": START, "period_end": END, "filters": dict(report["filters"]), "shared_report_id": "report-1", "raw_response_digest": readback._digest(readback._normalize_report_projection(report["raw_response"]))}
         verified = readback.verify_readback(api, report)
         self.assertEqual({"USD": "983.70", "EUR": "7.31"}, verified["native_costs"])
 
@@ -503,6 +503,17 @@ class ClockifyEvidenceKindTests(unittest.TestCase):
         envelope = gateway.read_report_result(report_id="report-1", workspace_id="workspace-1", member_id="member-1", start=datetime.fromisoformat(START), end=datetime.fromisoformat(END), filters={"timezone": "Europe/Bucharest", "include_running": False, "include_deleted": False})
         envelope["raw_response"]["totals"][0]["amounts"][0]["amountByCurrency"][0]["amount"] = {"bad": 1}
         envelope["request_receipt"]["raw_response_digest"] = readback._digest(envelope["raw_response"])
+        with self.assertRaisesRegex(readback.ClockifyReadbackError, "projection"):
+            readback.normalize_readback(envelope)
+
+    def test_report_outer_metrics_and_costs_cannot_contradict_bound_projection(self):
+        gateway = readback.ClockifyApiGateway("fixture-key")
+        gateway._post_report = mock.Mock(return_value={"totals": [{"entriesCount": 1, "totalTime": 60, "amounts": [{"amountByCurrency": [{"currency": "USD", "amount": 100}]}]}]})
+        envelope = gateway.read_report_result(report_id="report-1", workspace_id="workspace-1", member_id="member-1", start=datetime.fromisoformat(START), end=datetime.fromisoformat(END), filters={"timezone": "Europe/Bucharest", "include_running": False, "include_deleted": False})
+        envelope["entry_count"] = 2
+        envelope["duration_seconds"] = 120
+        envelope["native_costs"] = {"USD": "999.00"}
+        envelope.pop("digest", None)
         with self.assertRaisesRegex(readback.ClockifyReadbackError, "projection"):
             readback.normalize_readback(envelope)
     def test_period_gateway_paginates_beyond_two_hundred_and_stops_at_exhaustion(self):
