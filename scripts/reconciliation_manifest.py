@@ -545,7 +545,10 @@ class ReconciliationCoordinator:
         state = "collecting"
         blockers: set[str] = set()
         artifacts: list[ArtifactIdentity] = []
-        context = {"readback_verified": False, "authorization": None, "report_verified": False}
+        context = {
+            "readback_verified": False, "prepared_publication": None,
+            "authorization": None, "report_verified": False,
+        }
         for index, event in enumerate(events):
             if state == "published":
                 raise ManifestError("event is not legal after publication_complete")
@@ -594,8 +597,12 @@ class ReconciliationCoordinator:
         elif event.event_type == "publication_prepared":
             if not context["readback_verified"]:
                 raise ManifestError("publication_prepared requires verified Clockify readback")
+            context["prepared_publication"] = _publication_binding(event.payload)
         elif event.event_type == "publication_authorized":
-            context["authorization"] = _publication_binding(event.payload)
+            authorization = _publication_binding(event.payload)
+            if authorization != context["prepared_publication"]:
+                raise ManifestError("publication authorization does not bind the prepared contract")
+            context["authorization"] = authorization
         elif event.event_type == "shared_report_verified":
             if _publication_binding(event.payload) != context["authorization"] or not _verified_receipt(
                 event.payload, "report_receipt", context["authorization"]

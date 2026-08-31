@@ -103,7 +103,9 @@ def append_events(
         payload: dict[str, object] = {}
         if artifact is not None:
             payload["artifacts"] = [artifact_document(artifact)]
-        if event_type == "publication_authorized":
+        if event_type == "publication_prepared":
+            payload.update({"contract_digest": "sha256:" + "a" * 64, "idempotency_identity": "publication-1"})
+        elif event_type == "publication_authorized":
             payload.update({"contract_digest": "sha256:" + "a" * 64, "idempotency_identity": "publication-1"})
         elif event_type == "shared_report_verified":
             payload.update({
@@ -472,6 +474,21 @@ class ReconciliationCoordinatorTests(unittest.TestCase):
         write_jsonl(self.store.path, documents)
 
         with self.assertRaisesRegex(ManifestError, "shared report receipt"):
+            self.coordinator().derive()
+
+    def test_publication_authorization_must_bind_the_prepared_contract(self) -> None:
+        events = [
+            "period_opened", "collection_complete", "reconciliation_complete", "review_approved",
+            "posting_started", "posting_complete", "clockify_readback_verified", "publication_prepared",
+            "publication_authorized",
+        ]
+        append_events(self.store, self.identity, events, self.artifact)
+        documents = read_jsonl(self.store.path)
+        documents[-1]["payload"]["contract_digest"] = "sha256:" + "b" * 64
+        documents[-1]["event_digest"] = event_digest(documents[-1])
+        write_jsonl(self.store.path, documents)
+
+        with self.assertRaisesRegex(ManifestError, "prepared contract"):
             self.coordinator().derive()
 
     def test_blockers_and_audits_are_recorded_without_advancing(self) -> None:
