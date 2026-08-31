@@ -8,7 +8,14 @@
   "properties": {
     "sequence": {"type": "integer", "minimum": 1},
     "period_id": {"type": "string", "pattern": "^rperiod-[a-f0-9]{64}$"},
-    "event_type": {"type": "string", "minLength": 1},
+    "event_type": {"enum": [
+      "period_opened", "collection_complete", "reconciliation_complete", "review_approved",
+      "posting_started", "posting_complete", "clockify_readback_verified",
+      "publication_prepared", "publication_authorized", "shared_report_verified", "publication_complete",
+      "coverage_incomplete", "semantic_exceptions", "awaiting_approval", "post_interrupted",
+      "readback_mismatch", "report_mismatch", "currency_quote_unavailable", "publication_deferred",
+      "report_residual_resolved", "fathom_repair_complete", "coverage_limitation_approved"
+    ]},
     "payload": {"$ref": "#/$defs/safe_payload"},
     "previous_digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
     "occurred_at": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{6})?Z$"},

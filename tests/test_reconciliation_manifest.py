@@ -14,6 +14,8 @@ from scripts.reconciliation_manifest import (
     CoordinatorEventStore,
     ManifestError,
     PeriodIdentity,
+    ReconciliationCoordinator,
+    ReconciliationManifest,
 )
 
 
@@ -51,6 +53,13 @@ def event_schema_validation(document: dict[str, object]) -> subprocess.Completed
     )
 
 
+def manifest_schema_validation(document: dict[str, object]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["jsonschema", str(Path(__file__).parents[1] / "schemas/reconciliation-manifest-v1.json")],
+        input=json.dumps(document), text=True, capture_output=True, check=False,
+    )
+
+
 def schema_event(payload: dict[str, object]) -> dict[str, object]:
     return {
         "sequence": 1,
@@ -70,6 +79,47 @@ def event_digest(document: dict[str, object]) -> str:
     }
     canonical = json.dumps(unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+
+def artifact_document(path: Path) -> dict[str, object]:
+    return ArtifactIdentity(
+        path=path.resolve(),
+        schema_version="synthetic-artifact/v1",
+        compatibility_version="synthetic/v1",
+        digest="sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+    ).document()
+
+
+def append_events(
+    store: CoordinatorEventStore,
+    identity: PeriodIdentity,
+    event_types: list[str],
+    artifact: Path | None = None,
+) -> None:
+    for sequence, event_type in enumerate(event_types):
+        payload: dict[str, object] = {}
+        if artifact is not None:
+            payload["artifacts"] = [artifact_document(artifact)]
+        if event_type == "publication_authorized":
+            payload.update({"contract_digest": "sha256:" + "a" * 64, "idempotency_identity": "publication-1"})
+        elif event_type == "shared_report_verified":
+            payload.update({
+                "contract_digest": "sha256:" + "a" * 64, "idempotency_identity": "publication-1",
+                "report_receipt": {"contract_digest": "sha256:" + "a" * 64, "idempotency_identity": "publication-1", "status": "verified"},
+            })
+        elif event_type == "publication_complete":
+            payload.update({
+                "contract_digest": "sha256:" + "a" * 64,
+                "idempotency_identity": "publication-1",
+                "slack_receipt": {"contract_digest": "sha256:" + "a" * 64, "idempotency_identity": "publication-1", "status": "verified"},
+            })
+        store.append(identity, event_type, payload, occurred_at=NOW + timedelta(minutes=sequence))
+
+
+def complete_event_types() -> list[str]:
+    return [
+        "period_opened", "collection_complete", "reconciliation_complete",
+    ]
 
 
 class PeriodIdentityTests(unittest.TestCase):
@@ -245,9 +295,238 @@ class ReconciliationEventSchemaTests(unittest.TestCase):
                 self.assertNotEqual(0, result.returncode, result.stderr)
 
     def test_schema_accepts_safe_nested_payload(self) -> None:
-        result = event_schema_validation(schema_event({"artifact": {"digest": "sha256:" + "a" * 64}}))
+        document = schema_event({"artifact": {"digest": "sha256:" + "a" * 64}})
+        document["event_type"] = "period_opened"
+        result = event_schema_validation(document)
 
         self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_schema_covers_all_legal_events_and_rejects_unknown_type(self) -> None:
+        legal_events = (
+            "period_opened", "collection_complete", "reconciliation_complete", "review_approved",
+            "posting_started", "posting_complete", "clockify_readback_verified",
+            "publication_prepared", "publication_authorized", "shared_report_verified",
+            "publication_complete", "coverage_incomplete", "semantic_exceptions", "awaiting_approval",
+            "post_interrupted", "readback_mismatch", "report_mismatch", "currency_quote_unavailable",
+            "publication_deferred", "report_residual_resolved", "fathom_repair_complete",
+            "coverage_limitation_approved",
+        )
+        for event_type in legal_events:
+            with self.subTest(event_type=event_type):
+                document = schema_event({})
+                document["event_type"] = event_type
+                result = event_schema_validation(document)
+                self.assertEqual(0, result.returncode, result.stderr)
+
+        document = schema_event({})
+        document["event_type"] = "slice_completed"
+        result = event_schema_validation(document)
+        self.assertNotEqual(0, result.returncode, result.stderr)
+
+
+
+class ReconciliationCoordinatorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name)
+        self.identity = august_identity()
+        self.store = CoordinatorEventStore(self.root / "period-events.jsonl")
+        self.artifact = self.root / "review.json"
+        self.artifact.write_text('{"status":"complete"}\n', encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def coordinator(self) -> ReconciliationCoordinator:
+        return ReconciliationCoordinator(self.identity, self.store)
+
+    def test_complete_verified_events_derive_awaiting_review(self) -> None:
+        append_events(self.store, self.identity, complete_event_types(), self.artifact)
+
+        manifest = self.coordinator().derive()
+
+        self.assertEqual("awaiting_review", manifest.state)
+        self.assertTrue(manifest.manifest_digest.startswith("sha256:"))
+        self.assertEqual((artifact_document(self.artifact),), manifest.artifacts)
+
+    def test_referenced_artifact_drift_blocks_state_advance(self) -> None:
+        append_events(self.store, self.identity, complete_event_types(), self.artifact)
+        self.artifact.write_text("changed\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(ManifestError, "artifact digest mismatch"):
+            self.coordinator().derive()
+
+    def test_rejects_illegal_and_duplicate_advancing_transitions(self) -> None:
+        for event_types in (
+            ["period_opened", "posting_started"],
+            ["period_opened", "collection_complete", "reconciliation_complete", "review_approved", "posting_started", "posting_complete", "publication_prepared"],
+            ["period_opened", "collection_complete", "reconciliation_complete", "review_approved", "posting_started", "posting_complete", "clockify_readback_verified", "publication_prepared", "publication_authorized", "shared_report_verified", "publication_complete", "publication_complete"],
+            ["period_opened", "period_opened"],
+        ):
+            with self.subTest(event_types=event_types):
+                path = self.root / f"{len(event_types)}-{event_types[-1]}.jsonl"
+                store = CoordinatorEventStore(path)
+                append_events(store, self.identity, event_types, self.artifact)
+                with self.assertRaises(ManifestError):
+                    ReconciliationCoordinator(self.identity, store).derive()
+
+    def test_authorization_and_publication_require_bound_receipts(self) -> None:
+        cases = (
+            ["period_opened", "collection_complete", "reconciliation_complete", "review_approved", "posting_started", "posting_complete", "clockify_readback_verified", "publication_prepared", "publication_authorized", "shared_report_verified", "publication_complete"],
+            ["period_opened", "collection_complete", "reconciliation_complete", "review_approved", "posting_started", "posting_complete", "clockify_readback_verified", "publication_prepared", "publication_authorized", "publication_complete"],
+        )
+        for index, event_types in enumerate(cases):
+            with self.subTest(event_types=event_types):
+                store = CoordinatorEventStore(self.root / f"publication-{index}.jsonl")
+                append_events(store, self.identity, event_types, self.artifact)
+                if index == 0:
+                    self.assertEqual("published", ReconciliationCoordinator(self.identity, store).derive().state)
+                else:
+                    with self.assertRaises(ManifestError):
+                        ReconciliationCoordinator(self.identity, store).derive()
+
+    def test_rejects_receipt_with_a_different_publication_binding(self) -> None:
+        event_types = [
+            "period_opened", "collection_complete", "reconciliation_complete", "review_approved",
+            "posting_started", "posting_complete", "clockify_readback_verified", "publication_prepared",
+            "publication_authorized", "shared_report_verified",
+        ]
+        append_events(self.store, self.identity, event_types, self.artifact)
+        documents = read_jsonl(self.store.path)
+        documents[-1]["payload"]["report_receipt"]["idempotency_identity"] = "other-publication"
+        documents[-1]["event_digest"] = event_digest(documents[-1])
+        write_jsonl(self.store.path, documents)
+
+        with self.assertRaisesRegex(ManifestError, "shared report receipt"):
+            self.coordinator().derive()
+
+    def test_blockers_and_audits_are_recorded_without_advancing(self) -> None:
+        event_types = [
+            "period_opened", "coverage_incomplete", "semantic_exceptions", "awaiting_approval",
+            "post_interrupted", "readback_mismatch", "report_mismatch", "currency_quote_unavailable",
+            "publication_deferred", "report_residual_resolved", "fathom_repair_complete",
+            "coverage_limitation_approved",
+        ]
+        append_events(self.store, self.identity, event_types, self.artifact)
+
+        manifest = self.coordinator().derive()
+
+        self.assertEqual("collecting", manifest.state)
+        self.assertEqual((
+            "awaiting_approval", "coverage_incomplete", "currency_quote_unavailable", "post_interrupted",
+            "publication_deferred", "readback_mismatch", "report_mismatch", "semantic_exceptions",
+        ), manifest.blockers)
+
+    def test_rejects_unknown_event_type_and_private_payload_at_derivation(self) -> None:
+        self.store.append(self.identity, "period_opened", {}, occurred_at=NOW)
+        self.store.append(self.identity, "unknown", {}, occurred_at=LATER)
+        with self.assertRaisesRegex(ManifestError, "unknown reconciliation event"):
+            self.coordinator().derive()
+
+        for private_field in ("transcript", "raw_payload", "cursor", "api_key", "credential"):
+            with self.subTest(private_field=private_field):
+                private_store = CoordinatorEventStore(self.root / f"{private_field}.jsonl")
+                with self.assertRaisesRegex(ManifestError, "prohibited private field"):
+                    private_store.append(self.identity, "period_opened", {private_field: "secret"}, occurred_at=NOW)
+
+    def test_manifest_serialization_is_schema_valid_and_digest_bound(self) -> None:
+        append_events(self.store, self.identity, complete_event_types(), self.artifact)
+        manifest = self.coordinator().derive()
+        document = manifest.document()
+
+        self.assertEqual(0, manifest_schema_validation(document).returncode)
+        tampered = {**document, "state": "approved"}
+        with self.assertRaisesRegex(ManifestError, "manifest digest"):
+            ReconciliationManifest.from_document(tampered)
+
+
+class ReconciliationManifestCliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name) / "recovery"
+        self.events = self.root / "period-events.jsonl"
+        self.manifest = self.root / "period-manifest.json"
+        self.routing = self.root.parent / "routing.json"
+        self.routing.write_text(json.dumps({"workspace_id": "workspace-serenichron", "member_id": "member-vlad"}), encoding="utf-8")
+        self.script = Path(__file__).parents[1] / "scripts" / "reconciliation_manifest.py"
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def run_cli(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["python3", str(self.script), *arguments], text=True, capture_output=True, check=False,
+        )
+
+    def init_arguments(self, *, dry_run: bool = False) -> list[str]:
+        arguments = [
+            "init", "--workspace-id-from-routing", str(self.routing), "--member-id-from-routing", str(self.routing),
+            "--timezone", "Europe/Bucharest", "--since", "2026-08-01T00:00:00+03:00",
+            "--until", "2026-08-16T00:00:00+03:00", "--revision", "1", "--events", str(self.events),
+            "--manifest", str(self.manifest),
+        ]
+        return [*arguments, "--dry-run"] if dry_run else arguments
+
+    def test_init_dry_run_leaves_no_files_and_init_writes_collecting_manifest(self) -> None:
+        result = self.run_cli(*self.init_arguments(dry_run=True))
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertFalse(self.root.exists())
+
+        result = self.run_cli(*self.init_arguments())
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertTrue(self.events.exists())
+        self.assertEqual("collecting", json.loads(self.manifest.read_text(encoding="utf-8"))["state"])
+
+    def test_import_artifacts_stores_safe_identities_and_verify_detects_drift(self) -> None:
+        self.assertEqual(0, self.run_cli(*self.init_arguments()).returncode)
+        artifact = self.root / "review.json"
+        artifact.write_text('{"safe":true}\n', encoding="utf-8")
+        diagnostic = self.root.parent / "diagnostic.json"
+        diagnostic.write_text(json.dumps({"artifacts": [{
+            "kind": "quality_report", "path": str(artifact), "schema_version": "quality/v1",
+            "compatibility_version": "quality/v1",
+        }]}), encoding="utf-8")
+        inventory = self.root / "imported-artifacts.json"
+
+        result = self.run_cli("import-artifacts", "--events", str(self.events), "--manifest", str(self.manifest),
+                              "--diagnostic", str(diagnostic), "--discover-preserved-august", "--output", str(inventory))
+        self.assertEqual(0, result.returncode, result.stderr)
+        imported = json.loads(inventory.read_text(encoding="utf-8"))
+        self.assertEqual({"artifacts"}, set(imported))
+        self.assertEqual({"kind", "path", "schema_version", "compatibility_version", "digest"}, set(imported["artifacts"][0]))
+
+        result = self.run_cli("verify", "--events", str(self.events), "--manifest", str(self.manifest))
+        self.assertEqual(0, result.returncode, result.stderr)
+        artifact.write_text('{"safe":false}\n', encoding="utf-8")
+        result = self.run_cli("verify", "--events", str(self.events), "--manifest", str(self.manifest))
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("artifact digest mismatch", result.stderr)
+
+    def test_import_rejects_a_manifest_stale_against_the_event_history(self) -> None:
+        self.assertEqual(0, self.run_cli(*self.init_arguments()).returncode)
+        identity = ReconciliationManifest.from_document(json.loads(self.manifest.read_text(encoding="utf-8"))).identity
+        CoordinatorEventStore(self.events).append(
+            identity, "coverage_incomplete", {}, occurred_at=datetime.now(timezone.utc),
+        )
+        diagnostic = self.root.parent / "diagnostic.json"
+        diagnostic.write_text(json.dumps({"artifacts": []}), encoding="utf-8")
+
+        result = self.run_cli("import-artifacts", "--events", str(self.events), "--manifest", str(self.manifest),
+                              "--diagnostic", str(diagnostic), "--output", str(self.root / "imported-artifacts.json"))
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("manifest does not match verified event history", result.stderr)
+
+    def test_rejects_output_paths_outside_the_private_recovery_root(self) -> None:
+        outside_events = self.root.parent / "period-events.jsonl"
+        result = self.run_cli(
+            "init", "--workspace-id-from-routing", str(self.routing), "--member-id-from-routing", str(self.routing),
+            "--timezone", "Europe/Bucharest", "--since", "2026-08-01T00:00:00+03:00",
+            "--until", "2026-08-16T00:00:00+03:00", "--revision", "1", "--events", str(outside_events),
+            "--manifest", str(self.manifest),
+        )
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn("private recovery root", result.stderr)
 
 
 if __name__ == "__main__":
