@@ -690,17 +690,22 @@ class ClockifyApiGateway:
         duration_seconds = total.get("totalTime", result.get("totalTime"))
         if not isinstance(entry_count, int) or not isinstance(duration_seconds, int):
             raise ClockifyReadbackError("shared report result is missing totals metrics")
+        projection = {"totals": [{"entriesCount": entry_count, "totalTime": duration_seconds,
+                      "amounts": [{"amountByCurrency": [
+                          {"currency": currency, "amount": format(Decimal(value) * Decimal("100"), "f")}
+                          for currency, value in sorted(costs.items())
+                      ]}]}]}
         receipt = {"workspace_id": workspace_id, "member_id": member_id,
                    "period_start": _utc(start), "period_end": _utc(end),
                    "filters": dict(filters), "shared_report_id": report_id,
-                   "raw_response_digest": _digest(result)}
+                   "raw_response_digest": _digest(projection)}
         return {"evidence_kind": "report", "workspace_id": workspace_id, "member_id": member_id,
                 "timezone": str(filters.get("timezone", "Europe/Bucharest")),
                 "period_start": _utc(start), "period_end": _utc(end), "filters": dict(filters),
                 "include_running": False, "include_deleted": False,
                 "refreshed_at": datetime.now(timezone.utc).isoformat(),
                 "entry_count": entry_count, "duration_seconds": duration_seconds,
-                "native_costs": costs, "request_receipt": receipt, "raw_response": dict(result)}
+                "native_costs": costs, "request_receipt": receipt, "raw_response": projection}
 
 
 def _json(path: Path) -> Any:

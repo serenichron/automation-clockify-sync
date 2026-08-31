@@ -356,6 +356,19 @@ class ClockifyGatewayTests(unittest.TestCase):
         self.assertEqual("983.70", result["native_costs"]["USD"])
         self.assertEqual("report-1", result["request_receipt"]["shared_report_id"])
 
+    def test_report_persists_only_allowlisted_sanitized_projection(self):
+        gateway = readback.ClockifyApiGateway("fixture-key")
+        gateway._post_report = mock.Mock(return_value={
+            "totals": [{"entriesCount": 7, "totalTime": 420, "description": "drop", "amounts": [{"amountByCurrency": [{"currency": "USD", "amount": 100, "private_key": "drop", "metadata": {"access_token": "drop"}}]}]}],
+            "description": "drop", "unknown": {"nested": "drop"}, "access_token": "drop",
+        })
+        envelope = gateway.read_report_result(report_id="report-1", workspace_id="workspace-1", member_id="member-1", start=datetime.fromisoformat(START), end=datetime.fromisoformat(END), filters={"timezone": "Europe/Bucharest", "include_running": False, "include_deleted": False})
+        projection = envelope["raw_response"]
+        self.assertEqual({"totals"}, set(projection))
+        self.assertEqual({"entriesCount", "totalTime", "amounts"}, set(projection["totals"][0]))
+        self.assertNotIn("access_token", json.dumps(projection))
+        self.assertNotIn("description", json.dumps(projection))
+
     def test_report_metrics_are_read_from_totals_item(self):
         gateway = readback.ClockifyApiGateway("fixture-key")
         gateway._post_report = mock.Mock(return_value={
@@ -455,7 +468,8 @@ class ClockifyEvidenceKindTests(unittest.TestCase):
         envelope = gateway.read_report_result(report_id="report-1", workspace_id="workspace-1", member_id="member-1", start=datetime.fromisoformat(START), end=datetime.fromisoformat(END), filters={"timezone": "Europe/Bucharest", "include_running": False, "include_deleted": False})
         normalized = readback.normalize_readback(envelope)
         persisted = normalized.to_dict()
-        self.assertEqual(raw, persisted["raw_response"])
+        self.assertEqual({"totals"}, set(persisted["raw_response"]))
+        self.assertNotIn("description", json.dumps(persisted["raw_response"]))
         self.assertEqual("report", readback.normalize_readback(persisted).evidence_kind)
         persisted.pop("raw_response")
         with self.assertRaisesRegex(readback.ClockifyReadbackError, "raw response"):
