@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from scripts import clockify_period_readback as readback
 
@@ -52,12 +53,14 @@ def _api_fixture() -> dict:
         "filters": {
             "workspace_id": "workspace-1",
             "member_id": "member-1",
+            "timezone": "Europe/Bucharest",
             "include_running": True,
             "include_deleted": True,
         },
         "include_running": True,
         "include_deleted": True,
         "refreshed_at": API_REFRESH,
+        "native_costs": {"USD": "983.70", "EUR": "7.31"},
         "entries": entries,
     }
 
@@ -141,8 +144,21 @@ class ClockifyReadbackContractTests(unittest.TestCase):
 
     def test_missing_native_currency_code_fails_closed(self):
         fixture = _api_fixture()
-        fixture["entries"][0]["cost"] = {"amount": "1.00"}
+        fixture["native_costs"] = {"": "1.00"}
         with self.assertRaisesRegex(readback.ClockifyReadbackError, "currency"):
+            readback.normalize_readback(fixture)
+
+    def test_nonfinite_native_cost_fails_closed(self):
+        fixture = _api_fixture()
+        fixture["native_costs"] = {"USD": "NaN"}
+        with self.assertRaisesRegex(readback.ClockifyReadbackError, "invalid amount"):
+            readback.normalize_readback(fixture)
+
+    def test_explicit_summary_entry_count_binds_even_when_entry_ids_are_empty(self):
+        fixture = _report_from(_api_fixture())
+        fixture["entry_ids"] = []
+        fixture["entry_count"] = 1
+        with self.assertRaisesRegex(readback.ClockifyReadbackError, "entry count"):
             readback.normalize_readback(fixture)
 
     def test_credential_named_filter_is_rejected_without_echoing_value(self):
@@ -151,6 +167,29 @@ class ClockifyReadbackContractTests(unittest.TestCase):
         with self.assertRaisesRegex(readback.ClockifyReadbackError, "credential") as raised:
             readback.normalize_readback(fixture)
         self.assertNotIn("fixture-secret", str(raised.exception))
+
+    def test_nested_credential_named_filter_is_rejected_without_echoing_value(self):
+        fixture = _api_fixture()
+        fixture["filters"]["nested"] = {"transport": {"token": "fixture-secret"}}
+        with self.assertRaisesRegex(readback.ClockifyReadbackError, "credential") as raised:
+            readback.normalize_readback(fixture)
+        self.assertNotIn("fixture-secret", str(raised.exception))
+
+    def test_cost_rate_on_time_entries_is_not_native_cost_evidence(self):
+        fixture = _api_fixture()
+        fixture["native_costs"] = {"USD": "983.70"}
+        fixture["entries"][0]["costRate"] = {"amount": 999999, "currency": "USD"}
+        result = readback.normalize_readback(fixture)
+        self.assertEqual({"USD": Decimal("983.70")}, result.native_costs)
+
+    def test_running_and_deleted_semantics_are_not_asserted_when_gateway_cannot_filter_them(self):
+        gateway = readback.ClockifyApiGateway("fixture-key")
+        with self.assertRaisesRegex(readback.ClockifyReadbackError, "running/deleted"):
+            gateway.read_period(
+                workspace_id="workspace-1", member_id="member-1",
+                start=datetime.fromisoformat(START), end=datetime.fromisoformat(END),
+                filters={"include_running": True, "include_deleted": True},
+            )
 
     def test_running_and_deleted_entries_follow_explicit_inclusion_filters(self):
         fixture = _api_fixture()
@@ -201,15 +240,17 @@ class ClockifyReadbackCliTests(unittest.TestCase):
         fixture = _api_fixture()
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "api-fixture.json"
+            report_source = Path(directory) / "report-fixture.json"
             output = Path(directory) / "api.json"
             report = Path(directory) / "report.json"
             routing = Path(directory) / "routing.json"
             source.write_text(json.dumps(fixture), encoding="utf-8")
+            report_source.write_text(json.dumps(_report_from(fixture)), encoding="utf-8")
             routing.write_text(json.dumps({"timezone": "Europe/Bucharest", "workspace_id": "workspace-1", "clockify_user_id": "member-1"}), encoding="utf-8")
             result = self._run(
                 "capture", "--routing", str(routing), "--timezone", "Europe/Bucharest",
                 "--since", START, "--until", END, "--shared-report-id", "report-1",
-                "--api-fixture", str(source), "--api-output", str(output), "--report-output", str(report),
+                "--api-fixture", str(source), "--report-fixture", str(report_source), "--api-output", str(output), "--report-output", str(report), "--output-root", directory,
             )
             self.assertEqual(0, result.returncode, result.stderr)
             self.assertEqual(172, json.loads(output.read_text())["entry_count"])
@@ -223,7 +264,7 @@ class ClockifyReadbackCliTests(unittest.TestCase):
             api_path, report_path, output = [Path(directory) / name for name in ("api.json", "report.json", "reconcile.json")]
             api_path.write_text(json.dumps(api), encoding="utf-8")
             report_path.write_text(json.dumps(_report_from(api, seconds=132217 - 600, entry_ids=[entry["id"] for entry in api["entries"][:-1]], entry_count=171)), encoding="utf-8")
-            result = self._run("reconcile", "--api", str(api_path), "--shared-report", str(report_path), "--output", str(output))
+            result = self._run("reconcile", "--api", str(api_path), "--shared-report", str(report_path), "--output", str(output), "--output-root", directory)
             self.assertEqual(2, result.returncode)
             data = json.loads(output.read_text())
             self.assertEqual("readback_mismatch", data["status"])
@@ -239,9 +280,75 @@ class ClockifyReadbackCliTests(unittest.TestCase):
             api_path, report_path, output = [Path(directory) / name for name in ("api.json", "report.json", "reconcile.json")]
             api_path.write_text(json.dumps(api), encoding="utf-8")
             report_path.write_text(json.dumps(report), encoding="utf-8")
-            result = self._run("reconcile", "--api", str(api_path), "--shared-report", str(report_path), "--output", str(output))
+            result = self._run("reconcile", "--api", str(api_path), "--shared-report", str(report_path), "--output", str(output), "--output-root", directory)
             self.assertEqual(0, result.returncode)
             self.assertEqual("verified", json.loads(output.read_text())["status"])
+
+    def test_reconcile_filter_only_mismatch_calls_gate_and_returns_nonzero(self):
+        api = _api_fixture()
+        report = _report_from(api, filters={**api["filters"], "include_deleted": False})
+        with tempfile.TemporaryDirectory() as directory:
+            api_path, report_path, output = [Path(directory) / name for name in ("api.json", "report.json", "reconcile.json")]
+            api_path.write_text(json.dumps(api), encoding="utf-8")
+            report_path.write_text(json.dumps(report), encoding="utf-8")
+            result = self._run("reconcile", "--api", str(api_path), "--shared-report", str(report_path), "--output", str(output), "--output-root", directory)
+            self.assertEqual(2, result.returncode)
+            self.assertEqual("readback_mismatch", json.loads(output.read_text())["status"])
+
+    def test_output_writer_rejects_symlink_and_traversal_and_writes_atomically(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "root"
+            root.mkdir()
+            outside = Path(directory) / "outside.json"
+            link = root / "link.json"
+            link.symlink_to(outside)
+            with self.assertRaisesRegex(readback.ClockifyReadbackError, "symlink"):
+                readback._write(link, {"ok": True}, root=root)
+            with self.assertRaisesRegex(readback.ClockifyReadbackError, "root"):
+                readback._write(root / ".." / "escape.json", {"ok": True}, root=root)
+            destination = root / "safe.json"
+            readback._write(destination, {"ok": True}, root=root)
+            self.assertEqual({"ok": True}, json.loads(destination.read_text()))
+
+
+class ClockifyGatewayTests(unittest.TestCase):
+    def test_period_gateway_paginates_beyond_two_hundred_and_stops_at_exhaustion(self):
+        gateway = readback.ClockifyApiGateway("fixture-key", supports_inclusion_filters=True)
+        def page_entry(index: int) -> dict:
+            entry = {**_entry(index), "cost": None}
+            entry["timeInterval"] = {"start": "2026-08-01T09:00:00+03:00", "end": "2026-08-01T09:10:00+03:00", "duration": 600}
+            return entry
+        pages = [[page_entry(index) for index in range(200)], [page_entry(200)], []]
+        gateway._get = mock.Mock(side_effect=pages)
+        result = gateway.read_period(
+            workspace_id="workspace-1", member_id="member-1",
+            start=datetime.fromisoformat(START), end=datetime.fromisoformat(END),
+            filters={"timezone": "Europe/Bucharest", "include_running": True, "include_deleted": True},
+        )
+        self.assertEqual(201, result.entry_count)
+        self.assertEqual(3, gateway._get.call_count)
+        self.assertLessEqual(gateway._get.call_args_list[0].args[0].count("page-size=200"), 1)
+
+    def test_period_gateway_rejects_duplicate_page_ids(self):
+        gateway = readback.ClockifyApiGateway("fixture-key", supports_inclusion_filters=True)
+        page = [{**_entry(1), "cost": None, "timeInterval": {"start": "2026-08-01T09:00:00+03:00", "end": "2026-08-01T09:10:00+03:00", "duration": 600}}]
+        gateway._get = mock.Mock(side_effect=[page, page])
+        with self.assertRaisesRegex(readback.ClockifyReadbackError, "duplicate"):
+            gateway.read_period(
+            workspace_id="workspace-1", member_id="member-1",
+            start=datetime.fromisoformat(START), end=datetime.fromisoformat(END),
+                filters={"timezone": "Europe/Bucharest", "include_running": True, "include_deleted": True},
+            )
+
+    def test_report_config_without_results_is_not_report_evidence(self):
+        gateway = readback.ClockifyApiGateway("fixture-key")
+        gateway._post_report = mock.Mock(return_value={"name": "config", "id": "report-1"})
+        with self.assertRaisesRegex(readback.ClockifyReadbackError, "results"):
+            gateway.read_report_result(
+                report_id="report-1", workspace_id="workspace-1", member_id="member-1",
+                start=datetime.fromisoformat(START), end=datetime.fromisoformat(END),
+                filters={"timezone": "Europe/Bucharest", "include_running": True, "include_deleted": True},
+            )
 
 
 if __name__ == "__main__":
