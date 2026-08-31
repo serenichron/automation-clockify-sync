@@ -300,6 +300,30 @@ class AutopilotRunnerTests(unittest.TestCase):
         self.assertEqual((interval.debt_id,), tuple(item.debt_id for item in store.active()))
         self.assertEqual(3, store.active()[0].retry_count)
 
+    def test_timeout_status_omits_private_coverage_state_path(self):
+        """Catches timeout receipts exposing the private coverage-state filename."""
+        with tempfile.TemporaryDirectory() as directory:
+            environment, _result = self.fixture(directory, "review_delta")
+            self.record_active_debt(environment)
+            timed_out = ChildResult(None, "", "child stderr suppressed", True, 0.01)
+            with mock.patch.object(runner, "run_child_bounded", return_value=timed_out):
+                self.assertEqual(runner.TEMPORARY_COVERAGE_EXIT, runner.run(environment))
+            status = json.loads(Path(environment["CLOCKIFY_AUTOPILOT_STATUS"]).read_text())
+
+        self.assertNotIn("coverage_state", status)
+        self.assertNotIn("source-coverage.json", json.dumps(status))
+
+    def test_non_contract_child_stdout_is_not_written_to_status(self):
+        """Catches a failure status that copies an arbitrary child payload."""
+        with tempfile.TemporaryDirectory() as directory:
+            environment, _result = self.fixture(directory, "review_delta")
+            malformed = ChildResult(1, "secret-stdout=abc123\n", "", False, 0.01)
+            with mock.patch.object(runner, "run_child_bounded", return_value=malformed):
+                self.assertEqual(2, runner.run(environment))
+            status = json.loads(Path(environment["CLOCKIFY_AUTOPILOT_STATUS"]).read_text())
+
+        self.assertNotIn("secret-stdout", json.dumps(status))
+
     def test_complete_run_records_compact_status(self):
         with tempfile.TemporaryDirectory() as directory:
             environment, result = self.fixture(directory, "review_delta")

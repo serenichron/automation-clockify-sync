@@ -443,7 +443,6 @@ def run(environment: Mapping[str, str] | None = None) -> int:
                 "timeout_seconds": timeout.total_seconds,
                 "coverage_debt": debt,
                 "coverage_debts": _debt_status(debt_items),
-                "coverage_state": str(coverage_path),
                 "effective_since": effective_since,
             })
             return exit_code
