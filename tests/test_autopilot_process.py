@@ -165,6 +165,70 @@ class AutopilotProcessTests(unittest.TestCase):
                     except ProcessLookupError:
                         pass
 
+    def test_continuous_escaped_output_cannot_extend_timeout_budget(self):
+        """Catches a drain loop that never returns to its monotonic deadline."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ready = root / "writer-ready"
+            pid_file = root / "writer-pid"
+            timer_pid_file = root / "writer-timer-pid"
+            signaled = root / "writer-signaled"
+            timer_script = (
+                "import os, signal, sys, time; time.sleep(3); "
+                "os.killpg(int(sys.argv[1]), signal.SIGKILL)"
+            )
+            escaped = (
+                "import os, pathlib, signal, subprocess, sys, time\n"
+                "os.setsid()\n"
+                f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
+                f"ready = pathlib.Path({str(ready)!r})\n"
+                f"signaled = pathlib.Path({str(signaled)!r})\n"
+                "signal.signal(signal.SIGTERM, lambda *_: signaled.write_text('unexpected'))\n"
+                "ready.write_text('ready')\n"
+                f"timer = subprocess.Popen([sys.executable, '-c', {timer_script!r}, str(os.getpgrp())], start_new_session=True)\n"
+                f"pathlib.Path({str(timer_pid_file)!r}).write_text(str(timer.pid))\n"
+                "subprocess.Popen(['yes'])\n"
+                "subprocess.Popen(['yes'], stdout=sys.stderr)\n"
+                "while True: time.sleep(1)\n"
+            )
+            parent = (
+                "import pathlib, signal, subprocess, sys, time\n"
+                f"ready = pathlib.Path({str(ready)!r})\n"
+                f"subprocess.Popen([sys.executable, '-c', {escaped!r}])\n"
+                "while not ready.exists(): time.sleep(0.01)\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "time.sleep(30)\n"
+            )
+            escaped_pid = None
+            timer_pid = None
+            try:
+                result = run_child_bounded(
+                    [sys.executable, "-c", parent],
+                    cwd=root,
+                    timeout=ChildTimeoutConfig(total_seconds=2, grace_seconds=1),
+                    environment={},
+                )
+                escaped_pid = int(pid_file.read_text())
+                timer_pid = int(timer_pid_file.read_text())
+                self.assertTrue(result.timed_out)
+                self.assertLess(result.duration_seconds, 3.5)
+                self.assertFalse(signaled.exists())
+            finally:
+                if escaped_pid is None and pid_file.exists():
+                    escaped_pid = int(pid_file.read_text())
+                if timer_pid is None and timer_pid_file.exists():
+                    timer_pid = int(timer_pid_file.read_text())
+                if escaped_pid is not None:
+                    try:
+                        os.killpg(escaped_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                if timer_pid is not None:
+                    try:
+                        os.kill(timer_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
     def test_child_stderr_is_not_retained_as_a_failure_payload(self):
         """Catches failure receipts that expose credentials emitted by a child."""
         with tempfile.TemporaryDirectory() as directory:

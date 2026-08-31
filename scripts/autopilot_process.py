@@ -12,6 +12,7 @@ import time
 
 
 _MAX_CAPTURED_STDOUT = 4096
+_MAX_DRAIN_CHUNKS_PER_CYCLE = 8
 _POST_KILL_REAP_SECONDS = 1.0
 _POLL_SECONDS = 0.05
 
@@ -102,7 +103,7 @@ def _drain_ready(
     """Drain ready pipes without retaining unbounded child output."""
     for key, _ in selector.select(timeout):
         stream = key.fileobj
-        while True:
+        for _ in range(_MAX_DRAIN_CHUNKS_PER_CYCLE):
             try:
                 chunk = os.read(stream.fileno(), 65536)
             except BlockingIOError:
