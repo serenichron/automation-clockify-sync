@@ -27,6 +27,15 @@
         "previous_anchor_digest": {"type": ["string", "null"], "pattern": "^sha256:[a-f0-9]{64}$"}, "ledger_count": {"type": "integer", "minimum": 1},
         "ledger_head": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}, "anchor_digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}
       }
+    },
+    "pending": {
+      "type": "object", "additionalProperties": false,
+      "required": ["pending_schema_version", "ledger_schema_version", "base_count", "base_head", "record", "expected_head", "pending_digest"],
+      "properties": {
+        "pending_schema_version": {"const": "receipt-ledger-pending/v1"}, "ledger_schema_version": {"const": "approval-receipt/v1"}, "base_count": {"type": "integer", "minimum": 0},
+        "base_head": {"type": ["string", "null"], "pattern": "^sha256:[a-f0-9]{64}$"}, "record": {"type": "object", "minProperties": 1},
+        "expected_head": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}, "pending_digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"}
+      }
     }
   },
   "oneOf": [
@@ -40,6 +49,7 @@
       "required": ["schema_version", "record_type", "sequence", "previous_digest", "approval_id", "operation_identity", "consumed_at", "event_digest"],
       "properties": {"schema_version": {"$ref": "#/$defs/integrity/schema_version"}, "record_type": {"const": "consumed"}, "sequence": {"$ref": "#/$defs/integrity/sequence"}, "previous_digest": {"$ref": "#/$defs/integrity/previous_digest"}, "approval_id": {"type": "string", "minLength": 1}, "operation_identity": {"type": "string", "pattern": "^opid-[a-f0-9]{64}$"}, "consumed_at": {"type": "string", "format": "date-time"}, "event_digest": {"$ref": "#/$defs/integrity/event_digest"}}
     },
-    {"$ref": "#/$defs/anchor"}
+    {"$ref": "#/$defs/anchor"},
+    {"$ref": "#/$defs/pending"}
   ]
 }

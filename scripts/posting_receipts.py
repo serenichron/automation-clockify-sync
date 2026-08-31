@@ -92,6 +92,10 @@ def _anchor_path(path: Path) -> Path:
     return path.with_name(path.name + ".anchor.jsonl")
 
 
+def _pending_path(path: Path) -> Path:
+    return path.with_name(path.name + ".pending.json")
+
+
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -123,12 +127,8 @@ def _verify_chain(records: list[dict[str, Any]], schema_version: str) -> None:
         previous = expected
 
 
-def _verify_anchor(path: Path, records: list[dict[str, Any]], schema_version: str) -> None:
+def _verified_anchors(path: Path, schema_version: str) -> list[dict[str, Any]]:
     anchors = _read_jsonl(_anchor_path(path))
-    if not anchors:
-        if records:
-            raise PostingReceiptError("receipt ledger anchor is missing")
-        return
     previous: str | None = None
     for sequence, anchor in enumerate(anchors):
         payload = {key: value for key, value in anchor.items() if key != "anchor_digest"}
@@ -149,6 +149,15 @@ def _verify_anchor(path: Path, records: list[dict[str, Any]], schema_version: st
         ):
             raise PostingReceiptError("receipt ledger anchor integrity failure")
         previous = expected
+    return anchors
+
+
+def _verify_anchor(path: Path, records: list[dict[str, Any]], schema_version: str) -> None:
+    anchors = _verified_anchors(path, schema_version)
+    if not anchors:
+        if records:
+            raise PostingReceiptError("receipt ledger anchor is missing")
+        return
     latest = anchors[-1]
     actual_head = records[-1]["event_digest"] if records else None
     if latest["ledger_count"] != len(records) or latest["ledger_head"] != actual_head:
@@ -156,7 +165,7 @@ def _verify_anchor(path: Path, records: list[dict[str, Any]], schema_version: st
 
 
 def _append_anchor(path: Path, records: list[dict[str, Any]], schema_version: str) -> None:
-    anchors = _read_jsonl(_anchor_path(path))
+    anchors = _verified_anchors(path, schema_version)
     previous = anchors[-1]["anchor_digest"] if anchors else None
     record: dict[str, Any] = {
         "anchor_schema_version": "receipt-ledger-anchor/v1",
@@ -168,6 +177,126 @@ def _append_anchor(path: Path, records: list[dict[str, Any]], schema_version: st
     }
     record["anchor_digest"] = _digest(record)
     _append_jsonl(_anchor_path(path), record)
+
+
+def _write_pending(path: Path, pending: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with path.open("x", encoding="utf-8") as handle:
+            handle.write(canonical_json(pending) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except FileExistsError as error:
+        raise PostingReceiptError("pending receipt transaction already exists") from error
+
+
+def _clear_pending(path: Path) -> None:
+    if not path.exists():
+        return
+    path.unlink()
+    descriptor = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _load_pending(path: Path, schema_version: str) -> dict[str, Any] | None:
+    pending_path = _pending_path(path)
+    if not pending_path.exists():
+        return None
+    try:
+        value = json.loads(pending_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise PostingReceiptError("pending receipt transaction is invalid") from error
+    if not isinstance(value, dict):
+        raise PostingReceiptError("pending receipt transaction is invalid")
+    required = {
+        "pending_schema_version", "ledger_schema_version", "base_count", "base_head", "record",
+        "expected_head", "pending_digest",
+    }
+    payload = {key: item for key, item in value.items() if key != "pending_digest"}
+    if (
+        set(value) != required
+        or value.get("pending_schema_version") != "receipt-ledger-pending/v1"
+        or value.get("ledger_schema_version") != schema_version
+        or not isinstance(value.get("base_count"), int)
+        or isinstance(value.get("base_count"), bool)
+        or value["base_count"] < 0
+        or value.get("base_head") is not None and not isinstance(value.get("base_head"), str)
+        or not isinstance(value.get("record"), dict)
+        or not isinstance(value.get("expected_head"), str)
+        or value.get("pending_digest") != _digest(payload)
+    ):
+        raise PostingReceiptError("pending receipt transaction is invalid")
+    record = value["record"]
+    if (
+        record.get("schema_version") != schema_version
+        or record.get("sequence") != value["base_count"]
+        or record.get("previous_digest") != value["base_head"]
+        or record.get("event_digest") != value["expected_head"]
+        or record.get("event_digest") != _digest(
+            {key: item for key, item in record.items() if key != "event_digest"}
+        )
+    ):
+        raise PostingReceiptError("pending receipt transaction contradicts its record")
+    return value
+
+
+def _anchor_matches(anchors: list[dict[str, Any]], count: int, head: str | None) -> bool:
+    if count == 0:
+        return not anchors and head is None
+    return bool(anchors) and anchors[-1].get("ledger_count") == count and anchors[-1].get("ledger_head") == head
+
+
+def _recover_pending(path: Path, schema_version: str) -> None:
+    pending = _load_pending(path, schema_version)
+    if pending is None:
+        return
+    records = _read_jsonl(path)
+    _verify_chain(records, schema_version)
+    anchors = _verified_anchors(path, schema_version)
+    base_count = pending["base_count"]
+    base_head = pending["base_head"]
+    expected_head = pending["expected_head"]
+    expected_record = pending["record"]
+    primary_is_base = len(records) == base_count and (
+        (records[-1]["event_digest"] if records else None) == base_head
+    )
+    primary_is_extended = len(records) == base_count + 1 and (
+        records[-1]["event_digest"] if records else None
+    ) == expected_head and canonical_json(records[-1]) == canonical_json(expected_record)
+    anchor_is_base = _anchor_matches(anchors, base_count, base_head)
+    anchor_is_extended = _anchor_matches(anchors, base_count + 1, expected_head)
+    if primary_is_base and anchor_is_base:
+        _append_jsonl(path, expected_record)
+        records.append(expected_record)
+        _append_anchor(path, records, schema_version)
+    elif primary_is_extended and anchor_is_base:
+        _append_anchor(path, records, schema_version)
+    elif primary_is_extended and anchor_is_extended:
+        pass
+    else:
+        raise PostingReceiptError("pending receipt transaction contradicts ledger state")
+    _clear_pending(_pending_path(path))
+
+
+def _append_transaction(
+    path: Path, records: list[dict[str, Any]], record: dict[str, Any], schema_version: str
+) -> None:
+    pending: dict[str, Any] = {
+        "pending_schema_version": "receipt-ledger-pending/v1",
+        "ledger_schema_version": schema_version,
+        "base_count": len(records),
+        "base_head": records[-1]["event_digest"] if records else None,
+        "record": record,
+        "expected_head": record["event_digest"],
+    }
+    pending["pending_digest"] = _digest(pending)
+    _write_pending(_pending_path(path), pending)
+    _append_jsonl(path, record)
+    _append_anchor(path, records + [record], schema_version)
+    _clear_pending(_pending_path(path))
 
 
 @dataclass(frozen=True)
@@ -238,6 +367,7 @@ class ApprovalReceiptStore:
         self.path = Path(path)
 
     def _records(self) -> list[dict[str, Any]]:
+        _recover_pending(self.path, APPROVAL_SCHEMA_VERSION)
         records = _read_jsonl(self.path)
         _verify_chain(records, APPROVAL_SCHEMA_VERSION)
         _verify_anchor(self.path, records, APPROVAL_SCHEMA_VERSION)
@@ -305,8 +435,7 @@ class ApprovalReceiptStore:
             "receipt": receipt.document(),
         }
         record["event_digest"] = _digest(record)
-        _append_jsonl(self.path, record)
-        _append_anchor(self.path, records + [record], APPROVAL_SCHEMA_VERSION)
+        _append_transaction(self.path, records, record, APPROVAL_SCHEMA_VERSION)
 
     def require(self, receipt_id: str, *, operation_identity: str, now: datetime) -> ApprovalReceipt:
         if now.tzinfo is None:
@@ -337,8 +466,7 @@ class ApprovalReceiptStore:
             "consumed_at": consumed_at,
         }
         record["event_digest"] = _digest(record)
-        _append_jsonl(self.path, record)
-        _append_anchor(self.path, records + [record], APPROVAL_SCHEMA_VERSION)
+        _append_transaction(self.path, records, record, APPROVAL_SCHEMA_VERSION)
 
     def verify(self) -> None:
         self._records()
@@ -400,6 +528,7 @@ class PostEventStore:
         self.path = Path(path)
 
     def _events(self, *, complete: bool) -> tuple[PostEvent, ...]:
+        _recover_pending(self.path, POST_EVENT_SCHEMA_VERSION)
         records = _read_jsonl(self.path)
         _verify_chain(records, POST_EVENT_SCHEMA_VERSION)
         _verify_anchor(self.path, records, POST_EVENT_SCHEMA_VERSION)
@@ -462,8 +591,7 @@ class PostEventStore:
             **event.document(),
         }
         record["event_digest"] = _digest(record)
-        _append_jsonl(self.path, record)
-        _append_anchor(self.path, records + [record], POST_EVENT_SCHEMA_VERSION)
+        _append_transaction(self.path, records, record, POST_EVENT_SCHEMA_VERSION)
 
     def verify(self) -> tuple[PostEvent, ...]:
         return self._events(complete=True)

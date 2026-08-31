@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from scripts import posting_receipts
 
@@ -60,6 +61,40 @@ def post_event(disposition: str, **changes: object) -> posting_receipts.PostEven
 
 
 class ApprovalReceiptStoreTests(unittest.TestCase):
+    def test_approval_restart_completes_primary_only_pending_commit_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "approvals.jsonl"
+            store = posting_receipts.ApprovalReceiptStore(path)
+            receipt = approval_receipt()
+            with mock.patch.object(posting_receipts, "_append_anchor", side_effect=InterruptedError("stop")):
+                with self.assertRaises(InterruptedError):
+                    store.append(receipt)
+
+            restarted = posting_receipts.ApprovalReceiptStore(path)
+            self.assertEqual(
+                receipt,
+                restarted.require(receipt.approval_id, operation_identity=OPERATION, now=NOW),
+            )
+            self.assertEqual(1, len(path.read_text(encoding="utf-8").splitlines()))
+            restarted.verify()
+            with self.assertRaises(posting_receipts.PostingReceiptError):
+                restarted.require(receipt.approval_id, operation_identity="different", now=NOW)
+
+    def test_tampered_pending_commit_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "approvals.jsonl"
+            store = posting_receipts.ApprovalReceiptStore(path)
+            with mock.patch.object(posting_receipts, "_append_anchor", side_effect=InterruptedError("stop")):
+                with self.assertRaises(InterruptedError):
+                    store.append(approval_receipt())
+            pending = path.with_name(path.name + ".pending.json")
+            self.assertTrue(pending.is_file())
+            record = json.loads(pending.read_text(encoding="utf-8"))
+            record["expected_head"] = "sha256:tampered"
+            pending.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(posting_receipts.PostingReceiptError, "pending"):
+                posting_receipts.ApprovalReceiptStore(path).verify()
+
     def test_approval_anchor_rejects_truncated_consumption_and_deleted_ledger(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "approvals.jsonl"
@@ -166,6 +201,22 @@ class ApprovalReceiptStoreTests(unittest.TestCase):
 
 
 class PostEventStoreTests(unittest.TestCase):
+    def test_post_restart_completes_primary_only_pending_commit_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "post-events.jsonl"
+            store = posting_receipts.PostEventStore(path)
+            planned = post_event("planned")
+            with mock.patch.object(posting_receipts, "_append_anchor", side_effect=InterruptedError("stop")):
+                with self.assertRaises(InterruptedError):
+                    store.append(planned)
+
+            restarted = posting_receipts.PostEventStore(path)
+            receipt = restarted.derive_receipt(OPERATION)
+            self.assertEqual(["interrupted"], [entry["disposition"] for entry in receipt["entries"]])
+            self.assertEqual(1, len(path.read_text(encoding="utf-8").splitlines()))
+            restarted.append(post_event("interrupted"))
+            self.assertEqual(["interrupted"], [event.disposition for event in restarted.verify() if event.disposition != "planned"])
+
     def test_post_anchor_rejects_removal_of_completed_plan_and_terminal_pair(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = posting_receipts.PostEventStore(Path(directory) / "post-events.jsonl")
