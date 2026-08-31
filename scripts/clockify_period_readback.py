@@ -323,7 +323,8 @@ def _normalize_summary(payload: Mapping[str, Any], zone: ZoneInfo) -> ClockifyPe
                 if isinstance(currency_entries, list):
                     for item in currency_entries:
                         if isinstance(item, Mapping) and item.get("currency") is not None and item.get("amount") is not None:
-                            costs_raw[str(item["currency"]).upper()] = str(Decimal(str(item["amount"])) / Decimal("100"))
+                            currency = str(item["currency"]).upper()
+                            costs_raw[currency] = str(Decimal(costs_raw.get(currency, "0")) + Decimal(str(item["amount"])) / Decimal("100"))
                 elif amount_group.get("currency") is not None and amount_group.get("amount") is not None:
                     costs_raw[str(amount_group["currency"]).upper()] = str(Decimal(str(amount_group["amount"])) / Decimal("100"))
     if not isinstance(costs_raw, Mapping):
@@ -376,6 +377,7 @@ def _normalize_summary(payload: Mapping[str, Any], zone: ZoneInfo) -> ClockifyPe
             raise ClockifyReadbackError("report native costs are required")
     unsigned = {
         "schema_version": SCHEMA_VERSION,
+        "evidence_kind": evidence_kind,
         "workspace_id": workspace, "member_id": member, "timezone": zone.key,
         "period_start": _utc(period_start), "period_end": _utc(period_end),
         "filters": filters, "refreshed_at": _utc(refreshed),
@@ -384,6 +386,8 @@ def _normalize_summary(payload: Mapping[str, Any], zone: ZoneInfo) -> ClockifyPe
         "entry_durations": {key: entry_durations[key] for key in ids} if entry_durations else {},
         "native_costs": {key: str(value) for key, value in sorted(costs.items())},
     }
+    if receipt:
+        unsigned["request_receipt"] = dict(receipt)
     supplied_digest = payload.get("digest")
     digest = _digest(unsigned)
     if supplied_digest is not None and supplied_digest != digest:
@@ -470,7 +474,7 @@ def normalize_readback(
         entry_durations[entry_id] = seconds
         total += seconds
     summary = {
-        "schema_version": SCHEMA_VERSION, "workspace_id": workspace, "member_id": member,
+        "schema_version": SCHEMA_VERSION, "evidence_kind": "ledger", "workspace_id": workspace, "member_id": member,
         "timezone": zone.key, "period_start": _utc(period_start), "period_end": _utc(period_end),
         "filters": filters, "refreshed_at": _utc(refreshed),
         "include_running": include_running, "include_deleted": include_deleted,
@@ -659,7 +663,8 @@ class ClockifyApiGateway:
                     continue
                 for item in group.get("amountByCurrency", []):
                     if isinstance(item, Mapping) and item.get("currency") and item.get("amount") is not None:
-                        costs[str(item["currency"]).upper()] = format(Decimal(str(item["amount"])) / Decimal("100"), ".2f")
+                        currency = str(item["currency"]).upper()
+                        costs[currency] = format(Decimal(costs.get(currency, "0")) + Decimal(str(item["amount"])) / Decimal("100"), ".2f")
         if not costs:
             raise ClockifyReadbackError("shared report result is missing native costs")
         receipt = {"workspace_id": workspace_id, "member_id": member_id,

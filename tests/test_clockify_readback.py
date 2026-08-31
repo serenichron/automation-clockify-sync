@@ -354,6 +354,22 @@ class ClockifyGatewayTests(unittest.TestCase):
         self.assertEqual("983.70", result["native_costs"]["USD"])
         self.assertEqual("report-1", result["request_receipt"]["shared_report_id"])
 
+    def test_repeated_same_currency_totals_are_aggregated(self):
+        gateway = readback.ClockifyApiGateway("fixture-key")
+        gateway._post_report = mock.Mock(return_value={
+            "entriesCount": 1, "totalTime": 60,
+            "totals": [
+                {"amounts": [{"amountByCurrency": [{"currency": "USD", "amount": 100}]}]},
+                {"amounts": [{"amountByCurrency": [{"currency": "USD", "amount": 250}]}]},
+            ],
+        })
+        result = gateway.read_report_result(
+            report_id="report-1", workspace_id="workspace-1", member_id="member-1",
+            start=datetime.fromisoformat(START), end=datetime.fromisoformat(END),
+            filters={"timezone": "Europe/Bucharest", "include_running": False, "include_deleted": False},
+        )
+        self.assertEqual("3.50", result["native_costs"]["USD"])
+
     def test_report_result_rejects_missing_costs(self):
         gateway = readback.ClockifyApiGateway("fixture-key")
         gateway._post_report = mock.Mock(return_value={"entriesCount": 1, "totalTime": 60, "totals": [{"amounts": []}]})
@@ -383,6 +399,17 @@ class ClockifyEvidenceKindTests(unittest.TestCase):
         report["raw_response"] = {"entriesCount": 172, "totalTime": 132217, "totals": [{"amounts": [{"amountByCurrency": [{"currency": "USD", "amount": 98370}]}]}]}
         with self.assertRaisesRegex(readback.ClockifyReadbackError, "digest"):
             readback.normalize_readback(report)
+
+    def test_evidence_metadata_is_bound_into_canonical_digest(self):
+        report = _report_from(_api_fixture())
+        report["evidence_kind"] = "report"
+        report["request_receipt"] = {"workspace_id": "workspace-1", "member_id": "member-1", "period_start": START, "period_end": END, "filters": dict(report["filters"]), "shared_report_id": "report-1", "raw_response_digest": "sha256:" + "0" * 64}
+        normalized = readback.normalize_readback(report)
+        document = normalized.to_dict()
+        document["request_receipt"]["shared_report_id"] = "tampered"
+        document["digest"] = normalized.digest
+        with self.assertRaisesRegex(readback.ClockifyReadbackError, "digest"):
+            readback.normalize_readback(document)
 
     def test_report_costs_verify_without_ledger_costs(self):
         api = _api_fixture()
