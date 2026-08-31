@@ -131,34 +131,56 @@ class SourceDebtStore:
             if not isinstance(raw_interval, Mapping):
                 raise ValueError("source debt event interval is missing")
             try:
+                identity_fields = (
+                    "source", "since_utc", "until_utc", "slice_id",
+                    "compatibility_version",
+                )
+                if not all(isinstance(raw_interval.get(name), str) for name in identity_fields):
+                    raise ValueError("source debt interval identity fields must be strings")
+                if not isinstance(event.get("debt_id"), str):
+                    raise ValueError("source debt event ID must be a string")
                 interval = SourceInterval(
-                    source=str(raw_interval["source"]),
-                    since_utc=str(raw_interval["since_utc"]),
-                    until_utc=str(raw_interval["until_utc"]),
-                    slice_id=str(raw_interval["slice_id"]),
-                    compatibility_version=str(raw_interval["compatibility_version"]),
+                    source=raw_interval["source"],
+                    since_utc=raw_interval["since_utc"],
+                    until_utc=raw_interval["until_utc"],
+                    slice_id=raw_interval["slice_id"],
+                    compatibility_version=raw_interval["compatibility_version"],
                 )
                 if event.get("debt_id") != interval.debt_id:
                     raise ValueError("source debt event identity does not match its interval")
                 kind = event.get("event")
                 if kind == "failure":
+                    if not isinstance(event.get("failure_class"), str):
+                        raise ValueError("source debt failure class must be a string")
+                    if not isinstance(event.get("retryable"), bool):
+                        raise ValueError("source debt retryable flag must be a boolean")
+                    if not isinstance(event.get("resume_state_digest"), str):
+                        raise ValueError("source debt resume digest must be a string")
+                    if not isinstance(event.get("attempted_at"), str):
+                        raise ValueError("source debt attempted time must be a string")
                     store.record_failure(
                         interval,
-                        failure_class=str(event["failure_class"]),
-                        retryable=bool(event["retryable"]),
-                        resume_state_digest=str(event["resume_state_digest"]),
-                        attempted_at=str(event["attempted_at"]),
+                        failure_class=event["failure_class"],
+                        retryable=event["retryable"],
+                        resume_state_digest=event["resume_state_digest"],
+                        attempted_at=event["attempted_at"],
                     )
                 elif kind == "complete":
+                    if not isinstance(event.get("completion_bundle_digest"), str):
+                        raise ValueError("source debt completion digest must be a string")
+                    if not isinstance(event.get("completed_at"), str):
+                        raise ValueError("source debt completion time must be a string")
                     store.record_complete(
                         interval,
-                        completion_bundle_digest=str(event["completion_bundle_digest"]),
-                        completed_at=str(event["completed_at"]),
+                        completion_bundle_digest=event["completion_bundle_digest"],
+                        completed_at=event["completed_at"],
                     )
                 elif kind == "exhausted":
+                    if not isinstance(event.get("terminal_reason"), str):
+                        raise ValueError("source debt terminal reason must be a string")
                     store.exhaust(
                         interval.debt_id,
-                        terminal_reason=str(event["terminal_reason"]),
+                        terminal_reason=event["terminal_reason"],
                     )
                 else:
                     raise ValueError("source debt event kind is unsupported")

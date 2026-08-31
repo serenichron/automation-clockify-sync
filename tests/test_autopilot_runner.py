@@ -49,7 +49,7 @@ class AutopilotRunnerTests(unittest.TestCase):
             environment, first = self.fixture(
                 directory,
                 "review_delta",
-                date_range={"since": "2026-08-01", "until": "2026-08-02"},
+                date_range={"since": "2026-08-01T00:00:00Z", "until": "2026-08-02T00:00:00Z"},
                 source_completeness={"status": "complete", "incomplete_sources": []},
             )
             second = first.parent.parent / "run-2" / "autopilot-result.json"
@@ -57,7 +57,7 @@ class AutopilotRunnerTests(unittest.TestCase):
             second.write_text(json.dumps({
                 "action": "coverage_warning",
                 "run_id": "run-2",
-                "date_range": {"since": "2026-08-02", "until": "2026-08-03"},
+                "date_range": {"since": "2026-08-02T00:00:00Z", "until": "2026-08-03T00:00:00Z"},
                 "source_completeness": {"status": "complete", "incomplete_sources": []},
             }) + "\n")
             completed = subprocess.CompletedProcess(
@@ -82,6 +82,7 @@ class AutopilotRunnerTests(unittest.TestCase):
             environment, first = self.fixture(
                 directory,
                 "blocked",
+                date_range={"since": "2026-08-01T00:00:00Z", "until": "2026-08-02T00:00:00Z"},
                 source_completeness={
                     "status": "incomplete",
                     "incomplete_sources": ["sessions/omarchy-precision"],
@@ -91,6 +92,7 @@ class AutopilotRunnerTests(unittest.TestCase):
             second.parent.mkdir()
             second.write_text(json.dumps({
                 "action": "coverage_warning",
+                "date_range": {"since": "2026-08-01T00:00:00Z", "until": "2026-08-02T00:00:00Z"},
                 "source_completeness": {
                     "status": "incomplete",
                     "incomplete_sources": ["sessions/macbook"],
@@ -120,7 +122,11 @@ class AutopilotRunnerTests(unittest.TestCase):
 
     def test_coverage_warning_retries_twice_then_stops_looping(self):
         with tempfile.TemporaryDirectory() as directory:
-            environment, result = self.fixture(directory, "coverage_warning")
+            environment, result = self.fixture(
+                directory,
+                "coverage_warning",
+                date_range={"since": "2026-08-01T00:00:00Z", "until": "2026-08-02T00:00:00Z"},
+            )
             completed = subprocess.CompletedProcess(
                 ["review"], 0, stdout=str(result) + "\n", stderr=""
             )
@@ -163,6 +169,28 @@ class AutopilotRunnerTests(unittest.TestCase):
         retries = {item["source"]: item["retry_count"] for item in status["coverage_debts"]}
         self.assertEqual({"sessions/macbook": 1, "repositories/omarchy-desktop": 1}, retries)
 
+    def test_missing_utc_bounds_block_without_fabricating_epoch_debt(self):
+        """Catches fallback interval construction that schedules a fabricated 1970 debt."""
+        with tempfile.TemporaryDirectory() as directory:
+            environment, result = self.fixture(
+                directory,
+                "coverage_warning",
+                source_completeness={
+                    "status": "incomplete",
+                    "incomplete_sources": ["sessions/macbook"],
+                },
+            )
+            completed = subprocess.CompletedProcess(
+                ["review"], 0, stdout=str(result) + "\n", stderr=""
+            )
+            with mock.patch.object(runner.subprocess, "run", return_value=completed):
+                self.assertEqual(2, runner.run(environment))
+            status = json.loads(Path(environment["CLOCKIFY_AUTOPILOT_STATUS"]).read_text())
+
+        self.assertEqual("blocked", status["state"])
+        self.assertIn("UTC", status["reason"])
+        self.assertFalse(Path(environment["CLOCKIFY_AUTOPILOT_ROOT"], "state", "source-coverage.json").exists())
+
     def test_invalid_exact_interval_contract_blocks_without_writing_debt(self):
         """Catches malformed UTC bounds escaping the runner as an uncaught exception."""
         with tempfile.TemporaryDirectory() as directory:
@@ -187,7 +215,11 @@ class AutopilotRunnerTests(unittest.TestCase):
 
     def test_next_scheduled_run_retries_debt_after_prior_retry_exhaustion(self):
         with tempfile.TemporaryDirectory() as directory:
-            environment, result = self.fixture(directory, "coverage_warning")
+            environment, result = self.fixture(
+                directory,
+                "coverage_warning",
+                date_range={"since": "2026-08-01T00:00:00Z", "until": "2026-08-02T00:00:00Z"},
+            )
             completed = subprocess.CompletedProcess(
                 ["review"], 0, stdout=str(result) + "\n", stderr=""
             )
@@ -202,7 +234,11 @@ class AutopilotRunnerTests(unittest.TestCase):
 
     def test_first_deploy_bootstraps_prior_missed_interval_into_command(self):
         with tempfile.TemporaryDirectory() as directory:
-            environment, result = self.fixture(directory, "coverage_warning")
+            environment, result = self.fixture(
+                directory,
+                "coverage_warning",
+                date_range={"since": "2026-08-12T00:00:00Z", "until": "2026-08-13T00:00:00Z"},
+            )
             prior = Path(directory) / "runs" / "20260812T063103Z"
             prior.mkdir()
             (prior / "run-report.json").write_text(json.dumps({
@@ -241,6 +277,7 @@ class AutopilotRunnerTests(unittest.TestCase):
             environment, result = self.fixture(
                 directory,
                 "blocked",
+                date_range={"since": "2026-08-01T00:00:00Z", "until": "2026-08-02T00:00:00Z"},
                 source_completeness={
                     "status": "incomplete",
                     "incomplete_sources": [

@@ -133,26 +133,29 @@ def _result_interval(
 ) -> source_coverage.SourceInterval:
     """Derive an exact identity only when the action contract supplies UTC bounds."""
     date_range = result.get("date_range")
-    since = str(date_range.get("since") or "") if isinstance(date_range, Mapping) else ""
-    until = str(date_range.get("until") or "") if isinstance(date_range, Mapping) else ""
-    if since.endswith("Z") and until.endswith("Z"):
-        slice_id = str(result.get("slice_id") or "").strip()
-        if not slice_id:
-            identity = f"{source}\0{since}\0{until}".encode("utf-8")
-            slice_id = "source-completeness-" + hashlib.sha256(identity).hexdigest()[:16]
-        return source_coverage.SourceInterval(
-            source=source,
-            since_utc=since,
-            until_utc=until,
-            slice_id=slice_id,
-            compatibility_version="source-debt/v1",
-        )
+    if not isinstance(date_range, Mapping):
+        raise ValueError("source coverage interval requires explicit UTC bounds")
+    since = date_range.get("since")
+    until = date_range.get("until")
+    if not (
+        isinstance(since, str) and since.endswith("Z")
+        and isinstance(until, str) and until.endswith("Z")
+    ):
+        raise ValueError("source coverage interval requires explicit UTC bounds")
+    raw_slice_id = result.get("slice_id")
+    if raw_slice_id is None:
+        identity = f"{source}\0{since}\0{until}".encode("utf-8")
+        slice_id = "source-completeness-" + hashlib.sha256(identity).hexdigest()[:16]
+    elif isinstance(raw_slice_id, str) and raw_slice_id.strip():
+        slice_id = raw_slice_id.strip()
+    else:
+        raise ValueError("source coverage interval slice ID must be a non-empty string")
     return source_coverage.SourceInterval(
         source=source,
-        since_utc="1970-01-01T00:00:00Z",
-        until_utc="1970-01-02T00:00:00Z",
-        slice_id="legacy-runner-coverage-warning",
-        compatibility_version=source_coverage.LEGACY_COMPATIBILITY_VERSION,
+        since_utc=since,
+        until_utc=until,
+        slice_id=slice_id,
+        compatibility_version="source-debt/v1",
     )
 
 

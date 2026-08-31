@@ -179,6 +179,49 @@ class SourceCoverageTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             source_coverage.SourceDebtStore.from_document(document)
 
+    def test_replay_rejects_a_string_retryable_flag_as_ineligible_state(self):
+        """Catches bool() coercion that turns persisted JSON \"false\" into retryable debt."""
+        store = source_coverage.SourceDebtStore()
+        debt = interval("sessions/macbook", "2026-08-01", "2026-08-03")
+        store.record_failure(
+            debt, failure_class="offline", retryable=True,
+            resume_state_digest="sha256:r", attempted_at=NOW,
+        )
+        document = store.document()
+        document["events"][0]["retryable"] = "false"
+
+        with self.assertRaises(ValueError):
+            source_coverage.SourceDebtStore.from_document(document)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "source-coverage.json"
+            path.write_text(json.dumps(document))
+            recovered = source_coverage.read(path)
+        recovered_store = source_coverage.SourceDebtStore.from_document(recovered)
+        self.assertTrue(recovered["migration_warnings"])
+        self.assertEqual((), recovered_store.eligible(NOW))
+
+    def test_replay_rejects_non_string_interval_identity_fields(self):
+        """Catches str() coercion that changes persisted identity while accepting it."""
+        store = source_coverage.SourceDebtStore()
+        debt = interval("sessions/macbook", "2026-08-01", "2026-08-03")
+        store.record_failure(
+            debt, failure_class="offline", retryable=True,
+            resume_state_digest="sha256:r", attempted_at=NOW,
+        )
+        document = store.document()
+        event = document["events"][0]
+        event["interval"]["source"] = 7
+        event["debt_id"] = source_coverage.SourceInterval(
+            source="7",
+            since_utc="2026-08-01T00:00:00Z",
+            until_utc="2026-08-03T00:00:00Z",
+            slice_id="slice-2026-08-01-2026-08-03",
+            compatibility_version="source-debt/v1",
+        ).debt_id
+
+        with self.assertRaises(ValueError):
+            source_coverage.SourceDebtStore.from_document(document)
+
     def completeness(self, peer_status: str):
         return {
             "status": "incomplete" if peer_status != "complete" else "complete",
