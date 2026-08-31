@@ -40,6 +40,7 @@ def approval_receipt(**changes: object) -> posting_receipts.ApprovalReceipt:
         "manifest_digest": "sha256:manifest",
         "event_history_digest": "sha256:events",
         "historical_receipt_digest": "sha256:historical",
+        "max_create_count": 1,
         "single_use": True,
     }
     values.update(changes)
@@ -70,6 +71,20 @@ def canonical_digest(value: object) -> str:
 
 
 class ApprovalReceiptStoreTests(unittest.TestCase):
+    def test_execution_lock_excludes_a_second_store_until_released(self) -> None:
+        """Removing the nonblocking flock would let two processes post under one approval."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "approvals.jsonl"
+            first = posting_receipts.ApprovalReceiptStore(path)
+            second = posting_receipts.ApprovalReceiptStore(path)
+
+            first.acquire_execution_lock("approval-1")
+            with self.assertRaisesRegex(posting_receipts.PostingReceiptError, "in progress"):
+                second.acquire_execution_lock("approval-1")
+            first.release_execution_lock()
+            second.acquire_execution_lock("approval-1")
+            second.release_execution_lock()
+
     def test_pending_journal_directory_is_fsynced_before_primary_append(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "approvals.jsonl"

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import json
 import os
@@ -332,6 +333,7 @@ class ApprovalReceipt:
     manifest_digest: str
     event_history_digest: str
     historical_receipt_digest: str
+    max_create_count: int
     single_use: bool = True
 
     @property
@@ -369,6 +371,8 @@ class ApprovalReceipt:
             _digest_text(getattr(self, field), field)
         if not isinstance(self.single_use, bool):
             raise PostingReceiptError("single_use must be a boolean")
+        if isinstance(self.max_create_count, bool) or not isinstance(self.max_create_count, int) or self.max_create_count < 0:
+            raise PostingReceiptError("max_create_count must be a non-negative integer")
         if self.operation_identity != derive_operation_identity(
             operation=self.operation,
             period_id=self.period_id,
@@ -420,6 +424,34 @@ def _validate_approval_records(records: list[dict[str, Any]]) -> None:
 class ApprovalReceiptStore:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
+        self._execution_lock_descriptor: int | None = None
+
+    def __del__(self) -> None:
+        self.release_execution_lock()
+
+    def acquire_execution_lock(self, receipt_id: str) -> None:
+        if self._execution_lock_descriptor is not None:
+            raise PostingReceiptError("approval execution lock is already held")
+        approval_id = _required_text(receipt_id, "approval_id")
+        digest = hashlib.sha256(approval_id.encode("utf-8")).hexdigest()
+        lock_path = self.path.with_name(f"{self.path.name}.{digest}.execution.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            os.close(descriptor)
+            raise PostingReceiptError("approval execution is already in progress") from error
+        self._execution_lock_descriptor = descriptor
+
+    def release_execution_lock(self) -> None:
+        if self._execution_lock_descriptor is None:
+            return
+        try:
+            fcntl.flock(self._execution_lock_descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(self._execution_lock_descriptor)
+            self._execution_lock_descriptor = None
 
     def _records(self) -> list[dict[str, Any]]:
         _recover_pending(self.path, APPROVAL_SCHEMA_VERSION)
@@ -473,20 +505,23 @@ class ApprovalReceiptStore:
         return receipt
 
     def consume(self, receipt_id: str, *, operation_identity: str, consumed_at: str) -> None:
-        consumed_time = _parse_timestamp(consumed_at, "consumed_at")
-        self.require(receipt_id, operation_identity=operation_identity, now=consumed_time)
-        records = _read_jsonl(self.path)
-        record: dict[str, Any] = {
-            "schema_version": APPROVAL_SCHEMA_VERSION,
-            "record_type": "consumed",
-            "sequence": len(records),
-            "previous_digest": records[-1]["event_digest"] if records else None,
-            "approval_id": receipt_id,
-            "operation_identity": operation_identity,
-            "consumed_at": consumed_at,
-        }
-        record["event_digest"] = _digest(record)
-        _append_transaction(self.path, records, record, APPROVAL_SCHEMA_VERSION)
+        try:
+            consumed_time = _parse_timestamp(consumed_at, "consumed_at")
+            self.require(receipt_id, operation_identity=operation_identity, now=consumed_time)
+            records = _read_jsonl(self.path)
+            record: dict[str, Any] = {
+                "schema_version": APPROVAL_SCHEMA_VERSION,
+                "record_type": "consumed",
+                "sequence": len(records),
+                "previous_digest": records[-1]["event_digest"] if records else None,
+                "approval_id": receipt_id,
+                "operation_identity": operation_identity,
+                "consumed_at": consumed_at,
+            }
+            record["event_digest"] = _digest(record)
+            _append_transaction(self.path, records, record, APPROVAL_SCHEMA_VERSION)
+        finally:
+            self.release_execution_lock()
 
     def verify(self) -> None:
         self._records()

@@ -118,6 +118,7 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
             residual_exception_digest=digest(residual_path),
             manifest_digest=manifest.manifest_digest, event_history_digest=manifest.events_digest,
             historical_receipt_digest=digest(historical_path),
+            max_create_count=1,
         ))
         return argparse.Namespace(
             portfolio=portfolio_path, quality_report=quality_path,
@@ -321,6 +322,59 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
                 with self.assertRaisesRegex(poster.PortfolioPostError, "bounds or duration"):
                     poster.run(args)
 
+    def test_execute_rejects_two_missing_blocks_before_any_create(self) -> None:
+        """Removing the approval-bound one-create cap would permit partial multi-entry mutation."""
+        with tempfile.TemporaryDirectory() as directory:
+            args = self._write_posting_fixture(Path(directory), allocation_segments=[
+                {"start": "2026-08-14T10:00:00Z", "end": "2026-08-14T10:10:00Z", "duration_minutes": 10},
+                {"start": "2026-08-14T10:20:00Z", "end": "2026-08-14T10:30:00Z", "duration_minutes": 10},
+            ])
+            args.execute = True
+            with (
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
+                }),
+                mock.patch.object(poster, "_paged", side_effect=self._paged_with_live([])),
+                mock.patch.object(poster, "_request") as request,
+            ):
+                with self.assertRaisesRegex(poster.PortfolioPostError, "max_create_count"):
+                    poster.run(args)
+
+        request.assert_not_called()
+
+    def test_execute_does_not_reopen_historical_receipt_after_approval(self) -> None:
+        """Swapping the artifact after its digest check must not add a trusted historical ID."""
+        with tempfile.TemporaryDirectory() as directory:
+            args = self._write_posting_fixture(Path(directory))
+            args.execute = True
+            live = [self._clockify_entry(
+                "entry-history", "2026-08-14T10:00:31Z", "2026-08-14T10:10:31Z",
+                description="legacy wording",
+            )]
+
+            def paged(path: str, _api_key: str, *, timeout_seconds: int):
+                if path.startswith("/workspaces/workspace-1/projects"):
+                    args.historical_receipt.write_text(json.dumps({
+                        "schema_version": "clockify-historical-receipt/v1",
+                        "entries": [{
+                            "review_id": "review-a", "segment_index": 1,
+                            "clockify_entry_id": "entry-history",
+                        }],
+                    }), encoding="utf-8")
+                    return [{"id": "project-123456"}]
+                if path.startswith("/workspaces/workspace-1/tags"):
+                    return [{"id": "tag-654321"}]
+                return live
+
+            with (
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
+                }),
+                mock.patch.object(poster, "_paged", side_effect=paged),
+            ):
+                with self.assertRaises(poster.PortfolioPostError):
+                    poster.run(args)
+
     def test_exact_approval_permits_the_august_sheet_review_migration_exception(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             args = self._write_posting_fixture(
@@ -463,6 +517,33 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
 
         self.assertTrue(receipt["final_live_readback_sha256"].startswith("sha256:"))
 
+    def test_execute_rejects_final_readback_billable_drift_for_terminal_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            args = self._write_posting_fixture(Path(directory))
+            args.execute = True
+            initial = [self._clockify_entry(
+                "entry-exact", "2026-08-14T10:00:00Z", "2026-08-14T10:10:00Z"
+            )]
+            final = [dict(initial[0])]
+            final[0]["billable"] = False
+            readbacks = [initial, final]
+
+            def paged(path: str, _api_key: str, *, timeout_seconds: int):
+                if path.startswith("/workspaces/workspace-1/projects"):
+                    return [{"id": "project-123456"}]
+                if path.startswith("/workspaces/workspace-1/tags"):
+                    return [{"id": "tag-654321"}]
+                return readbacks.pop(0)
+
+            with (
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
+                }),
+                mock.patch.object(poster, "_paged", side_effect=paged),
+            ):
+                with self.assertRaisesRegex(poster.PortfolioPostError, "final live readback semantic"):
+                    poster.run(args)
+
     def test_cli_requires_approval_and_post_ledger_arguments_for_execution(self) -> None:
         args = poster.parse_args([
             "portfolio.json", "--quality-report", "quality.json", "--replay-integrity", "replay.json",
@@ -481,12 +562,12 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
             {
                 "id": "entry-b", "start": "2026-08-14T10:10:00+00:00",
                 "end": "2026-08-14T10:20:00Z", "project_id": "project-b",
-                "tag_ids": ["tag-z", "tag-a"], "description": " Work B ",
+                "tag_ids": ["tag-z", "tag-a"], "description": " Work B ", "billable": True,
             },
             {
                 "id": "entry-a", "start": "2026-08-14T10:00:00Z",
                 "end": "2026-08-14T10:10:00Z", "project_id": "project-a",
-                "tag_ids": ["tag-b"], "description": "Work A",
+                "tag_ids": ["tag-b"], "description": "Work A", "billable": True,
             },
         ]
         reordered = [
@@ -503,6 +584,7 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
             ("project_id", "project-other"),
             ("tag_ids", ["tag-other"]),
             ("description", "Other work"),
+            ("billable", False),
         ):
             with self.subTest(field=field):
                 mutated = [dict(entries[0]), dict(entries[1])]
@@ -739,7 +821,7 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
             first_live = [self._clockify_entry(
                 "entry-first", "2026-08-14T10:00:00Z", "2026-08-14T10:10:00Z"
             )]
-            readbacks = [[], first_live, first_live]
+            readbacks = [first_live, first_live]
 
             def paged(path: str, _api_key: str, *, timeout_seconds: int):
                 if path.startswith("/workspaces/workspace-1/projects"):
@@ -753,9 +835,7 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
                     "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
                 }),
                 mock.patch.object(poster, "_paged", side_effect=paged),
-                mock.patch.object(poster, "_request", side_effect=[
-                    {"id": "entry-first"}, poster.PortfolioPostError("write uncertain"),
-                ]),
+                mock.patch.object(poster, "_request", side_effect=poster.PortfolioPostError("write uncertain")),
             ):
                 with self.assertRaisesRegex(poster.PortfolioPostError, "write uncertain"):
                     poster.run(args)
@@ -772,7 +852,7 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
                     poster.run(args)
 
         self.assertEqual(["entry-first"], [
-            item["clockify_entry_id"] for item in interrupted["created"]
+            item["clockify_entry_id"] for item in interrupted["already_existing"]
         ])
         retry_post.assert_not_called()
 

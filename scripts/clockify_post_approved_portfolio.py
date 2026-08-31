@@ -381,9 +381,8 @@ def _live_entry(entry: Mapping[str, Any]) -> dict[str, Any] | None:
 
 
 def _exact(plan: Mapping[str, Any], live: Mapping[str, Any]) -> bool:
-    return all(
-        plan[key] == live[key]
-        for key in ("start", "end", "project_id", "tag_ids", "description")
+    return all(plan[key] == live[key] for key in ("start", "end", "project_id", "tag_ids", "description")) and (
+        plan.get("billable") == live.get("billable")
     )
 
 
@@ -712,10 +711,9 @@ def _validate_prior_candidates(
 
 
 def _historical_receipt_candidates(
-    path: Path,
+    value: object,
     approved_keys: AbstractSet[tuple[str, int]],
 ) -> tuple[HistoricalReceiptCandidate, ...]:
-    value = _read(path)
     if not isinstance(value, Mapping) or set(value) != {"schema_version", "entries"}:
         raise PortfolioPostError("historical receipt is invalid")
     if value.get("schema_version") != "clockify-historical-receipt/v1" or not isinstance(value["entries"], list):
@@ -753,16 +751,20 @@ def _resolve_historical_candidates(
         if entry is None:
             raise PortfolioPostError("historical Clockify entry is absent from fresh readback")
         plan = approved_by_key[key]
-        if (
-            entry.get("project_id") != plan.get("project_id")
-            or sorted(entry.get("tag_ids", [])) != sorted(plan.get("tag_ids", []))
-            or not isinstance(entry.get("billable"), bool)
-            or entry["billable"] != bool(plan.get("billable"))
-        ):
+        if not _historical_semantics_match(plan, entry):
             raise PortfolioPostError("historical Clockify entry semantic fields differ from approval")
         resolved[key] = entry
         removed.add(candidate.clockify_entry_id)
     return resolved, [entry for entry in rows if entry["id"] not in removed]
+
+
+def _historical_semantics_match(plan: Mapping[str, Any], entry: Mapping[str, Any]) -> bool:
+    return (
+        entry.get("project_id") == plan.get("project_id")
+        and sorted(entry.get("tag_ids", [])) == sorted(plan.get("tag_ids", []))
+        and isinstance(entry.get("billable"), bool)
+        and entry["billable"] == bool(plan.get("billable"))
+    )
 
 
 def _historical_bounds_match(plan: Mapping[str, Any], live: Mapping[str, Any]) -> bool:
@@ -785,12 +787,13 @@ def _normalized_snapshot_sha256(entries: Iterable[Mapping[str, Any]]) -> str:
             "project_id": str(entry.get("project_id") or ""),
             "tag_ids": sorted(str(value) for value in entry.get("tag_ids", [])),
             "description": str(entry.get("description") or "").strip(),
+            "billable": entry.get("billable"),
         }
         for entry in entries
     ]
     rows.sort(key=lambda row: (
         row["start"], row["end"], row["id"], row["project_id"],
-        tuple(row["tag_ids"]), row["description"],
+        tuple(row["tag_ids"]), row["description"], row["billable"],
     ))
     return hashlib.sha256(
         json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -883,7 +886,7 @@ def _approval_context(
     posting_receipts.ApprovalReceipt,
     posting_receipts.PostEventStore,
     posting_receipts.ApprovalReceiptStore,
-    Path,
+    Mapping[str, Any],
 ]:
     if not all(getattr(args, name, None) for name in (
         "approval_receipt", "approval_events", "post_events", "period_manifest", "period_events",
@@ -917,10 +920,15 @@ def _approval_context(
             workspace_id=identity.workspace_id, member_id=identity.member_id,
         )
         approval_store = posting_receipts.ApprovalReceiptStore(Path(args.approval_events).resolve())
-        receipt = approval_store.require(
-            str(args.approval_receipt), operation_identity=operation_identity,
-            now=dt.datetime.now(dt.timezone.utc),
-        )
+        approval_store.acquire_execution_lock(str(args.approval_receipt))
+        try:
+            receipt = approval_store.require(
+                str(args.approval_receipt), operation_identity=operation_identity,
+                now=dt.datetime.now(dt.timezone.utc),
+            )
+        except Exception:
+            approval_store.release_execution_lock()
+            raise
         expected = {
             "portfolio_digest": _approval_digest(portfolio_path),
             "quality_digest": _approval_digest(quality_path),
@@ -945,8 +953,14 @@ def _approval_context(
         ):
             raise PortfolioPostError("approval receipt manifest or event history binding does not match")
         historical_path = Path(args.historical_receipt).resolve()
-        if receipt.historical_receipt_digest != _approval_digest(historical_path):
+        historical_bytes = historical_path.read_bytes()
+        if receipt.historical_receipt_digest != "sha256:" + hashlib.sha256(historical_bytes).hexdigest():
             raise PortfolioPostError("approval receipt historical receipt binding does not match")
+        historical_document = json.loads(historical_bytes)
+        if not isinstance(historical_document, Mapping):
+            raise PortfolioPostError("historical receipt is invalid")
+        if receipt.max_create_count != 1:
+            raise PortfolioPostError("approval receipt max_create_count must be exactly one")
         artifact_digests = {str(value.get("digest")) for value in manifest.artifacts}
         if any(getattr(receipt, field) not in artifact_digests for field in (
             "correction_log_digest", "coverage_digest", "residual_exception_digest",
@@ -955,7 +969,7 @@ def _approval_context(
             raise PortfolioPostError("approval receipt correction, coverage, or residual digest is absent from period manifest")
         store = posting_receipts.PostEventStore(Path(args.post_events).resolve())
         store.derive_receipt(operation_identity)
-        return receipt, store, approval_store, historical_path
+        return receipt, store, approval_store, dict(historical_document)
     except (OSError, json.JSONDecodeError, posting_receipts.PostingReceiptError,
             reconciliation_manifest.ManifestError) as error:
         raise PortfolioPostError(f"approval receipt validation failed: {error}") from error
@@ -1002,9 +1016,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     approval: posting_receipts.ApprovalReceipt | None = None
     post_event_store: posting_receipts.PostEventStore | None = None
     approval_store: posting_receipts.ApprovalReceiptStore | None = None
-    historical_receipt_path: Path | None = None
+    historical_receipt_document: Mapping[str, Any] | None = None
     if args.execute:
-        approval, post_event_store, approval_store, historical_receipt_path = _approval_context(
+        approval, post_event_store, approval_store, historical_receipt_document = _approval_context(
             args, portfolio_path=portfolio_path, quality_path=quality_path,
             replay_path=replay_path, routing_path=routing_path, routing=routing,
         )
@@ -1051,10 +1065,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     }
     if len(approved_by_key) != len(approved_plans):
         raise PortfolioPostError("approved portfolio contains duplicate posting keys")
-    if args.execute and historical_receipt_path is None:
+    if args.execute and historical_receipt_document is None:
         raise AssertionError("execution historical receipt is missing")
     historical_candidates = (
-        _historical_receipt_candidates(historical_receipt_path, set(approved_by_key))
+        _historical_receipt_candidates(historical_receipt_document, set(approved_by_key))
         if args.execute else ()
     )
     prior_path = None if args.execute else args.prior_receipt
@@ -1163,6 +1177,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             raise PortfolioPostError(f"post event history is invalid: {error}") from error
         if set(post_history) - set(approved_by_key):
             raise PortfolioPostError("post event history contains an unknown approved key")
+        unmatched_create_count = sum(
+            (plan["review_id"], plan["segment_index"]) not in exact
+            and (plan["review_id"], plan["segment_index"]) not in post_history
+            for plan in plans
+        )
+        if unmatched_create_count > approval.max_create_count:
+            raise PortfolioPostError("approved max_create_count would be exceeded before POST")
 
     planned_seconds = sum(plan["duration_seconds"] for plan in plans)
     receipt = {
@@ -1315,6 +1336,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         final_id_counts[entry_id] = final_id_counts.get(entry_id, 0) + 1
     if any(final_id_counts.get(entry_id) != 1 for entry_id in receipt_ids):
         raise PortfolioPostError("post event Clockify entry is not present exactly once in final live readback")
+    final_by_id = {str(entry["id"]): entry for entry in final_live}
+    historical_keys = set(historical_live)
+    for plan in plans:
+        key = (plan["review_id"], plan["segment_index"])
+        entry_id = str(outcomes[key].get("clockify_entry_id") or "")
+        final_entry = final_by_id[entry_id]
+        if key in historical_keys:
+            valid = _historical_semantics_match(plan, final_entry) and _historical_bounds_match(plan, final_entry)
+        else:
+            valid = _exact(plan, final_entry)
+        if not valid:
+            raise PortfolioPostError("final live readback semantic fields differ from approved terminal outcome")
     receipt["created"] = []
     receipt["already_existing"] = []
     for plan in plans:
