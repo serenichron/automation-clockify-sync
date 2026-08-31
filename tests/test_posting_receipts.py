@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -60,7 +61,56 @@ def post_event(disposition: str, **changes: object) -> posting_receipts.PostEven
     return posting_receipts.PostEvent(**values)
 
 
+def canonical_digest(value: object) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
 class ApprovalReceiptStoreTests(unittest.TestCase):
+    def test_pending_journal_directory_is_fsynced_before_primary_append(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "approvals.jsonl"
+            store = posting_receipts.ApprovalReceiptStore(path)
+            real_append = posting_receipts._append_jsonl
+            with mock.patch.object(posting_receipts, "_fsync_directory", wraps=posting_receipts._fsync_directory) as sync_directory:
+                def append_observing_durable_journal(destination: Path, record: dict) -> None:
+                    if destination == path:
+                        self.assertTrue(sync_directory.called)
+                    real_append(destination, record)
+
+                with mock.patch.object(posting_receipts, "_append_jsonl", side_effect=append_observing_durable_journal):
+                    store.append(approval_receipt())
+
+    def test_semantically_invalid_pending_approval_never_mutates_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "approvals.jsonl"
+            store = posting_receipts.ApprovalReceiptStore(path)
+            real_append = posting_receipts._append_jsonl
+
+            def interrupt_primary(destination: Path, record: dict) -> None:
+                if destination == path:
+                    raise InterruptedError("stop before primary")
+                real_append(destination, record)
+
+            with mock.patch.object(posting_receipts, "_append_jsonl", side_effect=interrupt_primary):
+                with self.assertRaises(InterruptedError):
+                    store.append(approval_receipt())
+
+            pending_path = path.with_name(path.name + ".pending.json")
+            pending = json.loads(pending_path.read_text(encoding="utf-8"))
+            pending["record"]["receipt"]["workspace_id"] = ""
+            event_payload = {key: value for key, value in pending["record"].items() if key != "event_digest"}
+            pending["record"]["event_digest"] = canonical_digest(event_payload)
+            pending["expected_head"] = pending["record"]["event_digest"]
+            pending_payload = {key: value for key, value in pending.items() if key != "pending_digest"}
+            pending["pending_digest"] = canonical_digest(pending_payload)
+            pending_path.write_text(json.dumps(pending) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(posting_receipts.PostingReceiptError, "workspace"):
+                posting_receipts.ApprovalReceiptStore(path).verify()
+            self.assertFalse(path.exists())
+            self.assertFalse(path.with_name(path.name + ".anchor.jsonl").exists())
+
     def test_approval_restart_completes_primary_only_pending_commit_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "approvals.jsonl"

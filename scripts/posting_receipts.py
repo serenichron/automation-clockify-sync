@@ -88,6 +88,14 @@ def _append_jsonl(path: Path, record: Mapping[str, Any]) -> None:
         os.fsync(handle.fileno())
 
 
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _anchor_path(path: Path) -> Path:
     return path.with_name(path.name + ".anchor.jsonl")
 
@@ -186,6 +194,7 @@ def _write_pending(path: Path, pending: Mapping[str, Any]) -> None:
             handle.write(canonical_json(pending) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
+        _fsync_directory(path)
     except FileExistsError as error:
         raise PostingReceiptError("pending receipt transaction already exists") from error
 
@@ -194,11 +203,7 @@ def _clear_pending(path: Path) -> None:
     if not path.exists():
         return
     path.unlink()
-    descriptor = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    _fsync_directory(path)
 
 
 def _load_pending(path: Path, schema_version: str) -> dict[str, Any] | None:
@@ -269,6 +274,13 @@ def _recover_pending(path: Path, schema_version: str) -> None:
     anchor_is_base = _anchor_matches(anchors, base_count, base_head)
     anchor_is_extended = _anchor_matches(anchors, base_count + 1, expected_head)
     if primary_is_base and anchor_is_base:
+        candidate_records = records + [expected_record]
+    elif primary_is_extended and (anchor_is_base or anchor_is_extended):
+        candidate_records = records
+    else:
+        raise PostingReceiptError("pending receipt transaction contradicts ledger state")
+    _validate_pending_semantics(candidate_records, schema_version)
+    if primary_is_base and anchor_is_base:
         _append_jsonl(path, expected_record)
         records.append(expected_record)
         _append_anchor(path, records, schema_version)
@@ -276,8 +288,6 @@ def _recover_pending(path: Path, schema_version: str) -> None:
         _append_anchor(path, records, schema_version)
     elif primary_is_extended and anchor_is_extended:
         pass
-    else:
-        raise PostingReceiptError("pending receipt transaction contradicts ledger state")
     _clear_pending(_pending_path(path))
 
 
@@ -362,6 +372,45 @@ class ApprovalReceipt:
             raise PostingReceiptError("approval operation identity does not bind its operation and target")
 
 
+def _validate_approval_records(records: list[dict[str, Any]]) -> None:
+    approvals: dict[str, ApprovalReceipt] = {}
+    consumed: set[str] = set()
+    for record in records:
+        record_type = record.get("record_type")
+        if record_type == "approval":
+            if set(record) != {
+                "schema_version", "record_type", "sequence", "previous_digest", "receipt", "event_digest"
+            }:
+                raise PostingReceiptError("approval receipt record fields are invalid")
+            receipt_value = record.get("receipt")
+            if not isinstance(receipt_value, Mapping):
+                raise PostingReceiptError("approval receipt record is invalid")
+            receipt = ApprovalReceipt.from_document(receipt_value)
+            receipt.validate()
+            if receipt.approval_id in approvals:
+                raise PostingReceiptError("approval receipt repeats approval_id")
+            approvals[receipt.approval_id] = receipt
+        elif record_type == "consumed":
+            if set(record) != {
+                "schema_version", "record_type", "sequence", "previous_digest", "approval_id",
+                "operation_identity", "consumed_at", "event_digest",
+            }:
+                raise PostingReceiptError("approval consumption record fields are invalid")
+            approval_id = _required_text(record.get("approval_id"), "approval_id")
+            identity = _required_text(record.get("operation_identity"), "operation_identity")
+            consumed_at = _parse_timestamp(record.get("consumed_at"), "consumed_at")
+            receipt = approvals.get(approval_id)
+            if receipt is None or identity != receipt.operation_identity:
+                raise PostingReceiptError("approval consumption does not bind its approval")
+            if approval_id in consumed:
+                raise PostingReceiptError("approval receipt has duplicate consumption")
+            if consumed_at >= _parse_timestamp(receipt.expires_at, "expires_at"):
+                raise PostingReceiptError("approval consumption is expired")
+            consumed.add(approval_id)
+        else:
+            raise PostingReceiptError("approval receipt record type is invalid")
+
+
 class ApprovalReceiptStore:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
@@ -371,42 +420,7 @@ class ApprovalReceiptStore:
         records = _read_jsonl(self.path)
         _verify_chain(records, APPROVAL_SCHEMA_VERSION)
         _verify_anchor(self.path, records, APPROVAL_SCHEMA_VERSION)
-        approvals: dict[str, ApprovalReceipt] = {}
-        consumed: set[str] = set()
-        for record in records:
-            record_type = record.get("record_type")
-            if record_type == "approval":
-                if set(record) != {
-                    "schema_version", "record_type", "sequence", "previous_digest", "receipt", "event_digest"
-                }:
-                    raise PostingReceiptError("approval receipt record fields are invalid")
-                receipt_value = record.get("receipt")
-                if not isinstance(receipt_value, Mapping):
-                    raise PostingReceiptError("approval receipt record is invalid")
-                receipt = ApprovalReceipt.from_document(receipt_value)
-                receipt.validate()
-                if receipt.approval_id in approvals:
-                    raise PostingReceiptError("approval receipt repeats approval_id")
-                approvals[receipt.approval_id] = receipt
-            elif record_type == "consumed":
-                if set(record) != {
-                    "schema_version", "record_type", "sequence", "previous_digest", "approval_id",
-                    "operation_identity", "consumed_at", "event_digest",
-                }:
-                    raise PostingReceiptError("approval consumption record fields are invalid")
-                approval_id = _required_text(record.get("approval_id"), "approval_id")
-                identity = _required_text(record.get("operation_identity"), "operation_identity")
-                consumed_at = _parse_timestamp(record.get("consumed_at"), "consumed_at")
-                receipt = approvals.get(approval_id)
-                if receipt is None or identity != receipt.operation_identity:
-                    raise PostingReceiptError("approval consumption does not bind its approval")
-                if approval_id in consumed:
-                    raise PostingReceiptError("approval receipt has duplicate consumption")
-                if consumed_at >= _parse_timestamp(receipt.expires_at, "expires_at"):
-                    raise PostingReceiptError("approval consumption is expired")
-                consumed.add(approval_id)
-            else:
-                raise PostingReceiptError("approval receipt record type is invalid")
+        _validate_approval_records(records)
         return records
 
     def _state(self) -> tuple[dict[str, ApprovalReceipt], set[str]]:
@@ -523,6 +537,50 @@ class PostEvent:
             raise PostingReceiptError("post event operation identity does not bind its operation and target")
 
 
+def _validate_post_events(records: list[dict[str, Any]], *, complete: bool) -> tuple[PostEvent, ...]:
+    events: list[PostEvent] = []
+    target: tuple[str, str, str, str] | None = None
+    planned: set[tuple[str, int]] = set()
+    terminal: set[tuple[str, int]] = set()
+    for record in records:
+        payload = {key: value for key, value in record.items() if key not in {
+            "schema_version", "sequence", "previous_digest", "event_digest"
+        }}
+        event = PostEvent.from_document(payload)
+        event.validate()
+        event_target = (event.operation_identity, event.period_id, event.workspace_id, event.member_id)
+        if target is None:
+            target = event_target
+        elif event_target != target:
+            if event.operation_identity != target[0]:
+                raise PostingReceiptError("post event operation drift")
+            raise PostingReceiptError("post event target drift")
+        key = (event.review_id, event.segment_index)
+        if event.disposition == "planned":
+            if key in planned:
+                raise PostingReceiptError("post event repeats planned entry")
+            planned.add(key)
+        else:
+            if key not in planned:
+                raise PostingReceiptError("post event terminal lacks planned entry")
+            if key in terminal:
+                raise PostingReceiptError("post event has duplicate terminal entry")
+            terminal.add(key)
+        events.append(event)
+    if complete and planned != terminal:
+        raise PostingReceiptError("post event history has an unterminated terminal entry")
+    return tuple(events)
+
+
+def _validate_pending_semantics(records: list[dict[str, Any]], schema_version: str) -> None:
+    if schema_version == APPROVAL_SCHEMA_VERSION:
+        _validate_approval_records(records)
+    elif schema_version == POST_EVENT_SCHEMA_VERSION:
+        _validate_post_events(records, complete=False)
+    else:
+        raise PostingReceiptError("pending receipt transaction has an unknown schema")
+
+
 class PostEventStore:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
@@ -532,38 +590,7 @@ class PostEventStore:
         records = _read_jsonl(self.path)
         _verify_chain(records, POST_EVENT_SCHEMA_VERSION)
         _verify_anchor(self.path, records, POST_EVENT_SCHEMA_VERSION)
-        events: list[PostEvent] = []
-        target: tuple[str, str, str, str] | None = None
-        planned: set[tuple[str, int]] = set()
-        terminal: set[tuple[str, int]] = set()
-        for record in records:
-            payload = {key: value for key, value in record.items() if key not in {
-                "schema_version", "sequence", "previous_digest", "event_digest"
-            }}
-            event = PostEvent.from_document(payload)
-            event.validate()
-            event_target = (event.operation_identity, event.period_id, event.workspace_id, event.member_id)
-            if target is None:
-                target = event_target
-            elif event_target != target:
-                if event.operation_identity != target[0]:
-                    raise PostingReceiptError("post event operation drift")
-                raise PostingReceiptError("post event target drift")
-            key = (event.review_id, event.segment_index)
-            if event.disposition == "planned":
-                if key in planned:
-                    raise PostingReceiptError("post event repeats planned entry")
-                planned.add(key)
-            else:
-                if key not in planned:
-                    raise PostingReceiptError("post event terminal lacks planned entry")
-                if key in terminal:
-                    raise PostingReceiptError("post event has duplicate terminal entry")
-                terminal.add(key)
-            events.append(event)
-        if complete and planned != terminal:
-            raise PostingReceiptError("post event history has an unterminated terminal entry")
-        return tuple(events)
+        return _validate_post_events(records, complete=complete)
 
     def append(self, event: PostEvent) -> None:
         event.validate()
