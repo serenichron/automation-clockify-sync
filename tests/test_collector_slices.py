@@ -128,6 +128,22 @@ class BacklogReceiptTests(unittest.TestCase):
             self.assertEqual(self.slices[1], store.next_incomplete(state))
             self.assertFalse(state.complete)
 
+    def test_exact_existing_completion_is_idempotent_but_mismatch_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = collector_slices.BacklogStore(Path(directory))
+            artifact = Path(directory) / "completion-bundle.json"
+            artifact.write_bytes(b'{"bundle":"verified"}\n')
+            digest = self._digest(artifact)
+            first = store.record_complete(
+                store.open(self.identity, self.slices), self.slices[0].slice_id, artifact, digest
+            )
+            second = store.record_complete(first, self.slices[0].slice_id, artifact, digest)
+
+            self.assertEqual(first.completed, second.completed)
+            artifact.write_bytes(b'{"bundle":"drifted"}\n')
+            with self.assertRaises(collector_slices.BacklogError):
+                store.record_complete(second, self.slices[0].slice_id, artifact, digest)
+
     def test_missing_completed_artifact_fails_closed_on_resume(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = collector_slices.BacklogStore(Path(directory))

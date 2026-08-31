@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import datetime as dt
+import hashlib
 import importlib.util
 import io
 import json
@@ -53,6 +55,52 @@ def accounting_result(*, proposal_id: str = "P001") -> dict:
 
 
 class ReviewRunResultTests(unittest.TestCase):
+    def test_finalization_records_only_a_verified_downstream_bundle(self):
+        """Collector output stays pending until all downstream artifacts bind one slice."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "runs" / "run-1"
+            run_dir.mkdir(parents=True)
+            slice_ = review_run.clockify_sync_collect.plan_slices(
+                dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 8, 2, tzinfo=dt.timezone.utc),
+                zone=review_run.clockify_sync_collect.BUCHAREST,
+            )[0]
+            identity = review_run.clockify_sync_collect.BacklogIdentity(
+                since_utc="2026-08-01T00:00:00Z", until_utc="2026-08-02T00:00:00Z",
+                timezone="Europe/Bucharest", max_days=2, compatibility_version="fixture/v1",
+            )
+            for relative in (
+                "run-report.json", "evidence/evidence-ledger.json", "semantic-analysis.json",
+                "work-accounting-result.json", "quality_report.json", "review-snapshot.json",
+            ):
+                path = run_dir / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({"fixture": relative}) + "\n", encoding="utf-8")
+            (run_dir / "run-report.json").write_text(json.dumps({
+                "runtime_identity": {"git_sha": "fixture"},
+                "evidence_ledger": {"source_completeness": {"status": "complete", "incomplete_sources": []}},
+            }) + "\n", encoding="utf-8")
+            (run_dir / "slice-finalization.json").write_text(json.dumps({
+                "schema_version": "collector-slice-finalization/v1",
+                "backlog_identity": identity.document(),
+                "slice_id": slice_.slice_id,
+                "since_utc": review_run.clockify_sync_collect.iso_utc(slice_.since),
+                "until_utc": review_run.clockify_sync_collect.iso_utc(slice_.until),
+            }) + "\n", encoding="utf-8")
+
+            with mock.patch.dict(os.environ, {"CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT": str(root / "checkpoints")}):
+                bundle = review_run._finalize_backlog_completion(run_dir)
+                state = review_run.clockify_sync_collect.BacklogStore(root / "checkpoints").open(
+                    identity, (slice_,)
+                )
+
+            self.assertEqual(
+                "sha256:" + hashlib.sha256((run_dir / "completion-bundle.json").read_bytes()).hexdigest(),
+                state.completed[0].result_digest,
+            )
+            self.assertEqual(run_dir / "completion-bundle.json", state.completed[0].result_path)
+
     def test_collector_run_dirs_rejects_incomplete_report_receipt(self):
         with tempfile.TemporaryDirectory() as tmp:
             runs = Path(tmp) / "runs"

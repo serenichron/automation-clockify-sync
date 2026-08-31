@@ -1,4 +1,5 @@
 import json
+import datetime as dt
 from pathlib import Path
 import subprocess
 import tempfile
@@ -6,9 +7,67 @@ import unittest
 from unittest import mock
 
 from scripts import clockify_autopilot_runner as runner
+from scripts import collector_receipts, collector_slices, source_coverage
 
 
 class AutopilotRunnerTests(unittest.TestCase):
+    def test_verified_bundle_resolves_only_matching_exact_active_debt(self):
+        """Adjacent debt remains active when a verified bundle covers only its own slice."""
+        with tempfile.TemporaryDirectory() as directory:
+            environment, result = self.fixture(directory, "review_delta")
+            run_dir = result.parent
+            slice_ = collector_slices.CollectionSlice(
+                dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 8, 2, tzinfo=dt.timezone.utc), "slice-1",
+            )
+            for relative in (
+                "run-report.json", "evidence/evidence-ledger.json", "semantic-analysis.json",
+                "work-accounting-result.json", "quality_report.json", "review-snapshot.json",
+            ):
+                path = run_dir / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({"fixture": relative}) + "\n")
+            (run_dir / "run-report.json").write_text(json.dumps({
+                "runtime_identity": {"git_sha": "fixture"},
+                "evidence_ledger": {"source_completeness": {"status": "complete", "incomplete_sources": []}},
+            }) + "\n")
+            bundle = collector_receipts.build_completion_bundle(run_dir, slice_=slice_)
+            collector_receipts.write_completion_bundle(run_dir / "completion-bundle.json", bundle)
+            result.write_text(json.dumps({
+                "action": "review_delta", "run_id": "run-1", "run_dir": str(run_dir),
+                "slice_id": "slice-1",
+                "date_range": {"since": "2026-08-01T00:00:00Z", "until": "2026-08-02T00:00:00Z"},
+                "source_completeness": {"status": "complete", "incomplete_sources": []},
+                "completion_bundle_digest": bundle.bundle_digest,
+            }) + "\n")
+            first = source_coverage.SourceInterval(
+                source="sessions/macbook", since_utc="2026-08-01T00:00:00Z",
+                until_utc="2026-08-02T00:00:00Z", slice_id="slice-1",
+                compatibility_version="source-debt/v1",
+            )
+            second = source_coverage.SourceInterval(
+                source="sessions/macbook", since_utc="2026-08-02T00:00:00Z",
+                until_utc="2026-08-03T00:00:00Z", slice_id="slice-2",
+                compatibility_version="source-debt/v1",
+            )
+            store = source_coverage.SourceDebtStore()
+            for interval in (first, second):
+                store.record_failure(
+                    interval, failure_class="offline", retryable=True,
+                    resume_state_digest="sha256:" + "a" * 64,
+                    attempted_at="2026-08-01T00:00:00Z",
+                )
+            coverage_path = Path(directory) / "state" / "source-coverage.json"
+            source_coverage.write(coverage_path, store.document())
+            environment["CLOCKIFY_AUTOPILOT_COVERAGE_STATE"] = str(coverage_path)
+            completed = subprocess.CompletedProcess(["review"], 0, stdout=str(result) + "\n", stderr="")
+
+            with mock.patch.object(runner.subprocess, "run", return_value=completed):
+                self.assertEqual(0, runner.run(environment))
+
+            resolved = source_coverage.SourceDebtStore.from_document(source_coverage.read(coverage_path))
+            self.assertEqual((second.debt_id,), tuple(item.debt_id for item in resolved.active()))
+
     def fixture(
         self,
         directory: str,

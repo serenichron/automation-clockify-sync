@@ -20,8 +20,10 @@ from typing import Mapping
 
 try:
     from scripts import source_coverage
+    from scripts import collector_receipts
 except ModuleNotFoundError:  # direct script execution
     import source_coverage  # type: ignore[no-redef]
+    import collector_receipts  # type: ignore[no-redef]
 
 
 SCHEMA_VERSION = "clockify-autopilot-runner/v1"
@@ -206,6 +208,66 @@ def _record_coverage_failures(
     return tuple(recorded)
 
 
+def _record_verified_completions(
+    store: source_coverage.SourceDebtStore,
+    result_path: Path,
+    result: Mapping[str, object],
+    *,
+    completed_at: str,
+) -> tuple[source_coverage.DebtItem, ...]:
+    """Resolve only currently active exact debts bound by a verified bundle."""
+    bundle_digest = result.get("completion_bundle_digest")
+    if bundle_digest is None:
+        return ()
+    if not isinstance(bundle_digest, str):
+        raise ValueError("completion bundle digest is invalid")
+    try:
+        bundle = collector_receipts.load_completion_bundle(
+            result_path.parent / "completion-bundle.json", run_dir=result_path.parent,
+        )
+    except collector_receipts.CollectorReceiptError as exc:
+        raise ValueError("completion bundle cannot be verified") from exc
+    if bundle.bundle_digest != bundle_digest:
+        raise ValueError("completion bundle digest does not match action contract")
+    date_range = result.get("date_range")
+    if not isinstance(date_range, Mapping):
+        raise ValueError("completion bundle action contract has no date range")
+    since, until, slice_id = date_range.get("since"), date_range.get("until"), result.get("slice_id")
+    if not all(isinstance(value, str) for value in (since, until, slice_id)):
+        raise ValueError("completion bundle action contract identity is invalid")
+    if (bundle.since_utc, bundle.until_utc, bundle.slice_id) != (since, until, slice_id):
+        raise ValueError("completion bundle action contract identity does not match")
+    completeness = result.get("source_completeness")
+    if not isinstance(completeness, Mapping):
+        raise ValueError("completion bundle action contract has no source completeness")
+    incomplete = completeness.get("incomplete_sources")
+    if not isinstance(incomplete, list) or not all(isinstance(value, str) for value in incomplete):
+        raise ValueError("completion bundle action contract source completeness is invalid")
+    sources = completeness.get("sources")
+
+    def source_is_complete(source: str) -> bool:
+        if completeness.get("status") == "complete" and not incomplete:
+            return True
+        item = sources.get(source) if isinstance(sources, Mapping) else None
+        return isinstance(item, Mapping) and item.get("status") in {"complete", "excluded"}
+
+    resolved = []
+    for item in store.active():
+        interval = item.interval
+        if (
+            interval.compatibility_version != "source-debt/v1"
+            or interval.slice_id != bundle.slice_id
+            or interval.since_utc != bundle.since_utc
+            or interval.until_utc != bundle.until_utc
+            or not source_is_complete(interval.source)
+        ):
+            continue
+        resolved.append(store.record_complete(
+            interval, completion_bundle_digest=bundle.bundle_digest, completed_at=completed_at,
+        ))
+    return tuple(resolved)
+
+
 def _debt_status(items: tuple[source_coverage.DebtItem, ...]) -> list[dict[str, object]]:
     return [
         {
@@ -319,6 +381,13 @@ def run(environment: Mapping[str, str] | None = None) -> int:
             recorded_debt = _record_coverage_failures(
                 store, results, coordinator, attempted_at
             )
+            completed_debt = tuple(
+                item
+                for result_path, result in zip(result_paths, results, strict=True)
+                for item in _record_verified_completions(
+                    store, result_path, result, completed_at=attempted_at
+                )
+            )
         except ValueError as exc:
             _atomic_write(status_path, {
                 "schema_version": SCHEMA_VERSION,
@@ -377,6 +446,7 @@ def run(environment: Mapping[str, str] | None = None) -> int:
             "max_coverage_retries": max_retries,
             "coverage_debt": debt,
             "coverage_debts": _debt_status(debt_items),
+            "completed_coverage_debts": [item.debt_id for item in completed_debt],
             "coverage_state": str(coverage_path),
             "effective_since": effective_since,
         })

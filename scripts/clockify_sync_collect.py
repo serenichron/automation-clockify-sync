@@ -49,6 +49,11 @@ try:
         CollectionSlice,
         plan_slices,
     )
+    from scripts.collector_receipts import (
+        FailureReceiptStore,
+        failure_receipt,
+        load_completion_bundle,
+    )
 except ModuleNotFoundError:  # Support direct execution from this directory.
     from calendly_collector import fetch_calendly  # type: ignore[no-redef]
     from provider_env import (  # type: ignore[no-redef]
@@ -67,6 +72,11 @@ except ModuleNotFoundError:  # Support direct execution from this directory.
         BacklogStore,
         CollectionSlice,
         plan_slices,
+    )
+    from collector_receipts import (  # type: ignore[no-redef]
+        FailureReceiptStore,
+        failure_receipt,
+        load_completion_bundle,
     )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -3645,6 +3655,55 @@ def _file_digest(path: Path) -> str:
     return "sha256:" + digest.hexdigest()
 
 
+def _safe_slice_finalization_document(
+    identity: BacklogIdentity, slice_: CollectionSlice
+) -> dict[str, object]:
+    """Persist only the identity later stages need to finalize a slice."""
+    return {
+        "schema_version": "collector-slice-finalization/v1",
+        "backlog_identity": identity.document(),
+        "slice_id": slice_.slice_id,
+        "since_utc": iso_utc(slice_.since),
+        "until_utc": iso_utc(slice_.until),
+    }
+
+
+def _write_pending_slice_finalization(
+    run_dir: Path, identity: BacklogIdentity, slice_: CollectionSlice
+) -> None:
+    write_json(
+        run_dir / "slice-finalization.json",
+        _safe_slice_finalization_document(identity, slice_),
+    )
+
+
+def _record_slice_failure(
+    backlog_directory: Path,
+    identity: BacklogIdentity,
+    slice_: CollectionSlice,
+    *,
+    failure_class: str,
+) -> None:
+    checkpoint_identity = hashlib.sha256(
+        json.dumps(
+            {"backlog": identity.document(), "slice_id": slice_.slice_id},
+            sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    resume = hashlib.sha256(slice_.slice_id.encode("utf-8")).hexdigest()
+    FailureReceiptStore(backlog_directory / "failure-receipts.jsonl").append(
+        failure_receipt(
+            source="collector",
+            slice_id=slice_.slice_id,
+            checkpoint_identity_digest="sha256:" + checkpoint_identity,
+            failure_class=failure_class,
+            retryable=True,
+            resume_state_digest="sha256:" + resume,
+            occurred_at=dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+        )
+    )
+
+
 def _verified_existing_slice_bundle(
     run_dir: Path,
     since: dt.datetime,
@@ -4067,15 +4126,16 @@ def run(args: argparse.Namespace) -> int:
     for slice_ in backlog.slices:
         receipt = receipts.get(slice_.slice_id)
         if receipt is not None:
-            expected_report_path = (
-                _slice_run_dir(slice_, identity.compatibility_version) / "run-report.md"
-            )
-            if receipt.result_path != expected_report_path:
+            expected_run_dir = _slice_run_dir(slice_, identity.compatibility_version)
+            expected_bundle_path = expected_run_dir / "completion-bundle.json"
+            expected_report_path = expected_run_dir / "run-report.md"
+            if receipt.result_path != expected_bundle_path:
                 print("collector slice receipt is not safe to reuse", file=sys.stderr)
                 return 2
             try:
+                bundle = load_completion_bundle(expected_bundle_path, run_dir=expected_run_dir)
                 report_path, report = _verified_existing_slice_bundle(
-                    receipt.result_path.parent,
+                    expected_run_dir,
                     slice_.since,
                     slice_.until,
                     reason,
@@ -4085,7 +4145,11 @@ def run(args: argparse.Namespace) -> int:
             except (BacklogError, OSError, ValueError):
                 print("collector slice receipt is not safe to reuse", file=sys.stderr)
                 return 2
-            if report_path != expected_report_path or not _slice_is_complete(report):
+            if (
+                bundle.slice_id != slice_.slice_id
+                or report_path != expected_report_path
+                or not _slice_is_complete(report)
+            ):
                 print("collector slice receipt is not safe to reuse", file=sys.stderr)
                 return 2
             print(str(report_path), flush=True)
@@ -4110,6 +4174,12 @@ def run(args: argparse.Namespace) -> int:
                 coordinator=coordinator,
             )
         except (BacklogError, CheckpointError, OSError, ValueError):
+            try:
+                _record_slice_failure(
+                    backlog.directory, identity, slice_, failure_class="collection_error"
+                )
+            except (OSError, ValueError):
+                print("collector failure receipt could not be recorded safely", file=sys.stderr)
             _preserve_incomplete_run(
                 run_dir,
                 owned_by_current_invocation=run_dir in owned_run_dirs,
@@ -4117,19 +4187,22 @@ def run(args: argparse.Namespace) -> int:
             print("collector slice did not complete safely", file=sys.stderr)
             return 2
         if not _slice_is_complete(report):
+            try:
+                _record_slice_failure(
+                    backlog.directory, identity, slice_, failure_class="incomplete"
+                )
+            except (OSError, ValueError):
+                print("collector failure receipt could not be recorded safely", file=sys.stderr)
             _preserve_incomplete_run(
                 run_dir,
                 owned_by_current_invocation=run_dir in owned_run_dirs,
             )
             return 2
         try:
-            backlog = backlog_store.record_complete(
-                backlog, slice_.slice_id, report_path, _file_digest(report_path)
-            )
-        except (BacklogError, OSError):
-            print("collector slice receipt could not be recorded safely", file=sys.stderr)
+            _write_pending_slice_finalization(run_dir, identity, slice_)
+        except OSError:
+            print("collector slice finalization metadata could not be recorded safely", file=sys.stderr)
             return 2
-        receipts = {receipt.slice_id: receipt for receipt in backlog.completed}
         print(str(report_path), flush=True)
         del report
     return 0

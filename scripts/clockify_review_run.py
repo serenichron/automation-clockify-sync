@@ -21,10 +21,12 @@ from typing import Any
 
 try:
     from scripts import clockify_sync_collect, review_acceptance, semantic_analyzer
+    from scripts import collector_receipts
 except ModuleNotFoundError:  # direct script execution
     import clockify_sync_collect  # type: ignore[no-redef]
     import review_acceptance  # type: ignore[no-redef]
     import semantic_analyzer  # type: ignore[no-redef]
+    import collector_receipts  # type: ignore[no-redef]
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -413,6 +415,54 @@ def _run_child(path: Path, *, label: str) -> Path:
     if resolved.parent != RUNS.resolve() or not resolved.is_dir():
         raise ValueError(f"{label} must be a direct child of {RUNS.resolve()}: {resolved}")
     return resolved
+
+
+def _finalize_backlog_completion(
+    run_dir: Path, *, replay: bool = False
+) -> collector_receipts.SliceCompletionBundle:
+    """Finalize only the exact pending slice whose downstream artifacts verify."""
+    run_dir = Path(run_dir).resolve()
+    try:
+        pending = _read_json(run_dir / "slice-finalization.json")
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("slice finalization metadata is missing or invalid") from exc
+    if not isinstance(pending, dict) or set(pending) != {
+        "schema_version", "backlog_identity", "slice_id", "since_utc", "until_utc",
+    } or pending["schema_version"] != "collector-slice-finalization/v1":
+        raise ValueError("slice finalization metadata schema is invalid")
+    raw_identity = pending["backlog_identity"]
+    if not isinstance(raw_identity, dict):
+        raise ValueError("slice finalization backlog identity is invalid")
+    try:
+        identity = clockify_sync_collect.BacklogIdentity(**raw_identity)
+        slices = clockify_sync_collect.plan_slices(
+            dt.datetime.fromisoformat(identity.since_utc[:-1] + "+00:00"),
+            dt.datetime.fromisoformat(identity.until_utc[:-1] + "+00:00"),
+            zone=clockify_sync_collect.BUCHAREST,
+            max_days=identity.max_days,
+        )
+    except (TypeError, ValueError, clockify_sync_collect.BacklogError) as exc:
+        raise ValueError("slice finalization backlog identity is invalid") from exc
+    slice_ = next((item for item in slices if item.slice_id == pending["slice_id"]), None)
+    if slice_ is None or (
+        clockify_sync_collect.iso_utc(slice_.since) != pending["since_utc"]
+        or clockify_sync_collect.iso_utc(slice_.until) != pending["until_utc"]
+    ):
+        raise ValueError("slice finalization identity does not match backlog")
+    bundle_path = run_dir / "completion-bundle.json"
+    bundle = collector_receipts.build_completion_bundle(run_dir, slice_=slice_, replay=replay)
+    if bundle_path.exists():
+        existing = collector_receipts.load_completion_bundle(bundle_path, run_dir=run_dir)
+        if existing.bundle_digest != bundle.bundle_digest:
+            raise ValueError("existing completion bundle does not match verified artifacts")
+    else:
+        collector_receipts.write_completion_bundle(bundle_path, bundle)
+    verified = collector_receipts.load_completion_bundle(bundle_path, run_dir=run_dir)
+    store = clockify_sync_collect.BacklogStore(clockify_sync_collect.collector_checkpoint_root())
+    state = store.open(identity, slices)
+    bundle_digest = "sha256:" + hashlib.sha256(bundle_path.read_bytes()).hexdigest()
+    store.record_complete(state, slice_.slice_id, bundle_path.resolve(), bundle_digest)
+    return verified
 
 
 def _ledger_identity(run_dir: Path) -> dict[str, str]:
@@ -868,6 +918,37 @@ def _process_run(
         review_mode=args.review_mode,
         acceptance_gate=acceptance_gate,
     )
+    completion_error = None
+    if (run_dir / "slice-finalization.json").is_file() and snapshot is not None:
+        if quality.get("status") == "pass":
+            try:
+                bundle = _finalize_backlog_completion(
+                    run_dir, replay=replay_source is not None
+                )
+            except (OSError, ValueError, collector_receipts.CollectorReceiptError) as exc:
+                completion_error = str(exc)
+            else:
+                # The runner consumes only this safe exact identity, never report paths
+                # or downstream evidence names.
+                result["slice_id"] = bundle.slice_id
+                result["date_range"] = {
+                    "since": bundle.since_utc,
+                    "until": bundle.until_utc,
+                }
+                result["completion_bundle_digest"] = bundle.bundle_digest
+                result["completion_bundle"] = bundle.document()
+        else:
+            result["completion_bundle_digest"] = None
+    if completion_error is not None:
+        quality = {
+            "status": "blocked",
+            "summary": {"completion_bundle": "invalid_or_incomplete", "reason": completion_error},
+        }
+        result = build_result(
+            run_dir, quality, None, review_mode=args.review_mode,
+            acceptance_gate=acceptance_gate,
+        )
+        result["completion_bundle_digest"] = None
     result["paths"]["work_accounting_result"] = str(
         (run_dir / "work-accounting-result.json").resolve()
     )
@@ -886,7 +967,7 @@ def _process_run(
         result["paths"]["review_current_csv"] = None
     _write_json(result_path, result)
     write_summary(summary_path, result)
-    return 0, result_path
+    return (2 if completion_error is not None else 0), result_path
 
 
 def main(argv: list[str] | None = None) -> int:

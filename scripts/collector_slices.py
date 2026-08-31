@@ -148,14 +148,20 @@ class BacklogStore:
         result_digest: str,
     ) -> BacklogState:
         current = self._current_state(state)
-        if current.complete:
-            raise BacklogError("completed backlogs are immutable")
         if not isinstance(slice_id, str) or slice_id not in {
             slice_.slice_id for slice_ in current.slices
         }:
             raise BacklogError("receipt references an unknown slice")
-        if slice_id in {receipt.slice_id for receipt in current.completed}:
-            raise BacklogError("slice receipt is immutable")
+        existing = next(
+            (receipt for receipt in current.completed if receipt.slice_id == slice_id), None
+        )
+        if existing is not None:
+            artifact = _verified_artifact(result_path, result_digest)
+            if existing.result_path != artifact or existing.result_digest != result_digest:
+                raise BacklogError("slice receipt is immutable")
+            return current
+        if current.complete:
+            raise BacklogError("completed backlogs are immutable")
         if slice_id != current.slices[len(current.completed)].slice_id:
             raise BacklogError("receipt must complete the next chronological slice")
 

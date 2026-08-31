@@ -291,6 +291,11 @@ class ProcessIntegrationTests(unittest.TestCase):
                 )
                 backlog = collector.BacklogStore(checkpoint_root).open(identity, slices)
                 self.assertEqual((), backlog.completed)
+                failure_receipts = collector.FailureReceiptStore(
+                    backlog.directory / "failure-receipts.jsonl"
+                ).load()
+                self.assertEqual(1, len(failure_receipts))
+                self.assertNotIn("CALENDLY_RECORDINGS_URL", json.dumps(failure_receipts[0].document()))
 
     def test_collect_slice_writes_calendly_evidence_and_only_aggregate_report_fields(self) -> None:
         """Calendly recordings are persisted as evidence, never embedded in the compact report."""
@@ -800,8 +805,8 @@ class ProcessIntegrationTests(unittest.TestCase):
                     compatibility_version=collector._backlog_compatibility_version(routing, fleet),
                 )
                 backlog = collector.BacklogStore(checkpoint_root).open(identity, slices)
-                self.assertEqual(1, len(backlog.completed))
-                self.assertEqual(first_reports[0], backlog.completed[0].result_path)
+                self.assertEqual((), backlog.completed)
+                self.assertTrue((first_reports[0].parent / "slice-finalization.json").is_file())
 
                 failure_enabled[0] = False
                 clockify_attempts.clear()
