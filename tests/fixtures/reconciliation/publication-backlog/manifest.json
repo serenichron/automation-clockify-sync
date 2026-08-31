@@ -1,0 +1,33 @@
+{
+  "scenario": "publication-backlog",
+  "period": {
+    "member_id": "member-backlog",
+    "workspace_id": "workspace-backlog",
+    "timezone": "Europe/Bucharest",
+    "since": "2026-08-01T00:00:00+00:00",
+    "until": "2026-08-03T00:00:00+00:00",
+    "revision": 2
+  },
+  "coverage": {
+    "required_slices": [
+      {"slice_id": "backlog-2026-08-01", "since": "2026-08-01T00:00:00Z", "until": "2026-08-02T00:00:00Z"},
+      {"slice_id": "backlog-2026-08-02", "since": "2026-08-02T00:00:00Z", "until": "2026-08-03T00:00:00Z"}
+    ],
+    "transient_debt": {"source": "fathom", "missing_slice_id": "backlog-2026-08-02"},
+    "desktop_limitation": {"source": "desktop", "approval_id": "desktop-limitation-approval-1", "approver": "board", "approved_at": "2026-08-18T08:00:00Z"}
+  },
+  "recordings": [
+    {"recording_id": "calendly-only-1", "sources": ["calendly"], "status": "complete"},
+    {"recording_id": "fathom-calendly-duplicate-1", "sources": ["fathom", "calendly"], "status": "deduplicated"}
+  ],
+  "posting": {
+    "ambiguous_post_recovery": {"review_id": "review-backlog-2", "segment_index": 0, "disposition": "recovered_after_ambiguous_response"},
+    "retained_correction_revision": 2
+  },
+  "publication": {
+    "report_target": "shared-report:fixture-backlog",
+    "slack_target": "slack:finance-report:workspace-backlog:member-backlog",
+    "report_success_slack_failure_retry": true,
+    "native_currencies": ["USD", "EUR"]
+  }
+}

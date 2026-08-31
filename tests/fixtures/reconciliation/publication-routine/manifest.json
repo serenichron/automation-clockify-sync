@@ -1,0 +1,21 @@
+{
+  "scenario": "publication-routine",
+  "period": {
+    "member_id": "member-routine",
+    "workspace_id": "workspace-routine",
+    "timezone": "Europe/Bucharest",
+    "since": "2026-08-01T00:00:00+00:00",
+    "until": "2026-08-03T00:00:00+00:00",
+    "revision": 1
+  },
+  "coverage": {
+    "required_slices": [
+      {"slice_id": "routine-2026-08-01", "since": "2026-08-01T00:00:00Z", "until": "2026-08-02T00:00:00Z"},
+      {"slice_id": "routine-2026-08-02", "since": "2026-08-02T00:00:00Z", "until": "2026-08-03T00:00:00Z"}
+    ]
+  },
+  "publication": {
+    "report_target": "shared-report:fixture-routine",
+    "slack_target": "slack:finance-report:workspace-routine:member-routine"
+  }
+}

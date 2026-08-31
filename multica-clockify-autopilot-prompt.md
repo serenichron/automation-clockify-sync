@@ -1,7 +1,8 @@
 # Clockify evidence-grounded reconciliation — dry run
 
 Run the Clockify work-accounting process in dry-run mode for aggregate issue
-SER-651. Calendly is excluded.
+SER-651. Calendly is optional only for a bounded historical recovery explicitly
+recorded in coverage; future autopilot coverage treats it as a required source.
 
 1. On the Precision runtime, resolve `$CLOCKIFY_SYNC_ROOT`, or the first host-local directory containing
    `scripts/clockify_review_run.py` from:
@@ -71,3 +72,14 @@ to `scripts/clockify_sheet_publish.py --enable-write`, after both quality and
 immutable replay pass for the same source run. It must use the named monthly
 tab, deduplicate stable activity-segment IDs, and preserve human decision and
 notes columns. It never authorizes a Clockify write.
+
+Finance-report publication is a separate fail-closed path. It requires a
+verified period manifest, exact consumed Clockify posting receipt, fresh API and
+shared-report readbacks, eligible ECB conversion evidence, a prepared contract,
+and a separate approval binding the report and Slack targets. The adapter must
+update then read back the report before it may upsert Slack; persist the report
+receipt before Slack so a delivery failure retries only Slack. `publication_deferred`
+means readiness or approval is missing, `publication_incomplete` means the
+verified report awaits Slack retry, and `published` is idempotent by the bound
+contract identity. No scheduler, service, timer, launchd artifact, production
+transport, or external publication is authorized by this prompt.

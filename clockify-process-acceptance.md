@@ -5,9 +5,10 @@ evidence required before this process can replace manual review. A passing unit
 suite is not evidence that an analyzer route, fleet deployment, July source
 inventory, Sheet surface, or review-acceptance target is healthy.
 
-Calendly is intentionally excluded from this candidate. Existing Clockify
-entries are immutable fixed evidence; raw evidence may overlap, but proposals
-may not overlap fixed blocks or one another.
+Calendly is optional only for a bounded, explicitly recorded historical
+recovery. Future autopilot coverage treats Calendly as a first-class required
+source. Existing Clockify entries are immutable fixed evidence; raw evidence
+may overlap, but proposals may not overlap fixed blocks or one another.
 
 ## Required process
 
@@ -85,6 +86,7 @@ operational target with four deterministically ordered workers beneath its
 | Every skip/modify decision assessed | Missing | Critical-assessment record for every changed decision; unassessed decisions fail the denominator |
 | No critical routing, truth, meeting, or allocation errors | Missing live proof | Exception audit and human dispositions for guarded periods |
 | One batch summary plus genuine exceptions | Implemented locally; live usability unproven | Guarded run outputs and user review result |
+| Fail-closed finance publication | Proven locally with routine and backlog fixtures; live transport unproven | `tests/test_publication_end_to_end.py`; immutable coordinator/receipt/readback/gate evidence and a separately approved external transport |
 
 ## Guarded evidence sequence
 
@@ -140,3 +142,19 @@ python3 -m py_compile scripts/*.py
 python3 -c 'import json, pathlib; [json.loads(p.read_text()) for p in sorted(pathlib.Path("schemas").glob("*.json"))]; [json.loads(p.read_text()) for p in (pathlib.Path("routing.json"), pathlib.Path("fleet.json"))]'
 git diff --check
 ```
+
+## Finance-publication acceptance
+
+The publication gate consumes only artifacts bound into the verified period
+manifest: each required contiguous slice, source coverage and any immutable
+limitation approval, quality/replay results, consumed post approval, chained
+post-event receipt, fresh API and shared-report readbacks, and an eligible ECB
+quote. Native currency buckets remain visible beside their rounded USD
+equivalents; the quote must be EUR-base and no more than four calendar days old.
+
+The adapter order is fixed: update report, read it back exactly, persist the
+report receipt, then idempotently upsert Slack and persist the publication
+receipt. A Slack failure after report verification is `publication_incomplete`;
+retry uses the retained report receipt and must not update the report again.
+Only a separately approved contract may create `published`; an unchanged
+idempotency key returns the existing receipt without an external call.

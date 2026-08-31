@@ -704,3 +704,33 @@ before using it; the snapshot is intentionally not treated as current truth.
 The requirement-by-requirement distinction between local proof and missing live
 acceptance evidence is tracked in
 [`clockify-process-acceptance.md`](clockify-process-acceptance.md).
+
+## Finance-publication contract
+
+`tests/test_publication_end_to_end.py` drives the immutable coordinator event
+ledger, consumed Clockify posting approval and receipt, exact API/shared-report
+readback, ECB currency conversion, publication gate, receipt store, and finance
+adapter ordering with synthetic fixtures. It never uses a production transport:
+only the report/Slack boundary is a recording fake.
+
+`tests/fixtures/reconciliation/publication-routine/manifest.json` proves a
+two-day, two-slice routine period. Publication is legal only after the exact
+post receipt is bound to both fresh readbacks, the prepared contract has a
+separate approval, the report is read back, and Slack is upserted. Re-running a
+published period returns its persisted receipt without another report update or
+Slack message.
+
+`tests/fixtures/reconciliation/publication-backlog/manifest.json` carries a
+Calendly-only recording, a Fathom/Calendly duplicate, transient missing-slice
+coverage debt, an approved Desktop limitation, an ambiguous POST recovery,
+USD/EUR native buckets, retained correction revision, and report-success then
+Slack-failure retry. Calendly may be excluded only for a bounded historical
+recovery explicitly recorded in coverage; future autopilot coverage treats it
+as a first-class required source.
+
+Publication state is fail-closed: `publication_deferred` means preparation or
+authorization evidence is absent; `publication_incomplete` means a delivery
+attempt retained the verified report receipt but needs a Slack retry; and
+`published` requires the bound report and Slack receipts. ECB quotes use the
+latest eligible EUR-base quote, convert every native bucket to USD with
+half-up cent rounding, and are rejected when older than four calendar days.
