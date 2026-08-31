@@ -540,6 +540,74 @@ class PortfolioQualityTests(unittest.TestCase):
         value["exceptions"] = [{"evidence_ids": [second.evidence_id]}]
         self.assertEqual("blocked", quality.audit(value, ledger(first, second), source_proposals=proposals())["status"])
 
+    def test_explicitly_excluded_calendly_is_warning_only_when_optional(self):
+        event = fathom_event()
+        source = ledger(event)
+        source["manifest"] = evidence_ledger.LedgerManifest(
+            events_digest=source["manifest"]["events_digest"],
+            event_count=source["manifest"]["event_count"],
+            source_inventory={
+                "fathom": {
+                    "status": "complete",
+                    "expected_count": 1,
+                    "observed_count": 1,
+                },
+                "calendly": {
+                    "status": "excluded",
+                    "expected_count": 0,
+                    "observed_count": 0,
+                },
+            },
+            timezone="Europe/Bucharest",
+        ).document()
+
+        default_report = quality.audit(
+            document(event), source, source_proposals=proposals()
+        )
+        optional_report = quality.audit(
+            document(event),
+            source,
+            source_proposals=proposals(),
+            calendly_optional=True,
+        )
+
+        self.assertEqual("blocked", default_report["status"])
+        self.assertEqual("pass", optional_report["status"])
+        self.assertEqual(
+            [{"source": "calendly", "reason": "Calendly explicitly excluded"}],
+            optional_report["coverage_warnings"],
+        )
+
+    def test_optional_calendly_exclusion_requires_exact_zero_inventory(self):
+        """Malformed or nonzero excluded inventory remains a coverage blocker."""
+        event = fathom_event()
+        source = ledger(event)
+        for expected_count, observed_count in ((False, 0), (0, True), (1, 0), (0, -1)):
+            with self.subTest(expected_count=expected_count, observed_count=observed_count):
+                source["manifest"] = evidence_ledger.LedgerManifest(
+                    events_digest=source["manifest"]["events_digest"],
+                    event_count=source["manifest"]["event_count"],
+                    source_inventory={
+                        "fathom": {
+                            "status": "complete",
+                            "expected_count": 1,
+                            "observed_count": 1,
+                        },
+                        "calendly": {
+                            "status": "excluded",
+                            "expected_count": expected_count,
+                            "observed_count": observed_count,
+                        },
+                    },
+                    timezone="Europe/Bucharest",
+                ).document()
+
+                report = quality.audit(
+                    document(event), source, source_proposals=proposals(), calendly_optional=True
+                )
+                self.assertEqual("blocked", report["status"])
+                self.assertEqual([], report["coverage_warnings"])
+
     def test_inconsistent_fathom_source_inventory_blocks(self):
         event = fathom_event()
         source = ledger(event)

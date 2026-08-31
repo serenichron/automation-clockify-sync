@@ -101,6 +101,36 @@ class ReviewRunResultTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "not complete"):
                     review_run._collector_run_dirs(str(report_path))
 
+    def test_collector_run_dirs_accepts_non_coordinator_peer_coverage_debt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            run_dir = runs / "20260816T120000Z"
+            report_path = run_dir / "run-report.md"
+            report_path.parent.mkdir(parents=True)
+            report_path.write_text("# receipt\n", encoding="utf-8")
+            completeness = {
+                "status": "incomplete",
+                "incomplete_sources": ["sessions/macbook", "repositories/desktop"],
+            }
+            (run_dir / "run-report.json").write_text(json.dumps({
+                "evidence": {
+                    "calendly": {"status": "excluded", "complete": True},
+                },
+                "evidence_ledger": {"source_completeness": completeness},
+            }) + "\n", encoding="utf-8")
+            ledger_path = run_dir / "evidence" / "evidence-ledger.json"
+            ledger_path.parent.mkdir()
+            ledger_path.write_text(json.dumps({
+                "manifest": {"source_completeness": completeness},
+            }) + "\n", encoding="utf-8")
+
+            with mock.patch.object(review_run, "RUNS", runs):
+                self.assertEqual((run_dir,), review_run._collector_run_dirs(str(report_path)))
+
+    def test_parse_args_accepts_bounded_optional_calendly_override(self):
+        args = review_run.parse_args(["--calendly-optional"])
+        self.assertTrue(args.calendly_optional)
+
     def test_completed_slices_are_processed_before_later_collection_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             runs = Path(tmp) / "runs"
@@ -109,8 +139,13 @@ class ReviewRunResultTests(unittest.TestCase):
             for run_dir in (first, second):
                 run_dir.mkdir(parents=True)
                 (run_dir / "run-report.json").write_text(json.dumps({
+                    "evidence": {
+                        "calendly": {"status": "ok", "complete": True},
+                    },
                     "evidence_ledger": {
-                        "source_completeness": {"status": "complete"},
+                        "source_completeness": {
+                            "status": "complete", "incomplete_sources": [],
+                        },
                     },
                 }) + "\n", encoding="utf-8")
                 (run_dir / "run-report.md").write_text("# receipt\n", encoding="utf-8")
@@ -118,7 +153,9 @@ class ReviewRunResultTests(unittest.TestCase):
                 ledger_path.parent.mkdir()
                 ledger_path.write_text(json.dumps({
                     "manifest": {
-                        "source_completeness": {"status": "complete"},
+                        "source_completeness": {
+                            "status": "complete", "incomplete_sources": [],
+                        },
                     },
                 }) + "\n", encoding="utf-8")
             first_result = first / "autopilot-result.json"
@@ -662,8 +699,13 @@ class ReviewRunResultTests(unittest.TestCase):
             run_dir = runs / "run-blocked"
             run_dir.mkdir(parents=True)
             (run_dir / "run-report.json").write_text(json.dumps({
+                "evidence": {
+                    "calendly": {"status": "ok", "complete": True},
+                },
                 "evidence_ledger": {
-                    "source_completeness": {"status": "complete"},
+                    "source_completeness": {
+                        "status": "complete", "incomplete_sources": [],
+                    },
                 },
             }) + "\n", encoding="utf-8")
             (run_dir / "run-report.md").write_text("# fixture\n", encoding="utf-8")
@@ -671,7 +713,9 @@ class ReviewRunResultTests(unittest.TestCase):
             ledger_path.parent.mkdir()
             ledger_path.write_text(json.dumps({
                 "manifest": {
-                    "source_completeness": {"status": "complete"},
+                    "source_completeness": {
+                        "status": "complete", "incomplete_sources": [],
+                    },
                 },
             }) + "\n", encoding="utf-8")
             collected = subprocess.CompletedProcess(

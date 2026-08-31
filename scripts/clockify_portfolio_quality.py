@@ -270,8 +270,26 @@ def _proposal_routes_by_activity(
     return result
 
 
+def _is_zero_calendly_exclusion(
+    details: Mapping[str, Any], source_events: Sequence[Mapping[str, Any]]
+) -> bool:
+    return (
+        details.get("status") == "excluded"
+        and not source_events
+        and all(
+            isinstance(details.get(key), int)
+            and not isinstance(details.get(key), bool)
+            and details.get(key) == 0
+            for key in ("expected_count", "observed_count")
+        )
+    )
+
+
 def _recording_source_inventory_issues(
-    events: Sequence[Mapping[str, Any]], manifest: Mapping[str, Any]
+    events: Sequence[Mapping[str, Any]],
+    manifest: Mapping[str, Any],
+    *,
+    calendly_optional: bool = False,
 ) -> list[dict[str, Any]]:
     """Require complete inventories for every recording source actually present."""
     issues: list[dict[str, Any]] = []
@@ -286,6 +304,12 @@ def _recording_source_inventory_issues(
         if not isinstance(details, Mapping):
             if source_events:
                 issues.append({"reason": f"{source.title()} source completeness cannot be proved"})
+            continue
+        if (
+            source == "calendly"
+            and calendly_optional
+            and _is_zero_calendly_exclusion(details, source_events)
+        ):
             continue
         if details.get("status") != "complete":
             issues.append({"reason": f"{source.title()} source completeness cannot be proved"})
@@ -363,6 +387,8 @@ def _recording_coverage(
     row_evidence_ids: set[str],
     review_range: tuple[dt.date, dt.date] | None,
     manifest: Mapping[str, Any],
+    *,
+    calendly_optional: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     coverage: dict[str, Any] = {
         "source_recordings": 0,
@@ -386,7 +412,9 @@ def _recording_coverage(
     ]
     coverage["source_recordings"] = len(recording_events)
     clockify_blocks = work_accounting_pipeline._existing_blocks(events)
-    issues.extend(_recording_source_inventory_issues(events, manifest))
+    issues.extend(_recording_source_inventory_issues(
+        events, manifest, calendly_optional=calendly_optional
+    ))
     accounted, account_issues = _accounted_recording_ids(document)
     issues.extend(account_issues)
     try:
@@ -793,6 +821,7 @@ def audit(
     ledger_document: Mapping[str, Any] | None = None,
     source_proposals: Sequence[Mapping[str, Any]] | None = None,
     routing: Mapping[str, Any] | None = None,
+    calendly_optional: bool = False,
 ) -> dict[str, Any]:
     """Return a fail-closed integrity report without changing the review."""
     if evidence_ledger_document is not None and ledger_document is not None:
@@ -806,6 +835,7 @@ def audit(
             "schema_version": 3,
             "status": "blocked",
             "external_writes": False,
+            "coverage_warnings": [],
             "structural_issues": [{"reason": "activities must be a list of objects"}],
             "semantic_repair_rows": [],
             "recording_coverage": {"source_recordings": 0, "canonical_meetings": 0, "expected": 0, "represented": 0, "excluded": 0, "exceptions": 0, "missing": 0, "unverifiable": 0, "missing_evidence_ids": [], "exception_evidence_ids": [], "excluded_by_reason": {}, "excluded_evidence": [], "source_dispositions": {}},
@@ -1047,8 +1077,26 @@ def audit(
         row_evidence_ids,
         review_range,
         manifest,
+        calendly_optional=calendly_optional,
     )
     structural.extend(recording_issues)
+    calendly_inventory = (
+        manifest.get("source_inventory", {}).get("calendly")
+        if isinstance(manifest.get("source_inventory"), Mapping)
+        else None
+    )
+    coverage_warnings = []
+    if (
+        calendly_optional
+        and isinstance(calendly_inventory, Mapping)
+        and _is_zero_calendly_exclusion(
+            calendly_inventory,
+            [event for event in events if event.get("source_type") == "calendly"],
+        )
+    ):
+        coverage_warnings.append({
+            "source": "calendly", "reason": "Calendly explicitly excluded"
+        })
     fragmentation = {
         "row_count": len(rows),
         "total_minutes": row_total,
@@ -1060,6 +1108,7 @@ def audit(
         "schema_version": 3,
         "status": "blocked" if structural else "needs_semantic_repair" if semantic_repairs else "pass",
         "external_writes": False,
+        "coverage_warnings": coverage_warnings,
         "structural_issues": structural,
         "semantic_repair_rows": semantic_repairs,
         "overlaps": overlaps,
@@ -1080,10 +1129,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source-proposals", type=Path)
     parser.add_argument("--routing", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--calendly-optional",
+        action="store_true",
+        help="Accept only an explicit zero-event Calendly exclusion as coverage debt",
+    )
     args = parser.parse_args(argv)
     try:
         proposals = _read(args.source_proposals) if args.source_proposals else None
-        report = audit(_read(args.portfolio_review), _read(args.evidence_ledger), source_proposals=proposals, routing=_read(args.routing))
+        report = audit(
+            _read(args.portfolio_review), _read(args.evidence_ledger),
+            source_proposals=proposals, routing=_read(args.routing),
+            calendly_optional=args.calendly_optional,
+        )
         _write(args.output, report)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"clockify portfolio quality: {exc}", file=sys.stderr)

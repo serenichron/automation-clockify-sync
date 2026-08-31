@@ -20,8 +20,9 @@ import sys
 from typing import Any
 
 try:
-    from scripts import review_acceptance, semantic_analyzer
+    from scripts import clockify_sync_collect, review_acceptance, semantic_analyzer
 except ModuleNotFoundError:  # direct script execution
+    import clockify_sync_collect  # type: ignore[no-redef]
     import review_acceptance  # type: ignore[no-redef]
     import semantic_analyzer  # type: ignore[no-redef]
 
@@ -395,9 +396,9 @@ def _collector_run_dirs(stdout: str) -> tuple[Path, ...]:
         )
         if (
             not isinstance(reported_completeness, dict)
-            or reported_completeness.get("status") != "complete"
             or not isinstance(ledger_completeness, dict)
-            or ledger_completeness.get("status") != "complete"
+            or reported_completeness != ledger_completeness
+            or not clockify_sync_collect._slice_is_complete(receipt)
         ):
             raise ValueError(f"Collector emitted a run receipt that is not complete: {run_dir}")
         if run_dir in seen:
@@ -718,6 +719,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--until", help="YYYY-MM-DD inclusive")
     parser.add_argument("--no-enrich", action="store_true")
     parser.add_argument(
+        "--calendly-optional", action="store_true",
+        help="Explicitly exclude Calendly from this bounded collection without contacting its gateway",
+    )
+    parser.add_argument(
         "--replay-from",
         type=Path,
         help="Reuse a completed run's immutable evidence ledger in a distinct replay run.",
@@ -887,7 +892,8 @@ def _process_run(
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.replay_from and (
-        args.since or args.until or args.no_enrich or args.analysis_fixture
+        args.since or args.until or args.no_enrich or args.calendly_optional
+        or args.analysis_fixture
     ):
         print(
             "clockify review run: --replay-from cannot be combined with collection "
@@ -945,6 +951,8 @@ def main(argv: list[str] | None = None) -> int:
             collector.extend(["--since", args.since])
         if args.until:
             collector.extend(["--until", args.until])
+        if args.calendly_optional:
+            collector.append("--calendly-optional")
         collector.append("--no-enrich" if args.no_enrich else "--enrich")
         collected = _run(collector)
         collector_code = collected.returncode

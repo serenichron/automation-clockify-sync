@@ -29,6 +29,174 @@ COMPLETE_CALENDLY = {
 
 
 class ProcessIntegrationTests(unittest.TestCase):
+    def test_explicit_optional_calendly_skips_collection_and_completes_the_slice(self) -> None:
+        """A bounded operator override excludes Calendly without contacting its gateway."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "runs" / "bundle"
+            complete = {"status": "ok", "complete": True}
+            with (
+                mock.patch.object(collector, "fetch_clockify", return_value={**complete, "entries": []}),
+                mock.patch.object(collector, "fetch_fathom", return_value={**complete, "meetings": []}),
+                mock.patch.object(
+                    collector,
+                    "fetch_calendly",
+                    side_effect=AssertionError("optional Calendly must not contact the gateway"),
+                ),
+                mock.patch.object(collector, "fetch_multica_issues", return_value={**complete, "issues": []}),
+                mock.patch.object(
+                    collector, "collector_runtime_identity",
+                    return_value={"collector_path": "/repo/collector.py", "git_sha": "fixture"},
+                ),
+            ):
+                _path, report = collector._collect_slice(
+                    argparse.Namespace(enrich=False, calendly_optional=True),
+                    {"skip_rules": {}, "session_routes": [], "meeting_routes": []},
+                    {"machines": [], "ssh_options": []},
+                    {"_missing": True}, {"_missing": True}, SINCE, UNTIL, "fixture",
+                    collector.PageCheckpointStore(Path(tmp) / "checkpoints"), run_dir,
+                    calendly_env={"_missing": ["CALENDLY_RECORDINGS_URL"]},
+                )
+
+            self.assertTrue(collector._slice_is_complete(report))
+            self.assertEqual("excluded", report["evidence"]["calendly"]["status"])
+            self.assertEqual(
+                "excluded",
+                report["evidence_ledger"]["source_completeness"]["sources"]["calendly"]["status"],
+            )
+
+    def test_required_collection_rejects_an_optional_calendly_bundle(self) -> None:
+        """A required run must never reuse an explicitly excluded Calendly bundle."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "runs" / "bundle"
+            complete = {"status": "ok", "complete": True}
+            routing = {"skip_rules": {}, "session_routes": [], "meeting_routes": []}
+            fleet = {"machines": [], "ssh_options": []}
+            with (
+                mock.patch.object(collector, "fetch_clockify", return_value={**complete, "entries": []}),
+                mock.patch.object(collector, "fetch_fathom", return_value={**complete, "meetings": []}),
+                mock.patch.object(collector, "fetch_multica_issues", return_value={**complete, "issues": []}),
+                mock.patch.object(
+                    collector,
+                    "collector_runtime_identity",
+                    return_value={"collector_path": "/repo/collector.py", "git_sha": "fixture"},
+                ),
+            ):
+                collector._collect_slice(
+                    argparse.Namespace(enrich=False, calendly_optional=True),
+                    routing, fleet, {"_missing": True}, {"_missing": True},
+                    SINCE, UNTIL, "fixture",
+                    collector.PageCheckpointStore(Path(tmp) / "checkpoints"), run_dir,
+                )
+                with self.assertRaisesRegex(collector.BacklogError, "mode"):
+                    collector._collect_slice(
+                        argparse.Namespace(enrich=False, calendly_optional=False),
+                        routing, fleet, {"_missing": True}, {"_missing": True},
+                        SINCE, UNTIL, "fixture",
+                        collector.PageCheckpointStore(Path(tmp) / "checkpoints"), run_dir,
+                    )
+
+    def test_slice_completeness_accepts_only_non_coordinator_peer_gaps(self) -> None:
+        report = {
+            "evidence": {"calendly": {"status": "excluded", "complete": True}},
+            "evidence_ledger": {
+                "source_completeness": {
+                    "status": "incomplete",
+                    "incomplete_sources": [
+                        "sessions/macbook",
+                        "repositories/macbook",
+                        "sessions/desktop",
+                    ],
+                },
+            },
+        }
+
+        with mock.patch.dict(
+            collector.os.environ,
+            {"CLOCKIFY_AUTOPILOT_COORDINATOR": "omarchy-precision"},
+        ):
+            self.assertTrue(collector._slice_is_complete(report))
+
+        report["evidence_ledger"]["source_completeness"]["incomplete_sources"] = [
+            "clockify"
+        ]
+        self.assertFalse(collector._slice_is_complete(report))
+        report["evidence_ledger"]["source_completeness"]["incomplete_sources"] = [
+            "sessions/omarchy-precision"
+        ]
+        self.assertFalse(collector._slice_is_complete(report))
+
+    def test_slice_completeness_rejects_contradictory_or_malformed_gaps(self) -> None:
+        """A completed receipt has exactly one valid completeness state."""
+        report = {
+            "evidence": {"calendly": {"status": "ok", "complete": True}},
+            "evidence_ledger": {"source_completeness": {}},
+        }
+        invalid_completeness = (
+            {"status": "complete", "incomplete_sources": ["sessions/macbook"]},
+            {"status": "incomplete", "incomplete_sources": []},
+            {"status": "unexpected", "incomplete_sources": ["sessions/macbook"]},
+            {"status": "incomplete", "incomplete_sources": ["sessions/"]},
+            {"status": "incomplete", "incomplete_sources": ["repositories/ "]},
+            {"status": "incomplete", "incomplete_sources": ["sessions/ macbook"]},
+            {"status": "incomplete", "incomplete_sources": ["clockify"]},
+        )
+
+        for completeness in invalid_completeness:
+            with self.subTest(completeness=completeness):
+                report["evidence_ledger"]["source_completeness"] = completeness
+                self.assertFalse(collector._slice_is_complete(report))
+
+    def test_existing_slice_bundle_with_peer_coverage_debt_is_reusable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "runs" / "bundle"
+            complete = {"status": "ok", "complete": True}
+            peer_gap = {
+                "machine": "macbook",
+                "status": "error",
+                "complete": False,
+                "collector_contract": "canonical_export_v1",
+                "claude_bursts": [],
+                "hermes_sessions": [],
+                "hermes_db_sessions": [],
+                "codex_sessions": [],
+                "repository_events": [],
+                "repository_evidence_status": "unavailable",
+                "errors": ["bounded peer timeout"],
+            }
+            args = argparse.Namespace(enrich=False, calendly_optional=True)
+            routing = {"skip_rules": {}, "session_routes": [], "meeting_routes": []}
+            fleet = {
+                "machines": [{"name": "macbook", "enabled": True, "kind": "ssh"}],
+                "ssh_options": [],
+            }
+            with (
+                mock.patch.object(collector, "fetch_clockify", return_value={**complete, "entries": []}),
+                mock.patch.object(collector, "fetch_fathom", return_value={**complete, "meetings": []}),
+                mock.patch.object(collector, "fetch_multica_issues", return_value={**complete, "issues": []}),
+                mock.patch.object(collector, "machine_is_local", return_value=False),
+                mock.patch.object(collector, "collect_remote_sessions", return_value=peer_gap),
+                mock.patch.object(
+                    collector, "collector_runtime_identity",
+                    return_value={"collector_path": "/repo/collector.py", "git_sha": "fixture"},
+                ),
+            ):
+                collector._collect_slice(
+                    args, routing, fleet, {"_missing": True}, {"_missing": True},
+                    SINCE, UNTIL, "fixture",
+                    collector.PageCheckpointStore(Path(tmp) / "checkpoints"), run_dir,
+                )
+
+            try:
+                report_path, report = collector._collect_slice(
+                    args, routing, fleet, {"_missing": True}, {"_missing": True},
+                    SINCE, UNTIL, "fixture",
+                    collector.PageCheckpointStore(Path(tmp) / "checkpoints"), run_dir,
+                )
+            except collector.BacklogError as error:
+                self.fail(f"peer-debt bundle was not reusable: {error}")
+            self.assertEqual(run_dir / "run-report.md", report_path)
+            self.assertTrue(collector._slice_is_complete(report))
+
     def test_incomplete_calendly_result_never_records_a_completed_slice_receipt(self) -> None:
         """Calendly capability and pagination failures block the current slice before receipt creation."""
         incomplete_results = (

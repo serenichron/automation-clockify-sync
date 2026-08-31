@@ -3595,13 +3595,14 @@ def cleanup_checkpoints(args: argparse.Namespace) -> int:
 
 
 def _backlog_compatibility_version(
-    routing: Mapping[str, Any], fleet: Mapping[str, Any]
+    routing: Mapping[str, Any], fleet: Mapping[str, Any], *, calendly_optional: bool = False,
 ) -> str:
     payload = {
         "contract": BACKLOG_COMPATIBILITY_VERSION,
         "collector_sha256": collector_script_sha256(),
         "routing": routing,
         "fleet": fleet,
+        "calendly_optional": calendly_optional,
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return f"{BACKLOG_COMPATIBILITY_VERSION}:{hashlib.sha256(encoded.encode()).hexdigest()}"
@@ -3623,7 +3624,12 @@ def _file_digest(path: Path) -> str:
 
 
 def _verified_existing_slice_bundle(
-    run_dir: Path, since: dt.datetime, until: dt.datetime, reason: str
+    run_dir: Path,
+    since: dt.datetime,
+    until: dt.datetime,
+    reason: str,
+    *,
+    calendly_optional: bool,
 ) -> tuple[Path, dict[str, object]]:
     report_path = run_dir / "run-report.md"
     report_json_path = run_dir / "run-report.json"
@@ -3648,9 +3654,11 @@ def _verified_existing_slice_bundle(
         "reason": reason,
     }:
         raise BacklogError("existing slice bundle identity does not match")
+    if report.get("collection_mode") != {"calendly_optional": calendly_optional}:
+        raise BacklogError("existing slice bundle collection mode does not match")
     manifest = ledger.get("manifest")
     completeness = manifest.get("source_completeness") if isinstance(manifest, dict) else None
-    if not isinstance(completeness, Mapping) or completeness.get("status") != "complete":
+    if not isinstance(completeness, Mapping):
         raise BacklogError("existing slice bundle is not complete")
     reported_ledger = report.get("evidence_ledger")
     if not isinstance(reported_ledger, Mapping):
@@ -3666,7 +3674,21 @@ def _verified_existing_slice_bundle(
         raise BacklogError("existing slice bundle ledger receipt does not match")
     if f"- Evidence ledger receipt: {expected_ledger['ledger_digest']}\n" not in markdown:
         raise BacklogError("existing slice bundle Markdown receipt does not bind its ledger")
+    if not _slice_is_complete(report):
+        raise BacklogError("existing slice bundle is not complete")
     return report_path, report
+
+
+def _is_tolerated_peer_gap(source: str, coordinator: str) -> bool:
+    category, separator, peer = source.partition("/")
+    return (
+        category in {"sessions", "repositories"}
+        and separator == "/"
+        and "/" not in peer
+        and bool(peer)
+        and peer == peer.strip()
+        and peer != coordinator
+    )
 
 
 def _slice_is_complete(report: Mapping[str, object]) -> bool:
@@ -3674,13 +3696,32 @@ def _slice_is_complete(report: Mapping[str, object]) -> bool:
     if not isinstance(ledger, Mapping):
         return False
     completeness = ledger.get("source_completeness")
+    if not isinstance(completeness, Mapping):
+        return False
+    incomplete = completeness.get("incomplete_sources")
+    if not isinstance(incomplete, list) or not all(
+        isinstance(source, str) and source for source in incomplete
+    ):
+        return False
+    coordinator = os.environ.get(
+        "CLOCKIFY_AUTOPILOT_COORDINATOR", "omarchy-precision"
+    ).strip() or "omarchy-precision"
+    tolerated_peer_gaps = all(
+        _is_tolerated_peer_gap(source, coordinator)
+        for source in incomplete
+    )
+    complete = (
+        completeness.get("status") == "complete" and not incomplete
+    ) or (
+        completeness.get("status") == "incomplete"
+        and bool(incomplete)
+        and tolerated_peer_gaps
+    )
     evidence = report.get("evidence")
     calendly = evidence.get("calendly") if isinstance(evidence, Mapping) else None
-    return (
-        isinstance(completeness, Mapping)
-        and completeness.get("status") == "complete"
-        and isinstance(calendly, Mapping)
-        and calendly.get("status") == "ok"
+    return complete and (
+        isinstance(calendly, Mapping)
+        and calendly.get("status") in {"ok", "excluded"}
         and calendly.get("complete") is True
     )
 
@@ -3730,25 +3771,38 @@ def _collect_slice(
     requested_slices = plan_slices(since, until, zone=BUCHAREST)
     if len(requested_slices) != 1:
         raise ValueError("_collect_slice requires one bounded collection slice")
+    calendly_optional = getattr(args, "calendly_optional", False) is True
     claimed_run_dir = _claim_slice_run_dir(run_dir)
     if not claimed_run_dir:
-        return _verified_existing_slice_bundle(run_dir, since, until, reason)
+        return _verified_existing_slice_bundle(
+            run_dir, since, until, reason, calendly_optional=calendly_optional
+        )
     if owned_run_dirs is not None:
         owned_run_dirs.add(run_dir)
     runtime_identity = collector_runtime_identity()
     run_id = run_dir.name
 
+    if calendly_optional:
+        calendly_result = {
+            "status": "excluded",
+            "complete": True,
+            "recordings": [],
+            "scheduled_without_recording": [],
+            "reason": "explicit bounded operator exclusion",
+        }
+    else:
+        calendly_result = fetch_calendly(
+            calendly_env or {"_missing": ["CALENDLY_RECORDINGS_URL"]},
+            since,
+            until,
+            checkpoint_store=checkpoint_store,
+        )
     evidence = {
         "clockify": fetch_clockify(
             cenv, routing, since, until, checkpoint_store=checkpoint_store
         ),
         "fathom": fetch_fathom(fenv, since, until, checkpoint_store=checkpoint_store),
-        "calendly": fetch_calendly(
-            calendly_env or {"_missing": ["CALENDLY_RECORDINGS_URL"]},
-            since,
-            until,
-            checkpoint_store=checkpoint_store,
-        ),
+        "calendly": calendly_result,
         "multica_issues": fetch_multica_issues(
             since, until, checkpoint_store=checkpoint_store
         ),
@@ -3800,6 +3854,7 @@ def _collect_slice(
         "run_id": run_id,
         "runtime_identity": runtime_identity,
         "date_range": {"since": local_dt_string(since), "until": local_dt_string(until), "reason": reason},
+        "collection_mode": {"calendly_optional": calendly_optional},
         "safety": {"dry_run": True, "clockify_posted": False},
         "paths": {
             "run_dir": str(run_dir),
@@ -3943,7 +3998,9 @@ def run(args: argparse.Namespace) -> int:
         until_utc=iso_utc(until),
         timezone=BUCHAREST.key,
         max_days=2,
-        compatibility_version=_backlog_compatibility_version(routing, fleet),
+        compatibility_version=_backlog_compatibility_version(
+            routing, fleet, calendly_optional=getattr(args, "calendly_optional", False) is True
+        ),
     )
     backlog_store = BacklogStore(collector_checkpoint_root())
     try:
@@ -3969,6 +4026,7 @@ def run(args: argparse.Namespace) -> int:
                     slice_.since,
                     slice_.until,
                     reason,
+                    calendly_optional=getattr(args, "calendly_optional", False) is True,
                 )
             except (BacklogError, OSError, ValueError):
                 print("collector slice receipt is not safe to reuse", file=sys.stderr)
@@ -4032,6 +4090,10 @@ def main() -> int:
                     help="Extract user message context (prev/next assistant) for enriched descriptions (default: on)")
     r.add_argument("--no-enrich", action="store_false", dest="enrich",
                     help="Disable enriched context extraction")
+    r.add_argument(
+        "--calendly-optional", action="store_true",
+        help="Explicitly exclude Calendly from this bounded review run without contacting its gateway",
+    )
     export = sub.add_parser("export-local")
     export.add_argument("--machine-json", required=True)
     export.add_argument("--since", required=True)
