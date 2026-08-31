@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import secrets
 from typing import Mapping, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -45,6 +46,17 @@ AUDIT_EVENTS = frozenset({
     "report_residual_resolved", "fathom_repair_complete", "coverage_limitation_approved",
 })
 KNOWN_EVENT_TYPES = frozenset(ADVANCING_EVENTS) | BLOCKER_EVENTS | AUDIT_EVENTS
+BLOCKER_RESOLUTIONS = {
+    "collection_complete": frozenset({"coverage_incomplete"}),
+    "reconciliation_complete": frozenset({"semantic_exceptions"}),
+    "review_approved": frozenset({"awaiting_approval"}),
+    "posting_complete": frozenset({"post_interrupted"}),
+    "clockify_readback_verified": frozenset({"readback_mismatch"}),
+    "publication_prepared": frozenset({"currency_quote_unavailable"}),
+    "publication_authorized": frozenset({"publication_deferred"}),
+    "shared_report_verified": frozenset({"report_mismatch"}),
+    "coverage_limitation_approved": frozenset({"coverage_incomplete"}),
+}
 
 
 class ManifestError(RuntimeError):
@@ -528,11 +540,15 @@ class ReconciliationCoordinator:
 
     def derive(self) -> ReconciliationManifest:
         events = self.store.verify(self.identity)
+        if not events or events[0].event_type != "period_opened":
+            raise ManifestError("first event must be period_opened")
         state = "collecting"
         blockers: set[str] = set()
         artifacts: list[ArtifactIdentity] = []
         context = {"readback_verified": False, "authorization": None, "report_verified": False}
         for index, event in enumerate(events):
+            if state == "published":
+                raise ManifestError("event is not legal after publication_complete")
             artifacts.extend(_verify_artifact_refs(event.payload.get("artifacts")))
             state = self._apply_transition(state, event, index, context, blockers)
         unique_artifacts = { _canonical(artifact.document()): artifact for artifact in artifacts }
@@ -552,6 +568,7 @@ class ReconciliationCoordinator:
             blockers.add(event.event_type)
             return state
         if event.event_type in AUDIT_EVENTS:
+            blockers.difference_update(BLOCKER_RESOLUTIONS.get(event.event_type, ()))
             return state
         if event.event_type == "period_opened":
             if index != 0:
@@ -571,6 +588,7 @@ class ReconciliationCoordinator:
         }[event.event_type]
         if state != expected:
             raise ManifestError(f"illegal transition from {state} using {event.event_type}")
+        blockers.difference_update(BLOCKER_RESOLUTIONS.get(event.event_type, ()))
         if event.event_type == "clockify_readback_verified":
             context["readback_verified"] = True
         elif event.event_type == "publication_prepared":
@@ -585,6 +603,8 @@ class ReconciliationCoordinator:
                 raise ManifestError("shared report receipt does not bind the publication authorization")
             context["report_verified"] = True
         elif event.event_type == "publication_complete":
+            if blockers:
+                raise ManifestError("publication_complete requires no active blockers")
             if not context["report_verified"] or _publication_binding(event.payload) != context["authorization"]:
                 raise ManifestError("publication_complete requires bound report and Slack receipts")
             if not _verified_receipt(event.payload, "slack_receipt", context["authorization"]):
@@ -613,7 +633,17 @@ def _verified_receipt(
 
 def _path_below(root: Path, path: Path) -> Path:
     root = root.resolve()
-    resolved = path.resolve()
+    candidate = Path(os.path.abspath(path.expanduser()))
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as exc:
+        raise ManifestError("output path must remain below the private recovery root") from exc
+    component = root
+    for part in relative.parts:
+        component /= part
+        if component.is_symlink():
+            raise ManifestError("output path must not contain symlinks")
+    resolved = candidate.resolve()
     try:
         resolved.relative_to(root)
     except ValueError as exc:
@@ -621,15 +651,74 @@ def _path_below(root: Path, path: Path) -> Path:
     return resolved
 
 
-def _write_canonical(path: Path, document: object) -> None:
-    temporary = path.with_name(path.name + ".tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+def _write_canonical(root: Path, path: Path, document: object) -> None:
     try:
-        os.write(descriptor, _canonical(document) + b"\n")
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise ManifestError("output path must remain below the private recovery root") from exc
+    if not relative.parts or relative.name in {"", ".", ".."}:
+        raise ManifestError("output path is invalid")
+    root_descriptor: int | None = None
+    parent_descriptor: int | None = None
+    descriptor: int | None = None
+    temporary_name: str | None = None
+    try:
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        if not hasattr(os, "O_NOFOLLOW"):
+            raise ManifestError("safe directory traversal is unavailable")
+        directory_flags |= os.O_NOFOLLOW
+        root_descriptor = os.open(root, directory_flags)
+        parent_descriptor = root_descriptor
+        for component in relative.parts[:-1]:
+            try:
+                os.mkdir(component, 0o700, dir_fd=parent_descriptor)
+            except FileExistsError:
+                pass
+            next_descriptor = os.open(component, directory_flags, dir_fd=parent_descriptor)
+            if parent_descriptor != root_descriptor:
+                os.close(parent_descriptor)
+            parent_descriptor = next_descriptor
+        temporary_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        for _ in range(16):
+            candidate = f".{relative.name}.{secrets.token_hex(16)}.tmp"
+            try:
+                descriptor = os.open(candidate, temporary_flags, 0o600, dir_fd=parent_descriptor)
+            except FileExistsError:
+                continue
+            temporary_name = candidate
+            break
+        if descriptor is None or temporary_name is None:
+            raise ManifestError("could not create a private temporary output")
+        content = _canonical(document) + b"\n"
+        offset = 0
+        while offset < len(content):
+            written = os.write(descriptor, content[offset:])
+            if written <= 0:
+                raise OSError("private output write did not advance")
+            offset += written
         os.fsync(descriptor)
-    finally:
         os.close(descriptor)
-    os.replace(temporary, path)
+        descriptor = None
+        os.replace(
+            temporary_name, relative.name,
+            src_dir_fd=parent_descriptor, dst_dir_fd=parent_descriptor,
+        )
+        temporary_name = None
+        os.fsync(parent_descriptor)
+    except OSError as exc:
+        raise ManifestError("could not atomically write private output") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary_name is not None and parent_descriptor is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_descriptor)
+            except FileNotFoundError:
+                pass
+        if parent_descriptor is not None and parent_descriptor != root_descriptor:
+            os.close(parent_descriptor)
+        if root_descriptor is not None:
+            os.close(root_descriptor)
 
 
 def _routing_value(path: Path, field: str) -> str:
@@ -703,8 +792,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> int:
-    root = args.manifest.resolve().parent
-    manifest_path = _path_below(root, args.manifest)
+    manifest_request = Path(os.path.abspath(args.manifest.expanduser()))
+    root = manifest_request.parent.resolve()
+    manifest_path = _path_below(root, manifest_request)
     events_path = _path_below(root, args.events)
     if args.command == "init":
         identity = PeriodIdentity(
@@ -723,7 +813,7 @@ def run(args: argparse.Namespace) -> int:
         root.mkdir(parents=True, exist_ok=True)
         store = CoordinatorEventStore(events_path)
         store.append(identity, "period_opened", {"revision": identity.revision}, occurred_at=datetime.now(utc_timezone.utc))
-        _write_canonical(manifest_path, ReconciliationCoordinator(identity, store).derive().document())
+        _write_canonical(root, manifest_path, ReconciliationCoordinator(identity, store).derive().document())
         print(identity.period_id)
         return 0
     manifest = _load_manifest(manifest_path)
@@ -750,7 +840,7 @@ def run(args: argparse.Namespace) -> int:
                 digest=_artifact_digest(Path(_required_text(item["path"], "artifact path")).resolve()),
             )
             artifacts.append({"kind": _required_text(item["kind"], "artifact kind"), **identity.document()})
-        _write_canonical(output_path, {"artifacts": sorted(artifacts, key=_canonical)})
+        _write_canonical(root, output_path, {"artifacts": sorted(artifacts, key=_canonical)})
         print(output_path)
         return 0
     _verify_import_inventory(root / "imported-artifacts.json")

@@ -3,10 +3,12 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from zoneinfo import ZoneInfo
 
 from scripts.reconciliation_manifest import (
@@ -16,6 +18,7 @@ from scripts.reconciliation_manifest import (
     PeriodIdentity,
     ReconciliationCoordinator,
     ReconciliationManifest,
+    _write_canonical,
 )
 
 
@@ -119,6 +122,14 @@ def append_events(
 def complete_event_types() -> list[str]:
     return [
         "period_opened", "collection_complete", "reconciliation_complete",
+    ]
+
+
+def publication_event_types() -> list[str]:
+    return [
+        "period_opened", "collection_complete", "reconciliation_complete", "review_approved",
+        "posting_started", "posting_complete", "clockify_readback_verified", "publication_prepared",
+        "publication_authorized", "shared_report_verified", "publication_complete",
     ]
 
 
@@ -370,6 +381,69 @@ class ReconciliationCoordinatorTests(unittest.TestCase):
                 with self.assertRaises(ManifestError):
                     ReconciliationCoordinator(self.identity, store).derive()
 
+    def test_requires_period_opened_as_the_first_event(self) -> None:
+        self.store.append(self.identity, "collection_complete", {}, occurred_at=NOW)
+
+        with self.assertRaisesRegex(ManifestError, "first event must be period_opened"):
+            self.coordinator().derive()
+
+    def test_active_blocker_before_happy_path_prevents_publication(self) -> None:
+        event_types = [
+            "period_opened", "collection_complete", "coverage_incomplete",
+            *publication_event_types()[2:],
+        ]
+        append_events(self.store, self.identity, event_types, self.artifact)
+
+        with self.assertRaisesRegex(ManifestError, "active blockers"):
+            self.coordinator().derive()
+
+    def test_rejects_every_event_after_publication_complete(self) -> None:
+        append_events(self.store, self.identity, publication_event_types() + ["coverage_incomplete"], self.artifact)
+
+        with self.assertRaisesRegex(ManifestError, "after publication_complete"):
+            self.coordinator().derive()
+
+    def test_resolving_events_clear_only_their_mapped_active_blocker(self) -> None:
+        cases = (
+            ("coverage_incomplete", "collection_complete", ["period_opened"], "reconciling"),
+            ("semantic_exceptions", "reconciliation_complete", ["period_opened", "collection_complete"], "awaiting_review"),
+            ("awaiting_approval", "review_approved", ["period_opened", "collection_complete", "reconciliation_complete"], "approved"),
+            ("post_interrupted", "posting_complete", ["period_opened", "collection_complete", "reconciliation_complete", "review_approved", "posting_started"], "verifying"),
+            ("readback_mismatch", "clockify_readback_verified", ["period_opened", "collection_complete", "reconciliation_complete", "review_approved", "posting_started", "posting_complete"], "verifying"),
+            ("report_mismatch", "shared_report_verified", ["period_opened", "collection_complete", "reconciliation_complete", "review_approved", "posting_started", "posting_complete", "clockify_readback_verified", "publication_prepared", "publication_authorized"], "publication_authorized"),
+            ("currency_quote_unavailable", "publication_prepared", ["period_opened", "collection_complete", "reconciliation_complete", "review_approved", "posting_started", "posting_complete", "clockify_readback_verified"], "publication_prepared"),
+            ("publication_deferred", "publication_authorized", ["period_opened", "collection_complete", "reconciliation_complete", "review_approved", "posting_started", "posting_complete", "clockify_readback_verified", "publication_prepared"], "publication_authorized"),
+        )
+        for index, (blocker, resolver, prefix, state) in enumerate(cases):
+            with self.subTest(blocker=blocker):
+                store = CoordinatorEventStore(self.root / f"resolution-{index}.jsonl")
+                append_events(store, self.identity, [*prefix, blocker, resolver], self.artifact)
+
+                manifest = ReconciliationCoordinator(self.identity, store).derive()
+
+                self.assertEqual(state, manifest.state)
+                self.assertNotIn(blocker, manifest.blockers)
+
+    def test_coverage_limitation_approval_resolves_coverage_without_advancing(self) -> None:
+        append_events(self.store, self.identity, [
+            "period_opened", "coverage_incomplete", "coverage_limitation_approved",
+        ], self.artifact)
+
+        manifest = self.coordinator().derive()
+
+        self.assertEqual("collecting", manifest.state)
+        self.assertNotIn("coverage_incomplete", manifest.blockers)
+
+    def test_resolving_one_blocker_keeps_other_active_blockers(self) -> None:
+        append_events(self.store, self.identity, [
+            "period_opened", "coverage_incomplete", "semantic_exceptions", "collection_complete",
+        ], self.artifact)
+
+        manifest = self.coordinator().derive()
+
+        self.assertEqual("reconciling", manifest.state)
+        self.assertEqual(("semantic_exceptions",), manifest.blockers)
+
     def test_authorization_and_publication_require_bound_receipts(self) -> None:
         cases = (
             ["period_opened", "collection_complete", "reconciliation_complete", "review_approved", "posting_started", "posting_complete", "clockify_readback_verified", "publication_prepared", "publication_authorized", "shared_report_verified", "publication_complete"],
@@ -413,7 +487,7 @@ class ReconciliationCoordinatorTests(unittest.TestCase):
 
         self.assertEqual("collecting", manifest.state)
         self.assertEqual((
-            "awaiting_approval", "coverage_incomplete", "currency_quote_unavailable", "post_interrupted",
+            "awaiting_approval", "currency_quote_unavailable", "post_interrupted",
             "publication_deferred", "readback_mismatch", "report_mismatch", "semantic_exceptions",
         ), manifest.blockers)
 
@@ -502,6 +576,32 @@ class ReconciliationManifestCliTests(unittest.TestCase):
         self.assertNotEqual(0, result.returncode)
         self.assertIn("artifact digest mismatch", result.stderr)
 
+    def test_init_ignores_a_predictable_temp_symlink_without_touching_its_target(self) -> None:
+        self.root.mkdir()
+        outside = self.root.parent / "outside-init.json"
+        outside.write_text("unchanged", encoding="utf-8")
+        os.symlink(outside, self.root / "period-manifest.json.tmp")
+
+        result = self.run_cli(*self.init_arguments())
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("unchanged", outside.read_text(encoding="utf-8"))
+        self.assertTrue(self.manifest.exists())
+
+    def test_import_ignores_a_predictable_temp_symlink_without_touching_its_target(self) -> None:
+        self.assertEqual(0, self.run_cli(*self.init_arguments()).returncode)
+        outside = self.root.parent / "outside-import.json"
+        outside.write_text("unchanged", encoding="utf-8")
+        os.symlink(outside, self.root / "imported-artifacts.json.tmp")
+        diagnostic = self.root.parent / "diagnostic.json"
+        diagnostic.write_text(json.dumps({"artifacts": []}), encoding="utf-8")
+
+        result = self.run_cli("import-artifacts", "--events", str(self.events), "--manifest", str(self.manifest),
+                              "--diagnostic", str(diagnostic), "--output", str(self.root / "imported-artifacts.json"))
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("unchanged", outside.read_text(encoding="utf-8"))
+
     def test_import_rejects_a_manifest_stale_against_the_event_history(self) -> None:
         self.assertEqual(0, self.run_cli(*self.init_arguments()).returncode)
         identity = ReconciliationManifest.from_document(json.loads(self.manifest.read_text(encoding="utf-8"))).identity
@@ -527,6 +627,71 @@ class ReconciliationManifestCliTests(unittest.TestCase):
         )
         self.assertNotEqual(0, result.returncode)
         self.assertIn("private recovery root", result.stderr)
+
+
+class ReconciliationManifestAtomicWriteTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name) / "recovery"
+        self.root.mkdir()
+        self.target = self.root / "period-manifest.json"
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def assert_no_owned_temp(self) -> None:
+        self.assertEqual([], list(self.root.glob(".period-manifest.json.*.tmp")))
+
+    def test_write_failure_cleans_up_the_owned_temp_without_mutating_target(self) -> None:
+        outside = self.root.parent / "outside.json"
+        outside.write_text("unchanged", encoding="utf-8")
+        with mock.patch("scripts.reconciliation_manifest.os.write", side_effect=OSError("write failed")):
+            with self.assertRaises(ManifestError):
+                _write_canonical(self.root, self.target, {"safe": True})
+
+        self.assertFalse(self.target.exists())
+        self.assertEqual("unchanged", outside.read_text(encoding="utf-8"))
+        self.assert_no_owned_temp()
+
+    def test_fsync_failure_cleans_up_the_owned_temp_without_mutating_target(self) -> None:
+        outside = self.root.parent / "outside.json"
+        outside.write_text("unchanged", encoding="utf-8")
+        with mock.patch("scripts.reconciliation_manifest.os.fsync", side_effect=OSError("fsync failed")):
+            with self.assertRaises(ManifestError):
+                _write_canonical(self.root, self.target, {"safe": True})
+
+        self.assertFalse(self.target.exists())
+        self.assertEqual("unchanged", outside.read_text(encoding="utf-8"))
+        self.assert_no_owned_temp()
+
+    def test_parent_swap_to_symlink_after_validation_fails_closed(self) -> None:
+        parent = self.root / "nested"
+        parent.mkdir()
+        target = parent / "period-manifest.json"
+        moved = self.root / "moved"
+        outside = self.root.parent / "outside"
+        outside.mkdir()
+        outside_target = outside / "period-manifest.json"
+        outside_target.write_text("unchanged", encoding="utf-8")
+        real_open = os.open
+        swapped = False
+
+        def swap_parent(path: object, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+            nonlocal swapped
+            path_value = Path(path)
+            if not swapped and (path_value == Path("nested") or path_value.parent == parent):
+                parent.rename(moved)
+                os.symlink(outside, parent)
+                swapped = True
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with mock.patch("scripts.reconciliation_manifest.os.open", side_effect=swap_parent):
+            with self.assertRaises(ManifestError):
+                _write_canonical(self.root, target, {"safe": True})
+
+        self.assertTrue(swapped)
+        self.assertEqual("unchanged", outside_target.read_text(encoding="utf-8"))
+        self.assertFalse((moved / "period-manifest.json").exists())
 
 
 if __name__ == "__main__":
