@@ -640,7 +640,6 @@ class ReviewRunResultTests(unittest.TestCase):
                 for name in (
                     "period-manifest.json", "routing.json", "review-corrections.jsonl",
                     "review-acceptance.jsonl", "fathom-reconciliation.json",
-                    "completion-bundle.json",
                 ):
                     path = replay / name
                     original = path.read_bytes()
@@ -658,35 +657,66 @@ class ReviewRunResultTests(unittest.TestCase):
                     with self.assertRaises(ValueError, msg=name):
                         review_run._verify_replay_integrity(source, replay)
                     path.write_bytes(original)
+                bundle_path = source / "completion-bundle.json"
+                original = bundle_path.read_bytes()
+                bundle_path.write_bytes(original + b"\n")
+                with self.assertRaises(ValueError, msg="completion-bundle.json"):
+                    review_run._verify_replay_integrity(source, replay)
+                bundle_path.write_bytes(original)
 
     def test_replay_rejects_drift_or_loss_of_every_manifest_artifact(self):
         """Catches binding that validates bundles but trusts other manifest references."""
         with tempfile.TemporaryDirectory() as tmp:
             runs = Path(tmp) / "runs"
             source, replay = self._complete_replay_fixture(runs)
-            for run_dir in (source, replay):
-                artifact = run_dir / "safe-generic-artifact.json"
-                write_json(artifact, {"kind": "safe-fixture", "version": 1})
-                manifest_path = run_dir / "period-manifest.json"
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                manifest["artifacts"].append({
-                    "path": str(artifact.resolve()),
-                    "schema_version": "safe-generic/v1",
-                    "compatibility_version": "safe-generic/v1",
-                    "digest": "sha256:" + hashlib.sha256(artifact.read_bytes()).hexdigest(),
-                })
-                unsigned = dict(manifest)
-                unsigned.pop("manifest_digest")
-                manifest["manifest_digest"] = "sha256:" + hashlib.sha256(
-                    json.dumps(unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-                ).hexdigest()
-                write_json(manifest_path, manifest)
+            artifact = source / "safe-generic-artifact.json"
+            write_json(artifact, {"kind": "safe-fixture", "version": 1})
+            manifest_path = source / "period-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["artifacts"].append({
+                "path": str(artifact.resolve()),
+                "schema_version": "safe-generic/v1",
+                "compatibility_version": "safe-generic/v1",
+                "digest": "sha256:" + hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            })
+            unsigned = dict(manifest)
+            unsigned.pop("manifest_digest")
+            manifest["manifest_digest"] = "sha256:" + hashlib.sha256(
+                json.dumps(unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            write_json(manifest_path, manifest)
+            (replay / "period-manifest.json").write_bytes(manifest_path.read_bytes())
 
             with mock.patch.object(review_run, "RUNS", runs):
                 self.assertEqual("pass", review_run._verify_replay_integrity(source, replay)["status"])
-                (replay / "safe-generic-artifact.json").unlink()
+                artifact.unlink()
                 with self.assertRaises(review_run.ReviewRunError):
                     review_run._verify_replay_integrity(source, replay)
+
+    def test_replay_binds_exact_manifest_bytes_including_artifact_paths(self):
+        """Catches normalized identities accepting a different artifact location."""
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            source, replay = self._complete_replay_fixture(runs)
+            original_bundle = replay / "completion-bundle.json"
+            alternate_bundle = replay / "alternate-completion-bundle.json"
+            alternate_bundle.write_bytes(original_bundle.read_bytes())
+            manifest_path = replay / "period-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["artifacts"][0]["path"] = str(alternate_bundle.resolve())
+            unsigned = dict(manifest)
+            unsigned.pop("manifest_digest")
+            manifest["manifest_digest"] = "sha256:" + hashlib.sha256(
+                json.dumps(
+                    unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest()
+            write_json(manifest_path, manifest)
+
+            with mock.patch.object(review_run, "RUNS", runs), self.assertRaisesRegex(
+                ValueError, "reconciliation period binding differs"
+            ):
+                review_run._verify_replay_integrity(source, replay)
 
     def test_normal_run_snapshots_binding_inputs_before_replay_preparation(self):
         """Catches replay requiring files that normal collection never persisted."""
@@ -906,6 +936,9 @@ class ReviewRunResultTests(unittest.TestCase):
             write_json(run_dir / "routing.json", {"session_routes": [], "meeting_routes": []})
             (run_dir / "review-corrections.jsonl").write_text("", encoding="utf-8")
             (run_dir / "review-acceptance.jsonl").write_text("", encoding="utf-8")
+        (replay / "period-manifest.json").write_bytes(
+            (source / "period-manifest.json").read_bytes()
+        )
         return source, replay
 
     def test_replay_range_options_are_rejected_before_any_process_runs(self):

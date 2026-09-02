@@ -565,30 +565,11 @@ def _reconciliation_binding(
     if not isinstance(meeting, list):
         raise ReviewRunError("canonical meeting reconciliation must be a list")
 
-    manifest_identity = {
-        "schema_version": manifest_document["schema_version"],
-        "compatibility_version": manifest_document["compatibility_version"],
-        "period": manifest_document["period"],
-        "state": manifest_document["state"],
-        "event_count": manifest_document["event_count"],
-        "events_digest": manifest_document["events_digest"],
-        "artifacts": [
-            {
-                "schema_version": reference["schema_version"],
-                "compatibility_version": reference["compatibility_version"],
-                "digest": reference["digest"],
-            }
-            for reference in manifest.artifacts
-        ],
-        "blockers": manifest_document["blockers"],
-    }
     bundle_digest = "sha256:" + hashlib.sha256(
         json.dumps(bundle_records, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
     return {
-        "period_manifest_sha256": "sha256:" + hashlib.sha256(
-            json.dumps(manifest_identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest(),
+        "period_manifest_sha256": digests["period_manifest"],
         "period_id": manifest.identity.period_id,
         "period_revision": str(manifest.identity.revision),
         "period_events_digest": manifest.events_digest,
