@@ -1241,6 +1241,62 @@ class ReviewRunResultTests(unittest.TestCase):
             self.assertEqual(1, run.call_count)
             process_run.assert_not_called()
 
+    def test_fresh_run_accepts_collecting_period_without_completion_bundles(self):
+        """A new period must bootstrap before its own bundles can exist."""
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            run_dir = runs / "run-collecting-manifest"
+            run_dir.mkdir(parents=True)
+            (run_dir / "run-report.md").write_text("# fixture\n", encoding="utf-8")
+            write_json(run_dir / "run-report.json", {
+                "evidence": {"calendly": {"status": "excluded", "complete": True}},
+                "evidence_ledger": {
+                    "source_completeness": {"status": "complete", "incomplete_sources": []}
+                },
+            })
+            write_json(run_dir / "evidence" / "evidence-ledger.json", {
+                "manifest": {
+                    "source_completeness": {"status": "complete", "incomplete_sources": []}
+                }
+            })
+            inputs = Path(tmp) / "inputs"
+            self._write_reconciliation_snapshots(inputs)
+            manifest = json.loads((inputs / "period-manifest.json").read_text())
+            manifest.update({
+                "state": "collecting",
+                "event_count": 1,
+                "events_digest": "sha256:" + "a" * 64,
+                "artifacts": [],
+                "blockers": [],
+            })
+            unsigned = {key: value for key, value in manifest.items() if key != "manifest_digest"}
+            manifest["manifest_digest"] = "sha256:" + hashlib.sha256(
+                json.dumps(
+                    unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest()
+            write_json(inputs / "period-manifest.json", manifest)
+            collected = subprocess.CompletedProcess(
+                args=["collector"], returncode=0,
+                stdout=str(run_dir / "run-report.md") + "\n", stderr="",
+            )
+            result_path = run_dir / "autopilot-result.json"
+
+            with mock.patch.object(review_run, "RUNS", runs), mock.patch.object(
+                review_run, "_run", return_value=collected
+            ), mock.patch.object(
+                review_run, "_process_run", return_value=(0, result_path)
+            ) as process_run:
+                code = review_run.main([
+                    "--period-manifest", str(inputs / "period-manifest.json"),
+                    "--routing", str(inputs / "routing.json"),
+                    "--corrections", str(inputs / "review-corrections.jsonl"),
+                    "--acceptance-ledger", str(inputs / "review-acceptance.jsonl"),
+                ])
+
+            self.assertEqual(0, code)
+            process_run.assert_called_once()
+
     def test_healthy_carried_queue_requires_no_comment(self):
         snapshot = {
             "summary": {

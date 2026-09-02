@@ -609,7 +609,7 @@ def _read_snapshot_source(path: Path, *, label: str) -> bytes:
 
 
 def _validated_period_manifest(
-    path: Path,
+    path: Path, *, allow_collecting_bootstrap: bool = False,
 ) -> tuple[
     dict[str, Any], reconciliation_manifest.ReconciliationManifest,
     list[dict[str, str]], bytes,
@@ -651,7 +651,14 @@ def _validated_period_manifest(
             "bundle_digest": bundle.bundle_digest,
             "artifact_sha256": str(reference["digest"]),
         })
-    if not bundles:
+    collecting_bootstrap = (
+        allow_collecting_bootstrap
+        and manifest.state == "collecting"
+        and manifest.event_count == 1
+        and not manifest.artifacts
+        and not manifest.blockers
+    )
+    if not bundles and not collecting_bootstrap:
         raise ReviewRunError("reconciliation period manifest has no completion bundles")
     if len({record["slice_id"] for record in bundles}) != len(bundles):
         raise ReviewRunError("reconciliation period manifest repeats a completion bundle slice")
@@ -1379,7 +1386,9 @@ def main(argv: list[str] | None = None) -> int:
         run_args.corrections = snapshots["review-corrections.jsonl"]
         run_args.acceptance_ledger = snapshots["review-acceptance.jsonl"]
         try:
-            _validated_period_manifest(run_args.period_manifest)
+            _validated_period_manifest(
+                run_args.period_manifest, allow_collecting_bootstrap=True,
+            )
         except ReviewRunError as exc:
             print(
                 f"clockify review run: period manifest preflight failed: {exc}",
