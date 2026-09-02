@@ -634,6 +634,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("run_id", help="Run directory name or 'latest'")
     parser.add_argument("--runs-root", type=Path, default=RUNS)
     parser.add_argument("--root", type=Path, default=ROOT)
+    parser.add_argument("--routing", type=Path)
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -657,7 +658,7 @@ def main(argv: list[str] | None = None) -> int:
 
     proposals = get_proposals(run_dir)
     enriched = get_enriched_context(run_dir)
-    routing = get_routing(args.root)
+    routing = load_json(args.routing) if args.routing is not None else get_routing(args.root)
     routes = _quality_routes(routing)
     clockify_path = run_dir / "evidence" / "clockify-existing.json"
     existing_document = load_json(clockify_path) if clockify_path.exists() else {}

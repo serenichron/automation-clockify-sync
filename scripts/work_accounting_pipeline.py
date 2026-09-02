@@ -1042,6 +1042,7 @@ def run_accounting(
     run_dir: Path,
     *,
     root: Path,
+    routing_path: Path | None = None,
     analysis_fixture: Path | None = None,
     corrections_path: Path | None = None,
     analyzer_cache_path: Path | None = None,
@@ -1076,7 +1077,7 @@ def run_accounting(
     except meeting_reconciliation.MeetingReconciliationError as exc:
         raise WorkAccountingError(f"ledger member identities are invalid: {exc}") from exc
     analysis_events, noise = _analysis_events(all_events, member_identities)
-    routing = _read_json(root / "routing.json")
+    routing = _read_json(routing_path or (root / "routing.json"))
     corrections = _load_corrections(corrections_path)
     regression_cases = _load_regression_cases(corrections_path)
     _write_json(run_dir / "review-learning-cases.json", corrections)
@@ -1639,6 +1640,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_dir", type=Path)
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument("--routing", type=Path)
     parser.add_argument("--analysis-fixture", type=Path)
     parser.add_argument("--corrections", type=Path)
     parser.add_argument("--analyzer-cache", type=Path)
@@ -1654,6 +1656,7 @@ def main(argv: list[str] | None = None) -> int:
         run_accounting(
             args.run_dir.resolve(),
             root=args.root.resolve(),
+            routing_path=args.routing,
             analysis_fixture=args.analysis_fixture,
             corrections_path=args.corrections,
             analyzer_cache_path=args.analyzer_cache,

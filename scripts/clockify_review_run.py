@@ -518,10 +518,9 @@ def _accounting_identity(run_dir: Path) -> dict[str, str]:
 
 
 def _file_sha256(path: Path, *, label: str) -> str:
-    path = Path(path)
-    if not path.is_file() or path.is_symlink():
-        raise ReviewRunError(f"{label} is missing or unsafe")
-    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+    return "sha256:" + hashlib.sha256(
+        _read_snapshot_source(Path(path), label=label)
+    ).hexdigest()
 
 
 def _reconciliation_binding(
@@ -541,51 +540,19 @@ def _reconciliation_binding(
     run_dir = Path(run_dir).resolve()
     if not run_dir.is_dir() or run_dir.is_symlink():
         raise ReviewRunError("reconciliation run is missing or unsafe")
-    inputs = {
-        "period_manifest": Path(period_manifest), "routing": Path(routing),
-        "corrections": Path(corrections), "acceptance": Path(acceptance),
-    }
+    manifest_document, manifest, bundle_records, manifest_content = (
+        _validated_period_manifest(Path(period_manifest))
+    )
     digests = {
-        name: _file_sha256(path, label=f"reconciliation {name.replace('_', ' ')}")
-        for name, path in inputs.items()
+        "period_manifest": "sha256:" + hashlib.sha256(manifest_content).hexdigest(),
+        "routing": _file_sha256(Path(routing), label="reconciliation routing"),
+        "corrections": _file_sha256(
+            Path(corrections), label="reconciliation corrections"
+        ),
+        "acceptance": _file_sha256(
+            Path(acceptance), label="reconciliation acceptance"
+        ),
     }
-    try:
-        manifest_document = _read_json(inputs["period_manifest"])
-        manifest = reconciliation_manifest.ReconciliationManifest.from_document(
-            manifest_document
-        )
-    except (
-        OSError, json.JSONDecodeError, reconciliation_manifest.ManifestError,
-    ) as exc:
-        raise ReviewRunError("reconciliation period manifest is invalid") from exc
-
-    bundle_records: list[dict[str, str]] = []
-    for reference in manifest.artifacts:
-        try:
-            artifact_path = Path(str(reference["path"]))
-            if _file_sha256(artifact_path, label="reconciliation manifest artifact") != reference["digest"]:
-                raise ReviewRunError("reconciliation manifest artifact differs from its manifest")
-        except (OSError, ValueError) as exc:
-            raise ReviewRunError("reconciliation manifest artifact is invalid") from exc
-        if reference["schema_version"] != _COMPLETION_BUNDLE_SCHEMA:
-            continue
-        try:
-            bundle = collector_receipts.load_completion_bundle(
-                artifact_path, run_dir=artifact_path.parent,
-            )
-        except (OSError, ValueError, collector_receipts.CollectorReceiptError) as exc:
-            raise ReviewRunError("reconciliation completion bundle is invalid") from exc
-        bundle_records.append({
-            "slice_id": bundle.slice_id,
-            "since_utc": bundle.since_utc,
-            "until_utc": bundle.until_utc,
-            "bundle_digest": bundle.bundle_digest,
-            "artifact_sha256": str(reference["digest"]),
-        })
-    if not bundle_records:
-        raise ReviewRunError("reconciliation period manifest has no completion bundles")
-    if len({record["slice_id"] for record in bundle_records}) != len(bundle_records):
-        raise ReviewRunError("reconciliation period manifest repeats a completion bundle slice")
 
     meeting_path = run_dir / _CANONICAL_MEETING_RECONCILIATION
     meeting_digest = _file_sha256(
@@ -658,6 +625,56 @@ def _read_snapshot_source(path: Path, *, label: str) -> bytes:
         return b"".join(chunks)
     finally:
         os.close(descriptor)
+
+
+def _validated_period_manifest(
+    path: Path,
+) -> tuple[
+    dict[str, Any], reconciliation_manifest.ReconciliationManifest,
+    list[dict[str, str]], bytes,
+]:
+    """Validate one exact manifest snapshot and every referenced artifact."""
+    content = _read_snapshot_source(path, label="reconciliation period manifest")
+    try:
+        document = json.loads(content)
+        manifest = reconciliation_manifest.ReconciliationManifest.from_document(document)
+    except (
+        UnicodeDecodeError, json.JSONDecodeError, reconciliation_manifest.ManifestError,
+    ) as exc:
+        raise ReviewRunError("reconciliation period manifest is invalid") from exc
+    if not isinstance(document, dict):
+        raise ReviewRunError("reconciliation period manifest is invalid")
+
+    bundles: list[dict[str, str]] = []
+    for reference in manifest.artifacts:
+        artifact_path = Path(str(reference["path"]))
+        if (
+            _file_sha256(artifact_path, label="reconciliation manifest artifact")
+            != reference["digest"]
+        ):
+            raise ReviewRunError(
+                "reconciliation manifest artifact differs from its manifest"
+            )
+        if reference["schema_version"] != _COMPLETION_BUNDLE_SCHEMA:
+            continue
+        try:
+            bundle = collector_receipts.load_completion_bundle(
+                artifact_path, run_dir=artifact_path.parent,
+            )
+        except (OSError, ValueError, collector_receipts.CollectorReceiptError) as exc:
+            raise ReviewRunError("reconciliation completion bundle is invalid") from exc
+        bundles.append({
+            "slice_id": bundle.slice_id,
+            "since_utc": bundle.since_utc,
+            "until_utc": bundle.until_utc,
+            "bundle_digest": bundle.bundle_digest,
+            "artifact_sha256": str(reference["digest"]),
+        })
+    if not bundles:
+        raise ReviewRunError("reconciliation period manifest has no completion bundles")
+    if len({record["slice_id"] for record in bundles}) != len(bundles):
+        raise ReviewRunError("reconciliation period manifest repeats a completion bundle slice")
+    return document, manifest, bundles, content
 
 
 def _write_snapshot(target: Path, content: bytes, *, label: str) -> None:
@@ -1093,6 +1110,8 @@ def _process_run(
         str(run_dir),
         "--root",
         str(ROOT),
+        "--routing",
+        str(args.routing),
         "--corrections",
         str(args.corrections),
         "--analyzer-cache",
@@ -1162,6 +1181,8 @@ def _process_run(
             str(RUNS),
             "--root",
             str(ROOT),
+            "--routing",
+            str(args.routing),
         ]
     )
     if checked.returncode != 0:
@@ -1376,6 +1397,14 @@ def main(argv: list[str] | None = None) -> int:
         run_args.routing = snapshots["routing.json"]
         run_args.corrections = snapshots["review-corrections.jsonl"]
         run_args.acceptance_ledger = snapshots["review-acceptance.jsonl"]
+        try:
+            _validated_period_manifest(run_args.period_manifest)
+        except ReviewRunError as exc:
+            print(
+                f"clockify review run: period manifest preflight failed: {exc}",
+                file=sys.stderr,
+            )
+            return 2
         acceptance_gate = _acceptance_gate(run_args.acceptance_ledger)
         if run_args.review_mode == "exceptions_only" and not acceptance_gate.get(
             "exceptions_only_eligible"

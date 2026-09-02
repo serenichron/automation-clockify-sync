@@ -57,6 +57,19 @@ def _positive_int(environment: Mapping[str, str], name: str, default: int) -> in
     return value
 
 
+def _required_input(environment: Mapping[str, str], name: str) -> Path:
+    raw = str(environment.get(name) or "").strip()
+    if not raw:
+        raise ConfigurationError(f"{name} is required")
+    requested = Path(raw).expanduser()
+    if not requested.is_absolute():
+        raise ConfigurationError(f"{name} must be absolute")
+    resolved = requested.resolve()
+    if resolved != requested or not resolved.is_file() or resolved.is_symlink():
+        raise ConfigurationError(f"{name} must name a safe regular file")
+    return resolved
+
+
 def _timeout_config(
     environment: Mapping[str, str], *, has_coverage_debt: bool
 ) -> ChildTimeoutConfig:
@@ -363,6 +376,13 @@ def run(environment: Mapping[str, str] | None = None) -> int:
         max_retries = _positive_int(
             environment, "CLOCKIFY_AUTOPILOT_MAX_COVERAGE_RETRIES", 2
         )
+        for name in (
+            "CLOCKIFY_AUTOPILOT_PERIOD_MANIFEST",
+            "CLOCKIFY_AUTOPILOT_ROUTING",
+            "CLOCKIFY_AUTOPILOT_CORRECTIONS",
+            "CLOCKIFY_AUTOPILOT_ACCEPTANCE_LEDGER",
+        ):
+            _required_input(environment, name)
         _timeout_config(environment, has_coverage_debt=False)
         if not (root / "scripts" / "clockify_review_run.py").is_file():
             raise ConfigurationError("Clockify review entrypoint is unavailable")

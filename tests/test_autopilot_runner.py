@@ -213,7 +213,36 @@ class AutopilotRunnerTests(unittest.TestCase):
             "CLOCKIFY_AUTOPILOT_LOCK": str(root / "state" / "runner.lock"),
             "CLOCKIFY_AUTOPILOT_MAX_COVERAGE_RETRIES": "2",
         }
+        for variable, filename in (
+            ("CLOCKIFY_AUTOPILOT_PERIOD_MANIFEST", "period-manifest.json"),
+            ("CLOCKIFY_AUTOPILOT_ROUTING", "routing.json"),
+            ("CLOCKIFY_AUTOPILOT_CORRECTIONS", "review-corrections.jsonl"),
+            ("CLOCKIFY_AUTOPILOT_ACCEPTANCE_LEDGER", "review-acceptance.jsonl"),
+        ):
+            path = root / "inputs" / filename
+            path.parent.mkdir(exist_ok=True)
+            path.write_text("\n", encoding="utf-8")
+            environment[variable] = str(path)
         return environment, result
+
+    def test_runner_requires_absolute_reconciliation_inputs_before_child_spawn(self):
+        """Catches scheduled runs silently falling back to mutable defaults."""
+        with tempfile.TemporaryDirectory() as directory:
+            environment, _result = self.fixture(directory, "no_comment")
+            for variable, replacement in (
+                ("CLOCKIFY_AUTOPILOT_PERIOD_MANIFEST", None),
+                ("CLOCKIFY_AUTOPILOT_ROUTING", "relative-routing.json"),
+            ):
+                candidate = dict(environment)
+                if replacement is None:
+                    candidate.pop(variable)
+                else:
+                    candidate[variable] = replacement
+                with self.subTest(variable=variable), mock.patch.object(
+                    runner, "run_child_bounded"
+                ) as child:
+                    self.assertEqual(2, runner.run(candidate))
+                    child.assert_not_called()
 
     @staticmethod
     def record_active_debt(environment: dict[str, str]) -> source_coverage.SourceInterval:

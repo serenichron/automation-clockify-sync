@@ -751,6 +751,19 @@ class ReviewRunResultTests(unittest.TestCase):
             self.assertFalse(target.exists())
             self.assertEqual([], list(target.parent.glob(".routing.json.*.tmp")))
 
+    def test_artifact_hash_does_not_follow_a_swapped_symlink(self):
+        """Catches path checks racing a later hash read that follows a link."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outside = root / "outside.json"
+            outside.write_text('{"private":true}\n', encoding="utf-8")
+            artifact = root / "artifact.json"
+            artifact.symlink_to(outside)
+
+            with mock.patch.object(Path, "is_symlink", return_value=False), \
+                    self.assertRaises(review_run.ReviewRunError):
+                review_run._file_sha256(artifact, label="manifest artifact")
+
     def test_replay_source_requires_every_reconciliation_snapshot(self):
         """Catches replay preparation silently skipping a mandatory source snapshot."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -767,7 +780,57 @@ class ReviewRunResultTests(unittest.TestCase):
     @staticmethod
     def _write_reconciliation_snapshots(directory: Path) -> None:
         directory.mkdir(parents=True, exist_ok=True)
-        (directory / "period-manifest.json").write_text("{}\n", encoding="utf-8")
+        bundle_run = directory / "period-bundle-fixture"
+        coverage = {"status": "complete", "incomplete_sources": []}
+        write_json(bundle_run / "run-report.json", {
+            "runtime_identity": {"git_sha": "fixture"},
+            "date_range": {
+                "since": "2026-08-01T00:00:00Z",
+                "until": "2026-08-02T00:00:00Z",
+            },
+            "evidence_ledger": {"source_completeness": coverage},
+        })
+        write_json(bundle_run / "evidence" / "evidence-ledger.json", {
+            "manifest": {"source_completeness": coverage}
+        })
+        write_json(bundle_run / "semantic-analysis.json", {"schema_version": 1})
+        write_json(bundle_run / "work-accounting-result.json", accounting_result())
+        write_json(bundle_run / "quality_report.json", {"status": "pass"})
+        write_json(bundle_run / "review-snapshot.json", {"summary": {}})
+        slice_ = review_run.clockify_sync_collect.plan_slices(
+            dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc),
+            dt.datetime(2026, 8, 2, tzinfo=dt.timezone.utc),
+            zone=review_run.clockify_sync_collect.BUCHAREST,
+        )[0]
+        bundle = collector_receipts.build_completion_bundle(bundle_run, slice_=slice_)
+        bundle_path = bundle_run / "completion-bundle.json"
+        collector_receipts.write_completion_bundle(bundle_path, bundle)
+        manifest = {
+            "schema_version": reconciliation_manifest.MANIFEST_COMPATIBILITY_VERSION,
+            "compatibility_version": reconciliation_manifest.MANIFEST_COMPATIBILITY_VERSION,
+            "period": {
+                "compatibility_version": reconciliation_manifest.PERIOD_COMPATIBILITY_VERSION,
+                "member_id": "member-fixture", "workspace_id": "workspace-fixture",
+                "timezone": "Europe/Bucharest", "since_utc": "2026-08-01T00:00:00Z",
+                "until_utc": "2026-08-02T00:00:00Z", "revision": 1,
+            },
+            "state": "reconciling", "event_count": 2,
+            "events_digest": "sha256:" + "d" * 64,
+            "artifacts": [{
+                "path": str(bundle_path.resolve()),
+                "schema_version": "collector-completion-bundle/v1",
+                "compatibility_version": "collector-completion-bundle/v1",
+                "digest": "sha256:" + hashlib.sha256(bundle_path.read_bytes()).hexdigest(),
+            }],
+            "blockers": [],
+        }
+        unsigned = dict(manifest)
+        manifest["manifest_digest"] = "sha256:" + hashlib.sha256(
+            json.dumps(
+                unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+        write_json(directory / "period-manifest.json", manifest)
         (directory / "routing.json").write_text(
             '{"meeting_routes":[],"session_routes":[]}\n', encoding="utf-8"
         )
@@ -1088,6 +1151,10 @@ class ReviewRunResultTests(unittest.TestCase):
                 str(run_dir / "review-corrections.jsonl"),
                 accounting_command[accounting_command.index("--corrections") + 1],
             )
+            self.assertEqual(
+                str(run_dir / "routing.json"),
+                accounting_command[accounting_command.index("--routing") + 1],
+            )
             cache_index = accounting_command.index("--analyzer-cache") + 1
             self.assertEqual(
                 str(Path(tmp) / "analyzer-cache-v2.jsonl"), accounting_command[cache_index]
@@ -1098,6 +1165,48 @@ class ReviewRunResultTests(unittest.TestCase):
                 ("--analyzer-workers", "4"),
             ):
                 self.assertEqual(expected, accounting_command[accounting_command.index(option) + 1])
+
+    def test_fresh_run_rejects_invalid_period_snapshot_before_accounting(self):
+        """Catches malformed period inputs reaching semantic accounting."""
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            run_dir = runs / "run-invalid-manifest"
+            run_dir.mkdir(parents=True)
+            (run_dir / "run-report.md").write_text("# fixture\n", encoding="utf-8")
+            write_json(run_dir / "run-report.json", {
+                "evidence": {"calendly": {"status": "excluded", "complete": True}},
+                "evidence_ledger": {
+                    "source_completeness": {"status": "complete", "incomplete_sources": []}
+                }
+            })
+            write_json(run_dir / "evidence" / "evidence-ledger.json", {
+                "manifest": {
+                    "source_completeness": {"status": "complete", "incomplete_sources": []}
+                }
+            })
+            inputs = Path(tmp) / "inputs"
+            self._write_reconciliation_snapshots(inputs)
+            (inputs / "period-manifest.json").write_text("{}\n", encoding="utf-8")
+            collected = subprocess.CompletedProcess(
+                args=["collector"], returncode=0,
+                stdout=str(run_dir / "run-report.md") + "\n", stderr="",
+            )
+            with mock.patch.object(review_run, "RUNS", runs), mock.patch.object(
+                review_run, "_run", return_value=collected
+            ) as run, mock.patch.object(
+                review_run, "_process_run",
+                return_value=(0, run_dir / "autopilot-result.json"),
+            ) as process_run:
+                code = review_run.main([
+                    "--period-manifest", str(inputs / "period-manifest.json"),
+                    "--routing", str(inputs / "routing.json"),
+                    "--corrections", str(inputs / "review-corrections.jsonl"),
+                    "--acceptance-ledger", str(inputs / "review-acceptance.jsonl"),
+                ])
+
+            self.assertEqual(2, code)
+            self.assertEqual(1, run.call_count)
+            process_run.assert_not_called()
 
     def test_healthy_carried_queue_requires_no_comment(self):
         snapshot = {

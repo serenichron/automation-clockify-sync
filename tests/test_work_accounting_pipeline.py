@@ -700,7 +700,10 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         self.assertEqual(first["candidate_key"], moved["candidate_key"])
         self.assertNotEqual(first["candidate_key"], second_segment["candidate_key"])
 
-    def make_run(self, events, analysis, *, corrections_path=None):
+    def make_run(
+        self, events, analysis, *, corrections_path=None, root=ROOT,
+        routing_path=None,
+    ):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         run_dir = Path(temp.name) / "runs" / "fixture"
@@ -724,11 +727,32 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         write_json(fixture, analysis)
         result = pipeline.run_accounting(
             run_dir,
-            root=ROOT,
+            root=root,
             analysis_fixture=fixture,
             corrections_path=corrections_path,
+            routing_path=routing_path,
         )
         return run_dir, result
+
+    def test_accounting_uses_explicit_routing_snapshot(self):
+        """Catches replay falling back to mutable repository routing."""
+        meeting = fathom_event(
+            "2026-07-10T13:00:00+03:00",
+            "2026-07-10T13:30:00+03:00",
+            status="available",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "mutable-root"
+            root.mkdir()
+            (root / "routing.json").write_text("{not-json}\n", encoding="utf-8")
+            snapshot = Path(tmp) / "routing-snapshot.json"
+            snapshot.write_bytes((ROOT / "routing.json").read_bytes())
+            _, result = self.make_run(
+                [meeting], meeting_analysis(meeting), root=root,
+                routing_path=snapshot,
+            )
+
+        self.assertEqual(1, len(result["proposals"]))
 
     def test_collector_snapshot_local_minute_fathom_reaches_accounting_in_ledger_timezone(self):
         """The collector's local Fathom minute evidence is normalized before deduplication."""

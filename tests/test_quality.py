@@ -286,6 +286,26 @@ class QualityMatchingTests(unittest.TestCase):
 
 
 class QualityCliTests(unittest.TestCase):
+    def test_cli_uses_explicit_routing_snapshot(self):
+        """Catches replay quality checks reading mutable repository routing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "runs" / "run-1"
+            evidence = run_dir / "evidence"
+            evidence.mkdir(parents=True)
+            (run_dir / "proposals.json").write_text("[]\n")
+            (evidence / "enriched-context.json").write_text("{}\n")
+            (root / "routing.json").write_text("{not-json}\n")
+            snapshot = root / "routing-snapshot.json"
+            snapshot.write_text('{"session_routes": []}\n')
+
+            exit_code = quality.main([
+                "run-1", "--runs-root", str(root / "runs"),
+                "--root", str(root), "--routing", str(snapshot), "--dry-run",
+            ])
+
+        self.assertEqual(0, exit_code)
+
     def test_dry_run_performs_no_write(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
