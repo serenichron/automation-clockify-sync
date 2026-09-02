@@ -324,6 +324,15 @@ class PortfolioReplayTests(unittest.TestCase):
             legacy["identity"]["schema_version"] = 1
             legacy["identity"]["artifacts"]["immutable_ledger"] = replay._digest(ledger)
             legacy["identity"]["artifacts"]["work_accounting_result"] = replay._digest(accounting)
+            legacy["identity"]["reconciliation_binding"] = (
+                replay.clockify_review_run._reconciliation_binding(
+                    paths["run_dir"],
+                    period_manifest=paths["period_manifest"],
+                    routing=paths["routing"],
+                    corrections=paths["corrections"],
+                    acceptance=paths["acceptance"],
+                )
+            )
             for field in (
                 "meeting_reconciliation_digest", "meeting_dedup_version",
                 "meeting_dedup_tolerance_seconds", "meeting_split_digest",
