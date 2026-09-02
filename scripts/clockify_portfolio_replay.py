@@ -260,6 +260,8 @@ def verify(
     if sealed.get("status") != "sealed" or not isinstance(sealed.get("identity"), Mapping):
         raise PortfolioReplayError("invalid portfolio replay seal")
     sealed_identity = sealed["identity"]
+    if not isinstance(sealed_identity.get("reconciliation_binding"), Mapping):
+        raise PortfolioReplayError("portfolio replay seal lacks reconciliation binding")
     if not _MEETING_IDENTITY_FIELDS.issubset(sealed_identity):
         candidate = _identity(
             run_dir=run_dir, review=review, repair=repair, quality=quality,

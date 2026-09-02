@@ -13,10 +13,13 @@ import csv
 import datetime as dt
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 from typing import Any
 
 try:
@@ -34,6 +37,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
 RUNS = ROOT / "runs"
 DEFAULT_STATE = ROOT / "state" / "review-items.json"
+DEFAULT_ROUTING = ROOT / "routing.json"
 DEFAULT_CORRECTIONS = ROOT / "state" / "review-corrections.jsonl"
 DEFAULT_ACCEPTANCE_LEDGER = ROOT / "state" / "review-acceptance.jsonl"
 REVIEW_MODES = {"shadow_all", "exceptions_only"}
@@ -557,14 +561,17 @@ def _reconciliation_binding(
 
     bundle_records: list[dict[str, str]] = []
     for reference in manifest.artifacts:
+        try:
+            artifact_path = Path(str(reference["path"]))
+            if _file_sha256(artifact_path, label="reconciliation manifest artifact") != reference["digest"]:
+                raise ReviewRunError("reconciliation manifest artifact differs from its manifest")
+        except (OSError, ValueError) as exc:
+            raise ReviewRunError("reconciliation manifest artifact is invalid") from exc
         if reference["schema_version"] != _COMPLETION_BUNDLE_SCHEMA:
             continue
         try:
-            bundle_path = Path(str(reference["path"]))
-            if _file_sha256(bundle_path, label="reconciliation completion bundle") != reference["digest"]:
-                raise ReviewRunError("reconciliation completion bundle artifact differs from its manifest")
             bundle = collector_receipts.load_completion_bundle(
-                bundle_path, run_dir=bundle_path.parent,
+                artifact_path, run_dir=artifact_path.parent,
             )
         except (OSError, ValueError, collector_receipts.CollectorReceiptError) as exc:
             raise ReviewRunError("reconciliation completion bundle is invalid") from exc
@@ -627,6 +634,116 @@ def _reconciliation_binding(
     }
 
 
+def _read_snapshot_source(path: Path, *, label: str) -> bytes:
+    """Read one regular file through an owned descriptor without following links."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ReviewRunError(f"{label} is missing or unsafe") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ReviewRunError(f"{label} is missing or unsafe")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 65_536):
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        identity = lambda value: (
+            value.st_dev, value.st_ino, value.st_size,
+            value.st_mtime_ns, value.st_ctime_ns,
+        )
+        if identity(before) != identity(after):
+            raise ReviewRunError(f"{label} changed while being snapshotted")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _write_snapshot(target: Path, content: bytes, *, label: str) -> None:
+    """Create one durable snapshot, accepting only an identical retry."""
+    if target.exists() or target.is_symlink():
+        if _read_snapshot_source(target, label=label) != content:
+            raise ReviewRunError(f"{label} snapshot differs")
+        return
+    descriptor: int | None = None
+    temporary: Path | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+        )
+        temporary = Path(temporary_name)
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise ReviewRunError(f"{label} snapshot write was incomplete")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        try:
+            os.link(temporary, target, follow_symlinks=False)
+        except FileExistsError:
+            if _read_snapshot_source(target, label=label) != content:
+                raise ReviewRunError(f"{label} snapshot differs")
+        directory = os.open(target.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except ReviewRunError:
+        raise
+    except OSError as exc:
+        raise ReviewRunError(f"{label} snapshot write failed") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary is not None:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _reconciliation_input_sources(args: argparse.Namespace) -> dict[str, Path]:
+    sources = {
+        "period-manifest.json": getattr(args, "period_manifest", None),
+        "routing.json": getattr(args, "routing", None),
+        "review-corrections.jsonl": getattr(args, "corrections", None),
+        "review-acceptance.jsonl": getattr(args, "acceptance_ledger", None),
+    }
+    missing = [filename for filename, source in sources.items() if source is None]
+    if missing:
+        raise ReviewRunError(f"normal reconciliation requires {missing[0]}")
+    return {filename: Path(source) for filename, source in sources.items()}
+
+
+def _snapshot_reconciliation_inputs(
+    run_dir: Path,
+    args: argparse.Namespace,
+    *,
+    contents: dict[str, bytes] | None = None,
+) -> dict[str, Path]:
+    """Persist the exact normal-run inputs that a later replay must compare."""
+    run_dir = _run_child(Path(run_dir), label="reconciliation run")
+    sources = _reconciliation_input_sources(args)
+    exact = contents or {
+        filename: _read_snapshot_source(
+            source, label=f"normal reconciliation {filename}"
+        )
+        for filename, source in sources.items()
+    }
+    if set(exact) != set(sources):
+        raise ReviewRunError("normal reconciliation snapshot set is incomplete")
+    targets: dict[str, Path] = {}
+    for filename, content in exact.items():
+        target = run_dir / filename
+        _write_snapshot(target, content, label=f"normal reconciliation {filename}")
+        targets[filename] = target
+    return targets
+
+
 def _prepare_replay_run(source: Path) -> Path:
     """Create a distinct run with immutable ledger and semantic fixture copies."""
     source = _run_child(source, label="replay source")
@@ -640,6 +757,15 @@ def _prepare_replay_run(source: Path) -> Path:
     source_accounting_identity = _accounting_identity(source)
     source_analysis_path = source / "semantic-analysis.json"
     source_analysis_sha256 = hashlib.sha256(source_analysis_path.read_bytes()).hexdigest()
+    reconciliation_snapshots: dict[str, bytes] = {}
+    for filename in _RECONCILIATION_INPUTS.values():
+        source_path = source / filename
+        try:
+            reconciliation_snapshots[filename] = _read_snapshot_source(
+                source_path, label=f"replay source {filename}"
+            )
+        except ReviewRunError as exc:
+            raise ValueError(f"replay source missing reconciliation snapshot: {filename}") from exc
     stem = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ") + f"-replay-{source.name}"
     target = RUNS.resolve() / stem
     suffix = 1
@@ -655,10 +781,11 @@ def _prepare_replay_run(source: Path) -> Path:
         fixture_path = target / "replay-fixture" / "semantic-analysis.json"
         fixture_path.parent.mkdir(parents=True)
         shutil.copyfile(source_analysis_path, fixture_path)
-        for filename in (*_RECONCILIATION_INPUTS.values(), _CANONICAL_MEETING_RECONCILIATION):
-            source_path = source / filename
-            if source_path.is_file() and not source_path.is_symlink():
-                shutil.copyfile(source_path, target / filename)
+        for filename, content in reconciliation_snapshots.items():
+            _write_snapshot(target / filename, content, label=f"replay {filename}")
+        meeting_source = source / _CANONICAL_MEETING_RECONCILIATION
+        if meeting_source.is_file() and not meeting_source.is_symlink():
+            shutil.copyfile(meeting_source, target / _CANONICAL_MEETING_RECONCILIATION)
         report = _read_json(source / "run-report.json")
         if not isinstance(report, dict):
             raise ValueError("replay source run report must be an object")
@@ -923,6 +1050,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Reuse a completed run's immutable evidence ledger in a distinct replay run.",
     )
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
+    parser.add_argument("--period-manifest", type=Path)
+    parser.add_argument("--routing", type=Path, default=DEFAULT_ROUTING)
     parser.add_argument("--corrections", type=Path, default=DEFAULT_CORRECTIONS)
     parser.add_argument(
         "--review-mode",
@@ -1115,44 +1244,82 @@ def _process_run(
     return (2 if completion_error is not None else 0), result_path
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
-    if args.replay_from and (
-        args.since or args.until or args.no_enrich or args.calendly_optional
-        or args.analysis_fixture
-    ):
-        print(
-            "clockify review run: --replay-from cannot be combined with collection "
-            "range/enrichment options or --analysis-fixture",
-            file=sys.stderr,
-        )
-        return 2
-    acceptance_gate: dict[str, Any] = {
+def _acceptance_gate(path: Path) -> dict[str, Any]:
+    gate: dict[str, Any] = {
         "exceptions_only_eligible": False,
         "status": "not_recorded",
     }
-    if args.acceptance_ledger.exists():
-        try:
-            acceptance_gate = review_acceptance.evaluate_gate(
-                review_acceptance.load_ledger(args.acceptance_ledger)
-            )
-            acceptance_gate["status"] = "evaluated"
-        except (OSError, json.JSONDecodeError, review_acceptance.AcceptanceError) as exc:
-            if args.review_mode == "exceptions_only":
-                print(f"clockify review run: acceptance ledger invalid: {exc}", file=sys.stderr)
-                return 2
-            acceptance_gate = {
-                "exceptions_only_eligible": False,
-                "status": "invalid",
-                "reason": str(exc),
-            }
-    if args.review_mode == "exceptions_only" and not acceptance_gate.get("exceptions_only_eligible"):
+    try:
+        gate = review_acceptance.evaluate_gate(review_acceptance.load_ledger(path))
+        gate["status"] = "evaluated"
+    except (OSError, json.JSONDecodeError, review_acceptance.AcceptanceError) as exc:
+        gate = {
+            "exceptions_only_eligible": False,
+            "status": "invalid",
+            "reason": str(exc),
+        }
+    return gate
+
+
+def _acceptance_gate_content(content: bytes) -> dict[str, Any]:
+    """Evaluate the exact bytes retained for a future run snapshot."""
+    with tempfile.NamedTemporaryFile(prefix="clockify-acceptance-") as handle:
+        handle.write(content)
+        handle.flush()
+        return _acceptance_gate(Path(handle.name))
+
+
+def _option_was_supplied(argv: list[str], option: str) -> bool:
+    return option in argv or any(value.startswith(option + "=") for value in argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = parse_args(raw_argv)
+    reconciliation_options = (
+        "--period-manifest", "--routing", "--corrections", "--acceptance-ledger",
+    )
+    if args.replay_from and (
+        args.since or args.until or args.no_enrich or args.calendly_optional
+        or args.analysis_fixture
+        or any(_option_was_supplied(raw_argv, option) for option in reconciliation_options)
+    ):
         print(
-            "clockify review run: exceptions_only is locked until one passing 90% baseline "
-            "and two later consecutive passing 95% guarded periods",
+            "clockify review run: --replay-from cannot be combined with collection "
+            "range/enrichment options, --analysis-fixture, or reconciliation input overrides",
             file=sys.stderr,
         )
         return 2
+    if not args.replay_from and args.period_manifest is None:
+        print(
+            "clockify review run: every fresh run requires --period-manifest",
+            file=sys.stderr,
+        )
+        return 2
+
+    reconciliation_contents: dict[str, bytes] | None = None
+    if not args.replay_from:
+        try:
+            reconciliation_contents = {
+                filename: _read_snapshot_source(
+                    source, label=f"normal reconciliation {filename}"
+                )
+                for filename, source in _reconciliation_input_sources(args).items()
+            }
+        except ReviewRunError as exc:
+            print(f"clockify review run: {exc}", file=sys.stderr)
+            return 2
+        if args.review_mode == "exceptions_only":
+            acceptance_gate = _acceptance_gate_content(
+                reconciliation_contents["review-acceptance.jsonl"]
+            )
+            if not acceptance_gate.get("exceptions_only_eligible"):
+                print(
+                    "clockify review run: exceptions_only is locked until one passing 90% "
+                    "baseline and two later consecutive passing 95% guarded periods",
+                    file=sys.stderr,
+                )
+                return 2
 
     collector_code = 0
     collector_error = ""
@@ -1192,7 +1359,34 @@ def main(argv: list[str] | None = None) -> int:
             return collector_code or 2
 
     for run_dir in run_dirs:
-        code, result_path = _process_run(args, run_dir, acceptance_gate)
+        run_args = argparse.Namespace(**vars(args))
+        if args.replay_from:
+            snapshots = {
+                filename: run_dir / filename for filename in _RECONCILIATION_INPUTS.values()
+            }
+        else:
+            try:
+                snapshots = _snapshot_reconciliation_inputs(
+                    run_dir, args, contents=reconciliation_contents
+                )
+            except ReviewRunError as exc:
+                print(f"clockify review run: cannot snapshot reconciliation inputs: {exc}", file=sys.stderr)
+                return 2
+        run_args.period_manifest = snapshots["period-manifest.json"]
+        run_args.routing = snapshots["routing.json"]
+        run_args.corrections = snapshots["review-corrections.jsonl"]
+        run_args.acceptance_ledger = snapshots["review-acceptance.jsonl"]
+        acceptance_gate = _acceptance_gate(run_args.acceptance_ledger)
+        if run_args.review_mode == "exceptions_only" and not acceptance_gate.get(
+            "exceptions_only_eligible"
+        ):
+            print(
+                "clockify review run: exceptions_only is locked until one passing 90% baseline "
+                "and two later consecutive passing 95% guarded periods",
+                file=sys.stderr,
+            )
+            return 2
+        code, result_path = _process_run(run_args, run_dir, acceptance_gate)
         if code == 0 or result_path.is_file():
             print(result_path)
         if code != 0:

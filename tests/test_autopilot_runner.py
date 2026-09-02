@@ -412,6 +412,30 @@ class AutopilotRunnerTests(unittest.TestCase):
         self.assertIn("--analyzer-max-events-per-chunk", command)
         self.assertEqual("8", command[command.index("--analyzer-workers") + 1])
 
+    def test_command_passes_exact_reconciliation_inputs(self):
+        """Catches scheduled runs omitting the mandatory period snapshots."""
+        with tempfile.TemporaryDirectory() as directory:
+            environment, _result = self.fixture(directory, "no_comment")
+            environment.update({
+                "CLOCKIFY_AUTOPILOT_PERIOD_MANIFEST": "/private/period-manifest.json",
+                "CLOCKIFY_AUTOPILOT_ROUTING": "/private/routing.json",
+                "CLOCKIFY_AUTOPILOT_ACCEPTANCE_LEDGER": "/private/review-acceptance.jsonl",
+            })
+            command = runner._command(environment, Path(directory))
+
+        self.assertIn("--period-manifest", command)
+        self.assertIn("--routing", command)
+        self.assertIn("--acceptance-ledger", command)
+        self.assertEqual(
+            "/private/period-manifest.json",
+            command[command.index("--period-manifest") + 1],
+        )
+        self.assertEqual("/private/routing.json", command[command.index("--routing") + 1])
+        self.assertEqual(
+            "/private/review-acceptance.jsonl",
+            command[command.index("--acceptance-ledger") + 1],
+        )
+
     def test_coverage_warning_retries_twice_then_stops_looping(self):
         with tempfile.TemporaryDirectory() as directory:
             environment, result = self.fixture(

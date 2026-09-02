@@ -211,6 +211,18 @@ class PortfolioReplayTests(unittest.TestCase):
 
         self.assertEqual("pass", report["status"])
 
+    def test_legacy_seal_without_reconciliation_binding_fails_closed(self):
+        """Catches compatibility filtering away mandatory period identities."""
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self.fixture(Path(tmp))
+            sealed = replay.seal(**paths)
+            legacy = copy.deepcopy(sealed)
+            for field in (*replay._MEETING_IDENTITY_FIELDS, "reconciliation_binding"):
+                legacy["identity"].pop(field)
+
+            with self.assertRaisesRegex(replay.PortfolioReplayError, "reconciliation binding"):
+                replay.verify(legacy, **paths)
+
     def test_new_seal_derives_canonical_dedup_identity_from_immutable_recordings(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths = self.fixture(Path(tmp))

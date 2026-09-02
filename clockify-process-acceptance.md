@@ -79,7 +79,7 @@ operational target with four deterministically ordered workers beneath its
 | Zero gap filling | Proven locally | Guarded allocation report and audit |
 | Every eligible Fathom meeting reconciled/excluded | Implemented locally; live denominator missing | Complete paginated Fathom inventory and reconciliation artifact |
 | Replay produces `0 new / 0 changed` | Immutable replay path, evidence-bundle manifest binding, and validated append-only analyzer-decision cache proven locally; live proof missing | First shadow run plus a distinct `--replay-from` run with matching bundle/cache-decision digests, passing `replay-integrity.json`, and `0 new / 0 changed` |
-| Period-bound replay resilience | Proven locally with routine and exceptional synthetic fixtures; live proof missing | Matching period revision/event digest, routing, correction and acceptance identities, canonical meeting reconciliation, and every ordered verified slice bundle; no raw evidence paths or credentials in the binding |
+| Period-bound replay resilience | Proven locally with routine and exceptional synthetic fixtures; live proof missing | Every fresh run snapshots its exact period manifest, routing, corrections, and acceptance inputs before accounting; replay accepts no overrides and consumes only those snapshots, with matching period revision/event digest, canonical meeting reconciliation, and every ordered verified slice bundle; no raw evidence paths or credentials in the binding |
 | Every analyzer route passes digest-bound evaluation | Missing live proof | One verified scorecard per model/tier used in each acceptance period |
 | Versioned 86-record corpus | Proven locally | `tests/fixtures/clockify-regression/v1/manifest.json`; 86 content-addressed records |
 | At least 90% approve unchanged baseline | Missing | One complete integrity-linked `shadow_baseline` report with decisions for every active row, including ambiguous rows |
@@ -109,7 +109,9 @@ operational target with four deterministically ordered workers beneath its
 5. Run one complete July 1 through August 3 read-only shadow reconciliation and
    require complete source manifests, including every eligible Fathom meeting.
 6. Replay the same immutable input and model versions through the same durable
-   state and validated analyzer cache. Require identical cache-decision digests
+   state and validated analyzer cache. Do not supply period, routing,
+   corrections, or acceptance overrides: replay must consume only the four
+   snapshots retained by the source run. Require identical cache-decision digests
    plus matching period/revision, routing, correction, acceptance, canonical
    meeting, and ordered completion-bundle identities, and `0 new / 0 changed`; this is the second run, not an additional
    independently collected period.

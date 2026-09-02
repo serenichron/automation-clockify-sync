@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import hashlib
 import importlib.util
@@ -11,7 +12,7 @@ import subprocess
 import tempfile
 import unittest
 import csv
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 from scripts import collector_receipts, reconciliation_manifest
@@ -202,9 +203,41 @@ class ReviewRunResultTests(unittest.TestCase):
         args = review_run.parse_args(["--calendly-optional"])
         self.assertTrue(args.calendly_optional)
 
+    def test_fresh_run_requires_period_manifest_before_collector(self):
+        """Catches collection starting without an auditable period identity."""
+        collected = subprocess.CompletedProcess(
+            args=["collector"], returncode=0, stdout="", stderr=""
+        )
+        stderr = io.StringIO()
+        with mock.patch.object(review_run, "_run", return_value=collected) as run, \
+                redirect_stderr(stderr):
+            code = review_run.main([])
+
+        self.assertEqual(2, code)
+        self.assertIn("--period-manifest", stderr.getvalue())
+        run.assert_not_called()
+
+    def test_replay_rejects_external_reconciliation_overrides_before_source_access(self):
+        """Catches replay consuming mutable caller inputs instead of source snapshots."""
+        for option, value in (
+            ("--period-manifest", "/tmp/other-period-manifest.json"),
+            ("--routing", "/tmp/other-routing.json"),
+            ("--corrections", "/tmp/other-corrections.jsonl"),
+            ("--acceptance-ledger", "/tmp/other-acceptance.jsonl"),
+        ):
+            with self.subTest(option=option), mock.patch.object(
+                review_run, "_run_child", side_effect=ValueError("source accessed")
+            ) as source_access, redirect_stderr(io.StringIO()):
+                code = review_run.main(["--replay-from", "/tmp/source", option, value])
+
+            self.assertEqual(2, code)
+            source_access.assert_not_called()
+
     def test_completed_slices_are_processed_before_later_collection_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             runs = Path(tmp) / "runs"
+            inputs = Path(tmp) / "inputs"
+            self._write_reconciliation_snapshots(inputs)
             first = runs / "20260816T120000Z"
             second = runs / "20260816T130000Z"
             for run_dir in (first, second):
@@ -249,8 +282,11 @@ class ReviewRunResultTests(unittest.TestCase):
                 side_effect=[(0, first_result), (0, second_result)],
             ) as process_run, redirect_stdout(output):
                 code = review_run.main([
+                    "--period-manifest", str(inputs / "period-manifest.json"),
+                    "--routing", str(inputs / "routing.json"),
                     "--state", str(Path(tmp) / "state.json"),
-                    "--corrections", str(Path(tmp) / "corrections.jsonl"),
+                    "--corrections", str(inputs / "review-corrections.jsonl"),
+                    "--acceptance-ledger", str(inputs / "review-acceptance.jsonl"),
                 ])
 
         self.assertEqual(2, code)
@@ -355,6 +391,7 @@ class ReviewRunResultTests(unittest.TestCase):
             (source / "work-accounting-result.json").write_text(
                 json.dumps(accounting_result(), sort_keys=True) + "\n", encoding="utf-8"
             )
+            self._write_reconciliation_snapshots(source)
 
             with mock.patch.object(review_run, "RUNS", runs):
                 replay = review_run._prepare_replay_run(source)
@@ -404,6 +441,7 @@ class ReviewRunResultTests(unittest.TestCase):
             (source / "work-accounting-result.json").write_text(
                 json.dumps(accounting_result(), sort_keys=True) + "\n", encoding="utf-8"
             )
+            self._write_reconciliation_snapshots(source)
 
             with mock.patch.object(review_run, "RUNS", runs):
                 replay = review_run._prepare_replay_run(source)
@@ -439,6 +477,7 @@ class ReviewRunResultTests(unittest.TestCase):
             (source / "work-accounting-result.json").write_text(
                 json.dumps(accounting_result(), sort_keys=True) + "\n", encoding="utf-8"
             )
+            self._write_reconciliation_snapshots(source)
             blocked_after_command_capture = subprocess.CompletedProcess(
                 args=["accounting"], returncode=2, stdout="", stderr="fixture test stop"
             )
@@ -456,7 +495,6 @@ class ReviewRunResultTests(unittest.TestCase):
                 code = review_run.main([
                     "--replay-from", str(source),
                     "--state", str(Path(tmp) / "state.json"),
-                    "--corrections", str(Path(tmp) / "corrections.jsonl"),
                 ])
 
             self.assertEqual(2, code)
@@ -621,6 +659,121 @@ class ReviewRunResultTests(unittest.TestCase):
                         review_run._verify_replay_integrity(source, replay)
                     path.write_bytes(original)
 
+    def test_replay_rejects_drift_or_loss_of_every_manifest_artifact(self):
+        """Catches binding that validates bundles but trusts other manifest references."""
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            source, replay = self._complete_replay_fixture(runs)
+            for run_dir in (source, replay):
+                artifact = run_dir / "safe-generic-artifact.json"
+                write_json(artifact, {"kind": "safe-fixture", "version": 1})
+                manifest_path = run_dir / "period-manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest["artifacts"].append({
+                    "path": str(artifact.resolve()),
+                    "schema_version": "safe-generic/v1",
+                    "compatibility_version": "safe-generic/v1",
+                    "digest": "sha256:" + hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                })
+                unsigned = dict(manifest)
+                unsigned.pop("manifest_digest")
+                manifest["manifest_digest"] = "sha256:" + hashlib.sha256(
+                    json.dumps(unsigned, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest()
+                write_json(manifest_path, manifest)
+
+            with mock.patch.object(review_run, "RUNS", runs):
+                self.assertEqual("pass", review_run._verify_replay_integrity(source, replay)["status"])
+                (replay / "safe-generic-artifact.json").unlink()
+                with self.assertRaises(review_run.ReviewRunError):
+                    review_run._verify_replay_integrity(source, replay)
+
+    def test_normal_run_snapshots_binding_inputs_before_replay_preparation(self):
+        """Catches replay requiring files that normal collection never persisted."""
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            source, _ = self._complete_replay_fixture(runs)
+            (source / "run-report.md").write_text("# source\n", encoding="utf-8")
+            inputs = Path(tmp) / "inputs"
+            inputs.mkdir()
+            mapping = {
+                "period_manifest": ("period-manifest.json", "period-manifest.json"),
+                "routing": ("routing.json", "routing.json"),
+                "corrections": ("review-corrections.jsonl", "review-corrections.jsonl"),
+                "acceptance_ledger": ("review-acceptance.jsonl", "review-acceptance.jsonl"),
+            }
+            for _, (source_name, target_name) in mapping.items():
+                (inputs / target_name).write_bytes((source / source_name).read_bytes())
+                (source / source_name).unlink()
+            args = argparse.Namespace(
+                period_manifest=inputs / "period-manifest.json",
+                routing=inputs / "routing.json",
+                corrections=inputs / "review-corrections.jsonl",
+                acceptance_ledger=inputs / "review-acceptance.jsonl",
+            )
+
+            with mock.patch.object(review_run, "RUNS", runs):
+                review_run._snapshot_reconciliation_inputs(source, args)
+                replay = review_run._prepare_replay_run(source)
+
+            for _, (source_name, target_name) in mapping.items():
+                self.assertEqual((inputs / target_name).read_bytes(), (source / source_name).read_bytes())
+                self.assertEqual((source / source_name).read_bytes(), (replay / source_name).read_bytes())
+
+            original_routing = (source / "routing.json").read_bytes()
+            (inputs / "routing.json").write_text('{"changed":true}\n', encoding="utf-8")
+            with mock.patch.object(review_run, "RUNS", runs), self.assertRaisesRegex(
+                review_run.ReviewRunError, "snapshot differs"
+            ):
+                review_run._snapshot_reconciliation_inputs(source, args)
+            self.assertEqual(original_routing, (source / "routing.json").read_bytes())
+
+    def test_failed_snapshot_write_leaves_no_partial_target(self):
+        """Catches interrupted writes being mistaken for durable input snapshots."""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "routing.json"
+            original_write = os.write
+            writes = 0
+
+            def interrupt_after_one_byte(descriptor, content):
+                nonlocal writes
+                writes += 1
+                if writes == 1:
+                    return original_write(descriptor, content[:1])
+                raise OSError("simulated interrupted write")
+
+            with mock.patch.object(os, "write", side_effect=interrupt_after_one_byte), \
+                    self.assertRaises(review_run.ReviewRunError):
+                review_run._write_snapshot(
+                    target, b'{"meeting_routes":[],"session_routes":[]}\n', label="routing"
+                )
+
+            self.assertFalse(target.exists())
+            self.assertEqual([], list(target.parent.glob(".routing.json.*.tmp")))
+
+    def test_replay_source_requires_every_reconciliation_snapshot(self):
+        """Catches replay preparation silently skipping a mandatory source snapshot."""
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            source, _ = self._complete_replay_fixture(runs)
+            (source / "run-report.md").write_text("# source\n", encoding="utf-8")
+            (source / "review-acceptance.jsonl").unlink()
+
+            with mock.patch.object(review_run, "RUNS", runs), self.assertRaisesRegex(
+                ValueError, "missing reconciliation snapshot"
+            ):
+                review_run._prepare_replay_run(source)
+
+    @staticmethod
+    def _write_reconciliation_snapshots(directory: Path) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "period-manifest.json").write_text("{}\n", encoding="utf-8")
+        (directory / "routing.json").write_text(
+            '{"meeting_routes":[],"session_routes":[]}\n', encoding="utf-8"
+        )
+        (directory / "review-corrections.jsonl").write_text("", encoding="utf-8")
+        (directory / "review-acceptance.jsonl").write_text("", encoding="utf-8")
+
     @staticmethod
     def _complete_replay_fixture(runs: Path) -> tuple[Path, Path]:
         """Create two isolated, complete synthetic slices with equal identities."""
@@ -703,10 +856,15 @@ class ReviewRunResultTests(unittest.TestCase):
 
     def test_exceptions_only_cannot_start_before_acceptance_gate(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(review_run, "_run") as run:
+            inputs = Path(tmp) / "inputs"
+            self._write_reconciliation_snapshots(inputs)
             code = review_run.main(
                 [
                     "--review-mode", "exceptions_only",
-                    "--acceptance-ledger", str(Path(tmp) / "missing.jsonl"),
+                    "--period-manifest", str(inputs / "period-manifest.json"),
+                    "--routing", str(inputs / "routing.json"),
+                    "--corrections", str(inputs / "review-corrections.jsonl"),
+                    "--acceptance-ledger", str(inputs / "review-acceptance.jsonl"),
                 ]
             )
 
@@ -869,6 +1027,8 @@ class ReviewRunResultTests(unittest.TestCase):
     def test_missing_analyzer_configuration_emits_blocked_local_action_contract(self):
         with tempfile.TemporaryDirectory() as tmp:
             runs = Path(tmp) / "runs"
+            inputs = Path(tmp) / "inputs"
+            self._write_reconciliation_snapshots(inputs)
             run_dir = runs / "run-blocked"
             run_dir.mkdir(parents=True)
             (run_dir / "run-report.json").write_text(json.dumps({
@@ -907,8 +1067,11 @@ class ReviewRunResultTests(unittest.TestCase):
             ) as run:
                 result_code = review_run.main(
                     [
+                        "--period-manifest", str(inputs / "period-manifest.json"),
+                        "--routing", str(inputs / "routing.json"),
                         "--state", str(Path(tmp) / "state.json"),
-                        "--corrections", str(Path(tmp) / "corrections.jsonl"),
+                        "--corrections", str(inputs / "review-corrections.jsonl"),
+                        "--acceptance-ledger", str(inputs / "review-acceptance.jsonl"),
                         "--analyzer-target-body-bytes", "250000",
                         "--analyzer-max-events-per-chunk", "250",
                         "--analyzer-workers", "4",
@@ -921,6 +1084,10 @@ class ReviewRunResultTests(unittest.TestCase):
             self.assertIn("not configured", contract["quality_summary"]["reason"])
             self.assertTrue((run_dir / "autopilot-summary.md").is_file())
             accounting_command = run.call_args_list[1].args[0]
+            self.assertEqual(
+                str(run_dir / "review-corrections.jsonl"),
+                accounting_command[accounting_command.index("--corrections") + 1],
+            )
             cache_index = accounting_command.index("--analyzer-cache") + 1
             self.assertEqual(
                 str(Path(tmp) / "analyzer-cache-v2.jsonl"), accounting_command[cache_index]

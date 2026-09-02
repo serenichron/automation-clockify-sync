@@ -47,8 +47,11 @@ mutation, or schedule approval from a validation deployment. Calendly remains
 excluded. Clockify remains the system of record; the process only creates local
 review artifacts until the applicable guarded approval is granted.
 
-The standard local command is `python3 scripts/clockify_review_run.py`, which
-defaults to `--review-mode shadow_all`. In that mode the full active review
+The standard local command is `python3 scripts/clockify_review_run.py
+--period-manifest <absolute-private-manifest> --routing <absolute-routing>
+--corrections <absolute-corrections> --acceptance-ledger
+<absolute-acceptance-ledger>`, which snapshots all four inputs before accounting
+and defaults to `--review-mode shadow_all`. In that mode the full active review
 denominator is visible, including ambiguous rows. `--review-mode
 exceptions_only --acceptance-ledger state/review-acceptance.jsonl` is locked
 until `scripts/review_acceptance.py status --ledger
@@ -184,7 +187,9 @@ allocation, or correction-regression contracts recorded there.
 7. Replay the exact immutable evidence and model versions through that same
    validation state and its append-only `analyzer-cache-v2.jsonl` with
    `scripts/clockify_review_run.py --replay-from
-   /absolute/path/to/runs/<first-run-id>`. Require a passing
+   /absolute/path/to/runs/<first-run-id>`. Do not pass period, routing,
+   corrections, or acceptance overrides; replay consumes only the source run's
+   four snapshots. Require a passing
    `replay-integrity.json`, identical sealed cache-decision digests, `new=0`,
    `changed=0`, all unresolved active rows as
    `carried_pending`, complete source manifests, passing quality, and explicit

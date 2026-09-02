@@ -16,7 +16,11 @@ The source audit and process-level failure inventory are recorded in
 
 ```bash
 cd /Users/blackthorne/Work/automation-clockify-sync
-python3 scripts/clockify_review_run.py
+python3 scripts/clockify_review_run.py \
+  --period-manifest /absolute/private/path/period-manifest.json \
+  --routing /absolute/private/path/routing.json \
+  --corrections /absolute/private/path/review-corrections.jsonl \
+  --acceptance-ledger /absolute/private/path/review-acceptance.jsonl
 ```
 
 The orchestration command defaults to `--review-mode shadow_all` and runs the
@@ -168,7 +172,7 @@ and raw evidence are never retained.
 
 Each completed slice retains `completion-bundle.json`, which verifies all
 downstream artifacts before a backlog/debt entry may be reused. The bounded
-runner defaults to a 2,700-second slice timeout, a 10,800-second backlog total,
+runner defaults to a 2,700-second slice timeout, a 7,200-second backlog total,
 and a 30-second termination grace; environment configuration may tighten or
 extend those documented budgets. A replay binds the normalized period/revision
 and event digest, routing snapshot, correction and acceptance journals,
@@ -178,6 +182,13 @@ sealing now requires `--period-manifest`, `--corrections`, and `--acceptance`
 in addition to its existing inputs; this is intentionally pre-release
 backward-incompatible. Publication remains deferred to its separate approved
 gate and is never performed by collection or replay.
+
+Every fresh review run requires a period manifest and snapshots that exact
+manifest together with routing, corrections, and acceptance inputs into each
+run directory before accounting. Downstream accounting consumes the snapshots,
+not the mutable source paths. Replays reject caller overrides and consume only
+the source run's complete snapshot set. Missing, unsafe, or conflicting files
+fail before semantic accounting.
 
 Flash analysis and a separate Flash reviewer own semantic classification,
 project/task recommendations, consolidation boundaries, effort judgment, and
@@ -460,6 +471,9 @@ ledger whose status reports `exceptions_only_eligible: true`:
 ```bash
 python3 scripts/clockify_review_run.py \
   --review-mode exceptions_only \
+  --period-manifest /absolute/private/path/period-manifest.json \
+  --routing /absolute/private/path/routing.json \
+  --corrections /absolute/private/path/review-corrections.jsonl \
   --acceptance-ledger state/review-acceptance.jsonl
 ```
 
@@ -488,18 +502,22 @@ python3 scripts/review_acceptance.py status \
 ```
 
 An acceptance replay must not recollect live sources. Run the first shadow pass
-with isolated validation state, then point `--replay-from` at its absolute run
-directory while reusing the same state and corrections files:
+with isolated validation state and all four exact reconciliation inputs, then
+point `--replay-from` at its absolute run directory. Replay accepts no caller
+override for the period manifest, routing, corrections, or acceptance ledger;
+it consumes only the source run's snapshots:
 
 ```bash
 python3 scripts/clockify_review_run.py \
   --since 2026-07-01 --until 2026-08-03 \
   --state state/validation/july-baseline/review-items.json \
-  --corrections state/validation/july-baseline/review-corrections.jsonl
+  --period-manifest /absolute/private/path/period-manifest.json \
+  --routing /absolute/private/path/routing.json \
+  --corrections state/validation/july-baseline/review-corrections.jsonl \
+  --acceptance-ledger state/validation/july-baseline/review-acceptance.jsonl
 python3 scripts/clockify_review_run.py \
   --replay-from /absolute/path/to/runs/<first-run-id> \
-  --state state/validation/july-baseline/review-items.json \
-  --corrections state/validation/july-baseline/review-corrections.jsonl
+  --state state/validation/july-baseline/review-items.json
 ```
 
 The replay command creates a distinct run, copies the evidence ledger

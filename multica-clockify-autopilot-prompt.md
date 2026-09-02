@@ -21,7 +21,10 @@ recorded in coverage; future autopilot coverage treats it as a required source.
    `state/source-coverage.json`; every later primary run must expand collection
    to the earliest debt date until that peer successfully backfills it.
 4. Fail closed if the root, canonical exporter, or analyzer configuration is
-   unavailable.
+   unavailable. Before starting the service, require configured absolute paths
+   for the period manifest, routing, corrections, and acceptance ledger. Every
+   fresh review snapshots all four before accounting; replay accepts no caller
+   overrides and consumes only the source run's snapshots.
    A minimal analyzer route probe contains no evidence. Do not enable
    `CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED=approved` unless that private-text
    egress was separately authorized for this rollout.

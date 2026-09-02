@@ -16,6 +16,11 @@ set; otherwise select the first directory containing
 Fail closed if neither exists. Report the absolute root, collector path, and
 runtime Git SHA. Never substitute host-specific paths.
 
+Every fresh review requires configured absolute paths for the exact period
+manifest, routing, corrections, and acceptance ledger. The runner snapshots all
+four before accounting. Replay must accept no caller overrides for them and
+must consume only the source run's snapshots.
+
 ## Non-negotiable safety
 
 - Never post, edit, or delete Clockify entries without a human board decision
