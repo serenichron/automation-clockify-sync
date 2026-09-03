@@ -145,11 +145,22 @@ class PortfolioRepairTests(unittest.TestCase):
 
     def test_repair_reasons_detect_forbidden_content_and_target_length(self):
         reasons = repair.repair_reasons(
-            "SC — NEEDS REVIEW https://example.com /Users/private with many copied unnecessary status details for no useful reason across several unrelated client workstreams and meetings"
+            "SC — NEEDS REVIEW https://example.com /Users/private with many copied unnecessary status details for no useful reason across several unrelated client workstreams and meetings during final audit review"
         )
 
         self.assertTrue(any("8-24" in reason for reason in reasons))
         self.assertTrue(any("forbidden" in reason for reason in reasons))
+
+    def test_repair_word_count_matches_quality_whitespace_contract(self):
+        description = (
+            "SC — Prepared workstation storage plan covering controller drives firmware "
+            "filesystem RAID1 setup steps and documented validated installation sequence "
+            "for reliable recovery operations and testing"
+        )
+
+        reasons = repair.repair_reasons(description)
+
+        self.assertTrue(any("8-24" in reason for reason in reasons))
 
     def test_clean_no_repair_result_declares_no_unresolved_wording(self):
         source = source_document(

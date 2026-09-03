@@ -42,7 +42,6 @@ WORDING_FIELDS_REPAIR_PROMPT_VERSION = "clockify-portfolio-wording-fields-repair
 MAX_WORDING_RECOVERY_ATTEMPTS = 2
 PORTFOLIO_DESCRIPTION_MAX_WORDS = 24
 _PREFIX_RE = re.compile(r"^([A-Za-z][A-Za-z0-9 &-]{0,24}) — (.+)$")
-_WORD_RE = re.compile(r"\b[\w'-]+\b")
 CAVEMAN_WORDING_FAILURE_CODES = frozenset({
     "forbidden_hash",
     "forbidden_agent_status",
@@ -79,7 +78,7 @@ def _now() -> str:
 
 
 def _word_count(value: str) -> int:
-    return len(_WORD_RE.findall(value))
+    return len(value.split())
 
 
 def repair_reasons(description: Any) -> list[str]:
