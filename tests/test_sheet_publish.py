@@ -118,6 +118,23 @@ class SheetPublicationTests(unittest.TestCase):
         with self.assertRaises(publisher.PublicationError):
             publisher.verify_portfolio_gates(portfolio, quality, replay, "run-1")
 
+    def test_portfolio_gate_accepts_verified_zero_row_slice(self):
+        portfolio = portfolio_document()
+        portfolio["activities"] = []
+        quality = {
+            "status": "pass",
+            "fragmentation": {"row_count": 0, "total_minutes": 0},
+        }
+        replay = {
+            "status": "pass",
+            "identity": {"artifacts": {
+                "repair": publisher.portfolio_replay._digest(portfolio),
+                "quality": publisher.portfolio_replay._digest(quality),
+            }},
+        }
+
+        publisher.verify_portfolio_gates(portfolio, quality, replay, "run-1")
+
     def test_portfolio_gate_rejects_carried_source_review(self):
         portfolio = portfolio_document()
         portfolio["activities"][0]["validation_status"] = (

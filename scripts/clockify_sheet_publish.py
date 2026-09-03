@@ -307,10 +307,15 @@ def verify_portfolio_gates(
         raise PublicationError("portfolio quality report has not passed")
     fragmentation = quality.get("fragmentation")
     total_minutes = sum(int(row.get("duration_minutes") or 0) for row in activities)
+    try:
+        quality_rows = int(fragmentation["row_count"])
+        quality_minutes = int(fragmentation["total_minutes"])
+    except (KeyError, TypeError, ValueError):
+        quality_rows = quality_minutes = -1
     if (
         not isinstance(fragmentation, Mapping)
-        or int(fragmentation.get("row_count") or -1) != len(activities)
-        or int(fragmentation.get("total_minutes") or -1) != total_minutes
+        or quality_rows != len(activities)
+        or quality_minutes != total_minutes
     ):
         raise PublicationError("portfolio quality totals do not match the repair")
     identity = replay.get("identity")
