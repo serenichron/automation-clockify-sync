@@ -142,6 +142,38 @@ class WorkAllocatorTests(unittest.TestCase):
             [row.allocation_id for row in result.allocations],
         )
 
+    def test_second_precision_fixed_block_preserves_only_whole_minute_free_capacity(self):
+        fixed = {
+            "id": "recorded-meeting",
+            "start": datetime(2026, 8, 1, 9, 10, 30),
+            "end": datetime(2026, 8, 1, 9, 20, 30),
+        }
+        demand = activity("alpha", 49, start=at(9), end=at(10))
+
+        first = allocator.allocate_work([demand], [fixed])
+        second = allocator.allocate_work([demand], [dict(fixed)])
+
+        self.assertEqual(first.allocations, second.allocations)
+        self.assertEqual(
+            [(at(9), at(9, 10)), (at(9, 21), at(10))],
+            [(row.start, row.end) for row in first.allocations],
+        )
+        self.assertEqual(49, sum(row.duration_minutes for row in first.allocations))
+        self.assertTrue(
+            all(
+                row.start.second == row.end.second == 0
+                and row.start.microsecond == row.end.microsecond == 0
+                for row in first.allocations
+            )
+        )
+        self.assertTrue(
+            all(not allocator._overlaps(row.start, row.end, fixed["start"], fixed["end"])
+                for row in first.allocations)
+        )
+        self.assertEqual(0, first.unallocated_capacity.total_minutes)
+        self.assertEqual((), first.unallocated_capacity.intervals)
+        self.assertFalse(first.contested_time)
+
     def test_capacity_below_evidence_minimum_emits_no_token_entry(self):
         demand = activity("long-workstream", 120, start=at(9), end=at(10))
         demand["effort"] = {"min": 30, "recommended": 120, "max": 180}

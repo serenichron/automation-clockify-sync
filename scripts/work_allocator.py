@@ -336,6 +336,21 @@ def _subtract(blocks: Sequence[tuple[datetime, datetime]], start: datetime, end:
     return free
 
 
+def _whole_minute_intervals(
+    intervals: Iterable[tuple[datetime, datetime]],
+) -> list[tuple[datetime, datetime]]:
+    """Quantize free capacity inward without changing exact occupied spans."""
+    quantized: list[tuple[datetime, datetime]] = []
+    for start, end in intervals:
+        whole_start = start.replace(second=0, microsecond=0)
+        if start.second or start.microsecond:
+            whole_start += timedelta(minutes=1)
+        whole_end = end.replace(second=0, microsecond=0)
+        if whole_start < whole_end:
+            quantized.append((whole_start, whole_end))
+    return quantized
+
+
 def _merge_intervals(
     intervals: Iterable[tuple[datetime, datetime]],
 ) -> list[tuple[datetime, datetime]]:
@@ -409,7 +424,9 @@ def allocate_work(
         segment_number = 0
         allocation_start = len(allocations)
         for interval_start, interval_end in activity.allowed_intervals:
-            for free_start, free_end in _subtract(occupied, interval_start, interval_end):
+            for free_start, free_end in _whole_minute_intervals(
+                _subtract(occupied, interval_start, interval_end)
+            ):
                 if remaining <= 0:
                     break
                 capacity = _minutes(free_start, free_end)
@@ -475,7 +492,9 @@ def allocate_work(
     )
     unallocated_intervals: list[tuple[datetime, datetime]] = []
     for start, end in envelope_bounds:
-        unallocated_intervals.extend(_subtract(all_occupied, start, end))
+        unallocated_intervals.extend(
+            _whole_minute_intervals(_subtract(all_occupied, start, end))
+        )
     # Different demand envelopes may overlap.  Merge only for honest capacity totals.
     merged = _merge_intervals(unallocated_intervals)
     return AllocationResult(
