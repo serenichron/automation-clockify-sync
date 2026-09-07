@@ -18,6 +18,7 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
         self, root: Path, *, allocation_segments: list[dict[str, object]] | None = None,
         validation_status: str = "flash_validated",
         historical_entries: list[dict[str, object]] | None = None,
+        max_create_count: int = 1,
     ) -> argparse.Namespace:
         portfolio_path = root / "portfolio.json"
         quality_path = root / "quality.json"
@@ -118,7 +119,7 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
             residual_exception_digest=digest(residual_path),
             manifest_digest=manifest.manifest_digest, event_history_digest=manifest.events_digest,
             historical_receipt_digest=digest(historical_path),
-            max_create_count=1,
+            max_create_count=max_create_count,
         ))
         return argparse.Namespace(
             portfolio=portfolio_path, quality_report=quality_path,
@@ -341,6 +342,48 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
                     poster.run(args)
 
         request.assert_not_called()
+
+    def test_execute_allows_exact_approved_multi_block_backlog(self) -> None:
+        """Restoring the one-create-only check would block an exact approved backlog."""
+        with tempfile.TemporaryDirectory() as directory:
+            segments = [
+                {"start": "2026-08-14T10:00:00Z", "end": "2026-08-14T10:10:00Z", "duration_minutes": 10},
+                {"start": "2026-08-14T10:20:00Z", "end": "2026-08-14T10:30:00Z", "duration_minutes": 10},
+            ]
+            args = self._write_posting_fixture(
+                Path(directory), allocation_segments=segments, max_create_count=2,
+            )
+            args.execute = True
+            created = iter([
+                self._clockify_entry("entry-1", "2026-08-14T10:00:00Z", "2026-08-14T10:10:00Z"),
+                self._clockify_entry("entry-2", "2026-08-14T10:20:00Z", "2026-08-14T10:30:00Z"),
+            ])
+            live_after_create: list[dict[str, object]] = []
+
+            def request(*_args: object, **_kwargs: object) -> dict[str, object]:
+                entry = next(created)
+                live_after_create.append(entry)
+                return entry
+
+            def paged(path: str, _api_key: str, *, timeout_seconds: int):
+                self.assertEqual(45, timeout_seconds)
+                if path.startswith("/workspaces/workspace-1/projects"):
+                    return [{"id": "project-123456"}]
+                if path.startswith("/workspaces/workspace-1/tags"):
+                    return [{"id": "tag-654321"}]
+                return list(live_after_create)
+
+            with (
+                mock.patch.object(poster, "load_env_file", return_value={
+                    "CLOCKIFY_API_KEY": "secret", "CLOCKIFY_WORKSPACE_ID": "workspace-1",
+                }),
+                mock.patch.object(poster, "_paged", side_effect=paged),
+                mock.patch.object(poster, "_request", side_effect=request),
+            ):
+                receipt = poster.run(args)
+
+        self.assertEqual("complete", receipt["status"])
+        self.assertEqual(2, len(receipt["created"]))
 
     def test_execute_does_not_reopen_historical_receipt_after_approval(self) -> None:
         """Swapping the artifact after its digest check must not add a trusted historical ID."""
@@ -1105,6 +1148,113 @@ class ClockifyPortfolioPostTests(unittest.TestCase):
         receipt = poster._receipt_item(adjusted[0], "entry-1", "created")
         self.assertEqual(613, receipt["duration_seconds"])
         self.assertEqual(10, receipt["duration_minutes"])
+
+    def test_boundary_adjustment_restores_deficit_by_cascading_next_plan(self) -> None:
+        plans = [
+            {
+                "review_id": "review-a", "segment_index": 1,
+                "start": "2026-08-14T10:00:00Z", "end": "2026-08-14T10:10:00Z",
+                "duration_minutes": 10, "duration_seconds": 600,
+            },
+            {
+                "review_id": "review-a", "segment_index": 2,
+                "start": "2026-08-14T10:20:00Z", "end": "2026-08-14T10:21:00Z",
+                "duration_minutes": 1, "duration_seconds": 60,
+            },
+            {
+                "review_id": "review-b", "segment_index": 1,
+                "start": "2026-08-14T10:21:00Z", "end": "2026-08-14T10:31:00Z",
+                "duration_minutes": 10, "duration_seconds": 600,
+            },
+        ]
+        live = [
+            {"start": "2026-08-14T09:59:00Z", "end": "2026-08-14T10:00:31Z"},
+            {"start": "2026-08-14T10:10:00Z", "end": "2026-08-14T10:11:00Z"},
+        ]
+
+        adjusted, _changes = poster._align_subminute_boundaries(plans, live, set())
+
+        self.assertEqual("2026-08-14T10:21:31Z", adjusted[1]["end"])
+        self.assertEqual("2026-08-14T10:21:31Z", adjusted[2]["start"])
+        self.assertEqual("2026-08-14T10:31:31Z", adjusted[2]["end"])
+        self.assertEqual(660, sum(
+            item["duration_seconds"] for item in adjusted if item["review_id"] == "review-a"
+        ))
+        self.assertEqual(600, adjusted[2]["duration_seconds"])
+
+    def test_boundary_adjustment_restores_deficit_at_free_leading_edge(self) -> None:
+        plans = [
+            {
+                "review_id": "review-a", "segment_index": 1,
+                "start": "2026-08-14T10:00:00Z", "end": "2026-08-14T10:10:00Z",
+                "duration_minutes": 10, "duration_seconds": 600,
+            },
+            {
+                "review_id": "review-a", "segment_index": 2,
+                "start": "2026-08-14T11:00:00Z", "end": "2026-08-14T11:10:00Z",
+                "duration_minutes": 10, "duration_seconds": 600,
+            },
+        ]
+        live = [
+            {"start": "2026-08-14T10:10:00Z", "end": "2026-08-14T10:11:00Z"},
+            {"start": "2026-08-14T10:59:00Z", "end": "2026-08-14T11:00:33Z"},
+            {"start": "2026-08-14T11:10:00Z", "end": "2026-08-14T11:11:00Z"},
+        ]
+
+        adjusted, _changes = poster._align_subminute_boundaries(plans, live, set())
+
+        self.assertEqual("2026-08-14T09:59:27Z", adjusted[0]["start"])
+        self.assertEqual("2026-08-14T10:10:00Z", adjusted[0]["end"])
+        self.assertEqual("2026-08-14T11:00:33Z", adjusted[1]["start"])
+        self.assertEqual("2026-08-14T11:10:00Z", adjusted[1]["end"])
+        self.assertEqual(1200, sum(item["duration_seconds"] for item in adjusted))
+
+    def test_boundary_adjustment_credits_unplaceable_same_project_seconds(self) -> None:
+        plans = [{
+            "review_id": "review-a", "segment_index": 1,
+            "start": "2026-08-14T10:00:00Z", "end": "2026-08-14T10:10:00Z",
+            "duration_minutes": 10, "duration_seconds": 600,
+            "approved_duration_seconds": 600,
+            "project_id": "project-1", "billable": True,
+        }]
+        live = [
+            {
+                "start": "2026-08-14T09:59:00Z", "end": "2026-08-14T10:00:33Z",
+                "project_id": "project-1", "billable": True,
+            },
+            {
+                "start": "2026-08-14T10:10:00Z", "end": "2026-08-14T10:11:00Z",
+                "project_id": "project-1", "billable": True,
+            },
+        ]
+
+        adjusted, changes = poster._align_subminute_boundaries(plans, live, set())
+
+        self.assertEqual(567, adjusted[0]["duration_seconds"])
+        self.assertEqual(33, adjusted[0]["boundary_covered_seconds"])
+        self.assertEqual(33, changes[0]["boundary_covered_seconds"])
+
+    def test_boundary_adjustment_rejects_unplaceable_other_project_seconds(self) -> None:
+        plans = [{
+            "review_id": "review-a", "segment_index": 1,
+            "start": "2026-08-14T10:00:00Z", "end": "2026-08-14T10:10:00Z",
+            "duration_minutes": 10, "duration_seconds": 600,
+            "approved_duration_seconds": 600,
+            "project_id": "project-1", "billable": True,
+        }]
+        live = [
+            {
+                "start": "2026-08-14T09:59:00Z", "end": "2026-08-14T10:00:33Z",
+                "project_id": "project-other", "billable": True,
+            },
+            {
+                "start": "2026-08-14T10:10:00Z", "end": "2026-08-14T10:11:00Z",
+                "project_id": "project-1", "billable": True,
+            },
+        ]
+
+        with self.assertRaisesRegex(poster.PortfolioPostError, "cannot preserve approved minutes"):
+            poster._align_subminute_boundaries(plans, live, set())
 
     def _prior_candidates(self, receipt: dict[str, object], approved: set[tuple[str, int]]):
         with tempfile.TemporaryDirectory() as directory:

@@ -318,11 +318,14 @@ def _verify_approved_duration_seconds(plans: Iterable[Mapping[str, Any]]) -> Non
             approved_seconds.setdefault(review_id, set()).add(approved)
         posted_seconds[review_id] = posted_seconds.get(review_id, 0) + int(
             plan["duration_seconds"]
+        ) + int(
+            plan.get("boundary_covered_seconds") or 0
         )
     for review_id, expected in approved_seconds.items():
         if len(expected) != 1 or posted_seconds.get(review_id) != next(iter(expected)):
             raise PortfolioPostError(
-                "adjusted portfolio review seconds do not match approved duration"
+                f"adjusted portfolio review seconds do not match approved duration: {review_id}"
+                f" ({posted_seconds.get(review_id)} != {next(iter(expected)) if len(expected) == 1 else 'ambiguous'})"
             )
 
 
@@ -443,6 +446,7 @@ def _align_subminute_boundaries(
     # Trim only those shifted seconds, then restore them in a later free block
     # of the same approved review row so row-level minutes remain exact.
     deficits: dict[str, int] = {}
+    deficit_sources: dict[str, list[tuple[tuple[str, int], str, int]]] = {}
     for plan in adjusted:
         key = (plan["review_id"], plan["segment_index"])
         original_start, original_end = original_times[key]
@@ -460,6 +464,9 @@ def _align_subminute_boundaries(
             continue
         plan["end"] = boundary.strftime("%Y-%m-%dT%H:%M:%SZ")
         deficits[plan["review_id"]] = deficits.get(plan["review_id"], 0) + lost
+        deficit_sources.setdefault(plan["review_id"], []).append(
+            (key, original_start, lost)
+        )
 
     for review_id, seconds in deficits.items():
         restored = False
@@ -474,15 +481,75 @@ def _align_subminute_boundaries(
             ).strftime("%Y-%m-%dT%H:%M:%SZ")
             if any(_overlaps(candidate, entry) for entry in live):
                 continue
-            if index + 1 < len(adjusted) and _overlaps(candidate, adjusted[index + 1]):
+            trial = [dict(item) for item in adjusted]
+            trial[index] = candidate
+            cascade_valid = True
+            for next_index in range(index + 1, len(trial)):
+                prior = trial[next_index - 1]
+                current = trial[next_index]
+                if not _overlaps(current, prior):
+                    break
+                current_key = (current["review_id"], current["segment_index"])
+                if current_key in exact_keys:
+                    cascade_valid = False
+                    break
+                shift = int((_parse(prior["end"]) - _parse(current["start"])).total_seconds())
+                if not 0 < shift < 60:
+                    cascade_valid = False
+                    break
+                current["start"] = (
+                    _parse(current["start"]) + dt.timedelta(seconds=shift)
+                ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                current["end"] = (
+                    _parse(current["end"]) + dt.timedelta(seconds=shift)
+                ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                if any(_overlaps(current, entry) for entry in live):
+                    cascade_valid = False
+                    break
+            if not cascade_valid:
                 continue
-            plan["end"] = candidate["end"]
+            adjusted[:] = trial
             restored = True
             break
         if not restored:
-            raise PortfolioPostError(
-                f"cannot preserve approved minutes after sub-minute boundary trim: {review_id}"
-            )
+            for index, plan in enumerate(adjusted):
+                key = (plan["review_id"], plan["segment_index"])
+                if plan["review_id"] != review_id or key in exact_keys:
+                    continue
+                candidate = dict(plan)
+                candidate["start"] = (
+                    _parse(plan["start"]) - dt.timedelta(seconds=seconds)
+                ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                if any(_overlaps(candidate, entry) for entry in live):
+                    continue
+                if index and _overlaps(candidate, adjusted[index - 1]):
+                    continue
+                plan["start"] = candidate["start"]
+                restored = True
+                break
+        if not restored:
+            sources = deficit_sources.get(review_id, [])
+            for source_key, original_start, lost in sources:
+                source_plan = next(
+                    plan for plan in adjusted
+                    if (plan["review_id"], plan["segment_index"]) == source_key
+                )
+                covered_start = _parse(original_start)
+                covered_end = _parse(source_plan["start"])
+                covering = [
+                    entry for entry in live
+                    if _parse(entry["start"]) <= covered_start
+                    and _parse(entry["end"]) >= covered_end
+                    and entry.get("project_id") == source_plan.get("project_id")
+                    and entry.get("billable") == source_plan.get("billable")
+                ]
+                if len(covering) != 1:
+                    raise PortfolioPostError(
+                        f"cannot preserve approved minutes after sub-minute boundary trim: {review_id}"
+                    )
+                source_plan["boundary_covered_seconds"] = int(
+                    source_plan.get("boundary_covered_seconds") or 0
+                ) + lost
 
     for plan in adjusted:
         key = (plan["review_id"], plan["segment_index"])
@@ -504,6 +571,9 @@ def _align_subminute_boundaries(
                 "posted_start": plan["start"],
                 "posted_end": plan["end"],
                 "algorithm": BOUNDARY_ADJUSTMENT_ALGORITHM,
+                "boundary_covered_seconds": int(
+                    plan.get("boundary_covered_seconds") or 0
+                ),
             })
     return adjusted, changes
 
@@ -563,6 +633,7 @@ def _receipt_item(plan: Mapping[str, Any], entry_id: str, disposition: str) -> d
         "end": plan["end"],
         "duration_minutes": plan["duration_minutes"],
         "duration_seconds": plan["duration_seconds"],
+        "boundary_covered_seconds": int(plan.get("boundary_covered_seconds") or 0),
         "project_name": plan["project_name"],
         "description_digest": hashlib.sha256(plan["description"].encode("utf-8")).hexdigest(),
         "disposition": disposition,
@@ -949,8 +1020,6 @@ def _approval_context(
         historical_document = json.loads(historical_bytes)
         if not isinstance(historical_document, Mapping):
             raise PortfolioPostError("historical receipt is invalid")
-        if receipt.max_create_count != 1:
-            raise PortfolioPostError("approval receipt max_create_count must be exactly one")
         artifact_digests = {str(value.get("digest")) for value in manifest.artifacts}
         if any(getattr(receipt, field) not in artifact_digests for field in (
             "correction_log_digest", "coverage_digest", "residual_exception_digest",
@@ -1061,6 +1130,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     approved_plans = _plans(
         portfolio, _resolved_routes(routing, project_ids, tag_ids)
     )
+    if approval is not None and approval.max_create_count > len(approved_plans):
+        raise PortfolioPostError("approval max_create_count exceeds approved portfolio blocks")
     approved_by_key = {
         _receipt_key(plan, kind="approved plan"): plan for plan in approved_plans
     }
@@ -1187,6 +1258,9 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             raise PortfolioPostError("approved max_create_count would be exceeded before POST")
 
     planned_seconds = sum(plan["duration_seconds"] for plan in plans)
+    covered_boundary_seconds = sum(
+        int(plan.get("boundary_covered_seconds") or 0) for plan in plans
+    )
     receipt = {
         "schema_version": SCHEMA_VERSION,
         "status": "dry_run" if not args.execute else "running",
@@ -1198,6 +1272,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
         "planned_blocks": len(plans),
         "planned_seconds": planned_seconds,
         "planned_minutes": planned_seconds // 60,
+        "covered_boundary_seconds": covered_boundary_seconds,
+        "approved_seconds": planned_seconds + covered_boundary_seconds,
         "boundary_adjustment_algorithm": BOUNDARY_ADJUSTMENT_ALGORITHM,
         "live_snapshot_sha256": live_snapshot_sha256,
         "blocker_snapshot_sha256": blocker_snapshot_sha256,
