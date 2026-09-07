@@ -1696,6 +1696,75 @@ class CollectorBurstContextTests(unittest.TestCase):
         )
         self.assertFalse(result["canonical_export"]["git_sha_match"])
 
+    def test_canonical_export_attestation_negotiates_f3dd189_fleet_exporter(self) -> None:
+        machine = {
+            "name": "desktop",
+            "host": "desktop.example.test",
+            "collector_root": "/work/clockify",
+        }
+        fleet_digest = (
+            "6550287f05bd8bdd8bf1e133a6edd6d0d58be469e47f9d0c54c6811d16f4c240"
+        )
+        attestation = {
+            "collector_script_sha256": fleet_digest,
+            "runtime_identity": {
+                "git_sha": "f3dd189439bf31539701a1c8c8b0117790da5618",
+                "git_dirty": False,
+            },
+        }
+        handshake = {
+            "machine": "desktop",
+            "status": "unavailable",
+            "canonical_export_attestation": attestation,
+        }
+        exported = {
+            "machine": "desktop",
+            "status": "ok",
+            "claude_bursts": [],
+            "hermes_sessions": [],
+            "hermes_db_sessions": [],
+            "codex_sessions": [],
+            "repository_events": [],
+            "repository_evidence_status": "complete",
+            "errors": [],
+            "canonical_export_attestation": attestation,
+        }
+        responses = [
+            collector.subprocess.CompletedProcess(
+                ["ssh"], 0, json.dumps(handshake), ""
+            ),
+            collector.subprocess.CompletedProcess(
+                ["ssh"], 0, json.dumps(exported), ""
+            ),
+        ]
+        with (
+            mock.patch.object(
+                collector,
+                "collector_script_sha256",
+                return_value="new-coordinator-digest",
+            ),
+            mock.patch.object(
+                collector.subprocess, "run", side_effect=responses
+            ) as run,
+        ):
+            result = collector.collect_remote_sessions(
+                machine,
+                SINCE,
+                UNTIL,
+                [],
+                coordinator_identity={
+                    "git_sha": "coordinator-sha",
+                    "git_dirty": False,
+                },
+            )
+
+        self.assertEqual(2, run.call_count)
+        self.assertEqual("ok", result["status"])
+        self.assertEqual(
+            fleet_digest,
+            result["canonical_export"]["collector_script_sha256"],
+        )
+
     def test_canonical_export_attestation_accepts_sha_drift_and_records_dirty_worktree(self) -> None:
         machine = {"name": "precision", "host": "precision.example.test", "collector_root": "/work/clockify"}
         clean_export = {

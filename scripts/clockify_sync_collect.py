@@ -109,6 +109,9 @@ COMPATIBLE_CANONICAL_EXPORT_DIGESTS = frozenset({
     # Approved 5d329568 / dd455bb fleet exporter. Later coordinator-only
     # attestation changes do not alter its evidence-export contract.
     "fd8d72d4f3469a91087568da1a953c1f8bb09a45bef572a0a4390476101053bb",
+    # Approved f3dd189 fleet exporter. Direct compatibility probes confirmed
+    # the canonical evidence and attestation contract is unchanged.
+    "6550287f05bd8bdd8bf1e133a6edd6d0d58be469e47f9d0c54c6811d16f4c240",
 })
 BUCHAREST = ZoneInfo("Europe/Bucharest")
 
