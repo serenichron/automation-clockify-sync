@@ -17,6 +17,7 @@ class ReviewCycleTests(unittest.TestCase):
             config_path = root / "cycle.json"
             config_path.write_text(json.dumps({
                 "root": str(root),
+                "runs_dir": str(root / "runs"),
                 "state_dir": str(root / "state"),
                 "cache": str(root / "cache"),
                 "routing": str(root / "routing.json"),

@@ -45,6 +45,7 @@ def make_run(
     root: Path,
     name: str,
     *,
+    runs_dir: Path | None = None,
     replay: bool,
     source_name: str = "source-run",
     proposals: list[dict[str, object]] | None = None,
@@ -59,7 +60,7 @@ def make_run(
     accounting_remove: tuple[str, ...] = (),
     compatibility_version: str = "fixture-collector-lineage/v1",
 ) -> Path:
-    run_dir = root / "runs" / name
+    run_dir = (runs_dir or root / "runs") / name
     run_dir.mkdir(parents=True, exist_ok=True)
     proposals = [proposal()] if proposals is None else proposals
     coverage = (
@@ -155,8 +156,9 @@ def make_run(
         if replay_integrity_override is not None:
             write_json(run_dir / "replay-integrity.json", replay_integrity_override)
         else:
-            with mock.patch.object(review_run, "RUNS", root / "runs"):
-                review_run._verify_replay_integrity(root / "runs" / source_name, run_dir)
+            active_runs = runs_dir or root / "runs"
+            with mock.patch.object(review_run, "RUNS", active_runs):
+                review_run._verify_replay_integrity(active_runs / source_name, run_dir)
     slice_ = collector_slices.plan_slices(
         since_dt, until_dt, zone=local, max_days=2,
     )

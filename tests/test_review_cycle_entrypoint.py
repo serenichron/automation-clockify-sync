@@ -26,6 +26,7 @@ from test_review_cycle_delivery import make_run, write_json  # noqa: E402
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_EXAMPLE = ROOT / "ops/systemd/clockify-review-cycle.config.example.json"
 SERVICE = ROOT / "ops/systemd/clockify-review-cycle.service"
+CANARY_SERVICE = ROOT / "ops/systemd/clockify-review-cycle-canary.service"
 
 
 class ReviewCycleArtifactContractTests(unittest.TestCase):
@@ -36,6 +37,7 @@ class ReviewCycleArtifactContractTests(unittest.TestCase):
         self.assertEqual(
             {
                 "root",
+                "runs_dir",
                 "state_dir",
                 "cache",
                 "routing",
@@ -61,12 +63,15 @@ class ReviewCycleArtifactContractTests(unittest.TestCase):
             document["monthly_sheet_title_template"],
         )
         ZoneInfo(document["timezone"])
-        for key in ("root", "state_dir", "cache", "routing", "corrections", "acceptance"):
+        for key in ("root", "runs_dir", "state_dir", "cache", "routing", "corrections", "acceptance"):
             self.assertTrue(PurePosixPath(document[key]).is_absolute(), key)
-            self.assertTrue(document[key].startswith("/srv/serenichron/"), key)
+            self.assertTrue(
+                document[key].startswith(
+                    "/home/blackthorne/Work/automation-clockify-sync"
+                ),
+                key,
+            )
         serialized = json.dumps(document).casefold()
-        self.assertNotIn("/home/", serialized)
-        self.assertNotIn("blackthorne", serialized)
         self.assertFalse(
             {"password", "secret", "token", "api_key", "credential"} & {
                 key.casefold() for key in document
@@ -87,44 +92,110 @@ class ReviewCycleArtifactContractTests(unittest.TestCase):
         )
         self.assertNotIn("Install", parser)
         self.assertEqual("oneshot", service["Type"])
-        self.assertEqual("clockify-review-cycle", service["User"])
-        self.assertEqual("clockify-review-cycle", service["Group"])
+        self.assertEqual("blackthorne", service["User"])
+        self.assertEqual("blackthorne", service["Group"])
+        service_text = SERVICE.read_text(encoding="utf-8")
+        self.assertIn(
+            "EnvironmentFile=/etc/serenichron/clockify-review-cycle.env",
+            service_text,
+        )
         self.assertEqual(
-            "/etc/serenichron/clockify-review-cycle.env",
+            "-/etc/serenichron/clockify-review-cycle-override.env",
             service["EnvironmentFile"],
         )
         self.assertEqual(
             {
                 "PYTHONUNBUFFERED=1",
                 "GOOGLE_WORKSPACE_CLI_CONFIG_DIR=/var/lib/serenichron/clockify-review-cycle/gws",
+                "CLOCKIFY_AUTOPILOT_ROOT=/home/blackthorne/Work/automation-clockify-sync-releases/REPLACE_WITH_GIT_SHA",
+                "CLOCKIFY_REVIEW_CYCLE_CONFIG=/etc/serenichron/clockify-review-cycle.json",
             },
             set(shlex.split(service["Environment"])),
         )
         self.assertEqual("no", service["Restart"])
         self.assertEqual("0077", service["UMask"])
         self.assertEqual("true", service["NoNewPrivileges"])
+        self.assertEqual("read-only", service["ProtectHome"])
         self.assertEqual("control-group", service["KillMode"])
         self.assertEqual("journal", service["StandardOutput"])
         self.assertEqual("journal", service["StandardError"])
         self.assertEqual(
             [
                 "/usr/bin/python3",
-                "scripts/clockify_review_cycle.py",
+                "${CLOCKIFY_AUTOPILOT_ROOT}/scripts/clockify_review_cycle.py",
                 "--config",
-                "/etc/serenichron/clockify-review-cycle.json",
+                "${CLOCKIFY_REVIEW_CYCLE_CONFIG}",
                 "--enable-sheet-write",
             ],
             shlex.split(service["ExecStart"]),
         )
         self.assertEqual(
             {
-                "/srv/serenichron/clockify-review-cycle/runs",
-                "/srv/serenichron/clockify-review-cycle/state",
+                "/home/blackthorne/Work/automation-clockify-sync/runs",
+                "/home/blackthorne/Work/automation-clockify-sync/state",
                 "/var/lib/serenichron/clockify-review-cycle/gws",
             },
             set(shlex.split(service["ReadWritePaths"])),
         )
+        self.assertNotIn("/home/blackthorne", shlex.split(service["ReadWritePaths"]))
         self.assertFalse((SERVICE.parent / "clockify-review-cycle.timer").exists())
+        self.assertEqual(
+            {
+                "CLOCKIFY_ANALYZER_FALLBACK_URL",
+                "CLOCKIFY_ANALYZER_FALLBACK_MODEL",
+                "CLOCKIFY_ANALYZER_FALLBACK_API_KEY",
+                "CLOCKIFY_ANALYZER_FALLBACK_TIMEOUT_SECONDS",
+                "CLOCKIFY_ANALYZER_FALLBACK_REVISION",
+            },
+            set(shlex.split(service["UnsetEnvironment"])),
+        )
+
+    def test_canary_is_plan_only_and_has_the_same_write_boundary(self) -> None:
+        """Catches a release canary that can publish Sheets rows."""
+        parser = configparser.ConfigParser(interpolation=None, strict=False)
+        parser.optionxform = str
+        parser.read_string(CANARY_SERVICE.read_text(encoding="utf-8"))
+        service = parser["Service"]
+        command = shlex.split(service["ExecStart"])
+
+        self.assertEqual("blackthorne", service["User"])
+        self.assertEqual("blackthorne", service["Group"])
+        self.assertEqual("read-only", service["ProtectHome"])
+        self.assertNotIn("--enable-sheet-write", command)
+        self.assertEqual(
+            {
+                "/home/blackthorne/Work/automation-clockify-sync/runs",
+                "/home/blackthorne/Work/automation-clockify-sync/state",
+                "/var/lib/serenichron/clockify-review-cycle/gws",
+            },
+            set(shlex.split(service["ReadWritePaths"])),
+        )
+        self.assertNotIn("/home/blackthorne", shlex.split(service["ReadWritePaths"]))
+        self.assertEqual(
+            {
+                "CLOCKIFY_ANALYZER_FALLBACK_URL",
+                "CLOCKIFY_ANALYZER_FALLBACK_MODEL",
+                "CLOCKIFY_ANALYZER_FALLBACK_API_KEY",
+                "CLOCKIFY_ANALYZER_FALLBACK_TIMEOUT_SECONDS",
+                "CLOCKIFY_ANALYZER_FALLBACK_REVISION",
+            },
+            set(shlex.split(service["UnsetEnvironment"])),
+        )
+
+    def test_routing_is_sha_bound_to_the_immutable_release(self) -> None:
+        document = json.loads(CONFIG_EXAMPLE.read_text(encoding="utf-8"))
+        rollout = (ROOT / "clockify-review-rollout.md").read_text(encoding="utf-8")
+
+        self.assertEqual(
+            "/home/blackthorne/Work/automation-clockify-sync-releases/"
+            "REPLACE_WITH_GIT_SHA/routing.json",
+            document["routing"],
+        )
+        self.assertNotEqual(
+            "/home/blackthorne/Work/automation-clockify-sync/state/routing.json",
+            document["routing"],
+        )
+        self.assertNotIn("state/routing.json", rollout)
 
 
 class ReviewCycleEntrypointTests(unittest.TestCase):
@@ -132,6 +203,7 @@ class ReviewCycleEntrypointTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+        self.runs_dir = self.root / "operational" / "runs"
         self.state_dir = self.root / "state"
         self.cache = self.state_dir / "analyzer-cache.jsonl"
         for filename, value in (
@@ -142,6 +214,7 @@ class ReviewCycleEntrypointTests(unittest.TestCase):
             write_json(self.root / filename, value)
         self.config = {
             "root": str(self.root),
+            "runs_dir": str(self.runs_dir),
             "state_dir": str(self.state_dir),
             "cache": str(self.cache),
             "routing": str(self.root / "routing.json"),
@@ -158,9 +231,40 @@ class ReviewCycleEntrypointTests(unittest.TestCase):
             "max_slices": 1,
             "total_child_budget_seconds": 7200,
         }
-        runs_patch = mock.patch.object(review_run, "RUNS", self.root / "runs")
+        runs_patch = mock.patch.object(review_run, "RUNS", self.runs_dir)
         runs_patch.start()
         self.addCleanup(runs_patch.stop)
+
+    def test_children_receive_the_configured_runs_directory(self) -> None:
+        """Catches collection/replay children reverting to code-root/runs."""
+        commands: list[list[str]] = []
+        with mock.patch.object(
+            cycle,
+            "run_child_bounded",
+            side_effect=self.child_for_runs(commands),
+        ):
+            code, result, error = self.call_main(enable_write=True)
+
+        self.assertEqual(0, code, error)
+        self.assertEqual("delivered", result["status"])
+        review_commands = [
+            command for command in commands
+            if Path(command[1]).name == "clockify_review_run.py"
+        ]
+        self.assertTrue(review_commands)
+        for command in review_commands:
+            self.assertEqual(
+                self.config["runs_dir"],
+                command[command.index("--runs-root") + 1],
+            )
+
+    def test_result_outside_configured_runs_directory_is_rejected(self) -> None:
+        """Catches release-local output being accepted when operational runs are separate."""
+        outside = self.root / "runs" / "source" / "autopilot-result.json"
+        outside.parent.mkdir(parents=True)
+        outside.write_text("{}\n", encoding="utf-8")
+        with self.assertRaisesRegex(cycle.CycleError, "safe result"):
+            cycle._result(str(outside), self.root / "operational" / "runs")
 
     def write_config(self, value: object | None = None, *, name: str = "cycle.json") -> Path:
         path = self.root / name
@@ -173,7 +277,8 @@ class ReviewCycleEntrypointTests(unittest.TestCase):
         argv = ["--config", str(config or self.write_config())]
         if enable_write:
             argv.append("--enable-sheet-write")
-        with redirect_stdout(stdout), redirect_stderr(stderr):
+        with mock.patch.object(cycle, "_validate_runtime_root", return_value=self.root), \
+             redirect_stdout(stdout), redirect_stderr(stderr):
             code = cycle.main(argv)
         lines = stdout.getvalue().splitlines()
         result = json.loads(lines[-1]) if lines else None
@@ -199,8 +304,9 @@ class ReviewCycleEntrypointTests(unittest.TestCase):
                 path = make_run(
                     self.root,
                     "replay-run",
+                    runs_dir=self.runs_dir,
                     replay=True,
-                    snapshots_from=self.root / "runs" / "source-run",
+                    snapshots_from=self.runs_dir / "source-run",
                     coverage=coverage,
                     ambiguous=ambiguous,
                 )
@@ -210,6 +316,7 @@ class ReviewCycleEntrypointTests(unittest.TestCase):
             path = make_run(
                 self.root,
                 "source-run",
+                runs_dir=self.runs_dir,
                 replay=False,
                 coverage=coverage,
                 ambiguous=ambiguous,
@@ -242,6 +349,55 @@ class ReviewCycleEntrypointTests(unittest.TestCase):
                 self.assertIsNone(result)
                 self.assertIn("blocked", error)
                 child.assert_not_called()
+
+    def test_legacy_config_without_runs_dir_uses_canonical_root_runs(self) -> None:
+        """Catches a compatible legacy config being rejected instead of bounded."""
+        config = {key: value for key, value in self.config.items() if key != "runs_dir"}
+        path = self.write_config(config, name="legacy-config.json")
+
+        loaded = cycle.load_config(path)
+
+        self.assertNotIn("runs_dir", loaded)
+        self.assertEqual((self.root / "runs").resolve(), cycle._runs_dir(loaded))
+
+    def test_runtime_root_identity_rejects_checkout_env_and_config_drift(self) -> None:
+        """Catches a canary validating different code from the configured release."""
+        release = self.root / "release"
+        script = release / "scripts" / "clockify_review_cycle.py"
+        script.parent.mkdir(parents=True)
+        script.write_text("# release fixture\n", encoding="utf-8")
+        config = {**self.config, "root": str(release)}
+
+        self.assertEqual(
+            release.resolve(),
+            cycle._validate_runtime_root(
+                config,
+                {"CLOCKIFY_AUTOPILOT_ROOT": str(release)},
+                script,
+            ),
+        )
+        for env_root, config_root in (
+            (self.root / "other", release),
+            (release, self.root / "other"),
+        ):
+            with self.subTest(env_root=env_root, config_root=config_root):
+                with self.assertRaisesRegex(cycle.CycleError, "runtime root"):
+                    cycle._validate_runtime_root(
+                        {**config, "root": str(config_root)},
+                        {"CLOCKIFY_AUTOPILOT_ROOT": str(env_root)},
+                        script,
+                    )
+
+    def test_runs_dir_rejects_lexical_alias_and_symlink_components(self) -> None:
+        """Catches containment checks normalizing an unsafe runs path first."""
+        real = self.root / "real-runs"
+        real.mkdir()
+        alias = self.root / "runs-alias"
+        alias.symlink_to(real, target_is_directory=True)
+        for runs_dir in (alias, self.root / "real-runs" / ".." / "real-runs"):
+            with self.subTest(runs_dir=runs_dir):
+                with self.assertRaisesRegex(cycle.CycleError, "canonical"):
+                    cycle._runs_dir({**self.config, "runs_dir": str(runs_dir)})
 
     def test_unknown_result_status_prints_json_and_fails_closed(self) -> None:
         """Catches a future coordinator status being silently treated as success."""
@@ -323,6 +479,7 @@ class ReviewCycleEntrypointTests(unittest.TestCase):
                 nested = ReviewCycleEntrypointTests(methodName="runTest")
                 nested.temporary = None
                 nested.root = Path(directory)
+                nested.runs_dir = nested.root / "operational" / "runs"
                 nested.state_dir = nested.root / "state"
                 nested.cache = nested.state_dir / "analyzer-cache.jsonl"
                 for filename, value in (
@@ -334,6 +491,7 @@ class ReviewCycleEntrypointTests(unittest.TestCase):
                 nested.config = {
                     **self.config,
                     "root": str(nested.root),
+                    "runs_dir": str(nested.runs_dir),
                     "state_dir": str(nested.state_dir),
                     "cache": str(nested.cache),
                     "routing": str(nested.root / "routing.json"),
@@ -341,7 +499,7 @@ class ReviewCycleEntrypointTests(unittest.TestCase):
                     "acceptance": str(nested.root / "acceptance.jsonl"),
                 }
                 commands: list[list[str]] = []
-                with mock.patch.object(review_run, "RUNS", nested.root / "runs"), mock.patch.object(
+                with mock.patch.object(review_run, "RUNS", nested.runs_dir), mock.patch.object(
                     cycle,
                     "run_child_bounded",
                     side_effect=nested.child_for_runs(commands, **kwargs),

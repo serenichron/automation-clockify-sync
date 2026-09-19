@@ -198,10 +198,9 @@ class AutopilotRunnerTests(unittest.TestCase):
         action: str,
         **result_fields,
     ) -> tuple[dict[str, str], Path]:
-        root = Path(directory)
-        (root / "scripts").mkdir()
-        (root / "scripts" / "clockify_review_run.py").write_text("# fixture\n")
-        run = root / "runs" / "run-1"
+        private_root = Path(directory)
+        root = Path(runner.__file__).resolve().parents[1]
+        run = private_root / "runs" / "run-1"
         run.mkdir(parents=True)
         result = run / "autopilot-result.json"
         result.write_text(
@@ -209,8 +208,10 @@ class AutopilotRunnerTests(unittest.TestCase):
         )
         environment = {
             "CLOCKIFY_AUTOPILOT_ROOT": str(root),
-            "CLOCKIFY_AUTOPILOT_STATUS": str(root / "state" / "status.json"),
-            "CLOCKIFY_AUTOPILOT_LOCK": str(root / "state" / "runner.lock"),
+            "CLOCKIFY_AUTOPILOT_RUNS_ROOT": str(private_root / "runs"),
+            "CLOCKIFY_AUTOPILOT_STATUS": str(private_root / "state" / "status.json"),
+            "CLOCKIFY_AUTOPILOT_LOCK": str(private_root / "state" / "runner.lock"),
+            "CLOCKIFY_AUTOPILOT_COVERAGE_STATE": str(private_root / "state" / "source-coverage.json"),
             "CLOCKIFY_AUTOPILOT_MAX_COVERAGE_RETRIES": "2",
         }
         for variable, filename in (
@@ -219,7 +220,7 @@ class AutopilotRunnerTests(unittest.TestCase):
             ("CLOCKIFY_AUTOPILOT_CORRECTIONS", "review-corrections.jsonl"),
             ("CLOCKIFY_AUTOPILOT_ACCEPTANCE_LEDGER", "review-acceptance.jsonl"),
         ):
-            path = root / "inputs" / filename
+            path = private_root / "inputs" / filename
             path.parent.mkdir(exist_ok=True)
             path.write_text("\n", encoding="utf-8")
             environment[variable] = str(path)
@@ -261,7 +262,7 @@ class AutopilotRunnerTests(unittest.TestCase):
             resume_state_digest="sha256:" + "a" * 64,
             attempted_at="2026-08-02T00:00:00Z",
         )
-        path = Path(environment["CLOCKIFY_AUTOPILOT_ROOT"]) / "state" / "source-coverage.json"
+        path = Path(environment["CLOCKIFY_AUTOPILOT_COVERAGE_STATE"])
         source_coverage.write(path, store.document())
         environment["CLOCKIFY_AUTOPILOT_COVERAGE_STATE"] = str(path)
         return interval
@@ -465,6 +466,50 @@ class AutopilotRunnerTests(unittest.TestCase):
             command[command.index("--acceptance-ledger") + 1],
         )
 
+    def test_command_passes_separate_canonical_runs_root(self):
+        """Catches release code silently writing run artifacts beside its source."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "release"
+            runs = Path(directory) / "operational" / "runs"
+            root.mkdir()
+            runs.mkdir(parents=True)
+            command = runner._command(
+                {"CLOCKIFY_AUTOPILOT_RUNS_ROOT": str(runs)}, root
+            )
+
+        self.assertEqual(str(runs), command[command.index("--runs-root") + 1])
+
+    def test_result_paths_are_bounded_by_configured_runs_root(self):
+        """Catches a result under the release checkout bypassing operational containment."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = root / "operational" / "runs"
+            valid = runs / "run-1" / "autopilot-result.json"
+            invalid = root / "release" / "runs" / "run-1" / "autopilot-result.json"
+            valid.parent.mkdir(parents=True)
+            invalid.parent.mkdir(parents=True)
+
+            self.assertEqual((valid.resolve(),), runner._result_paths(str(valid), runs))
+            with self.assertRaisesRegex(runner.ConfigurationError, "unsafe"):
+                runner._result_paths(str(invalid), runs)
+
+    def test_runs_root_defaults_to_release_runs_and_rejects_symlink_alias(self):
+        """Catches a compatibility default regression or symlinked operational storage."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "release"
+            root.mkdir()
+            expected = root / "runs"
+            self.assertEqual(expected, runner._runs_root({}, root))
+
+            target = Path(directory) / "real-runs"
+            target.mkdir()
+            alias = Path(directory) / "runs-alias"
+            alias.symlink_to(target, target_is_directory=True)
+            with self.assertRaisesRegex(runner.ConfigurationError, "symlink"):
+                runner._runs_root(
+                    {"CLOCKIFY_AUTOPILOT_RUNS_ROOT": str(alias)}, root
+                )
+
     def test_command_passes_calendly_optional_when_enabled(self):
         """Catches enabled scheduled runs failing to request optional Calendly evidence."""
         with tempfile.TemporaryDirectory() as directory:
@@ -563,7 +608,30 @@ class AutopilotRunnerTests(unittest.TestCase):
 
         self.assertEqual("blocked", status["state"])
         self.assertIn("UTC", status["reason"])
-        self.assertFalse(Path(environment["CLOCKIFY_AUTOPILOT_ROOT"], "state", "source-coverage.json").exists())
+        self.assertFalse(Path(environment["CLOCKIFY_AUTOPILOT_COVERAGE_STATE"]).exists())
+
+    def test_runtime_root_identity_rejects_symlink_or_different_checkout(self):
+        """Catches executing one checkout while trusting another release root."""
+        with tempfile.TemporaryDirectory() as directory:
+            release = Path(directory) / "release"
+            script = release / "scripts" / "clockify_autopilot_runner.py"
+            script.parent.mkdir(parents=True)
+            script.write_text("# release fixture\n", encoding="utf-8")
+            alias = Path(directory) / "alias"
+            alias.symlink_to(release, target_is_directory=True)
+
+            self.assertEqual(
+                release.resolve(),
+                runner._validate_runtime_root(
+                    {"CLOCKIFY_AUTOPILOT_ROOT": str(release)}, script
+                ),
+            )
+            for root in (alias, Path(directory) / "other"):
+                with self.subTest(root=root):
+                    with self.assertRaisesRegex(runner.ConfigurationError, "runtime root"):
+                        runner._validate_runtime_root(
+                            {"CLOCKIFY_AUTOPILOT_ROOT": str(root)}, script
+                        )
 
     def test_invalid_exact_interval_contract_blocks_without_writing_debt(self):
         """Catches malformed UTC bounds escaping the runner as an uncaught exception."""

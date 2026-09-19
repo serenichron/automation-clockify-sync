@@ -43,6 +43,7 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
             write_json(self.root / filename, value)
         self.config = {
             "root": str(self.root),
+            "runs_dir": str(self.root / "runs"),
             "state_dir": str(self.state_dir),
             "cache": str(self.cache),
             "routing": str(self.root / "routing.json"),

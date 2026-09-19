@@ -54,6 +54,45 @@ class ResumeTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     review._resume_source(alias)
 
+    def test_configured_runs_root_bounds_resume_and_replay_sources(self):
+        """Catches replay/resume accepting a sibling release checkout's artifacts."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = root / "operational" / "runs"
+            source = self.source(root / "operational")
+            outside = self.source(root / "release")
+            with mock.patch.object(review, "RUNS", runs):
+                self.assertEqual(source.resolve(), review._run_child(source, label="resume source"))
+                with self.assertRaisesRegex(ValueError, "direct child"):
+                    review._run_child(outside, label="replay source")
+
+    def test_run_child_rejects_symlink_and_lexical_alias_inside_runs_root(self):
+        """Catches replay/resume normalizing unsafe aliases before containment."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = root / "runs"
+            source = self.source(root)
+            alias = runs / "alias"
+            alias.symlink_to(source, target_is_directory=True)
+            lexical = runs / "nested" / ".." / "source"
+            with mock.patch.object(review, "RUNS", runs):
+                for candidate in (alias, lexical):
+                    with self.subTest(candidate=candidate):
+                        with self.assertRaisesRegex(ValueError, "canonical"):
+                            review._run_child(candidate, label="resume source")
+
+    def test_runs_root_option_is_forwarded_to_collector(self):
+        """Catches fresh review collection falling back to the release checkout's runs/."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = root / "operational" / "runs"
+            runs.mkdir(parents=True)
+            args = review.parse_args([
+                "--runs-root", str(runs),
+                "--period-manifest", str(root / "manifest.json"),
+            ])
+            self.assertEqual(runs, args.runs_root)
+
     def test_forbidden_resume_overrides_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             run = Path(directory) / "runs" / "source"

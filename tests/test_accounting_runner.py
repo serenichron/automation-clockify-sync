@@ -192,20 +192,31 @@ class AccountingRunnerTests(unittest.TestCase):
         self.assertEqual("failed", status["state"])
         self.assertEqual(1, status["exit_code"])
 
-    def test_systemd_templates_target_the_current_desktop_checkout(self):
+    def test_systemd_template_separates_immutable_release_from_operational_data(self):
         root = Path(__file__).resolve().parents[1]
         service = (root / "ops/systemd/clockify-work-accounting.service").read_text()
         environment = (
             root / "ops/systemd/clockify-work-accounting.env.example"
         ).read_text()
 
-        self.assertIn("%h/Work/automation-clockify-sync", service)
+        self.assertIn("${CLOCKIFY_AUTOPILOT_ROOT}/scripts/clockify_autopilot_runner.py", service)
         self.assertIn(
-            "CLOCKIFY_ACCOUNTING_ROOT=/home/blackthorne/Work/automation-clockify-sync",
+            "CLOCKIFY_AUTOPILOT_ROOT=/home/blackthorne/Work/automation-clockify-sync-releases/REPLACE_WITH_GIT_SHA",
             environment,
         )
-        self.assertNotIn("Work/serenichron/automation/clockify-sync", service)
-        self.assertNotIn("Work/serenichron/automation/clockify-sync", environment)
+        self.assertIn(
+            "CLOCKIFY_AUTOPILOT_RUNS_ROOT=/home/blackthorne/Work/automation-clockify-sync/runs",
+            environment,
+        )
+        self.assertIn(
+            "CLOCKIFY_AUTOPILOT_ROUTING=/home/blackthorne/Work/"
+            "automation-clockify-sync-releases/REPLACE_WITH_GIT_SHA/routing.json",
+            environment,
+        )
+        self.assertNotIn("automation-clockify-sync/state/routing.json", environment)
+        self.assertIn("ReadWritePaths=%h/Work/automation-clockify-sync/runs", service)
+        self.assertIn("ReadWritePaths=%h/Work/automation-clockify-sync/state", service)
+        self.assertNotIn(".local/state/serenichron/clockify-autopilot", service)
 
     def test_launchd_templates_use_guarded_runner_without_embedded_secrets(self):
         root = Path(__file__).resolve().parents[1]

@@ -211,6 +211,24 @@ class ReviewRunResultTests(unittest.TestCase):
             with mock.patch.object(review_run, "RUNS", runs):
                 self.assertEqual((run_dir,), review_run._collector_run_dirs(str(report_path)))
 
+    def test_collector_run_dirs_rejects_symlink_and_lexical_result_paths(self):
+        """Collector stdout cannot smuggle aliases into the trusted run root."""
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            run_dir = runs / "source"
+            run_dir.mkdir(parents=True)
+            report = run_dir / "run-report.md"
+            report.write_text("# receipt\n", encoding="utf-8")
+            alias = runs / "alias"
+            alias.symlink_to(run_dir, target_is_directory=True)
+            lexical = runs / "nested" / ".." / "source" / "run-report.md"
+            with mock.patch.object(review_run, "RUNS", runs):
+                for candidate in (alias / "run-report.md", lexical):
+                    with self.subTest(candidate=candidate), self.assertRaisesRegex(
+                        ValueError, "canonical"
+                    ):
+                        review_run._collector_run_dirs(str(candidate))
+
     def test_parse_args_accepts_bounded_optional_calendly_override(self):
         args = review_run.parse_args(["--calendly-optional"])
         self.assertTrue(args.calendly_optional)

@@ -1,5 +1,48 @@
 # Clockify review recovery rollout
 
+## Side-by-side release activation
+
+Release code and operational data are separate. Install each tested Git SHA in
+its own immutable directory and never copy, rename, or migrate `runs/`,
+`state/`, analyzer caches, checkpoints, receipts, or credentials as part of a
+code activation. The reviewed layouts are:
+
+- user runner and review-cycle code:
+  `/home/blackthorne/Work/automation-clockify-sync-releases/<40-hex-git-sha>`;
+- existing durable data (shared unchanged by every release):
+  `/home/blackthorne/Work/automation-clockify-sync/{runs,state}`.
+
+Activation never moves durable data. Status, lock, coverage, analyzer cache,
+review state, corrections, and acceptance inputs remain under the existing
+checkout's `state/`; immutable receipts and run artifacts remain under its
+`runs/`. Routing is tracked release content and must resolve to the exact
+SHA-bound release's `routing.json`; it is not operational state.
+
+Prepare and fully test the new release directory before activation. Verify its
+tracked content and read back its runtime identity with
+`git -C <exact-release-directory> rev-parse HEAD`; it must equal the approved
+SHA. Keep the existing credential-bearing environment files unchanged. Write a
+new non-secret override file beside them, fsync it, and atomically rename it
+over the host's `clockify-work-accounting-override.env` or
+`clockify-review-cycle-override.env`. The override must name the exact release
+directory and the existing operational paths. Reload systemd only after reading
+the installed override back byte-for-byte.
+
+Run `clockify-review-cycle-canary.service` first. Its command intentionally
+omits `--enable-sheet-write`, so it can only return a plan and cannot publish a
+Google Sheet row. Read back `ExecMainPID`/`ExecMainStatus`, the expanded command
+line, the configured release root, and the release Git SHA. For the user runner,
+also verify `autopilot-runner-status.json` and the completed run's
+`runtime_identity.git_sha` before enabling the recurring service. A mismatch is
+a failed activation; do not reinterpret it as a healthy canary.
+
+Rollback uses the same atomic override-file replacement, pointing to the
+previous verified release directory, followed by daemon reload and service
+restart. Do not move or restore operational data: both releases use the same
+explicit `CLOCKIFY_AUTOPILOT_RUNS_ROOT`, state, cache, checkpoint, and receipt
+paths, so replay/resume continue from the existing immutable artifacts. Keep
+the failed release and its run evidence until diagnosis is complete.
+
 ## Live Precision coordinator — 2026-08-10
 
 The authoritative dry-run workflow now separates short Multica coordination

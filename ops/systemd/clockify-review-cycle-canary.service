@@ -1,5 +1,5 @@
 [Unit]
-Description=Clockify bounded review-cycle coordinator
+Description=Clockify review-cycle release canary (plan only)
 
 [Service]
 Type=oneshot
@@ -7,20 +7,13 @@ User=blackthorne
 Group=blackthorne
 WorkingDirectory=/
 Environment=PYTHONUNBUFFERED=1 GOOGLE_WORKSPACE_CLI_CONFIG_DIR=/var/lib/serenichron/clockify-review-cycle/gws CLOCKIFY_AUTOPILOT_ROOT=/home/blackthorne/Work/automation-clockify-sync-releases/REPLACE_WITH_GIT_SHA CLOCKIFY_REVIEW_CYCLE_CONFIG=/etc/serenichron/clockify-review-cycle.json
-# This required, externally provisioned 0600 file supplies the analyzer route
-# and either GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE or another supported gws
-# credential source. It is intentionally not included in this repository.
 EnvironmentFile=/etc/serenichron/clockify-review-cycle.env
-# Final non-secret activation pointer. Change this file atomically; leave the
-# credential-bearing EnvironmentFile above untouched.
 EnvironmentFile=-/etc/serenichron/clockify-review-cycle-override.env
 UnsetEnvironment=CLOCKIFY_ANALYZER_FALLBACK_URL CLOCKIFY_ANALYZER_FALLBACK_MODEL CLOCKIFY_ANALYZER_FALLBACK_API_KEY CLOCKIFY_ANALYZER_FALLBACK_TIMEOUT_SECONDS CLOCKIFY_ANALYZER_FALLBACK_REVISION
-# Exit 0: plan, lock contention, idle, or delivery. Exit 2: configuration or
-# integrity block. Exit 75: incomplete, failed, or recovery-blocked delivery.
-ExecStart=/usr/bin/python3 ${CLOCKIFY_AUTOPILOT_ROOT}/scripts/clockify_review_cycle.py --config ${CLOCKIFY_REVIEW_CYCLE_CONFIG} --enable-sheet-write
+ExecStart=/usr/bin/python3 ${CLOCKIFY_AUTOPILOT_ROOT}/scripts/clockify_review_cycle.py --config ${CLOCKIFY_REVIEW_CYCLE_CONFIG}
 Restart=no
 KillMode=control-group
-TimeoutStartSec=7500
+TimeoutStartSec=300
 TimeoutStopSec=30
 UMask=0077
 NoNewPrivileges=true
@@ -30,4 +23,4 @@ ProtectHome=read-only
 ReadWritePaths=/home/blackthorne/Work/automation-clockify-sync/runs /home/blackthorne/Work/automation-clockify-sync/state /var/lib/serenichron/clockify-review-cycle/gws
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=clockify-review-cycle
+SyslogIdentifier=clockify-review-cycle-canary

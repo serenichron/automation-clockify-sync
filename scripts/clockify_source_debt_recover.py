@@ -70,9 +70,14 @@ def _read_object(path: Path, *, label: str) -> dict[str, Any]:
 
 
 def _direct_run(path: Path, *, label: str) -> Path:
-    if path.is_symlink():
-        raise SourceDebtRecoveryError(f"{label} must not be a symlink")
-    resolved = path.resolve()
+    requested = Path(path)
+    if not requested.is_absolute():
+        raise SourceDebtRecoveryError(f"{label} must be an absolute canonical path")
+    resolved = requested.resolve()
+    if requested != resolved:
+        raise SourceDebtRecoveryError(
+            f"{label} must be canonical and contain no symlink components"
+        )
     if resolved.parent != RUNS.resolve() or not resolved.is_dir():
         raise SourceDebtRecoveryError(f"{label} must be a direct child of {RUNS.resolve()}")
     return resolved

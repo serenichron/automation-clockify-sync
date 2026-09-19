@@ -6,7 +6,8 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-WorkingDirectory=%h/Work/automation-clockify-sync
+WorkingDirectory=/
+Environment=PYTHONUNBUFFERED=1 CLOCKIFY_AUTOPILOT_ROOT=%h/Work/automation-clockify-sync-releases/REPLACE_WITH_GIT_SHA CLOCKIFY_AUTOPILOT_RUNS_ROOT=%h/Work/automation-clockify-sync/runs
 EnvironmentFile=%h/.config/serenichron/clockify-work-accounting.env
 # Optional protected OpenAI-compatible Precision gateway client. The analyzer
 # consumes OPENAI_* plus the Cloudflare Access service credential pair without
@@ -15,9 +16,8 @@ EnvironmentFile=-%h/.config/serenichron/precision-inference-client.env
 # Optional final non-secret host overrides (URL, paths, range, retry count).
 # Kept separate so the credential-bearing files never need rewriting.
 EnvironmentFile=-%h/.config/serenichron/clockify-work-accounting-override.env
-Environment=PYTHONUNBUFFERED=1
 UnsetEnvironment=CLOCKIFY_ANALYZER_FALLBACK_URL CLOCKIFY_ANALYZER_FALLBACK_MODEL CLOCKIFY_ANALYZER_FALLBACK_API_KEY CLOCKIFY_ANALYZER_FALLBACK_TIMEOUT_SECONDS CLOCKIFY_ANALYZER_FALLBACK_REVISION
-ExecStart=/usr/bin/python3 scripts/clockify_autopilot_runner.py
+ExecStart=/usr/bin/python3 ${CLOCKIFY_AUTOPILOT_ROOT}/scripts/clockify_autopilot_runner.py
 Restart=on-failure
 RestartPreventExitStatus=2
 # Exit 75 means source coverage was incomplete. Recollect after peers have had

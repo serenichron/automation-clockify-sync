@@ -84,6 +84,21 @@ RUNS = ROOT / "runs"
 CLOCKIFY_API = "https://api.clockify.me/api/v1"
 CLOCKIFY_HTTP_TIMEOUT_NAME = "CLOCKIFY_HTTP_TIMEOUT_SECONDS"
 CLOCKIFY_HTTP_TIMEOUT_DEFAULT_SECONDS = 30
+
+
+def configure_runs_root(path: Path) -> Path:
+    """Select a canonical, non-symlink run root independently of release code."""
+    global RUNS
+    requested = Path(path).expanduser()
+    if not requested.is_absolute():
+        raise ValueError("runs root must be absolute")
+    resolved = requested.resolve()
+    if requested != resolved:
+        raise ValueError("runs root must be canonical and contain no symlink components")
+    if resolved.exists() and (not resolved.is_dir() or resolved.is_symlink()):
+        raise ValueError("runs root must be a safe directory")
+    RUNS = resolved
+    return resolved
 CLOCKIFY_HTTP_TIMEOUT_MIN_SECONDS = 5
 CLOCKIFY_HTTP_TIMEOUT_MAX_SECONDS = 120
 FATHOM_API = "https://api.fathom.ai/external/v1"
@@ -4336,6 +4351,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Clockify sync dry-run collector")
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run")
+    r.add_argument(
+        "--runs-root",
+        type=Path,
+        default=Path(os.environ.get("CLOCKIFY_AUTOPILOT_RUNS_ROOT", str(RUNS))),
+    )
     r.add_argument("--since", help="YYYY-MM-DD")
     r.add_argument("--until", help="YYYY-MM-DD inclusive")
     r.add_argument("--enrich", action="store_true", default=True,
@@ -4358,6 +4378,11 @@ def main() -> int:
     cleanup.add_argument("--checkpoint-root", required=True, help="existing absolute checkpoint root")
     args = ap.parse_args()
     if args.cmd == "run":
+        try:
+            configure_runs_root(args.runs_root)
+        except ValueError as exc:
+            print(f"collector blocked: {exc}", file=sys.stderr)
+            return 2
         return run(args)
     if args.cmd == "cleanup-checkpoints":
         return cleanup_checkpoints(args)

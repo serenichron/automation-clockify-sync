@@ -116,6 +116,18 @@ class SourceDebtRecoveryTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_direct_run_rejects_symlink_and_lexical_aliases(self) -> None:
+        run_dir = self.runs / "source"
+        run_dir.mkdir(parents=True)
+        alias = self.runs / "alias"
+        alias.symlink_to(run_dir, target_is_directory=True)
+        lexical = self.runs / "nested" / ".." / "source"
+        for candidate in (alias, lexical):
+            with self.subTest(candidate=candidate), self.assertRaisesRegex(
+                recovery.SourceDebtRecoveryError, "canonical"
+            ):
+                recovery._direct_run(candidate, label="recovery run")
+
     def test_immutable_attempt_marker_fsyncs_file_then_parent_directory(self) -> None:
         """A durable marker must persist both its bytes and directory entry."""
         marker = self.root / "attempt" / "attempt-marker.json"

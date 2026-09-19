@@ -47,6 +47,54 @@ def _path(environment: Mapping[str, str], name: str, default: Path) -> Path:
     return path
 
 
+def _canonical_path(raw: str | Path, *, label: str) -> Path:
+    """Reject lexical aliases and every symlink component before use."""
+    requested = Path(raw)
+    if not requested.is_absolute():
+        raise ConfigurationError(f"{label} must be absolute")
+    resolved = requested.resolve()
+    if requested != resolved:
+        raise ConfigurationError(
+            f"{label} must be canonical and contain no symlink components"
+        )
+    return resolved
+
+
+def _validate_runtime_root(
+    environment: Mapping[str, str], script_path: Path = Path(__file__)
+) -> Path:
+    """Bind configured execution to the exact checkout containing this script."""
+    script = _canonical_path(script_path, label="runtime root script")
+    if not script.is_file():
+        raise ConfigurationError("runtime root script is unavailable")
+    checkout = script.parent.parent
+    raw_root = str(environment.get("CLOCKIFY_AUTOPILOT_ROOT") or "").strip()
+    if not raw_root:
+        raise ConfigurationError("runtime root CLOCKIFY_AUTOPILOT_ROOT is required")
+    configured = _canonical_path(raw_root, label="runtime root")
+    if not configured.is_dir() or configured != checkout:
+        raise ConfigurationError(
+            "runtime root must exactly match the checkout containing the running script"
+        )
+    return configured
+
+
+def _runs_root(environment: Mapping[str, str], root: Path) -> Path:
+    """Return the canonical, non-symlink operational run root."""
+    raw = str(environment.get("CLOCKIFY_AUTOPILOT_RUNS_ROOT") or root / "runs").strip()
+    requested = Path(raw).expanduser()
+    if not requested.is_absolute():
+        raise ConfigurationError("CLOCKIFY_AUTOPILOT_RUNS_ROOT must be absolute")
+    resolved = requested.resolve()
+    if requested != resolved:
+        raise ConfigurationError(
+            "CLOCKIFY_AUTOPILOT_RUNS_ROOT must be canonical and contain no symlink components"
+        )
+    if resolved.exists() and (not resolved.is_dir() or resolved.is_symlink()):
+        raise ConfigurationError("CLOCKIFY_AUTOPILOT_RUNS_ROOT must be a safe directory")
+    return resolved
+
+
 def _positive_int(environment: Mapping[str, str], name: str, default: int) -> int:
     try:
         value = int(str(environment.get(name) or default))
@@ -123,14 +171,14 @@ def _read_status(path: Path) -> dict[str, object]:
     return value if isinstance(value, dict) else {}
 
 
-def _result_paths(stdout: str, root: Path) -> tuple[Path, ...]:
+def _result_paths(stdout: str, runs_root: Path) -> tuple[Path, ...]:
     lines = [line.strip() for line in stdout.splitlines() if line.strip()]
     if not lines:
         raise ConfigurationError("review workflow did not emit an action contract path")
-    runs = (root / "runs").resolve()
+    runs = runs_root.resolve()
     paths: list[Path] = []
     for line in lines:
-        path = Path(line).expanduser().resolve()
+        path = _canonical_path(line, label="review workflow result path")
         if path.name != "autopilot-result.json" or runs not in path.parents:
             raise ConfigurationError("review workflow emitted an unsafe action contract path")
         if path in paths:
@@ -142,7 +190,12 @@ def _result_paths(stdout: str, root: Path) -> tuple[Path, ...]:
 def _command(
     environment: Mapping[str, str], root: Path, *, effective_since: str | None = None
 ) -> list[str]:
-    command = [sys.executable, str(root / "scripts" / "clockify_review_run.py")]
+    command = [
+        sys.executable,
+        str(root / "scripts" / "clockify_review_run.py"),
+        "--runs-root",
+        str(_runs_root(environment, root)),
+    ]
     for variable, option in (
         ("CLOCKIFY_AUTOPILOT_SINCE", "--since"),
         ("CLOCKIFY_AUTOPILOT_UNTIL", "--until"),
@@ -366,11 +419,8 @@ def _debt_status(items: tuple[source_coverage.DebtItem, ...]) -> list[dict[str, 
 def run(environment: Mapping[str, str] | None = None) -> int:
     environment = os.environ if environment is None else environment
     try:
-        root = _path(
-            environment,
-            "CLOCKIFY_AUTOPILOT_ROOT",
-            Path.home() / "Work" / "automation-clockify-sync",
-        )
+        root = _validate_runtime_root(environment)
+        runs_root = _runs_root(environment, root)
         status_path = _path(
             environment,
             "CLOCKIFY_AUTOPILOT_STATUS",
@@ -416,7 +466,7 @@ def run(environment: Mapping[str, str] | None = None) -> int:
         ).strip()
         coverage = source_coverage.read(coverage_path)
         if not coverage_path.exists() and not coverage.get("events"):
-            legacy = source_coverage.bootstrap_from_runs(root / "runs", coordinator)
+            legacy = source_coverage.bootstrap_from_runs(runs_root, coordinator)
             if legacy.get("sources"):
                 source_coverage.write(coverage_path, legacy)
                 coverage = source_coverage.read(coverage_path)
@@ -484,7 +534,7 @@ def run(environment: Mapping[str, str] | None = None) -> int:
             })
             return exit_code
         try:
-            result_paths = _result_paths(completed.stdout, root)
+            result_paths = _result_paths(completed.stdout, runs_root)
             results = []
             for result_path in result_paths:
                 result = json.loads(result_path.read_text(encoding="utf-8"))
@@ -589,6 +639,7 @@ def mark_reported(environment: Mapping[str, str] | None, result: Path) -> int:
         "CLOCKIFY_AUTOPILOT_ROOT",
         Path.home() / "Work" / "automation-clockify-sync",
     )
+    runs_root = _runs_root(environment, root)
     status_path = _path(
         environment,
         "CLOCKIFY_AUTOPILOT_STATUS",
@@ -596,6 +647,8 @@ def mark_reported(environment: Mapping[str, str] | None, result: Path) -> int:
     )
     status = _read_status(status_path)
     resolved = result.expanduser().resolve()
+    if runs_root not in resolved.parents:
+        return 2
     results = status.get("results")
     allowed = (
         {str(path) for path in results if isinstance(path, str)}

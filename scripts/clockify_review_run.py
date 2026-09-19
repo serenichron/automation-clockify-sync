@@ -57,6 +57,23 @@ class ReviewRunError(ValueError):
     """A replay cannot prove that its reconciliation inputs are identical."""
 
 
+def _configure_runs_root(path: Path) -> Path:
+    """Bind every local collector/recovery component to one safe run root."""
+    global RUNS
+    requested = Path(path).expanduser()
+    if not requested.is_absolute():
+        raise ValueError("runs root must be absolute")
+    resolved = requested.resolve()
+    if requested != resolved:
+        raise ValueError("runs root must be canonical and contain no symlink components")
+    if resolved.exists() and (not resolved.is_dir() or resolved.is_symlink()):
+        raise ValueError("runs root must be a safe directory")
+    RUNS = resolved
+    clockify_sync_collect.RUNS = resolved
+    clockify_source_debt_recover.RUNS = resolved
+    return resolved
+
+
 def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -379,11 +396,18 @@ def _run(command: list[str]) -> subprocess.CompletedProcess[str]:
 
 
 def _collector_run_dirs(stdout: str) -> tuple[Path, ...]:
-    reports = [
-        Path(line.strip()).expanduser().resolve()
-        for line in stdout.splitlines()
-        if line.strip().endswith("/run-report.md")
-    ]
+    reports: list[Path] = []
+    for line in stdout.splitlines():
+        raw = line.strip()
+        if not raw.endswith("/run-report.md"):
+            continue
+        requested = Path(raw)
+        if not requested.is_absolute():
+            raise ValueError("Collector emitted a non-canonical run-report path")
+        resolved = requested.resolve()
+        if requested != resolved:
+            raise ValueError("Collector emitted a non-canonical run-report path")
+        reports.append(resolved)
     if not reports:
         raise ValueError("Collector did not emit a completed run-report.md path.")
     run_dirs: list[Path] = []
@@ -430,7 +454,12 @@ def _collector_run_dirs(stdout: str) -> tuple[Path, ...]:
 
 
 def _run_child(path: Path, *, label: str) -> Path:
-    resolved = path.resolve()
+    requested = Path(path)
+    if not requested.is_absolute():
+        raise ValueError(f"{label} must be an absolute canonical path")
+    resolved = requested.resolve()
+    if requested != resolved:
+        raise ValueError(f"{label} must be canonical and contain no symlink components")
     if resolved.parent != RUNS.resolve() or not resolved.is_dir():
         raise ValueError(f"{label} must be a direct child of {RUNS.resolve()}: {resolved}")
     return resolved
@@ -1271,6 +1300,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--since", help="YYYY-MM-DD")
     parser.add_argument("--until", help="YYYY-MM-DD inclusive")
+    parser.add_argument(
+        "--runs-root",
+        type=Path,
+        default=Path(os.environ.get("CLOCKIFY_AUTOPILOT_RUNS_ROOT", str(RUNS))),
+        help="Canonical operational run directory; defaults to <release-root>/runs.",
+    )
     parser.add_argument("--no-enrich", action="store_true")
     parser.add_argument(
         "--calendly-optional", action="store_true",
@@ -1614,6 +1649,11 @@ def _adopt_completed_recovery(source: Path) -> Path | None:
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(raw_argv)
+    try:
+        args.runs_root = _configure_runs_root(args.runs_root)
+    except ValueError as exc:
+        print(f"clockify review run: {exc}", file=sys.stderr)
+        return 2
     reconciliation_options = (
         "--period-manifest", "--routing", "--corrections", "--acceptance-ledger",
     )
@@ -1733,6 +1773,8 @@ def main(argv: list[str] | None = None) -> int:
             sys.executable,
             str(SCRIPTS / "clockify_sync_collect.py"),
             "run",
+            "--runs-root",
+            str(RUNS),
         ]
         if args.since:
             collector.extend(["--since", args.since])

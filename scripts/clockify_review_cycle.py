@@ -94,6 +94,65 @@ def _path(config: Mapping[str, Any], key: str, *, file: bool = False) -> Path:
     return path
 
 
+def _runs_dir(config: Mapping[str, Any]) -> Path:
+    """Use the explicit operational root, preserving legacy root/runs configs."""
+    raw = config.get("runs_dir")
+    if raw is None:
+        root = config.get("root")
+        if not isinstance(root, str) or not root:
+            raise CycleError("root must be an absolute path")
+        requested_root = Path(root)
+        if not requested_root.is_absolute() or requested_root != requested_root.resolve():
+            raise CycleError("root must be canonical and contain no symlink components")
+        requested = requested_root / "runs"
+    else:
+        requested = Path(str(raw))
+    if not requested.is_absolute():
+        raise CycleError("runs_dir must be an absolute path")
+    resolved = requested.resolve()
+    if requested != resolved:
+        raise CycleError("runs_dir must be canonical and contain no symlink components")
+    if resolved.exists() and (not resolved.is_dir() or resolved.is_symlink()):
+        raise CycleError("runs_dir must be a safe directory")
+    return resolved
+
+
+def _canonical_runtime_path(raw: str | Path, *, label: str) -> Path:
+    requested = Path(raw)
+    if not requested.is_absolute():
+        raise CycleError(f"{label} must be absolute")
+    resolved = requested.resolve()
+    if requested != resolved:
+        raise CycleError(f"{label} must be canonical and contain no symlink components")
+    return resolved
+
+
+def _validate_runtime_root(
+    config: Mapping[str, Any],
+    environment: Mapping[str, str],
+    script_path: Path = Path(__file__),
+) -> Path:
+    """Require script, environment, and config to identify one exact checkout."""
+    script = _canonical_runtime_path(script_path, label="runtime root script")
+    if not script.is_file():
+        raise CycleError("runtime root script is unavailable")
+    checkout = script.parent.parent
+    raw_environment = str(environment.get("CLOCKIFY_AUTOPILOT_ROOT") or "").strip()
+    if not raw_environment:
+        raise CycleError("runtime root CLOCKIFY_AUTOPILOT_ROOT is required")
+    environment_root = _canonical_runtime_path(raw_environment, label="runtime root")
+    config_root = _canonical_runtime_path(
+        str(config.get("root") or ""), label="runtime root"
+    )
+    if not environment_root.is_dir() or not config_root.is_dir() or not (
+        checkout == environment_root == config_root
+    ):
+        raise CycleError(
+            "runtime root must exactly match the checkout containing the running script"
+        )
+    return checkout
+
+
 def load_config(path: Path) -> dict[str, Any]:
     try:
         config = json.loads(path.read_text(encoding="utf-8"))
@@ -101,7 +160,7 @@ def load_config(path: Path) -> dict[str, Any]:
         raise CycleError("config must be valid JSON") from exc
     if not isinstance(config, dict) or not _REQUIRED.issubset(config):
         raise CycleError("config is missing required review-cycle fields")
-    if set(config) - (_REQUIRED | {"catchup_until", "max_slices", "total_child_budget_seconds"}):
+    if set(config) - (_REQUIRED | {"runs_dir", "catchup_until", "max_slices", "total_child_budget_seconds"}):
         raise CycleError("config contains unsupported review-cycle fields")
     if not isinstance(config["calendly_optional"], bool):
         raise CycleError("calendly_optional must be boolean")
@@ -120,6 +179,7 @@ def load_config(path: Path) -> dict[str, Any]:
         raise CycleError("total_child_budget_seconds must be a positive integer")
     for key in ("root", "state_dir", "cache"):
         _path(config, key)
+    _runs_dir(config)
     for key in ("routing", "corrections", "acceptance"):
         _path(config, key, file=True)
     for key in ("workspace_id", "member_id", "spreadsheet_id", "monthly_sheet_title_template"):
@@ -530,9 +590,12 @@ def _expected_snapshot_digests(
     }
 
 
-def _result(stdout: str, root: Path) -> Path:
-    paths = [Path(line).resolve() for line in stdout.splitlines() if line.strip()]
-    runs = (root / "runs").resolve()
+def _result(stdout: str, runs: Path) -> Path:
+    paths = [
+        _canonical_runtime_path(line.strip(), label="review child result")
+        for line in stdout.splitlines() if line.strip()
+    ]
+    runs = runs.resolve()
     if len(paths) != 1 or paths[0].name != "autopilot-result.json" or runs not in paths[0].parents:
         raise CycleError("review child did not emit exactly one safe result path")
     if not paths[0].is_file():
@@ -540,11 +603,11 @@ def _result(stdout: str, root: Path) -> Path:
     return paths[0]
 
 
-def _artifact_path(result: Mapping[str, Any], name: str, root: Path) -> Path:
+def _artifact_path(result: Mapping[str, Any], name: str, runs: Path) -> Path:
     paths = result.get("paths")
     raw = paths.get(name) if isinstance(paths, Mapping) else None
-    candidate = Path(str(raw)).resolve()
-    runs = (root / "runs").resolve()
+    candidate = _canonical_runtime_path(str(raw), label=f"result {name}")
+    runs = runs.resolve()
     if runs not in candidate.parents or not candidate.is_file():
         raise CycleError(f"result {name} path is unsafe or missing")
     return candidate
@@ -553,10 +616,7 @@ def _artifact_path(result: Mapping[str, Any], name: str, root: Path) -> Path:
 def _safe_run_file(run_dir: Path, raw: object, label: str) -> Path:
     if not isinstance(raw, str) or not raw:
         raise CycleError(f"{label} path is missing")
-    candidate = Path(raw)
-    if candidate.is_symlink():
-        raise CycleError(f"{label} path is unsafe")
-    candidate = candidate.resolve()
+    candidate = _canonical_runtime_path(raw, label=f"{label} path")
     try:
         candidate.relative_to(run_dir)
     except ValueError as exc:
@@ -615,8 +675,9 @@ def _validate_stage(
     expected_snapshot_digests: Mapping[str, str],
     source_run_id: str | None = None, source_run_dir: str | None = None,
 ) -> dict[str, Any]:
-    root = _path(config, "root")
-    result_path = _safe_run_file((root / "runs").resolve(), str(result_path), "result")
+    result_path = _safe_run_file(
+        _runs_dir(config), str(result_path), "result"
+    )
     if result_path.name != "autopilot-result.json":
         raise CycleError("review result filename is invalid")
     run_dir = result_path.parent
@@ -770,7 +831,7 @@ def completion_status(result: Mapping[str, Any]) -> dict[str, Any]:
 
 def _review_command(config: Mapping[str, Any], since: str, until: str) -> list[str]:
     root = _path(config, "root")
-    command = [sys.executable, str(root / "scripts" / "clockify_review_run.py"), "--since", since, "--until", (dt.date.fromisoformat(until) - dt.timedelta(days=1)).isoformat(), "--state", str(_path(config, "state_dir") / "review-state.json"), "--period-manifest", str(_path(config, "state_dir") / f"{since}.period-manifest.json"), "--routing", str(_path(config, "routing", file=True)), "--corrections", str(_path(config, "corrections", file=True)), "--acceptance-ledger", str(_path(config, "acceptance", file=True)), "--analyzer-cache", str(_path(config, "cache"))]
+    command = [sys.executable, str(root / "scripts" / "clockify_review_run.py"), "--runs-root", str(_runs_dir(config)), "--since", since, "--until", (dt.date.fromisoformat(until) - dt.timedelta(days=1)).isoformat(), "--state", str(_path(config, "state_dir") / "review-state.json"), "--period-manifest", str(_path(config, "state_dir") / f"{since}.period-manifest.json"), "--routing", str(_path(config, "routing", file=True)), "--corrections", str(_path(config, "corrections", file=True)), "--acceptance-ledger", str(_path(config, "acceptance", file=True)), "--analyzer-cache", str(_path(config, "cache"))]
     if config["calendly_optional"]:
         command.append("--calendly-optional")
     return command
@@ -783,6 +844,7 @@ def _recovery_command(
     return [
         sys.executable,
         str(root / "scripts" / "clockify_review_run.py"),
+        "--runs-root", str(_runs_dir(config)),
         "--recover-source-debt-from", str(parent_run_dir),
         "--recover-source", source,
         "--recover-attempt-id", attempt_id,
@@ -793,13 +855,18 @@ def _recovery_command(
 
 def _run_budgeted_child(
     command: list[str], *, root: Path, budget: list[float], cap: int, grace: int,
+    runs_dir: Path | None = None,
 ):
     total = min(cap, int(budget[0]))
     if total <= grace:
         raise _BudgetExhausted("total_child_budget_exhausted")
+    child_environment = dict(os.environ)
+    child_environment["CLOCKIFY_AUTOPILOT_RUNS_ROOT"] = str(
+        (runs_dir or root / "runs").resolve()
+    )
     child = run_child_bounded(
         command, cwd=root, timeout=ChildTimeoutConfig(total, grace),
-        environment=dict(os.environ),
+        environment=child_environment,
     )
     budget[0] = max(0.0, budget[0] - float(child.duration_seconds))
     return child
@@ -810,6 +877,7 @@ def _replay_command(config: Mapping[str, Any], source: Path) -> list[str]:
     return [
         sys.executable,
         str(root / "scripts" / "clockify_review_run.py"),
+        "--runs-root", str(_runs_dir(config)),
         "--replay-from", str(source),
         "--state", str(_path(config, "state_dir") / "review-state.json"),
         "--analyzer-cache", str(_path(config, "cache")),
@@ -1699,13 +1767,16 @@ def _run_exact_recovery(
         raise CycleError("finished recovery attempt was selected without a new ordinal")
     else:
         try:
-            child = _run_budgeted_child(command, root=root, budget=budget, cap=2700, grace=30)
+            child = _run_budgeted_child(
+                command, root=root, runs_dir=_runs_dir(config),
+                budget=budget, cap=2700, grace=30,
+            )
         except _BudgetExhausted:
             record["status"] = "incomplete"
             _persist_state(state_path, state, since, record)
             return {"status": "incomplete", "reason": "total_child_budget_exhausted", "slice": {"since": since, "until": until}}
         try:
-            result_path = _result(child.stdout, root)
+            result_path = _result(child.stdout, _runs_dir(config))
         except CycleError:
             record["status"] = "incomplete"
             _persist_state(state_path, state, since, record)
@@ -1789,6 +1860,7 @@ def _run_slice(
         try:
             child = _run_budgeted_child(
                 review_command, root=root, budget=budget, cap=2700, grace=30,
+                runs_dir=_runs_dir(config),
             )
         except _BudgetExhausted:
             record["status"] = "incomplete"
@@ -1796,7 +1868,7 @@ def _run_slice(
             return {"status": "incomplete", "reason": "total_child_budget_exhausted", "slice": {"since": since, "until": until}, "advance_frontier": False}
         if not child.timed_out:
             try:
-                result_path = _result(child.stdout, root)
+                result_path = _result(child.stdout, _runs_dir(config))
             except CycleError:
                 result_path = None
             if result_path is not None:
@@ -1869,7 +1941,8 @@ def _run_slice(
         try:
             child = _run_budgeted_child(
                 _replay_command(config, Path(str(source["run_dir"]))),
-                root=root, budget=budget, cap=2700, grace=30,
+                root=root, runs_dir=_runs_dir(config),
+                budget=budget, cap=2700, grace=30,
             )
         except _BudgetExhausted:
             record["status"] = "source_verified"
@@ -1880,7 +1953,7 @@ def _run_slice(
             _persist_state(state_path, state, since, record)
             return {"status": "failed", "slice": {"since": since, "until": until}}
         replay = _validate_stage(
-            config, _result(child.stdout, root), since, until, replay=True,
+            config, _result(child.stdout, _runs_dir(config)), since, until, replay=True,
             expected_snapshot_digests=source["snapshot_digests"],
             source_run_id=str(source["run_id"]), source_run_dir=str(source["run_dir"]),
         )
@@ -1902,7 +1975,8 @@ def _run_slice(
         try:
             child = _run_budgeted_child(
                 _publisher_command(config, source, replay, sheet_title=sheet_title),
-                root=root, budget=budget, cap=900, grace=30,
+                root=root, runs_dir=_runs_dir(config),
+                budget=budget, cap=900, grace=30,
             )
         except _BudgetExhausted:
             record["status"] = "replay_verified"
@@ -2049,8 +2123,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--enable-sheet-write", action="store_true")
     args = parser.parse_args(argv)
     try:
+        config = load_config(args.config)
+        _validate_runtime_root(config, os.environ)
         result = run_cycle(
-            load_config(args.config), enable_sheet_write=args.enable_sheet_write
+            config, enable_sheet_write=args.enable_sheet_write
         )
         print(json.dumps(result, sort_keys=True))
     except (CycleError, OSError, ValueError, json.JSONDecodeError) as exc:
