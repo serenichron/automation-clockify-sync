@@ -23,6 +23,36 @@ def interval(source: str, since: str, until: str) -> object:
 
 
 class SourceCoverageTests(unittest.TestCase):
+    def test_get_returns_active_exhausted_and_resolved_items_without_mutation(self):
+        store = source_coverage.SourceDebtStore()
+        active_interval = interval("sessions/macbook", "2026-08-01", "2026-08-03")
+        exhausted_interval = interval("repositories/desktop", "2026-08-01", "2026-08-03")
+        resolved_interval = interval("sessions/macbook", "2026-08-03", "2026-08-05")
+        active = store.record_failure(
+            active_interval, failure_class="offline", retryable=True,
+            resume_state_digest="sha256:active", attempted_at=NOW,
+        )
+        exhausted = store.record_failure(
+            exhausted_interval, failure_class="offline", retryable=True,
+            resume_state_digest="sha256:exhausted", attempted_at=NOW,
+        )
+        exhausted = store.exhaust(exhausted.debt_id, terminal_reason="retry_limit")
+        store.record_failure(
+            resolved_interval, failure_class="offline", retryable=True,
+            resume_state_digest="sha256:resolved", attempted_at=NOW,
+        )
+        resolved = store.record_complete(
+            resolved_interval, completion_bundle_digest="sha256:complete",
+            completed_at=LATER,
+        )
+        before = store.document()
+
+        self.assertEqual(active, store.get(active.debt_id))
+        self.assertEqual(exhausted, store.get(exhausted.debt_id))
+        self.assertEqual(resolved, store.get(resolved.debt_id))
+        self.assertIsNone(store.get("source-debt/" + "f" * 64))
+        self.assertEqual(before, store.document())
+
     def test_completing_one_failed_slice_does_not_clear_adjacent_debt(self):
         """Catches a source/day completion branch that clears an adjacent interval."""
         store = source_coverage.SourceDebtStore()

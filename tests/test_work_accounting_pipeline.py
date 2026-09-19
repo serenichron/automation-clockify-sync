@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import datetime as dt
 import json
 from pathlib import Path
@@ -8,6 +9,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from scripts import clockify_sheet_publish as sheet_publisher
 from scripts import evidence_ledger
 from scripts import review_corrections
 from scripts import work_accounting_pipeline as pipeline
@@ -102,7 +104,25 @@ def assert_schema_valid(schema, candidate) -> None:
     validate(schema, candidate)
 
 
-def session_event(source_id: str, timestamp: str, content: str = "Fix Clockify"):
+def session_event(
+    source_id: str,
+    timestamp: str,
+    content: str = "Fix Clockify",
+    *,
+    span_end: str | None = None,
+):
+    raw_source_span = (
+        {
+            "start": timestamp,
+            "end": span_end,
+            "path": "/Users/blackthorne/Work/automation-clockify-sync/session.jsonl",
+        }
+        if span_end
+        else {
+            "timestamp": timestamp,
+            "path": "/Users/blackthorne/Work/automation-clockify-sync/session.jsonl",
+        }
+    )
     return evidence_ledger.evidence_event(
         "codex_sessions_event",
         {
@@ -112,21 +132,18 @@ def session_event(source_id: str, timestamp: str, content: str = "Fix Clockify")
             "session_id": "session-1",
         },
         observed_at=timestamp,
-        raw_source_span={
-            "timestamp": timestamp,
-            "path": "/Users/blackthorne/Work/automation-clockify-sync/session.jsonl",
-        },
+        raw_source_span=raw_source_span,
         attributes={"role": "user", "kind": "message", "content": content},
     )
 
 
-def clockify_event(start: str, end: str):
+def clockify_event(start: str, end: str, **attributes):
     return evidence_ledger.evidence_event(
         "clockify",
         {"source_type": "clockify", "source_id": "existing-1"},
         observed_at=start,
         raw_source_span={"start": start, "end": end},
-        attributes={"description": "Existing work"},
+        attributes={"description": "Existing work", **attributes},
     )
 
 
@@ -557,6 +574,47 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         self.assertEqual("Serenichron Level 1", route["project_name"])
         self.assertEqual(["Project Management"], route["tag_names"])
 
+    def test_evidence_fallback_does_not_override_flash_project_recommendation(self):
+        routing = json.loads((ROOT / "routing.json").read_text())
+        cited = [session_event(
+            "reviewed-client:event:1",
+            "2026-07-10T09:00:00+03:00",
+            "Updated Serenichron notes while delivering Lens of Alex work",
+        ).document()]
+        activity = {
+            "semantic_reviewer_model": "deepseek-v4-flash:cloud",
+            "project_recommendation": {
+                "name": "Lens of Alex Retainer",
+                "prefix": "LoA",
+                "tag_names": ["Web content"],
+            },
+        }
+
+        route, error = pipeline.resolve_route(activity, cited, routing)
+
+        self.assertIsNone(error)
+        self.assertEqual("Lens of Alex Retainer", route["project_name"])
+        self.assertEqual("LoA", route["prefix"])
+
+    def test_evidence_fallback_does_not_override_deterministic_client_route(self):
+        routing = json.loads((ROOT / "routing.json").read_text())
+        event = session_event(
+            "tstprep-bni:event:1",
+            "2026-07-10T09:00:00+03:00",
+            "Documented a BNI example in the TST Prep implementation",
+        ).document()
+        event["raw_source_span"]["path"] = (
+            "/Users/blackthorne/Work/tstprep-com-site-codebase/session.jsonl"
+        )
+
+        route, error = pipeline.resolve_route(
+            {"project_recommendation": {}}, [event], routing
+        )
+
+        self.assertIsNone(error)
+        self.assertEqual("TST Prep Level 2", route["project_name"])
+        self.assertEqual("TSTP", route["prefix"])
+
     def test_emblemstudio_uses_serenichron_project_with_es_prefix(self):
         routing = json.loads((ROOT / "routing.json").read_text())
         cited = [
@@ -917,6 +975,7 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             "session-1:event:review-1",
             "2026-07-10T09:00:00+03:00",
             "Hold brand strategy alignment meeting",
+            span_end="2026-07-10T10:00:00+03:00",
         )
         last = session_event(
             "session-1:event:review-2",
@@ -997,7 +1056,11 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         )
 
     def test_splits_effort_around_existing_block_without_overlap(self):
-        first = session_event("session-1:event:1", "2026-07-10T09:00:00+03:00")
+        first = session_event(
+            "session-1:event:1",
+            "2026-07-10T09:00:00+03:00",
+            span_end="2026-07-10T12:00:00+03:00",
+        )
         last = session_event("session-1:event:2", "2026-07-10T12:00:00+03:00")
         existing = clockify_event("2026-07-10T10:00:00+03:00", "2026-07-10T10:30:00+03:00")
         _, result = self.make_run(
@@ -1010,8 +1073,372 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         self.assertGreaterEqual(result["proposals"][1]["start"], "2026-07-10T10:30+03:00")
         self.assertTrue(all(row["allocation_mode"] == "non_overlapping_v1" for row in result["proposals"]))
 
+    def test_full_fixed_block_exhaustion_emits_review_proposal_with_warnings(self):
+        work = session_event(
+            "capacity-recovery:event:1",
+            "2026-07-10T09:00:00+03:00",
+            span_end="2026-07-10T10:00:00+03:00",
+        )
+        existing = clockify_event(
+            "2026-07-10T09:00:00+03:00",
+            "2026-07-10T10:00:00+03:00",
+            project_id_suffix="775f9f",
+        )
+
+        _, result = self.make_run(
+            [work, existing],
+            analysis_for([work.evidence_id], recommended=30),
+        )
+
+        self.assertEqual(1, len(result["proposals"]))
+        proposal = result["proposals"][0]
+        self.assertEqual(30, proposal["duration_minutes"])
+        self.assertEqual(
+            {
+                "type": "allocation_capacity_recovery",
+                "requested_minutes": 30,
+                "allocator_allocated_minutes": 0,
+                "recovered_minutes": 30,
+                "residual_minutes": 0,
+            },
+            proposal["review_warnings"][0],
+        )
+        self.assertEqual(
+            {
+                "type": "existing_clockify_overlap",
+                "counterpart_id": existing.evidence_id,
+                "counterpart_project_suffix": "775f9f",
+                "overlap_start": "2026-07-10T09:00:00+03:00",
+                "overlap_end": "2026-07-10T09:30:00+03:00",
+                "overlap_duration_seconds": 1800,
+            },
+            proposal["review_warnings"][1],
+        )
+        self.assertFalse(any(
+            row.get("activity_id") == proposal["activity_id"]
+            and row.get("exception_kind") == "contested_time"
+            for row in result["ambiguous"]
+        ))
+        self.assertEqual([], result["allocation"]["contested_time"])
+        self.assertEqual(
+            [{
+                "activity_id": proposal["activity_id"],
+                "requested_minutes": 30,
+                "allocator_allocated_minutes": 0,
+                "recovered_minutes": 30,
+                "residual_minutes": 0,
+            }],
+            result["allocation"]["capacity_recoveries"],
+        )
+        row = sheet_publisher.proposal_row(
+            proposal,
+            "run-capacity-recovery",
+            project_allowlist={"775f9f": "Serenichron Level 2"},
+        )
+        self.assertEqual(
+            "allocation_capacity_recovery",
+            json.loads(row[12])[0]["type"],
+        )
+
+    def test_partial_allocator_capacity_recovers_only_unallocated_duration(self):
+        work = session_event(
+            "partial-recovery:event:1",
+            "2026-07-10T09:00:00+03:00",
+            span_end="2026-07-10T10:00:00+03:00",
+        )
+        existing = clockify_event(
+            "2026-07-10T09:20:00+03:00",
+            "2026-07-10T09:50:00+03:00",
+            project_id_suffix="775f9f",
+        )
+
+        _, result = self.make_run(
+            [work, existing],
+            analysis_for([work.evidence_id], recommended=40),
+        )
+
+        self.assertEqual(40, sum(row["duration_minutes"] for row in result["proposals"]))
+        recovered = next(
+            row for row in result["proposals"]
+            if any(
+                warning.get("type") == "allocation_capacity_recovery"
+                for warning in row["review_warnings"]
+            )
+        )
+        self.assertEqual("2026-07-10T09:20:00+03:00", recovered["start"])
+        self.assertEqual("2026-07-10T09:30:00+03:00", recovered["end"])
+        self.assertEqual(
+            {
+                "type": "allocation_capacity_recovery",
+                "requested_minutes": 40,
+                "allocator_allocated_minutes": 30,
+                "recovered_minutes": 10,
+                "residual_minutes": 0,
+            },
+            recovered["review_warnings"][0],
+        )
+        self.assertFalse(any(
+            row.get("activity_id") == recovered["activity_id"]
+            and row.get("exception_kind") == "contested_time"
+            for row in result["ambiguous"]
+        ))
+        self.assertEqual([], result["allocation"]["contested_time"])
+
+    def test_capacity_recovery_dedupes_same_activity_interval_but_keeps_distinct_work(self):
+        first = session_event(
+            "dedupe-recovery:event:1",
+            "2026-07-10T09:00:00+03:00",
+            span_end="2026-07-10T09:30:00+03:00",
+        )
+        duplicate_span = session_event(
+            "dedupe-recovery:event:2",
+            "2026-07-10T09:00:00+03:00",
+            span_end="2026-07-10T09:30:00+03:00",
+        )
+        distinct_span = session_event(
+            "dedupe-recovery:event:3",
+            "2026-07-10T09:00:00+03:00",
+            span_end="2026-07-10T09:30:00+03:00",
+        )
+        existing = clockify_event(
+            "2026-07-10T09:00:00+03:00",
+            "2026-07-10T09:30:00+03:00",
+        )
+        analysis = analysis_for(
+            [first.evidence_id, duplicate_span.evidence_id], recommended=10
+        )
+        distinct = copy.deepcopy(analysis["activities"][0])
+        distinct["action"] = "Reviewed"
+        distinct["object"] = "separate capacity recovery"
+        distinct["outcome"] = "for a distinct deliverable"
+        distinct["evidence_ids"] = [distinct_span.evidence_id]
+        distinct["evidence_spans"] = [{
+            "evidence_id": distinct_span.evidence_id,
+            "start": "2026-07-10T09:00:00+03:00",
+            "end": "2026-07-10T09:30:00+03:00",
+        }]
+        analysis["activities"].append(distinct)
+
+        _, result = self.make_run(
+            [first, duplicate_span, distinct_span, existing], analysis
+        )
+
+        recovered = [
+            row for row in result["proposals"]
+            if any(
+                warning.get("type") == "allocation_capacity_recovery"
+                for warning in row["review_warnings"]
+            )
+        ]
+        self.assertEqual(2, len(recovered))
+        self.assertEqual(2, len({row["activity_id"] for row in recovered}))
+        self.assertEqual(
+            2,
+            len({(row["activity_id"], row["start"], row["end"]) for row in recovered}),
+        )
+
+    def test_multi_interval_recovery_emits_one_aggregate_capacity_warning(self):
+        first = session_event(
+            "multi-recovery:event:1",
+            "2026-07-10T09:00:00+03:00",
+            span_end="2026-07-10T09:20:00+03:00",
+        )
+        second = session_event(
+            "multi-recovery:event:2",
+            "2026-07-10T10:00:00+03:00",
+            span_end="2026-07-10T10:10:00+03:00",
+        )
+        first_block = clockify_event(
+            "2026-07-10T09:00:00+03:00",
+            "2026-07-10T09:20:00+03:00",
+            project_id_suffix="775f9f",
+        )
+        second_block = evidence_ledger.evidence_event(
+            "clockify",
+            {"source_type": "clockify", "source_id": "existing-2"},
+            observed_at="2026-07-10T10:00:00+03:00",
+            raw_source_span={
+                "start": "2026-07-10T10:00:00+03:00",
+                "end": "2026-07-10T10:10:00+03:00",
+            },
+            attributes={
+                "description": "Existing second block",
+                "project_id_suffix": "775f9f",
+            },
+        )
+
+        _, result = self.make_run(
+            [first, second, first_block, second_block],
+            analysis_for([first.evidence_id, second.evidence_id], recommended=30),
+        )
+
+        recovered = sorted(result["proposals"], key=lambda row: row["start"])
+        self.assertEqual([20, 10], [row["duration_minutes"] for row in recovered])
+        capacity_warnings = [
+            warning
+            for row in recovered
+            for warning in row["review_warnings"]
+            if warning.get("type") == "allocation_capacity_recovery"
+        ]
+        self.assertEqual(1, len(capacity_warnings))
+        self.assertEqual(
+            sum(row["duration_minutes"] for row in recovered),
+            capacity_warnings[0]["recovered_minutes"],
+        )
+        self.assertEqual(
+            ["allocation_capacity_recovery", "existing_clockify_overlap"],
+            [warning["type"] for warning in recovered[0]["review_warnings"]],
+        )
+        self.assertEqual(
+            ["existing_clockify_overlap"],
+            [warning["type"] for warning in recovered[1]["review_warnings"]],
+        )
+        self.assertEqual(1, len(result["allocation"]["capacity_recoveries"]))
+        for proposal in recovered:
+            sheet_publisher.proposal_row(
+                proposal,
+                "run-multi-capacity-recovery",
+                project_allowlist={"775f9f": "Serenichron Level 2"},
+            )
+
+    def test_recovery_replay_preserves_all_intervals_capacity_and_overlap_warnings(self):
+        """Exact replay must keep every recovered interval reviewable exactly once."""
+        first = session_event(
+            "replay-recovery:event:1",
+            "2026-07-10T09:00:00+03:00",
+            span_end="2026-07-10T09:20:00+03:00",
+        )
+        second = session_event(
+            "replay-recovery:event:2",
+            "2026-07-10T10:00:00+03:00",
+            span_end="2026-07-10T10:10:00+03:00",
+        )
+        existing = clockify_event(
+            "2026-07-10T09:05:00+03:00",
+            "2026-07-10T09:15:00+03:00",
+            project_id_suffix="775f9f",
+        )
+        analysis = analysis_for([first.evidence_id], recommended=20)
+        second_activity = copy.deepcopy(analysis["activities"][0])
+        second_activity.update({
+            "action": "Reviewed",
+            "object": "a separate exact interval",
+            "outcome": "for complete recovery coverage",
+            "evidence_ids": [second.evidence_id],
+            "evidence_spans": [{
+                "evidence_id": second.evidence_id,
+                "start": "2026-07-10T10:00:00+03:00",
+                "end": "2026-07-10T10:10:00+03:00",
+            }],
+            "effort": {
+                "minimum_minutes": 10,
+                "recommended_minutes": 10,
+                "maximum_minutes": 10,
+            },
+        })
+        analysis["activities"].append(second_activity)
+        run_dir, first_result = self.make_run(
+            [first, second, existing],
+            analysis,
+            routing_path=ROOT / "routing.json",
+        )
+        fixture = run_dir.parents[1] / "analysis.json"
+
+        replay_result = pipeline.run_accounting(
+            run_dir,
+            root=ROOT,
+            analysis_fixture=fixture,
+            routing_path=ROOT / "routing.json",
+        )
+
+        self.assertEqual(first_result, replay_result)
+        proposals = sorted(replay_result["proposals"], key=lambda row: row["start"])
+        self.assertEqual(30, sum(row["duration_minutes"] for row in proposals))
+        self.assertEqual(
+            [
+                ("2026-07-10T09:00:00+03:00", "2026-07-10T09:05:00+03:00"),
+                ("2026-07-10T09:05:00+03:00", "2026-07-10T09:15:00+03:00"),
+                ("2026-07-10T09:15:00+03:00", "2026-07-10T09:20:00+03:00"),
+                ("2026-07-10T10:00:00+03:00", "2026-07-10T10:10:00+03:00"),
+            ],
+            [(row["start"], row["end"]) for row in proposals],
+        )
+        self.assertEqual(
+            {first.evidence_id, second.evidence_id},
+            {
+                evidence_id
+                for row in proposals
+                for evidence_id in row["provenance"]["evidence_ids"]
+            },
+        )
+        warning_types = {
+            warning["type"]
+            for proposal in proposals
+            for warning in proposal["review_warnings"]
+        }
+        self.assertEqual(
+            {"allocation_capacity_recovery", "existing_clockify_overlap"},
+            warning_types,
+        )
+        overlapping = next(
+            proposal
+            for proposal in proposals
+            if any(
+                warning["type"] == "existing_clockify_overlap"
+                for warning in proposal["review_warnings"]
+            )
+        )
+        self.assertEqual(
+            ("2026-07-10T09:05:00+03:00", "2026-07-10T09:15:00+03:00"),
+            (overlapping["start"], overlapping["end"]),
+        )
+        self.assertEqual(
+            {
+                "type": "existing_clockify_overlap",
+                "counterpart_id": existing.evidence_id,
+                "counterpart_project_suffix": "775f9f",
+                "overlap_start": "2026-07-10T09:05:00+03:00",
+                "overlap_end": "2026-07-10T09:15:00+03:00",
+                "overlap_duration_seconds": 600,
+            },
+            next(
+                warning
+                for warning in overlapping["review_warnings"]
+                if warning["type"] == "existing_clockify_overlap"
+            ),
+        )
+        self.assertEqual(
+            {
+                "type": "allocation_capacity_recovery",
+                "requested_minutes": 20,
+                "allocator_allocated_minutes": 10,
+                "recovered_minutes": 10,
+                "residual_minutes": 0,
+            },
+            next(
+                warning
+                for warning in overlapping["review_warnings"]
+                if warning["type"] == "allocation_capacity_recovery"
+            ),
+        )
+        self.assertEqual(
+            len(proposals),
+            len({
+                sheet_publisher.proposal_row(
+                    proposal,
+                    "run-replay-capacity-recovery",
+                    project_allowlist={"775f9f": "Serenichron Level 2"},
+                )[0]
+                for proposal in proposals
+            }),
+        )
+
     def test_prior_skip_removes_every_segment_and_records_one_skip(self):
-        first = session_event("session-1:event:1", "2026-07-10T09:00:00+03:00")
+        first = session_event(
+            "session-1:event:1",
+            "2026-07-10T09:00:00+03:00",
+            span_end="2026-07-10T12:00:00+03:00",
+        )
         last = session_event("session-1:event:2", "2026-07-10T12:00:00+03:00")
         existing = clockify_event("2026-07-10T10:00:00+03:00", "2026-07-10T10:30:00+03:00")
         run_dir, initial = self.make_run(
@@ -1037,7 +1464,11 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         self.assertEqual(1, rerun["correction_regression"]["summary"]["fail"])
 
     def test_modify_mismatch_removes_segments_and_emits_one_exception(self):
-        first = session_event("session-1:event:1", "2026-07-10T09:00:00+03:00")
+        first = session_event(
+            "session-1:event:1",
+            "2026-07-10T09:00:00+03:00",
+            span_end="2026-07-10T12:00:00+03:00",
+        )
         last = session_event("session-1:event:2", "2026-07-10T12:00:00+03:00")
         existing = clockify_event("2026-07-10T10:00:00+03:00", "2026-07-10T10:30:00+03:00")
         run_dir, initial = self.make_run(
@@ -1072,7 +1503,11 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         self.assertEqual(activity_id, failures[0]["activity_id"])
 
     def test_matching_modify_correction_passes_and_keeps_all_segments(self):
-        first = session_event("session-1:event:1", "2026-07-10T09:00:00+03:00")
+        first = session_event(
+            "session-1:event:1",
+            "2026-07-10T09:00:00+03:00",
+            span_end="2026-07-10T12:00:00+03:00",
+        )
         last = session_event("session-1:event:2", "2026-07-10T12:00:00+03:00")
         existing = clockify_event("2026-07-10T10:00:00+03:00", "2026-07-10T10:30:00+03:00")
         run_dir, initial = self.make_run(
@@ -1104,7 +1539,11 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         self.assertFalse(any(row.get("exception_kind") == "correction_regression" for row in rerun["ambiguous"]))
 
     def test_missing_modified_activity_is_a_visible_correction_exception(self):
-        first = session_event("session-1:event:1", "2026-07-10T09:00:00+03:00")
+        first = session_event(
+            "session-1:event:1",
+            "2026-07-10T09:00:00+03:00",
+            span_end="2026-07-10T10:00:00+03:00",
+        )
         last = session_event("session-1:event:2", "2026-07-10T10:00:00+03:00")
         run_dir, initial = self.make_run(
             [first, last],
@@ -1148,7 +1587,11 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         self.assertEqual(1, rerun["correction_regression"]["summary"]["fail"])
 
     def test_only_generalized_corrections_reach_pipeline_analyzer(self):
-        first = session_event("session-1:event:1", "2026-07-10T09:00:00+03:00")
+        first = session_event(
+            "session-1:event:1",
+            "2026-07-10T09:00:00+03:00",
+            span_end="2026-07-10T10:00:00+03:00",
+        )
         last = session_event("session-1:event:2", "2026-07-10T10:00:00+03:00")
         run_dir, initial = self.make_run(
             [first, last],
@@ -1177,13 +1620,24 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             "2026-07-10T09:00:00+03:00",
             "Reduced Honcho memory use",
         )
-        rollout = session_event(
+        memory_end = session_event(
             "session-1:event:2",
+            "2026-07-10T09:10:00+03:00",
+            "Verified Honcho memory reduction",
+        )
+        rollout = session_event(
+            "session-1:event:3",
             "2026-07-10T10:00:00+03:00",
             "Wrote Honcho rollout plan",
         )
+        rollout_end = session_event(
+            "session-1:event:4",
+            "2026-07-10T10:10:00+03:00",
+            "Reviewed Honcho rollout plan",
+        )
         analysis = analysis_for([memory.evidence_id], recommended=20)
         memory_activity = analysis["activities"][0]
+        memory_activity["evidence_ids"] = [memory.evidence_id, memory_end.evidence_id]
         memory_activity.update({
             "workstream": "Honcho adoption",
             "action": "Reduced",
@@ -1197,7 +1651,7 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             "action": "Wrote",
             "object": "Honcho rollout plan",
             "outcome": "for safer staged adoption",
-            "evidence_ids": [rollout.evidence_id],
+            "evidence_ids": [rollout.evidence_id, rollout_end.evidence_id],
             "evidence_spans": [{
                 "evidence_id": rollout.evidence_id,
                 "start": "2026-07-10T10:00:00+03:00",
@@ -1207,7 +1661,9 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         })
         analysis["activities"].append(rollout_activity)
 
-        _, result = self.make_run([memory, rollout], analysis)
+        _, result = self.make_run(
+            [memory, memory_end, rollout, rollout_end], analysis
+        )
 
         self.assertEqual(
             {
@@ -1218,7 +1674,11 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         )
 
     def test_does_not_expand_short_effort_to_fill_empty_day(self):
-        first = session_event("session-1:event:1", "2026-07-10T09:00:00+03:00")
+        first = session_event(
+            "session-1:event:1",
+            "2026-07-10T09:00:00+03:00",
+            span_end="2026-07-10T12:00:00+03:00",
+        )
         last = session_event("session-1:event:2", "2026-07-10T12:00:00+03:00")
         _, result = self.make_run(
             [first, last],
@@ -1227,17 +1687,278 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         self.assertEqual(20, sum(row["duration_minutes"] for row in result["proposals"]))
         self.assertGreater(result["allocation"]["unallocated_capacity"]["total_minutes"], 100)
 
-    def test_infeasible_effort_emits_contested_time_without_hiding_demand(self):
-        first = session_event("session-1:event:1", "2026-07-10T09:00:00+03:00")
+    def test_infeasible_effort_is_capped_to_observed_interval_without_hiding_request(self):
+        first = session_event(
+            "session-1:event:1",
+            "2026-07-10T09:00:00+03:00",
+            span_end="2026-07-10T10:00:00+03:00",
+        )
         last = session_event("session-1:event:2", "2026-07-10T10:00:00+03:00")
         _, result = self.make_run(
             [first, last],
             analysis_for([first.evidence_id, last.evidence_id], recommended=90),
         )
-        contested = [row for row in result["ambiguous"] if row.get("exception_kind") == "contested_time"]
-        self.assertEqual(1, len(contested))
-        self.assertEqual(90, contested[0]["requested_minutes"])
-        self.assertGreater(contested[0]["unallocated_minutes"], 0)
+        self.assertEqual(60, sum(row["duration_minutes"] for row in result["proposals"]))
+        self.assertEqual(90, result["proposals"][0]["review_warnings"][0]["requested_minutes"])
+        self.assertEqual(60, result["proposals"][0]["review_warnings"][0]["observed_capacity_minutes"])
+        self.assertFalse(any(
+            row.get("exception_kind") == "contested_time"
+            for row in result["ambiguous"]
+        ))
+
+    def test_requested_effort_above_observed_interval_proposes_observed_duration_with_warning(self):
+        """Catches valid short evidence being rolled back as contested time."""
+        first = session_event("capacity:event:1", "2026-07-10T09:00:00+03:00")
+        last = session_event("capacity:event:2", "2026-07-10T09:10:00+03:00")
+
+        _, result = self.make_run(
+            [first, last],
+            analysis_for([first.evidence_id, last.evidence_id], recommended=30),
+        )
+
+        self.assertEqual(1, len(result["proposals"]))
+        proposal = result["proposals"][0]
+        self.assertEqual("2026-07-10T09:00:00+03:00", proposal["start"])
+        self.assertEqual("2026-07-10T09:10:00+03:00", proposal["end"])
+        self.assertEqual(10, proposal["duration_minutes"])
+        self.assertEqual(
+            [{
+                "type": "observed_capacity_cap",
+                "requested_minutes": 30,
+                "observed_capacity_minutes": 10,
+                "proposed_minutes": 10,
+            }],
+            proposal["review_warnings"],
+        )
+        self.assertFalse(any(
+            row.get("activity_id") == proposal["activity_id"]
+            and row.get("exception_kind") == "contested_time"
+            for row in result["ambiguous"]
+        ))
+
+    def test_single_point_evidence_does_not_invent_a_one_minute_interval(self):
+        """Catches the pipeline turning an observed instant into unobserved time."""
+        point = session_event("point:event:1", "2026-07-10T09:00:00+03:00")
+
+        _, result = self.make_run(
+            [point],
+            analysis_for([point.evidence_id], recommended=1),
+        )
+
+        self.assertEqual([], result["proposals"])
+        timing = next(
+            row for row in result["ambiguous"]
+            if row.get("exception_kind") == "timing_evidence"
+        )
+        self.assertEqual(
+            "cited evidence has timestamps but no positive observed interval",
+            timing["reason"],
+        )
+
+    def test_point_timestamp_is_not_paired_with_session_end(self):
+        """Catches point evidence borrowing unrelated session metadata duration."""
+        carried = session_event(
+            "session-metadata:event:1", "2026-09-11T23:50:00+03:00"
+        ).document()
+        carried["raw_source_span"].update({
+            "session_start": "2026-09-10T08:00:00+03:00",
+            "session_end": "2026-09-12T01:00:00+03:00",
+        })
+        next_first = session_event(
+            "session-metadata:event:2", "2026-09-12T00:10:00+03:00"
+        ).document()
+        next_last = session_event(
+            "session-metadata:event:3", "2026-09-12T00:20:00+03:00"
+        ).document()
+
+        intervals = pipeline._activity_observed_intervals(
+            [carried, next_first, next_last]
+        )
+
+        self.assertEqual([{
+            "start": "2026-09-12T00:10:00+03:00",
+            "end": "2026-09-12T00:20:00+03:00",
+        }], intervals)
+
+    def test_point_observations_split_at_authoritative_collector_idle_gap(self):
+        events = [
+            session_event("cluster:event:1", "2026-07-10T09:00:00+03:00").document(),
+            session_event("cluster:event:2", "2026-07-10T09:01:00+03:00").document(),
+            session_event("cluster:event:3", "2026-07-10T17:00:00+03:00").document(),
+        ]
+
+        intervals = pipeline._activity_observed_intervals(events)
+
+        self.assertEqual([{
+            "start": "2026-07-10T09:00:00+03:00",
+            "end": "2026-07-10T09:01:00+03:00",
+        }], intervals)
+
+    def test_point_observations_join_at_exact_collector_idle_gap(self):
+        points = [
+            session_event("threshold:event:1", "2026-07-10T09:00:00+03:00"),
+            session_event("threshold:event:2", "2026-07-10T09:30:00+03:00"),
+        ]
+        events = [point.document() for point in points]
+
+        intervals = pipeline._activity_observed_intervals(events)
+
+        self.assertEqual([{
+            "start": "2026-07-10T09:00:00+03:00",
+            "end": "2026-07-10T09:30:00+03:00",
+        }], intervals)
+        self.assertEqual(
+            pipeline.collector.BURST_GAP_SECONDS,
+            pipeline.POINT_OBSERVATION_GAP_THRESHOLDS_SECONDS[
+                "codex_sessions_event"
+            ],
+        )
+        _, result = self.make_run(
+            points,
+            analysis_for([point.evidence_id for point in points], recommended=30),
+        )
+        self.assertEqual(
+            {
+                "configuration_source": (
+                    "scripts.clockify_sync_collect.BURST_GAP_SECONDS"
+                ),
+                "max_consecutive_gap_seconds": pipeline.collector.BURST_GAP_SECONDS,
+                "source_types": ["claude_bursts_event", "codex_sessions_event"],
+            },
+            result["allocation"]["deterministic_inputs"]
+            ["point_observation_clustering"],
+        )
+
+    def test_point_observations_split_above_collector_idle_gap(self):
+        events = [
+            session_event("threshold:event:1", "2026-07-10T09:00:00+03:00").document(),
+            session_event("threshold:event:2", "2026-07-10T09:30:01+03:00").document(),
+        ]
+
+        self.assertEqual([], pipeline._activity_observed_intervals(events))
+
+    def test_point_source_without_authoritative_gap_does_not_create_duration(self):
+        events = [
+            evidence_ledger.evidence_event(
+                "unsupported_event",
+                {"source_type": "unsupported", "source_id": f"event-{index}"},
+                observed_at=timestamp,
+                raw_source_span={"timestamp": timestamp},
+                attributes={"content": "Observed work"},
+            ).document()
+            for index, timestamp in enumerate(
+                ("2026-07-10T09:00:00+03:00", "2026-07-10T09:01:00+03:00"),
+                1,
+            )
+        ]
+
+        self.assertEqual([], pipeline._activity_observed_intervals(events))
+
+    def test_orphan_raw_end_does_not_pair_with_observed_at(self):
+        event = {
+            "observed_at": "2026-07-10T09:00:00+03:00",
+            "raw_source_span": {"end": "2026-07-10T10:00:00+03:00"},
+        }
+
+        start, end = pipeline._observed_span(event)
+
+        self.assertEqual(
+            dt.datetime.fromisoformat("2026-07-10T09:00:00+03:00"), start
+        )
+        self.assertIsNone(end)
+
+    def test_observed_intervals_coalesce_overlaps_without_filling_gaps(self):
+        """Catches overlapping evidence double-counting and disjoint gap filling."""
+        events = [
+            {
+                "evidence_id": "ev-one",
+                "raw_source_span": {
+                    "start": "2026-07-10T09:00:00+03:00",
+                    "end": "2026-07-10T09:30:00+03:00",
+                },
+            },
+            {
+                "evidence_id": "ev-two",
+                "raw_source_span": {
+                    "start": "2026-07-10T09:20:00+03:00",
+                    "end": "2026-07-10T09:45:00+03:00",
+                },
+            },
+            {
+                "evidence_id": "ev-three",
+                "raw_source_span": {
+                    "start": "2026-07-10T10:00:00+03:00",
+                    "end": "2026-07-10T10:15:00+03:00",
+                },
+            },
+        ]
+
+        intervals = pipeline._activity_observed_intervals(events)
+
+        self.assertEqual([
+            {
+                "start": "2026-07-10T09:00:00+03:00",
+                "end": "2026-07-10T09:45:00+03:00",
+            },
+            {
+                "start": "2026-07-10T10:00:00+03:00",
+                "end": "2026-07-10T10:15:00+03:00",
+            },
+        ], intervals)
+
+    def test_point_only_routing_correction_passes_without_inventing_duration(self):
+        point = session_event(
+            "mazilu:event:historical",
+            "2026-09-11T12:35:03Z",
+            "Reviewed Mazilu & Partners commercial proposal and confirmed draft status",
+        )
+        analysis = analysis_for([point.evidence_id], recommended=30)
+        analysis["activities"][0]["project_recommendation"] = {
+            "name": "", "prefix": "", "tag_names": [],
+        }
+        run_dir, initial = self.make_run([point], analysis)
+        activity_id = next(
+            row["activity_id"] for row in initial["ambiguous"]
+            if row.get("exception_kind") == "timing_evidence"
+        )
+        corrections_path = run_dir.parent.parent / "review-corrections.jsonl"
+        item = {
+            "id": "rvi-mazilu-point-routing",
+            "current": {
+                "activity_id": activity_id,
+                "evidence_ids": [point.evidence_id],
+            },
+        }
+        correction = review_corrections.build_decision(
+            item,
+            decision="modify",
+            reviewer="reviewer",
+            reviewed_at="2026-09-18T00:00:00+03:00",
+            correction_categories=["routing"],
+            rationale="Route historical pre-contract review to Serenichron.",
+            field_patch={
+                "client_project": {"op": "replace", "value": "Serenichron Level 1"},
+                "tag_names": {"op": "replace", "value": ["Business development"]},
+            },
+        )
+        review_corrections.append_decision(
+            corrections_path, correction, item=item
+        )
+        result = pipeline.run_accounting(
+            run_dir,
+            root=ROOT,
+            analysis_fixture=run_dir.parent.parent / "analysis.json",
+            corrections_path=corrections_path,
+        )
+
+        self.assertEqual([], result["proposals"])
+        timing = [
+            row for row in result["ambiguous"]
+            if row.get("activity_id") == activity_id
+        ]
+        self.assertEqual(["timing_evidence"], [row["exception_kind"] for row in timing])
+        self.assertEqual(1, result["correction_regression"]["summary"]["pass"])
+        self.assertEqual(0, result["correction_regression"]["summary"]["fail"])
 
     def test_unrelated_workstream_does_not_widen_allocation_envelope(self):
         early_one = session_event("early:event:1", "2026-07-10T09:00:00+03:00")
@@ -1261,18 +1982,18 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             [early_one, early_two, late_one, late_two], early_analysis
         )
 
-        self.assertFalse(
-            any(row["source_label"] == "Clockify review process" for row in result["proposals"])
+        early = next(
+            row for row in result["proposals"]
+            if row["source_label"] == "Clockify review process"
         )
-        contested = next(
-            row for row in result["ambiguous"]
-            if row.get("exception_kind") == "contested_time"
-        )
-        self.assertEqual(60, contested["unallocated_minutes"])
-        self.assertIn(
-            ["2026-07-10T09:00:00+03:00", "2026-07-10T09:21:00+03:00"],
-            result["allocation"]["unallocated_capacity"]["intervals"],
-        )
+        self.assertEqual(20, early["duration_minutes"])
+        self.assertEqual(60, early["review_warnings"][0]["requested_minutes"])
+        self.assertEqual(20, early["review_warnings"][0]["observed_capacity_minutes"])
+        self.assertTrue(all(
+            row["end"] <= "2026-07-10T09:20:00+03:00"
+            or row["start"] >= "2026-07-10T17:00:00+03:00"
+            for row in result["proposals"]
+        ))
 
     def test_title_only_fathom_meeting_is_a_fixed_exception(self):
         meeting = fathom_event("2026-07-10T13:00:00+03:00", "2026-07-10T14:00:00+03:00")
@@ -1301,6 +2022,35 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         self.assertEqual("proposed", result["fathom_reconciliation"][0]["status"])
         self.assertEqual(meeting.evidence_id, result["fathom_reconciliation"][0]["evidence_id"])
         self.assertEqual([meeting.evidence_id], result["fathom_reconciliation"][0]["source_evidence_ids"])
+
+    def test_eligible_meeting_blocks_nonmeeting_allocation_inside_canonical_interval(self):
+        """Catches ordinary work being allocated concurrently with a meeting."""
+        meeting = fathom_event(
+            "2026-07-10T13:00:00+03:00",
+            "2026-07-10T14:00:00+03:00",
+            status="available",
+        )
+        first = session_event(
+            "inside-meeting:event:1", "2026-07-10T13:10:00+03:00"
+        )
+        last = session_event(
+            "inside-meeting:event:2", "2026-07-10T13:50:00+03:00"
+        )
+        analysis = meeting_analysis(meeting)
+        analysis["activities"].extend(
+            analysis_for(
+                [first.evidence_id, last.evidence_id], recommended=30
+            )["activities"]
+        )
+
+        _, result = self.make_run([meeting, first, last], analysis)
+
+        self.assertEqual(1, len(result["proposals"]))
+        self.assertEqual("Discovery call scope", result["proposals"][0]["source_label"])
+        self.assertFalse(any(
+            row["source_label"] == "Clockify review process"
+            for row in result["proposals"]
+        ))
 
     def test_accounting_uses_the_canonical_meeting_identity_for_fixed_time(self):
         meeting = fathom_event(
@@ -1616,7 +2366,7 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             result["fathom_reconciliation"][0]["reason"],
         )
 
-    def test_matching_clockify_block_reconciles_fathom_meeting_without_proposal(self):
+    def test_temporal_overlap_without_meeting_identity_does_not_dedupe(self):
         meeting = fathom_event(
             "2026-07-10T13:00:00+03:00",
             "2026-07-10T14:00:00+03:00",
@@ -1627,14 +2377,99 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         )
         _, result = self.make_run([meeting, existing], meeting_analysis(meeting))
 
+        self.assertEqual(1, len(result["proposals"]))
+        reconciliation = result["fathom_reconciliation"][0]
+        self.assertEqual("proposed", reconciliation["status"])
+        self.assertEqual(meeting.evidence_id, reconciliation["evidence_id"])
+        self.assertEqual([meeting.evidence_id], reconciliation["source_evidence_ids"])
+        self.assertEqual(
+            "existing_clockify_overlap",
+            result["proposals"][0]["review_warnings"][0]["type"],
+        )
+
+    def test_exact_canonical_meeting_identity_dedupes_without_overlap_ratio(self):
+        meeting = fathom_event(
+            "2026-07-10T13:00:00+03:00",
+            "2026-07-10T14:00:00+03:00",
+            status="available",
+        )
+        canonical = reconcile_meetings(
+            [meeting.document()], [], vlad_identities={"vlad@serenichron.com"}
+        ).meetings[0]
+        existing = clockify_event(
+            "2026-07-10T13:00:00+03:00",
+            "2026-07-10T15:00:00+03:00",
+            canonical_meeting_id=canonical.canonical_id,
+        )
+
+        _, result = self.make_run([meeting, existing], meeting_analysis(meeting))
+
         self.assertEqual([], result["proposals"])
         reconciliation = result["fathom_reconciliation"][0]
         self.assertEqual("reconciled", reconciliation["status"])
         self.assertEqual("existing_clockify_meeting_match", reconciliation["reason"])
-        self.assertEqual(meeting.evidence_id, reconciliation["evidence_id"])
-        self.assertEqual([meeting.evidence_id], reconciliation["source_evidence_ids"])
 
-    def test_partial_clockify_overlap_is_fixed_block_conflict_not_proposal(self):
+    def test_exact_schedule_title_and_participants_form_cross_source_identity(self):
+        meeting = fathom_event(
+            "2026-07-10T13:00:00+03:00",
+            "2026-07-10T14:00:00+03:00",
+            status="available",
+        )
+        existing = clockify_event(
+            "2026-07-10T13:00:00+03:00",
+            "2026-07-10T14:00:00+03:00",
+            meeting_title="  Discovery   CALL ",
+            participants=[{"email": "PROSPECT@example.test"}],
+        )
+
+        _, result = self.make_run([meeting, existing], meeting_analysis(meeting))
+
+        self.assertEqual([], result["proposals"])
+        self.assertEqual(
+            "reconciled", result["fathom_reconciliation"][0]["status"]
+        )
+
+    def test_exact_meeting_match_reconciles_with_unrelated_overlap_diagnostic(self):
+        meeting = fathom_event(
+            "2026-07-10T13:00:00+03:00",
+            "2026-07-10T14:00:00+03:00",
+            status="available",
+        )
+        canonical = reconcile_meetings(
+            [meeting.document()], [], vlad_identities={"vlad@serenichron.com"}
+        ).meetings[0]
+        matching = clockify_event(
+            "2026-07-10T13:00:00+03:00",
+            "2026-07-10T14:00:00+03:00",
+            canonical_meeting_id=canonical.canonical_id,
+        )
+        unrelated = evidence_ledger.evidence_event(
+            "clockify",
+            {"source_type": "clockify", "source_id": "existing-2"},
+            observed_at="2026-07-10T13:30:00+03:00",
+            raw_source_span={
+                "start": "2026-07-10T13:30:00+03:00",
+                "end": "2026-07-10T14:30:00+03:00",
+            },
+            attributes={"description": "Unrelated overlapping work"},
+        )
+
+        _, result = self.make_run(
+            [meeting, matching, unrelated], meeting_analysis(meeting)
+        )
+
+        self.assertEqual([], result["proposals"])
+        reconciliation = result["fathom_reconciliation"][0]
+        self.assertEqual("reconciled", reconciliation["status"])
+        self.assertEqual(
+            [unrelated.evidence_id],
+            [row["counterpart_id"] for row in reconciliation["overlap_diagnostics"]],
+        )
+        self.assertNotIn(
+            "counterpart_project", reconciliation["overlap_diagnostics"][0]
+        )
+
+    def test_partial_clockify_overlap_keeps_full_meeting_proposal_with_review_warning(self):
         meeting = fathom_event(
             "2026-07-10T13:00:00+03:00",
             "2026-07-10T14:00:00+03:00",
@@ -1645,21 +2480,215 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         )
         _, result = self.make_run([meeting, existing], meeting_analysis(meeting))
 
-        self.assertEqual([], result["proposals"])
+        self.assertEqual(1, len(result["proposals"]))
+        proposal = result["proposals"][0]
+        self.assertEqual("2026-07-10T13:00:00+03:00", proposal["start"])
+        self.assertEqual("2026-07-10T14:00:00+03:00", proposal["end"])
         reconciliation = result["fathom_reconciliation"][0]
-        self.assertEqual("exception", reconciliation["status"])
-        self.assertEqual("meeting_overlap", reconciliation["reason"])
+        self.assertEqual("proposed", reconciliation["status"])
         self.assertEqual(meeting.evidence_id, reconciliation["evidence_id"])
         self.assertEqual([meeting.evidence_id], reconciliation["source_evidence_ids"])
-        conflict = next(
-            row for row in result["ambiguous"]
-            if row.get("exception_kind") == "fixed_block_conflict"
+        self.assertEqual(
+            [{
+                "type": "existing_clockify_overlap",
+                "counterpart_id": existing.evidence_id,
+                "overlap_start": "2026-07-10T13:30:00+03:00",
+                "overlap_end": "2026-07-10T14:00:00+03:00",
+                "overlap_duration_seconds": 1800,
+            }],
+            proposal["review_warnings"],
         )
-        self.assertEqual("meeting_overlap", conflict["conflict_reason"])
+        self.assertFalse(any(
+            row.get("exception_kind") == "fixed_block_conflict"
+            for row in result["ambiguous"]
+        ))
         self.assertFalse(any(
             row.get("exception_kind") == "insufficient_meeting_evidence"
             for row in result["ambiguous"]
         ))
+
+    def test_overlap_warning_retains_only_clockify_project_suffix(self):
+        meeting = fathom_event(
+            "2026-07-10T13:00:00+03:00",
+            "2026-07-10T14:00:00+03:00",
+            status="available",
+        )
+        existing = clockify_event(
+            "2026-07-10T13:30:00+03:00",
+            "2026-07-10T14:30:00+03:00",
+            project_id_suffix="775f9f",
+            project_name="Untrusted Source Label",
+        )
+
+        _, result = self.make_run([meeting, existing], meeting_analysis(meeting))
+
+        warning = result["proposals"][0]["review_warnings"][0]
+        self.assertEqual("775f9f", warning["counterpart_project_suffix"])
+        self.assertNotIn("counterpart_project", warning)
+
+    def test_bni_evidence_routes_to_canonical_serenichron_business_development(self):
+        """Catches BNI work being left unrouted when evidence names BNI explicitly."""
+        routing = json.loads((ROOT / "routing.json").read_text())
+        cited = [session_event(
+            "bni:event:1",
+            "2026-07-10T09:00:00+03:00",
+            "Prepared BNI Connect profile and referral follow-up",
+        ).document()]
+        activity = {
+            "semantic_reviewer_model": "deepseek-v4-flash:cloud",
+            "project_recommendation": {"name": "", "prefix": "", "tag_names": []},
+        }
+
+        route, error = pipeline.resolve_route(activity, cited, routing)
+
+        self.assertIsNone(error)
+        self.assertEqual("Serenichron Level 1", route["project_name"])
+        self.assertEqual("31b39a", route["project_suffix"])
+        self.assertEqual("SC", route["prefix"])
+        self.assertEqual(["Business development"], route["tag_names"])
+
+    def test_bni_in_path_and_metadata_does_not_activate_evidence_fallback(self):
+        routing = json.loads((ROOT / "routing.json").read_text())
+        event = session_event(
+            "bni-metadata:event:1",
+            "2026-07-10T09:00:00+03:00",
+            "Prepared an unrelated sales follow-up",
+        ).document()
+        event["raw_source_span"].update({
+            "path": "/Users/blackthorne/Work/BNI/session.jsonl",
+            "cwd": "/Users/blackthorne/Work/BNI",
+        })
+        event["source_ref"]["session_id"] = "BNI-session"
+
+        route, error = pipeline.resolve_route(
+            {"project_recommendation": {}}, [event], routing
+        )
+
+        self.assertIsNone(error)
+        self.assertNotEqual("Serenichron Level 1", route["project_name"])
+        self.assertNotEqual(["Business development"], route["tag_names"])
+
+    def test_exact_historical_correction_routes_precontract_mazilu_review_to_sc(self):
+        """Catches exact pre-contract M&P work being overridden by text routing."""
+        routing = json.loads((ROOT / "routing.json").read_text())
+        event = session_event(
+            "mazilu:event:historical",
+            "2026-09-11T12:35:03Z",
+            "Reviewed Mazilu & Partners commercial proposal and confirmed draft status",
+        )
+        activity = {
+            "activity_id": "act-9c6489fe2e707cb7a4057fa2",
+            "evidence_ids": [event.evidence_id],
+            "project_recommendation": {"name": "", "prefix": "", "tag_names": []},
+        }
+        regression_case = {
+            "activity_id": activity["activity_id"],
+            "evidence_fingerprint": review_corrections.evidence_fingerprint(
+                activity["evidence_ids"]
+            ),
+            "decision": "modify",
+            "expected_field_patch": {
+                "client_project": {"op": "replace", "value": "Serenichron Level 1"},
+                "tag_names": {"op": "replace", "value": ["Business development"]},
+            },
+        }
+
+        route = pipeline._route_from_review_correction(
+            activity, [regression_case], routing
+        )
+
+        self.assertEqual("Serenichron Level 1", route["project_name"])
+        self.assertEqual("SC", route["prefix"])
+        self.assertEqual(["Business development"], route["tag_names"])
+
+    def test_mazilu_text_does_not_activate_future_client_route_without_marker_and_date(self):
+        """Catches a client name alone inventing a contract activation cutover."""
+        routing = json.loads((ROOT / "routing.json").read_text())
+        cited = [session_event(
+            "mazilu:event:future",
+            "2026-09-18T09:00:00+03:00",
+            "Prepared future Mazilu & Partners work",
+        ).document()]
+
+        self.assertIsNone(pipeline._route_from_client_lifecycle(cited, routing))
+
+    def test_client_lifecycle_requires_marker_in_substantive_evidence(self):
+        routing = json.loads((ROOT / "routing.json").read_text())
+        routing["client_lifecycle_routes"][0]["activation"] = {
+            "marker": "contract activated",
+            "effective_at": "2026-09-18T00:00:00+03:00",
+            "route": {
+                "project_name": "Mazilu & Partners Level 1",
+                "project_suffix": "abcdef",
+                "tag_names": ["Project Management"],
+                "tag_suffixes": ["12345678"],
+                "prefix": "M&P",
+            },
+        }
+        cited = [session_event(
+            "mazilu:event:after-cutover",
+            "2026-09-18T09:00:00+03:00",
+            "Prepared Mazilu & Partners onboarding plan",
+        ).document()]
+        cited[0]["raw_source_span"]["path"] = (
+            "/Users/blackthorne/Work/contract-activated/session.jsonl"
+        )
+
+        self.assertIsNone(pipeline._route_from_client_lifecycle(cited, routing))
+
+    def test_client_lifecycle_activates_after_effective_marker_is_observed(self):
+        routing = json.loads((ROOT / "routing.json").read_text())
+        routing["client_lifecycle_routes"][0]["activation"] = {
+            "marker": "contract activated",
+            "effective_at": "2026-09-18T00:00:00+03:00",
+            "route": {
+                "project_name": "Mazilu & Partners Level 1",
+                "project_suffix": "abcdef",
+                "tag_names": ["Project Management"],
+                "tag_suffixes": ["12345678"],
+                "prefix": "M&P",
+            },
+        }
+        cited = [session_event(
+            "mazilu:event:active",
+            "2026-09-18T09:00:00+03:00",
+            "Mazilu & Partners contract activated; prepared onboarding plan",
+        ).document()]
+
+        route = pipeline._route_from_client_lifecycle(cited, routing)
+
+        self.assertEqual("Mazilu & Partners Level 1", route["project_name"])
+        self.assertEqual("M&P", route["prefix"])
+
+    def test_client_lifecycle_requires_marker_and_effective_date_on_same_event(self):
+        routing = json.loads((ROOT / "routing.json").read_text())
+        routing["client_lifecycle_routes"][0]["activation"] = {
+            "marker": "contract activated",
+            "effective_at": "2026-09-18T00:00:00+03:00",
+            "route": {
+                "project_name": "Mazilu & Partners Level 1",
+                "project_suffix": "abcdef",
+                "tag_names": ["Project Management"],
+                "tag_suffixes": ["12345678"],
+                "prefix": "M&P",
+            },
+        }
+        marker_before_effective = session_event(
+            "mazilu:event:premature-activation",
+            "2026-09-17T23:59:00+03:00",
+            "Mazilu & Partners contract activated",
+        ).document()
+        unrelated_after_effective = session_event(
+            "unrelated:event:after-cutover",
+            "2026-09-18T09:00:00+03:00",
+            "Reviewed an unrelated internal checklist",
+        ).document()
+
+        route = pipeline._route_from_client_lifecycle(
+            [marker_before_effective, unrelated_after_effective], routing
+        )
+
+        self.assertIsNone(route)
 
     def test_incomplete_coordinator_source_blocks_semantic_accounting(self):
         temp = tempfile.TemporaryDirectory()
@@ -1735,7 +2764,11 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         assert_schema_valid(schema, result)
 
     def test_replay_is_byte_stable_for_unchanged_inputs_and_versions(self):
-        first = session_event("session-1:event:1", "2026-07-10T09:00:00+03:00")
+        first = session_event(
+            "session-1:event:1",
+            "2026-07-10T09:00:00+03:00",
+            span_end="2026-07-10T10:00:00+03:00",
+        )
         last = session_event("session-1:event:2", "2026-07-10T10:00:00+03:00")
         run_dir, first_result = self.make_run(
             [first, last],

@@ -271,6 +271,10 @@ class SourceDebtStore:
     def active(self) -> tuple[DebtItem, ...]:
         return tuple(item for item in self._items.values() if item.status != "resolved")
 
+    def get(self, debt_id: str) -> DebtItem | None:
+        """Return one derived debt item without mutating its event history."""
+        return self._items.get(debt_id)
+
     def eligible(self, now: str) -> tuple[DebtItem, ...]:
         now = _utc_timestamp(now)
         return tuple(

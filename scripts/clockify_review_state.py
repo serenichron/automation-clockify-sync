@@ -359,13 +359,18 @@ def _evidence_warnings(run_dir: Path, warnings: list[dict[str, str]]) -> None:
     if not report.exists():
         return
     try:
-        evidence = _read_json(report).get("evidence", {})
+        report_document = _read_json(report)
+        evidence = report_document.get("evidence", {})
     except (OSError, ValueError, json.JSONDecodeError):
         _add_warning(warnings, "coverage_warning", "run-report.json", "Could not read collector evidence status.")
         return
     if not isinstance(evidence, dict):
         return
     healthy = {"ok", "available", "success", "complete"}
+    ledger = report_document.get("evidence_ledger", {})
+    completeness = ledger.get("source_completeness", {}) if isinstance(ledger, dict) else {}
+    coverage_sources = completeness.get("sources", {}) if isinstance(completeness, dict) else {}
+    calendly_coverage = coverage_sources.get("calendly", {}) if isinstance(coverage_sources, dict) else {}
     sessions = evidence.get("sessions", [])
     if isinstance(sessions, list):
         for session in sessions:
@@ -383,6 +388,21 @@ def _evidence_warnings(run_dir: Path, warnings: list[dict[str, str]]) -> None:
         if not isinstance(status_data, dict):
             continue
         status = _normal_text(status_data.get("status"))
+        # An explicitly optional Calendly collection records a complete,
+        # empty exclusion.  This is intentional and must not be treated as a
+        # missing source; other excluded or incomplete statuses remain visible.
+        if (
+            source == "calendly"
+            and status == "excluded"
+            and status_data.get("complete") is True
+            and status_data.get("recording_count") == 0
+            and status_data.get("scheduled_without_recording_count") == 0
+            and isinstance(calendly_coverage, dict)
+            and calendly_coverage.get("status") == "excluded"
+            and calendly_coverage.get("expected_count") == 0
+            and calendly_coverage.get("observed_count") == 0
+        ):
+            continue
         if status and status not in healthy:
             _add_warning(warnings, "source_unavailable", source, f"Collector evidence status: {status}.")
 

@@ -153,22 +153,30 @@ def _coverage_exclusion(coverage: dict[str, Any], evidence_id: str, reason: str)
 
 
 def _reconciled_by_existing_clockify(
-    meeting: Mapping[str, Any], clockify_blocks: Sequence[Mapping[str, Any]]
+    meeting: meeting_reconciliation.CanonicalMeeting,
+    meeting_events: Sequence[Mapping[str, Any]],
+    clockify_blocks: Sequence[Mapping[str, Any]],
 ) -> bool:
-    """Use the accounting pipeline's reciprocal-overlap reconciliation rule."""
-    interval = _event_interval(meeting)
-    if interval is None:
+    """Reconcile only one exact canonical or derived cross-source identity."""
+    try:
+        start, end = _parse(meeting.start), _parse(meeting.end)
+    except (TypeError, ValueError):
         return False
-    start, end = interval
     overlapping = [
         block for block in clockify_blocks
         if work_accounting_pipeline._overlap_ratio(start, end, block["start"], block["end"]) > 0
     ]
     matching = [
         block for block in overlapping
-        if work_accounting_pipeline._meeting_matches_existing_block(start, end, block)
+        if work_accounting_pipeline._meeting_matches_existing_block(
+            meeting,
+            {"events": list(meeting_events)},
+            start,
+            end,
+            block,
+        )
     ]
-    return len(overlapping) == 1 and len(matching) == 1
+    return len(matching) == 1
 
 
 def _accounted_recording_ids(document: Mapping[str, Any]) -> tuple[set[str], list[dict[str, Any]]]:
@@ -547,7 +555,15 @@ def _recording_coverage(
                 "canonical_meeting_id": meeting_id,
                 "evidence_ids": list(evidence_ids),
             })
-        elif _reconciled_by_existing_clockify(representative, clockify_blocks):
+        elif _reconciled_by_existing_clockify(
+            meeting,
+            [
+                source_events[source_id]
+                for source_id in source_ids
+                if source_id in source_events
+            ],
+            clockify_blocks,
+        ):
             assign_disposition(source_ids, "excluded")
             _recording_coverage_exclusion(
                 coverage, meeting_id, evidence_ids, "existing_clockify_meeting_match"

@@ -57,12 +57,22 @@ def calendly_event(day="2026-07-10", source_id="calendar-one", *, meeting_id="me
     )
 
 
-def clockify_event(day="2026-07-10", source_id="clockify-one"):
+def clockify_event(
+    day="2026-07-10",
+    source_id="clockify-one",
+    *,
+    start_time="09:00",
+    end_time="09:30",
+    **attributes,
+):
     return evidence_ledger.evidence_event(
         "clockify",
         {"source_type": "clockify", "source_id": source_id},
-        raw_source_span={"start": f"{day}T09:00+03:00", "end": f"{day}T09:30+03:00"},
-        attributes={"description": "Existing July meeting"},
+        raw_source_span={
+            "start": f"{day}T{start_time}+03:00",
+            "end": f"{day}T{end_time}+03:00",
+        },
+        attributes={"description": "Existing July meeting", **attributes},
     )
 
 
@@ -500,23 +510,69 @@ class PortfolioQualityTests(unittest.TestCase):
         self.assertEqual("pass", report["status"])
         self.assertEqual(1, report["fathom_coverage"]["excluded"])
 
-    def test_existing_clockify_reconciliation_excludes_eligible_fathom_meeting(self):
+    def test_temporal_overlap_without_identity_does_not_reconcile_fathom_meeting(self):
         meeting, existing = fathom_event(), clockify_event()
         value = document(meeting)
         value.update({"activities": [], "source_minutes": 0, "review_minutes": 0, "excluded_minutes": 0, "groups": []})
         report = quality.audit(value, ledger(meeting, existing), source_proposals=[])
 
-        self.assertEqual("pass", report["status"])
-        self.assertEqual(1, report["fathom_coverage"]["excluded"])
-        self.assertEqual(0, report["fathom_coverage"]["missing"])
-        self.assertEqual(1, report["fathom_coverage"]["excluded_by_reason"]["existing_clockify_meeting_match"])
+        self.assertEqual("blocked", report["status"])
+        self.assertEqual(0, report["fathom_coverage"]["excluded"])
+        self.assertEqual(1, report["fathom_coverage"]["missing"])
 
-    def test_naive_fathom_timestamp_reconciles_with_aware_clockify_block(self):
-        meeting, existing = fathom_event(naive=True), clockify_event()
+    def test_exact_meeting_identity_reconciles_fathom_meeting(self):
+        meeting = fathom_event()
+        existing = clockify_event(meeting_id="events/meeting-one")
         value = document(meeting)
         value.update({"activities": [], "source_minutes": 0, "review_minutes": 0, "excluded_minutes": 0, "groups": []})
 
         report = quality.audit(value, ledger(meeting, existing), source_proposals=[])
+
+        self.assertEqual("pass", report["status"])
+        self.assertEqual(1, report["fathom_coverage"]["excluded_by_reason"]["existing_clockify_meeting_match"])
+
+    def test_exact_derived_meeting_identity_reconciles_across_sources(self):
+        participants = [{"email": "client@example.test"}]
+        meeting = fathom_event(participants=participants)
+        existing = clockify_event(
+            meeting_title="  JULY   review ",
+            participants=[{"email": "CLIENT@example.test"}],
+        )
+        value = document(meeting)
+        value.update({"activities": [], "source_minutes": 0, "review_minutes": 0, "excluded_minutes": 0, "groups": []})
+
+        report = quality.audit(value, ledger(meeting, existing), source_proposals=[])
+
+        self.assertEqual("pass", report["status"])
+        self.assertEqual(1, report["fathom_coverage"]["excluded_by_reason"]["existing_clockify_meeting_match"])
+
+    def test_naive_fathom_timestamp_reconciles_with_aware_exact_identity(self):
+        meeting = fathom_event(naive=True)
+        existing = clockify_event(meeting_id="events/meeting-one")
+        value = document(meeting)
+        value.update({"activities": [], "source_minutes": 0, "review_minutes": 0, "excluded_minutes": 0, "groups": []})
+
+        report = quality.audit(value, ledger(meeting, existing), source_proposals=[])
+
+        self.assertEqual("pass", report["status"])
+        self.assertEqual(1, report["fathom_coverage"]["excluded_by_reason"]["existing_clockify_meeting_match"])
+
+    def test_exact_identity_reconciles_despite_unrelated_overlap(self):
+        meeting = fathom_event()
+        exact = clockify_event(meeting_id="events/meeting-one")
+        unrelated = clockify_event(
+            source_id="clockify-unrelated",
+            start_time="09:10",
+            end_time="09:40",
+        )
+        value = document(meeting)
+        value.update({"activities": [], "source_minutes": 0, "review_minutes": 0, "excluded_minutes": 0, "groups": []})
+
+        report = quality.audit(
+            value,
+            ledger(meeting, exact, unrelated),
+            source_proposals=[],
+        )
 
         self.assertEqual("pass", report["status"])
         self.assertEqual(1, report["fathom_coverage"]["excluded_by_reason"]["existing_clockify_meeting_match"])

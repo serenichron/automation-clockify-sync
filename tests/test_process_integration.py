@@ -13,6 +13,7 @@ import unittest
 from unittest import mock
 
 from scripts import clockify_sync_collect as collector
+from scripts import clockify_source_debt_recover as recovery
 from scripts import evidence_ledger
 from scripts import work_accounting_pipeline
 
@@ -29,6 +30,21 @@ COMPLETE_CALENDLY = {
 
 
 class ProcessIntegrationTests(unittest.TestCase):
+    def test_recovery_attempt_marker_survives_partial_os_writes(self) -> None:
+        """A short write must not leave a truncated durable attempt identity."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "attempt" / "attempt-marker.json"
+            expected = {"schema_version": "fixture/v1", "attempt_id": "sha256:" + "a" * 64}
+            real_write = recovery.os.write
+
+            def short_write(descriptor: int, payload: bytes) -> int:
+                return real_write(descriptor, payload[:5])
+
+            with mock.patch.object(recovery.os, "write", side_effect=short_write):
+                recovery._write_immutable_json(path, expected)
+
+            self.assertEqual(expected, json.loads(path.read_text()))
+
     def test_explicit_optional_calendly_skips_collection_and_completes_the_slice(self) -> None:
         """A bounded operator override excludes Calendly without contacting its gateway."""
         with tempfile.TemporaryDirectory() as tmp:

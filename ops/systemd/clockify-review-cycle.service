@@ -1,0 +1,29 @@
+[Unit]
+Description=Clockify bounded review-cycle coordinator
+
+[Service]
+Type=oneshot
+User=clockify-review-cycle
+Group=clockify-review-cycle
+WorkingDirectory=/srv/serenichron/clockify-review-cycle
+# This required, externally provisioned 0600 file supplies the analyzer route
+# and either GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE or another supported gws
+# credential source. It is intentionally not included in this repository.
+EnvironmentFile=/etc/serenichron/clockify-review-cycle.env
+Environment=PYTHONUNBUFFERED=1 GOOGLE_WORKSPACE_CLI_CONFIG_DIR=/var/lib/serenichron/clockify-review-cycle/gws
+# Exit 0: plan, lock contention, idle, or delivery. Exit 2: configuration or
+# integrity block. Exit 75: incomplete, failed, or recovery-blocked delivery.
+ExecStart=/usr/bin/python3 scripts/clockify_review_cycle.py --config /etc/serenichron/clockify-review-cycle.json --enable-sheet-write
+Restart=no
+KillMode=control-group
+TimeoutStartSec=7500
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/serenichron/clockify-review-cycle/runs /srv/serenichron/clockify-review-cycle/state /var/lib/serenichron/clockify-review-cycle/gws
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=clockify-review-cycle

@@ -1294,6 +1294,7 @@ def _review_messages(
     transport_failure_code: str | None = None,
     review_scope: str = "extraction",
     review_prompt_version: str = REVIEW_PROMPT_VERSION,
+    include_repair_contract: bool = True,
 ) -> list[dict[str, str]]:
     """Build an independent semantic-review request for one extraction."""
     system = f"""You are the independent Clockify accounting reviewer.
@@ -1441,6 +1442,17 @@ between 8 and 14 words.
             "schema-valid replacement. "
             "Do not discuss the prior response."
         )
+        if include_repair_contract:
+            system += (
+                " Follow repair_response_contract for exact provider field names and types. "
+                "Its record examples are alternatives, not evidence or inferred defaults: "
+                "replace their semantic values, effort and timestamps with supported values. "
+                "Return activities, exceptions and omissions as lists; empty lists are valid. "
+                "Cite only evidence_partitions with bundle_ref and inclusive integer "
+                "member_ranges. Never return evidence_ids or original/local IDs. "
+                "Every supplied member must occur exactly once across all three lists. "
+                "Copy evidence_spans from cited member time_span values, not example dates."
+            )
     if transport_recovery_attempt is not None:
         if (
             transport_failure_code not in {"transport_timeout", "transport_error"}
@@ -1498,6 +1510,36 @@ between 8 and 14 words.
                 "inside its bundle's allowed_member_range."
             ),
         }
+        if include_repair_contract:
+            payload["repair_response_contract"] = {
+                "top_level": {"activities": "list", "exceptions": "list", "omissions": "list"},
+                "activity_example": {
+                    "lifecycle": "completed", "workstream": "Review recovery",
+                    "action": "Verified", "object": "review recovery",
+                    "outcome": "preserved validated evidence",
+                    "evidence_partitions": [{"bundle_ref": "b-0001", "member_ranges": [[1, 1]]}],
+                    "evidence_spans": [{"start": "copy cited time_span.start", "end": "copy cited time_span.end"}],
+                    "project_recommendation": {"name": "", "prefix": "", "tag_names": []},
+                    "effort": {"minimum_minutes": 5, "recommended_minutes": 5, "maximum_minutes": 5},
+                    "semantic_confidence": "medium", "timing_confidence": "medium",
+                    "split_rationale": "One evidenced recovery outcome",
+                    "merge_rationale": "", "omit_rationale": "",
+                },
+                "exception_example": {
+                    "kind": "insufficient_evidence",
+                    "evidence_partitions": [{"bundle_ref": "b-0001", "member_ranges": [[1, 1]]}],
+                    "reason": "Explain the exact evidence limitation",
+                },
+                "omission_example": {
+                    "lifecycle": "noise",
+                    "evidence_partitions": [{"bundle_ref": "b-0001", "member_ranges": [[1, 1]]}],
+                    "reason": "Explain why no human work is supported",
+                },
+                "effort_rule": "positive integer minutes: minimum <= recommended <= maximum, supported by evidence",
+                "lifecycle_values": ["completed", "advanced", "investigated", "meeting", "planned", "blocked", "noise"],
+                "confidence_values": ["low", "medium", "high"],
+                "coverage": "each supplied member exactly once across all lists; ranges are 1-based inclusive",
+            }
     if transport_recovery_attempt is not None:
         payload["review_transport_recovery"] = {
             "failure_code": transport_failure_code,
@@ -1521,6 +1563,7 @@ def _review_body(
     transport_failure_code: str | None = None,
     review_scope: str = "extraction",
     review_prompt_version: str = REVIEW_PROMPT_VERSION,
+    include_repair_contract: bool = True,
 ) -> dict[str, Any]:
     return {
         "model": model,
@@ -1540,6 +1583,7 @@ def _review_body(
             transport_failure_code=transport_failure_code,
             review_scope=review_scope,
             review_prompt_version=review_prompt_version,
+            include_repair_contract=include_repair_contract,
         ),
     }
 
@@ -3002,8 +3046,7 @@ def _call_semantic_review_once(
     review_scope: str = "extraction",
     review_prompt_version: str = REVIEW_PROMPT_VERSION,
 ) -> dict[str, Any]:
-    body = _review_body(
-        events,
+    request_options = dict(
         candidate=candidate,
         taxonomy=taxonomy,
         model=endpoint.model,
@@ -3013,10 +3056,20 @@ def _call_semantic_review_once(
         review_scope=review_scope,
         review_prompt_version=review_prompt_version,
     )
+    body = _review_body(events, **request_options)
     if len(canonical_json(body).encode("utf-8")) > DEFAULT_MAX_BODY_BYTES:
         raise AnalyzerError("semantic review body exceeds configured request ceiling")
     _raise_if_cancelled(cancelled)
     response = cache.lookup(endpoint, body) if cache is not None else None
+    if response is None and cache is not None and repair_failure_code is not None:
+        # Preserve accepted repairs sealed before the explicit response contract.
+        # A prior rejection is not a valid response and may receive the newly
+        # specified single repair; cache corruption and identity errors still fail.
+        legacy_body = _review_body(events, **request_options, include_repair_contract=False)
+        try:
+            response = cache.lookup(endpoint, legacy_body)
+        except (AnalyzerContractError, AnalyzerTimeoutError, AnalyzerTransportError):
+            response = None
     cache_miss = response is None
     if response is None:
         if before_transport is not None:
@@ -3169,8 +3222,11 @@ def _call_semantic_review(
                     review_scope=review_scope,
                     review_prompt_version=review_prompt_version,
                 )
-            except AnalyzerContractError:
-                return failure("Flash reviewer exhausted one structural repair")
+            except AnalyzerContractError as repair_error:
+                return failure(
+                    "Flash reviewer exhausted one structural repair: "
+                    + _contract_failure_code(repair_error)
+                )
 
     try:
         return call_with_structural_repair()

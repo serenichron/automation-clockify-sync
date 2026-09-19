@@ -489,6 +489,46 @@ def find_duplicate_descriptions(proposals: list[dict[str, Any]]) -> list[dict[st
     return duplicates
 
 
+def _declares_exact_proposal_overlap(
+    proposal: dict[str, Any],
+    counterpart: dict[str, Any],
+    overlap_start: dt.datetime,
+    overlap_end: dt.datetime,
+) -> bool:
+    """Accept only the pipeline's exact, privacy-bounded overlap warning."""
+    warnings = proposal.get("review_warnings")
+    if not isinstance(warnings, list):
+        return False
+    counterpart_id = str(counterpart.get("candidate_key") or "")
+    if not re.fullmatch(r"wks-[a-f0-9]{24}", counterpart_id):
+        return False
+    required = {
+        "type", "counterpart_id", "overlap_start", "overlap_end",
+        "overlap_duration_seconds",
+    }
+    allowed = required | {"counterpart_project_suffix"}
+    elapsed = (overlap_end - overlap_start).total_seconds()
+    if not elapsed.is_integer() or elapsed <= 0:
+        return False
+    for warning in warnings:
+        if not isinstance(warning, dict) or set(warning) - allowed or required - set(warning):
+            continue
+        if warning.get("type") not in {
+            "meeting_proposal_overlap", "review_proposal_overlap",
+        }:
+            continue
+        if warning.get("counterpart_id") != counterpart_id:
+            continue
+        start = parse_timestamp(warning.get("overlap_start"))
+        end = parse_timestamp(warning.get("overlap_end"))
+        if start != overlap_start or end != overlap_end:
+            continue
+        duration = warning.get("overlap_duration_seconds")
+        if type(duration) is int and duration == int(elapsed):
+            return True
+    return False
+
+
 def find_time_overlaps(
     proposals: list[dict[str, Any]], existing: list[dict[str, Any]] | None = None
 ) -> list[dict[str, str]]:
@@ -497,12 +537,12 @@ def find_time_overlaps(
         start = parse_timestamp(proposal.get("start"))
         end = parse_timestamp(proposal.get("end"))
         if start and end and end > start:
-            intervals.append((start, end, str(proposal.get("id")), "proposal"))
+            intervals.append((start, end, str(proposal.get("id")), "proposal", proposal))
     for index, entry in enumerate(existing or [], 1):
         start = parse_timestamp(entry.get("start"))
         end = parse_timestamp(entry.get("end"))
         if start and end and end > start:
-            intervals.append((start, end, f"existing-{index}", "existing_clockify"))
+            intervals.append((start, end, f"existing-{index}", "existing_clockify", entry))
     intervals.sort(key=lambda row: (row[0], row[1], row[2]))
     overlaps = []
     for index, left in enumerate(intervals):
@@ -513,6 +553,17 @@ def find_time_overlaps(
                 # Existing Clockify entries can overlap each other historically;
                 # the new process owns only conflicts involving a proposal.
                 if left[3] == right[3] == "existing_clockify":
+                    continue
+                overlap_start = max(left[0], right[0])
+                overlap_end = min(left[1], right[1])
+                if left[3] == right[3] == "proposal" and (
+                    _declares_exact_proposal_overlap(
+                        left[4], right[4], overlap_start, overlap_end
+                    )
+                    or _declares_exact_proposal_overlap(
+                        right[4], left[4], overlap_start, overlap_end
+                    )
+                ):
                     continue
                 overlaps.append({"left": left[2], "right": right[2]})
     return overlaps

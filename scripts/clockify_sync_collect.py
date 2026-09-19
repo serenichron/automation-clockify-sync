@@ -1506,6 +1506,49 @@ except Exception as e: res['errors'].append('codex scan: '+str(e)[:200])
 '''
 
 
+def _remote_hermes_contract() -> str:
+    """Legacy remote Hermes extraction with local half-open window semantics."""
+    return r'''try:
+    if HDB and Path(HDB).exists():
+        import sqlite3
+        conn=sqlite3.connect(HDB)
+        since_ts=SINCE.timestamp(); until_ts=UNTIL.timestamp()
+        rows=conn.execute("""SELECT id, started_at, ended_at, message_count, model, cwd,
+                   estimated_cost_usd, title, input_tokens, output_tokens,
+                   COALESCE(ended_at,
+                       (SELECT MAX(timestamp) FROM messages WHERE session_id = sessions.id),
+                       started_at) AS effective_end
+            FROM sessions
+            WHERE started_at < ?
+              AND ((ended_at IS NOT NULL AND ended_at >= started_at)
+                   OR (ended_at IS NULL AND
+                       COALESCE((SELECT MAX(timestamp) FROM messages WHERE session_id = sessions.id),
+                                started_at) >= started_at))
+              AND (ended_at > ? OR (ended_at IS NULL AND
+                   COALESCE((SELECT MAX(timestamp) FROM messages WHERE session_id = sessions.id),
+                            started_at) >= ?))
+            ORDER BY started_at, id""", (until_ts, since_ts, since_ts)).fetchall()
+        for row in rows:
+            sid, started_at, ended_at, source_count, model, cwd, cost, title, in_tok, out_tok, effective_end=row
+            if not started_at: continue
+            source_start=dt.datetime.fromtimestamp(started_at, tz=BUCHAREST)
+            source_end=dt.datetime.fromtimestamp(effective_end, tz=BUCHAREST)
+            start_dt=max(source_start,SINCE); end_dt=min(source_end,UNTIL)
+            start_clipped=source_start<SINCE; end_clipped=source_end>UNTIL
+            message_rows=conn.execute('SELECT role, timestamp, content, tool_name FROM messages WHERE session_id = ? AND timestamp >= ? AND timestamp < ? ORDER BY timestamp, id', (sid,since_ts,until_ts)).fetchall()
+            events=[]
+            for index,(role,timestamp,content,tool_name) in enumerate(message_rows):
+                event_dt=dt.datetime.fromtimestamp(timestamp,tz=BUCHAREST) if timestamp else None
+                events.append({'timestamp':local_str(event_dt),'role':str(role or 'unknown'),'kind':'tool' if tool_name else 'message','content':str(content or ''),'tool_name':str(tool_name or ''),'ordinal':index})
+            first_content=next((event['content'][:300] for event in events if event['role']=='user' and event['content']), '')
+            res['hermes_db_sessions'].append({'source':'hermes_db','machine':MACHINE,'session_id':sid,'start':local_str(start_dt),'end':local_str(end_dt),'duration_minutes':max(0,int((end_dt-start_dt).total_seconds()/60)),'message_count':len(events),'source_message_count':source_count,'model':model,'cwd':cwd or '','estimated_cost_usd':cost or 0.0,'input_tokens':in_tok or 0,'output_tokens':out_tok or 0,'title':first_content if (start_clipped or end_clipped) else (title or ''),'first_user_message':first_content,'events':events,'boundary_clipped':start_clipped or end_clipped,'start_clipped':start_clipped,'end_clipped':end_clipped})
+        conn.close()
+    else:
+        res['errors'].append('hermes_db not found: '+HDB)
+except Exception as e: res['errors'].append('hermes_db scan: '+str(e)[:200])
+'''
+
+
 def collect_remote_sessions(
     machine: dict[str, Any],
     since: dt.datetime,
@@ -1696,6 +1739,12 @@ def collect_remote_sessions(
         flags=re.DOTALL,
     )
     remote_code = re.sub(
+        r"try:\n    if HDB.*?(?=try:\n    if CXBASE)",
+        lambda _match: _remote_hermes_contract(),
+        remote_code,
+        flags=re.DOTALL,
+    )
+    remote_code = re.sub(
         r"try:\n    if CXBASE.*?(?=print\(json\.dumps\(res\)\))",
         lambda _match: _remote_codex_contract(),
         remote_code,
@@ -1762,27 +1811,55 @@ def collect_hermes_db_sessions(db_path: str, machine: str, since: dt.datetime, u
         until_ts = until.timestamp()
         rows = conn.execute("""
             SELECT id, started_at, ended_at, message_count, model, cwd,
-                   estimated_cost_usd, title, input_tokens, output_tokens
+                   estimated_cost_usd, title, input_tokens, output_tokens,
+                   COALESCE(
+                       ended_at,
+                       (SELECT MAX(timestamp) FROM messages WHERE session_id = sessions.id),
+                       started_at
+                   ) AS effective_end
             FROM sessions
-            WHERE started_at >= ? AND started_at < ?
-            ORDER BY started_at
-        """, (since_ts, until_ts)).fetchall()
+            WHERE started_at < ?
+              AND (
+                  (ended_at IS NOT NULL AND ended_at >= started_at)
+                  OR (
+                      ended_at IS NULL
+                      AND COALESCE(
+                          (SELECT MAX(timestamp) FROM messages WHERE session_id = sessions.id),
+                          started_at
+                      ) >= started_at
+                  )
+              )
+              AND (
+                  ended_at > ?
+                  OR (
+                      ended_at IS NULL
+                      AND COALESCE(
+                          (SELECT MAX(timestamp) FROM messages WHERE session_id = sessions.id),
+                          started_at
+                      ) >= ?
+                  )
+              )
+            ORDER BY started_at, id
+        """, (until_ts, since_ts, since_ts)).fetchall()
         for row in rows:
-            sid, started_at, ended_at, msg_count, model, cwd, cost, title, in_tok, out_tok = row
+            (
+                sid, started_at, ended_at, msg_count, model, cwd, cost, title,
+                in_tok, out_tok, effective_end,
+            ) = row
             if not started_at:
                 continue
-            start_dt = dt.datetime.fromtimestamp(started_at, tz=BUCHAREST)
-            end_dt = dt.datetime.fromtimestamp(ended_at, tz=BUCHAREST) if ended_at else None
-            duration_m = int((end_dt - start_dt).total_seconds() / 60) if end_dt else None
-            first_msg = conn.execute(
-                "SELECT content FROM messages WHERE session_id = ? AND role = 'user' ORDER BY timestamp LIMIT 1",
-                (sid,)
-            ).fetchone()
-            first_content = (first_msg[0][:300] if first_msg and first_msg[0] else "") if first_msg else ""
+            source_start_dt = dt.datetime.fromtimestamp(started_at, tz=BUCHAREST)
+            source_end_dt = dt.datetime.fromtimestamp(effective_end, tz=BUCHAREST)
+            start_dt = max(source_start_dt, since)
+            end_dt = min(source_end_dt, until)
+            duration_m = max(0, int((end_dt - start_dt).total_seconds() / 60))
+            start_clipped = source_start_dt < since
+            end_clipped = source_end_dt > until
             message_rows = conn.execute(
                 "SELECT role, timestamp, content, tool_name FROM messages "
-                "WHERE session_id = ? ORDER BY timestamp",
-                (sid,),
+                "WHERE session_id = ? AND timestamp >= ? AND timestamp < ? "
+                "ORDER BY timestamp, id",
+                (sid, since_ts, until_ts),
             ).fetchall()
             events = []
             for index, (role, timestamp, content, tool_name) in enumerate(message_rows):
@@ -1801,22 +1878,34 @@ def collect_hermes_db_sessions(db_path: str, machine: str, since: dt.datetime, u
                         "ordinal": index,
                     }
                 )
+            first_content = next(
+                (
+                    event["content"][:300]
+                    for event in events
+                    if event["role"] == "user" and event["content"]
+                ),
+                "",
+            )
             out.append({
                 "source": "hermes_db",
                 "machine": machine,
                 "session_id": sid,
                 "start": local_dt_string(start_dt),
-                "end": local_dt_string(end_dt) if end_dt else None,
+                "end": local_dt_string(end_dt),
                 "duration_minutes": duration_m,
-                "message_count": msg_count,
+                "message_count": len(events),
+                "source_message_count": msg_count,
                 "model": model,
                 "cwd": cwd or "",
                 "estimated_cost_usd": cost or 0.0,
                 "input_tokens": in_tok or 0,
                 "output_tokens": out_tok or 0,
-                "title": title or "",
+                "title": first_content if (start_clipped or end_clipped) else (title or ""),
                 "first_user_message": first_content,
                 "events": events,
+                "boundary_clipped": start_clipped or end_clipped,
+                "start_clipped": start_clipped,
+                "end_clipped": end_clipped,
             })
         conn.close()
     except Exception as e:
@@ -2143,22 +2232,52 @@ def extract_hermes_db_context(db_path: str, since: dt.datetime, until: dt.dateti
         since_ts = since.timestamp()
         until_ts = until.timestamp()
         sessions = conn.execute("""
-            SELECT id, started_at, ended_at, message_count, model, cwd
+            SELECT id, started_at, ended_at, message_count, model, cwd,
+                   COALESCE(
+                       ended_at,
+                       (SELECT MAX(timestamp) FROM messages WHERE session_id = sessions.id),
+                       started_at
+                   ) AS effective_end
             FROM sessions
-            WHERE (started_at >= ? AND started_at < ?) OR (ended_at >= ? AND ended_at < ?)
-            ORDER BY started_at
-        """, (since_ts, until_ts, since_ts, until_ts)).fetchall()
+            WHERE started_at < ?
+              AND (
+                  (ended_at IS NOT NULL AND ended_at >= started_at)
+                  OR (
+                      ended_at IS NULL
+                      AND COALESCE(
+                          (SELECT MAX(timestamp) FROM messages WHERE session_id = sessions.id),
+                          started_at
+                      ) >= started_at
+                  )
+              )
+              AND (
+                  ended_at > ?
+                  OR (
+                      ended_at IS NULL
+                      AND COALESCE(
+                          (SELECT MAX(timestamp) FROM messages WHERE session_id = sessions.id),
+                          started_at
+                      ) >= ?
+                  )
+              )
+            ORDER BY started_at, id
+        """, (until_ts, since_ts, since_ts)).fetchall()
         for s in sessions:
-            sid, started_at, ended_at, msg_count, model, cwd = s
+            sid, started_at, ended_at, msg_count, model, cwd, effective_end = s
             if not started_at:
                 continue
-            start_dt = dt.datetime.fromtimestamp(started_at, tz=BUCHAREST)
-            end_dt = dt.datetime.fromtimestamp(ended_at, tz=BUCHAREST) if ended_at else None
+            source_start_dt = dt.datetime.fromtimestamp(started_at, tz=BUCHAREST)
+            source_end_dt = dt.datetime.fromtimestamp(effective_end, tz=BUCHAREST)
+            start_dt = max(source_start_dt, since)
+            end_dt = min(source_end_dt, until)
+            start_clipped = source_start_dt < since
+            end_clipped = source_end_dt > until
             msgs = conn.execute("""
                 SELECT role, timestamp, content, tool_name
-                FROM messages WHERE session_id = ?
-                ORDER BY timestamp
-            """, (sid,)).fetchall()
+                FROM messages
+                WHERE session_id = ? AND timestamp >= ? AND timestamp < ?
+                ORDER BY timestamp, id
+            """, (sid, since_ts, until_ts)).fetchall()
             if not msgs:
                 continue
             parsed = []
@@ -2173,8 +2292,6 @@ def extract_hermes_db_context(db_path: str, since: dt.datetime, until: dt.dateti
             user_msgs = []
             for i, p in enumerate(parsed):
                 if p["role"] != "user":
-                    continue
-                if not (since <= p["timestamp"] < until):
                     continue
                 prev_assistant = ""
                 for j in range(i - 1, -1, -1):
@@ -2210,15 +2327,19 @@ def extract_hermes_db_context(db_path: str, since: dt.datetime, until: dt.dateti
                 "model": model,
                 "cwd": cwd or "",
                 "start": local_dt_string(start_dt),
-                "end": local_dt_string(end_dt) if end_dt else None,
+                "end": local_dt_string(end_dt),
                 "duration_hours": round((end_dt - start_dt).total_seconds() / 3600, 2) if end_dt else None,
                 "computed_active_minutes": active_min,
                 "computed_method": active_method,
                 "total_messages": len(parsed),
+                "source_message_count": msg_count,
                 "user_message_count": len(user_msgs),
                 "user_messages": user_msgs,
                 "last_message_role": last_role,
                 "last_message": last_msg,
+                "boundary_clipped": start_clipped or end_clipped,
+                "start_clipped": start_clipped,
+                "end_clipped": end_clipped,
             })
         conn.close()
     except Exception as e:

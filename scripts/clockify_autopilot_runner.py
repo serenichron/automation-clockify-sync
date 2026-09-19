@@ -57,6 +57,17 @@ def _positive_int(environment: Mapping[str, str], name: str, default: int) -> in
     return value
 
 
+def _boolean(environment: Mapping[str, str], name: str, default: bool = False) -> bool:
+    raw = str(environment.get(name) or "").strip()
+    if not raw:
+        return default
+    if raw == "true":
+        return True
+    if raw == "false":
+        return False
+    raise ConfigurationError(f"{name} must be exactly true or false")
+
+
 def _required_input(environment: Mapping[str, str], name: str) -> Path:
     raw = str(environment.get(name) or "").strip()
     if not raw:
@@ -150,6 +161,8 @@ def _command(
             value = effective_since
         if value:
             command.extend([option, value])
+    if _boolean(environment, "CLOCKIFY_AUTOPILOT_CALENDLY_OPTIONAL"):
+        command.append("--calendly-optional")
     return command
 
 
@@ -376,6 +389,7 @@ def run(environment: Mapping[str, str] | None = None) -> int:
         max_retries = _positive_int(
             environment, "CLOCKIFY_AUTOPILOT_MAX_COVERAGE_RETRIES", 2
         )
+        _boolean(environment, "CLOCKIFY_AUTOPILOT_CALENDLY_OPTIONAL")
         for name in (
             "CLOCKIFY_AUTOPILOT_PERIOD_MANIFEST",
             "CLOCKIFY_AUTOPILOT_ROUTING",

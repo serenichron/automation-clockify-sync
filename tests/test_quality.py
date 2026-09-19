@@ -222,6 +222,61 @@ class QualityMatchingTests(unittest.TestCase):
         )
         self.assertEqual([{"left": "P001", "right": "existing-1"}], overlaps)
 
+    def test_quality_allows_exact_proposal_overlap_declared_for_human_review(self):
+        left = {
+            "id": "P001",
+            "candidate_key": "wks-111111111111111111111111",
+            "start": "2026-07-10T10:00:00+03:00",
+            "end": "2026-07-10T11:00:00+03:00",
+            "review_warnings": [
+                {
+                    "type": "review_proposal_overlap",
+                    "counterpart_id": "wks-222222222222222222222222",
+                    "overlap_start": "2026-07-10T10:30:00+03:00",
+                    "overlap_end": "2026-07-10T11:00:00+03:00",
+                    "overlap_duration_seconds": 1800,
+                }
+            ],
+        }
+        right = {
+            "id": "P002",
+            "candidate_key": "wks-222222222222222222222222",
+            "start": "2026-07-10T10:30:00+03:00",
+            "end": "2026-07-10T11:30:00+03:00",
+            "review_warnings": [],
+        }
+
+        self.assertEqual([], quality.find_time_overlaps([left, right]))
+
+    def test_quality_blocks_overlap_when_warning_does_not_match_exact_interval(self):
+        left = {
+            "id": "P001",
+            "candidate_key": "wks-111111111111111111111111",
+            "start": "2026-07-10T10:00:00+03:00",
+            "end": "2026-07-10T11:00:00+03:00",
+            "review_warnings": [
+                {
+                    "type": "review_proposal_overlap",
+                    "counterpart_id": "wks-222222222222222222222222",
+                    "overlap_start": "2026-07-10T10:31:00+03:00",
+                    "overlap_end": "2026-07-10T11:00:00+03:00",
+                    "overlap_duration_seconds": 1740,
+                }
+            ],
+        }
+        right = {
+            "id": "P002",
+            "candidate_key": "wks-222222222222222222222222",
+            "start": "2026-07-10T10:30:00+03:00",
+            "end": "2026-07-10T11:30:00+03:00",
+            "review_warnings": [],
+        }
+
+        self.assertEqual(
+            [{"left": "P001", "right": "P002"}],
+            quality.find_time_overlaps([left, right]),
+        )
+
     def test_flash_reviewed_semantic_proposal_gets_caveman_advisory(self):
         row = proposal(
             id="P001",

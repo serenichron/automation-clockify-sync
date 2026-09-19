@@ -212,6 +212,68 @@ class ReviewStateTests(unittest.TestCase):
             )
         )
 
+    def test_intentionally_excluded_empty_calendly_does_not_warn(self):
+        """Catches optional Calendly exclusion being reported as unavailable evidence."""
+        run_dir = self.tmp_path / "run-calendly-optional"
+        write_json(run_dir / "proposals.json", [])
+        write_json(run_dir / "ambiguous.json", [])
+        write_json(
+            run_dir / "run-report.json",
+            {
+                "evidence": {
+                    "calendly": {
+                        "status": "excluded",
+                        "complete": True,
+                        "recording_count": 0,
+                        "scheduled_without_recording_count": 0,
+                    },
+                    "clockify": {"status": "complete"},
+                },
+                "evidence_ledger": {
+                    "source_completeness": {
+                        "sources": {
+                            "calendly": {
+                                "status": "excluded",
+                                "expected_count": 0,
+                                "observed_count": 0,
+                            }
+                        }
+                    }
+                },
+            },
+        )
+
+        snapshot = review_state.ingest_run(run_dir, review_state._new_state())
+
+        self.assertFalse(
+            any(warning["source"] == "calendly" for warning in snapshot["coverage_warnings"])
+        )
+
+    def test_nonempty_excluded_calendly_still_warns(self):
+        """Catches the optional-source exception hiding a real Calendly mismatch."""
+        run_dir = self.tmp_path / "run-calendly-mismatch"
+        write_json(run_dir / "proposals.json", [])
+        write_json(run_dir / "ambiguous.json", [])
+        write_json(
+            run_dir / "run-report.json",
+            {
+                "evidence": {
+                    "calendly": {
+                        "status": "excluded",
+                        "complete": True,
+                        "expected_count": 1,
+                        "observed_count": 0,
+                    }
+                }
+            },
+        )
+
+        snapshot = review_state.ingest_run(run_dir, review_state._new_state())
+
+        self.assertTrue(
+            any(warning["source"] == "calendly" for warning in snapshot["coverage_warnings"])
+        )
+
     def test_semantic_activity_segment_replay_keeps_rvi_and_evidence_view(self):
         record = semantic_proposal("wk-segment-one", "act-clockify", ["ev-1", "ev-2"])
         state, snapshot, _ = ingest(self.tmp_path, "run-one", [record])

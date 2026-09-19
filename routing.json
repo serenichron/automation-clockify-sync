@@ -16,6 +16,43 @@
       "prefix": "ES"
     }
   ],
+  "evidence_routes": [
+    {
+      "pattern": "\\bBNI\\b",
+      "project_name": "Serenichron Level 1",
+      "project_suffix": "31b39a",
+      "tag_suffixes": [
+        "35aa9b46"
+      ],
+      "tag_names": [
+        "Business development"
+      ],
+      "billable": true,
+      "confidence": "high",
+      "prefix": "SC"
+    },
+    {
+      "pattern": "\\bSerenichron\\b",
+      "project_name": "Serenichron Level 2",
+      "project_suffix": "775f9f",
+      "tag_suffixes": [
+        "35aa9afb"
+      ],
+      "tag_names": [
+        "System development"
+      ],
+      "billable": true,
+      "confidence": "medium",
+      "prefix": "SC"
+    }
+  ],
+  "client_lifecycle_routes": [
+    {
+      "client": "Mazilu & Partners",
+      "pattern": "\\bMazilu(?:\\s*&\\s*Partners)?\\b",
+      "activation": null
+    }
+  ],
   "safety": {
     "post_clockify_unattended": false,
     "mutate_downstream_multica_issues_unattended": false,

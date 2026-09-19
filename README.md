@@ -190,6 +190,20 @@ not the mutable source paths. Replays reject caller overrides and consume only
 the source run's complete snapshot set. Missing, unsafe, or conflicting files
 fail before semantic accounting.
 
+Interrupted accounting can use `clockify_review_run.py --resume-from` with the
+existing source run and explicit state/cache paths. It never recollects or
+replaces the four snapshots. Completed sources are adopted only after their
+completion bundle verifies. An explicitly authorized `--repair-from` instead
+creates a distinct derived run, retaining the source and its receipts unchanged;
+validated cache decisions are reused and only missing decisions may use the
+approved cloud route. Repairs still require separate immutable replay before
+Sheet publication, and neither command posts to Clockify.
+
+A newly opened period's input manifest cannot contain its own future output.
+For this bootstrap case, replay binds the completed source bundle separately,
+verifies its exact interval and artifacts, and leaves both manifest snapshots
+byte-identical. A missing, drifted, or different-period bundle still fails closed.
+
 Flash analysis and a separate Flash reviewer own semantic classification,
 project/task recommendations, consolidation boundaries, effort judgment, and
 human-readable wording. Deterministic code owns evidence identity, exact taxonomy

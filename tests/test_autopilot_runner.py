@@ -465,6 +465,35 @@ class AutopilotRunnerTests(unittest.TestCase):
             command[command.index("--acceptance-ledger") + 1],
         )
 
+    def test_command_passes_calendly_optional_when_enabled(self):
+        """Catches enabled scheduled runs failing to request optional Calendly evidence."""
+        with tempfile.TemporaryDirectory() as directory:
+            environment, _result = self.fixture(directory, "no_comment")
+            environment["CLOCKIFY_AUTOPILOT_CALENDLY_OPTIONAL"] = "true"
+            command = runner._command(environment, Path(directory))
+
+        self.assertIn("--calendly-optional", command)
+
+    def test_command_requires_calendly_by_default(self):
+        """Catches the default changing to optional and silently weakening evidence."""
+        with tempfile.TemporaryDirectory() as directory:
+            environment, _result = self.fixture(directory, "no_comment")
+            for value in (None, "false"):
+                candidate = dict(environment)
+                if value is not None:
+                    candidate["CLOCKIFY_AUTOPILOT_CALENDLY_OPTIONAL"] = value
+                command = runner._command(candidate, Path(directory))
+                self.assertNotIn("--calendly-optional", command)
+
+    def test_invalid_calendly_optional_fails_before_child_spawn(self):
+        """Catches typoed booleans silently excluding required Calendly evidence."""
+        with tempfile.TemporaryDirectory() as directory:
+            environment, _result = self.fixture(directory, "no_comment")
+            environment["CLOCKIFY_AUTOPILOT_CALENDLY_OPTIONAL"] = "yes"
+            with mock.patch.object(runner, "run_child_bounded") as child:
+                self.assertEqual(2, runner.run(environment))
+            child.assert_not_called()
+
     def test_coverage_warning_retries_twice_then_stops_looping(self):
         with tempfile.TemporaryDirectory() as directory:
             environment, result = self.fixture(

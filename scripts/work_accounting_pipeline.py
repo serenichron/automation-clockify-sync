@@ -40,6 +40,15 @@ except ModuleNotFoundError:
 SCHEMA_VERSION = 1
 ALLOCATION_MODE = "non_overlapping_v1"
 MEETING_RECONCILIATION_MIN_RATIO = 0.8
+POINT_OBSERVATION_GAP_THRESHOLDS_SECONDS = {
+    "claude_bursts_event": collector.BURST_GAP_SECONDS,
+    "codex_sessions_event": collector.BURST_GAP_SECONDS,
+}
+POINT_OBSERVATION_CLUSTERING_INPUT = {
+    "configuration_source": "scripts.clockify_sync_collect.BURST_GAP_SECONDS",
+    "max_consecutive_gap_seconds": collector.BURST_GAP_SECONDS,
+    "source_types": sorted(POINT_OBSERVATION_GAP_THRESHOLDS_SECONDS),
+}
 NOISE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("heartbeat", re.compile(r"^\s*(?:heartbeat|health[- ]?check)(?:\s*[:—-].*)?\s*$", re.I)),
     ("standing_by", re.compile(r"^\s*(?:standing by|still waiting|no change(?: yet)?)(?:[.!])?\s*$", re.I)),
@@ -159,6 +168,24 @@ def _span(event: Mapping[str, Any]) -> tuple[dt.datetime | None, dt.datetime | N
     if start and end and end <= start:
         end = start + dt.timedelta(minutes=1)
     return start, end
+
+
+def _observed_span(event: Mapping[str, Any]) -> tuple[dt.datetime | None, dt.datetime | None]:
+    """Return only source-recorded bounds; an observed instant is not duration."""
+    raw = event.get("raw_source_span") if isinstance(event.get("raw_source_span"), Mapping) else {}
+    if raw.get("start"):
+        start = _parse_dt(raw.get("start"))
+        end = _parse_dt(raw.get("end"))
+    elif raw.get("timestamp"):
+        start = _parse_dt(raw.get("timestamp"))
+        end = None
+    elif raw.get("session_start"):
+        start = _parse_dt(raw.get("session_start"))
+        end = _parse_dt(raw.get("session_end"))
+    else:
+        start = _parse_dt(event.get("observed_at"))
+        end = None
+    return (start, end) if start and end and end > start else (start, None)
 
 
 def _attributes(event: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -568,7 +595,7 @@ def _routes_by_selection(
     routing: Mapping[str, Any],
 ) -> dict[tuple[str, str, tuple[str, ...]], dict[str, Any]]:
     result: dict[tuple[str, str, tuple[str, ...]], dict[str, Any]] = {}
-    for section in ("session_routes", "meeting_routes"):
+    for section in ("session_routes", "meeting_routes", "evidence_routes"):
         for route in routing.get(section, []):
             if not isinstance(route, dict) or not route.get("project_name"):
                 continue
@@ -595,6 +622,117 @@ def _routes_by_selection(
                         },
                     )
     return result
+
+
+def _route_from_review_correction(
+    activity: Mapping[str, Any],
+    regression_cases: Iterable[Mapping[str, Any]],
+    routing: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Resolve only an exact evidence-bound routing correction."""
+    evidence_ids = activity.get("evidence_ids", [])
+    if not isinstance(evidence_ids, list) or not evidence_ids:
+        return None
+    target = (
+        str(activity.get("activity_id") or ""),
+        review_corrections.evidence_fingerprint(evidence_ids),
+    )
+    for case in regression_cases:
+        if (
+            str(case.get("activity_id") or ""),
+            str(case.get("evidence_fingerprint") or ""),
+        ) != target:
+            continue
+        if case.get("decision") != "modify":
+            return None
+        patch = case.get("expected_field_patch")
+        if not isinstance(patch, Mapping):
+            return None
+        project = patch.get("client_project")
+        tags = patch.get("tag_names")
+        project_name = project.get("value") if isinstance(project, Mapping) else None
+        tag_names = tags.get("value") if isinstance(tags, Mapping) else None
+        if not isinstance(project_name, str) or not isinstance(tag_names, list):
+            return None
+        selection = (
+            project_name.casefold(),
+            "SC",
+            tuple(sorted(str(value) for value in tag_names)),
+        )
+        return _routes_by_selection(routing).get(selection)
+    return None
+
+
+def _route_from_client_lifecycle(
+    cited_events: list[Mapping[str, Any]], routing: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    """Activate client routing only with an explicit marker and effective date."""
+    for rule in routing.get("client_lifecycle_routes", []):
+        if not isinstance(rule, Mapping):
+            continue
+        pattern = str(rule.get("pattern") or "")
+        if not pattern:
+            continue
+        activation = rule.get("activation")
+        if not isinstance(activation, Mapping):
+            return None
+        marker = str(activation.get("marker") or "").strip()
+        effective = _parse_dt(activation.get("effective_at"))
+        route = activation.get("route")
+        if not marker or effective is None or not isinstance(route, Mapping):
+            return None
+        activated = False
+        for event in cited_events:
+            searchable = _substantive_evidence_text((event,))
+            observed = _parse_dt(event.get("observed_at"))
+            if (
+                observed is not None
+                and observed >= effective
+                and re.search(pattern, searchable, flags=re.IGNORECASE) is not None
+                and re.search(re.escape(marker), searchable, flags=re.IGNORECASE)
+                is not None
+            ):
+                activated = True
+                break
+        if not activated:
+            continue
+        selection = (
+            str(route.get("project_name") or "").casefold(),
+            str(route.get("prefix") or "SC"),
+            tuple(sorted(str(value) for value in route.get("tag_names", []))),
+        )
+        return _routes_by_selection(routing).get(selection) or dict(route)
+    return None
+
+
+def _route_from_explicit_evidence(
+    cited_events: list[Mapping[str, Any]], routing: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    searchable = _substantive_evidence_text(cited_events)
+    for rule in routing.get("evidence_routes", []):
+        if not isinstance(rule, Mapping):
+            continue
+        pattern = str(rule.get("pattern") or "")
+        if not pattern or re.search(pattern, searchable, flags=re.IGNORECASE) is None:
+            continue
+        selection = (
+            str(rule.get("project_name") or "").casefold(),
+            str(rule.get("prefix") or "SC"),
+            tuple(sorted(str(value) for value in rule.get("tag_names", []))),
+        )
+        return _routes_by_selection(routing).get(selection) or dict(rule)
+    return None
+
+
+def _substantive_evidence_text(cited_events: Iterable[Mapping[str, Any]]) -> str:
+    """Return human-authored evidence text without paths or source metadata."""
+    return " ".join(
+        " ".join(
+            str(_attributes(event).get(field) or "")
+            for field in ("content", "title", "description", "summary")
+        )
+        for event in cited_events
+    )
 
 
 def _apply_prefix_override(
@@ -649,6 +787,8 @@ def resolve_route(
     cited_events: list[dict[str, Any]],
     routing: Mapping[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
+    if lifecycle := _route_from_client_lifecycle(cited_events, routing):
+        return _apply_prefix_override(lifecycle, cited_events, routing), None
     deterministic_routes: list[dict[str, Any]] = []
     skipped_routes: list[str] = []
     for event in cited_events:
@@ -696,6 +836,12 @@ def resolve_route(
         return _apply_prefix_override(reviewed_route, cited_events, routing), None
     named = _routes_by_name(routing).get(recommended_name) if recommended_name else None
     route = deterministic or named
+    explicit = _route_from_explicit_evidence(cited_events, routing)
+    route_is_broad_sc = str((route or {}).get("project_name") or "").casefold().startswith(
+        "serenichron"
+    )
+    if explicit is not None and (route is None or route_is_broad_sc):
+        route = explicit
     if route is None:
         return None, "no deterministic Clockify project route"
     if deterministic and recommended_name:
@@ -706,6 +852,101 @@ def resolve_route(
                 f"{recommended.get('name')} vs {deterministic.get('project_name')}"
             )
     return _apply_prefix_override(route, cited_events, routing), None
+
+
+_MEETING_IDENTITY_FIELDS = (
+    "canonical_meeting_id",
+    "cross_provider_meeting_id",
+    "meeting_id",
+    "calendar_event_id",
+)
+
+
+def _normalized_meeting_title(value: Any) -> str:
+    return " ".join(str(value or "").split()).casefold()
+
+
+def _participant_identity_set(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    identities = []
+    for person in value:
+        if not isinstance(person, Mapping):
+            continue
+        for field in ("email", "id", "name"):
+            identity = str(person.get(field) or "").strip().casefold()
+            if identity:
+                identities.append(f"{field}:{identity}")
+                break
+    return tuple(sorted(set(identities)))
+
+
+def _derived_meeting_identity(
+    start: dt.datetime,
+    end: dt.datetime,
+    title: Any,
+    participants: Any,
+) -> str | None:
+    normalized_title = _normalized_meeting_title(title)
+    participant_ids = _participant_identity_set(participants)
+    if not normalized_title or not participant_ids:
+        return None
+    return json.dumps(
+        {
+            "start": start.astimezone(dt.timezone.utc).isoformat(),
+            "end": end.astimezone(dt.timezone.utc).isoformat(),
+            "title": normalized_title,
+            "participants": participant_ids,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _existing_meeting_identity_keys(
+    event: Mapping[str, Any], start: dt.datetime, end: dt.datetime
+) -> list[str]:
+    attrs = _attributes(event)
+    keys = {
+        f"explicit:{identity}"
+        for field in _MEETING_IDENTITY_FIELDS
+        if (identity := str(attrs.get(field) or "").strip().casefold())
+    }
+    derived = _derived_meeting_identity(
+        start,
+        end,
+        attrs.get("meeting_title") or attrs.get("title"),
+        attrs.get("participants", attrs.get("calendar_invitees")),
+    )
+    if derived:
+        keys.add(f"derived:{derived}")
+    return sorted(keys)
+
+
+def _canonical_meeting_identity_keys(
+    meeting: meeting_reconciliation.CanonicalMeeting,
+    entry: Mapping[str, Any],
+    start: dt.datetime,
+    end: dt.datetime,
+) -> set[str]:
+    keys = {f"explicit:{meeting.canonical_id.casefold()}"}
+    for source_id in meeting.source_ids:
+        keys.add(f"explicit:{str(source_id).casefold()}")
+        if ":" in str(source_id):
+            keys.add(f"explicit:{str(source_id).split(':', 1)[1].casefold()}")
+    for event in entry.get("events", []):
+        attrs = _attributes(event)
+        source = event.get("source_ref") if isinstance(event.get("source_ref"), Mapping) else {}
+        for field in _MEETING_IDENTITY_FIELDS:
+            identity = str(attrs.get(field) or source.get(field) or "").strip().casefold()
+            if identity:
+                keys.add(f"explicit:{identity}")
+    derived = _derived_meeting_identity(
+        start, end, meeting.title, list(meeting.participants)
+    )
+    if derived:
+        keys.add(f"derived:{derived}")
+    return keys
 
 
 def _existing_blocks(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -722,6 +963,12 @@ def _existing_blocks(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
                 "start": start,
                 "end": end,
                 "kind": "existing_clockify",
+                "project_id_suffix": str(
+                    _attributes(event).get("project_id_suffix") or ""
+                ),
+                "meeting_identity_keys": _existing_meeting_identity_keys(
+                    event, start, end
+                ),
             }
         )
     return blocks
@@ -811,22 +1058,18 @@ def _overlap_ratio(
 
 
 def _meeting_matches_existing_block(
+    meeting: meeting_reconciliation.CanonicalMeeting,
+    entry: Mapping[str, Any],
     start: dt.datetime,
     end: dt.datetime,
     block: Mapping[str, Any],
 ) -> bool:
-    """Return whether an existing block credibly represents this full meeting.
-
-    A one-sided comparison would reconcile a short meeting against a much
-    longer Clockify entry that merely contains it.  Require substantial overlap
-    from both perspectives before treating the two records as the same work.
-    """
-    return (
-        _overlap_ratio(start, end, block["start"], block["end"])
-        >= MEETING_RECONCILIATION_MIN_RATIO
-        and _overlap_ratio(block["start"], block["end"], start, end)
-        >= MEETING_RECONCILIATION_MIN_RATIO
-    )
+    """Match only explicit identity or exact schedule/title/participant identity."""
+    canonical_keys = _canonical_meeting_identity_keys(meeting, entry, start, end)
+    block_keys = {
+        str(value) for value in block.get("meeting_identity_keys", [])
+    }
+    return bool(canonical_keys & block_keys)
 
 
 def _canonical_meeting_span(
@@ -967,6 +1210,122 @@ def _allowed_intervals(
     ]
 
 
+def _activity_observed_intervals(
+    cited_events: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """Union actual bounds and authoritative per-source point clusters."""
+    candidates: list[tuple[dt.datetime, dt.datetime]] = []
+    point_groups: dict[tuple[str, str, str, str], list[dt.datetime]] = {}
+    for event in cited_events:
+        start, end = _observed_span(event)
+        if start is None:
+            continue
+        if end is not None:
+            candidates.append((start, end))
+            continue
+        source_type = str(event.get("source_type") or "")
+        if source_type not in POINT_OBSERVATION_GAP_THRESHOLDS_SECONDS:
+            continue
+        source_ref = (
+            event.get("source_ref")
+            if isinstance(event.get("source_ref"), Mapping)
+            else {}
+        )
+        group = (
+            start.date().isoformat(),
+            source_type,
+            str(source_ref.get("machine") or ""),
+            str(source_ref.get("session_id") or ""),
+        )
+        point_groups.setdefault(group, []).append(start)
+    for group in sorted(point_groups):
+        points = sorted(set(point_groups[group]))
+        threshold = POINT_OBSERVATION_GAP_THRESHOLDS_SECONDS[group[1]]
+        cluster: list[dt.datetime] = []
+        for point in points:
+            if cluster and (point - cluster[-1]).total_seconds() > threshold:
+                if len(cluster) >= 2:
+                    candidates.append((cluster[0], cluster[-1]))
+                cluster = []
+            cluster.append(point)
+        if len(cluster) >= 2:
+            candidates.append((cluster[0], cluster[-1]))
+    merged: list[tuple[dt.datetime, dt.datetime]] = []
+    for start, end in sorted(candidates):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return [
+        {"start": _iso(start), "end": _iso(end)}
+        for start, end in merged
+    ]
+
+
+def _interval_capacity_minutes(intervals: Iterable[Mapping[str, Any]]) -> int:
+    parsed = [
+        (_parse_dt(interval.get("start")), _parse_dt(interval.get("end")))
+        for interval in intervals
+    ]
+    valid = sorted((start, end) for start, end in parsed if start and end and end > start)
+    merged: list[tuple[dt.datetime, dt.datetime]] = []
+    for start, end in valid:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return sum(int((end - start).total_seconds() // 60) for start, end in merged)
+
+
+def _subtract_intervals(
+    intervals: Iterable[tuple[dt.datetime, dt.datetime]],
+    exclusions: Iterable[tuple[dt.datetime, dt.datetime]],
+) -> list[tuple[dt.datetime, dt.datetime]]:
+    """Subtract only this activity's accepted segments from observed intervals."""
+    remaining = list(intervals)
+    for excluded_start, excluded_end in sorted(exclusions):
+        next_remaining: list[tuple[dt.datetime, dt.datetime]] = []
+        for start, end in remaining:
+            if excluded_end <= start or excluded_start >= end:
+                next_remaining.append((start, end))
+                continue
+            if start < excluded_start:
+                next_remaining.append((start, excluded_start))
+            if excluded_end < end:
+                next_remaining.append((excluded_end, end))
+        remaining = next_remaining
+    return remaining
+
+
+def _capacity_recovery_slices(
+    demand: work_allocator.ActivityDemand,
+    accepted: Iterable[work_allocator.AllocationSegment],
+    requested_minutes: int,
+) -> list[tuple[dt.datetime, dt.datetime]]:
+    """Place review-only residuals inside observed time, excluding own allocations."""
+    if requested_minutes <= 0:
+        return []
+    own_intervals = [
+        (segment.start, segment.end)
+        for segment in accepted
+        if segment.activity_id == demand.activity_id
+    ]
+    available = _subtract_intervals(demand.allowed_intervals, own_intervals)
+    remaining_seconds = requested_minutes * 60
+    result: list[tuple[dt.datetime, dt.datetime]] = []
+    for start, end in available:
+        if remaining_seconds <= 0:
+            break
+        take_seconds = min(int((end - start).total_seconds()), remaining_seconds)
+        if take_seconds < 60:
+            continue
+        take_seconds -= take_seconds % 60
+        recovered_end = start + dt.timedelta(seconds=take_seconds)
+        result.append((start, recovered_end))
+        remaining_seconds -= take_seconds
+    return result
+
+
 def _proposal(
     activity: Mapping[str, Any],
     route: Mapping[str, Any],
@@ -975,6 +1334,8 @@ def _proposal(
     end: dt.datetime,
     evidence_ids: list[str],
     segment: int,
+    *,
+    review_warnings: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     seconds = int((end - start).total_seconds())
     if seconds <= 0:
@@ -1021,6 +1382,7 @@ def _proposal(
         "rationale": activity.get("split_rationale") or activity.get("merge_rationale"),
         "allocation_mode": ALLOCATION_MODE,
         "effort": activity.get("effort"),
+        "review_warnings": copy.deepcopy(review_warnings or []),
         "provenance": {
             "source_type": "semantic_activity",
             "source_session_id": activity_id,
@@ -1166,7 +1528,7 @@ def run_accounting(
             }
 
     fixed = list(existing)
-    meeting_conflicts: list[dict[str, Any]] = []
+    meeting_overlap_blocks: dict[str, list[dict[str, Any]]] = {}
     for entry in eligible_recordings:
         meeting = entry["meeting"]
         representative = next(
@@ -1184,41 +1546,56 @@ def run_accounting(
             block
             for block in overlapping_blocks
             if block["kind"] == "existing_clockify"
-            and _meeting_matches_existing_block(start, end, block)
+            and _meeting_matches_existing_block(meeting, entry, start, end, block)
         ]
-        if len(overlapping_blocks) == 1 and len(matching_existing) == 1:
-            fathom_manifest[meeting_id].update({
-                "status": "reconciled",
-                "reason": "existing_clockify_meeting_match",
-                "fixed_block_ids": [matching_existing[0]["block_id"]],
-            })
-            continue
-        if overlapping_blocks:
-            block_ids = [str(block["block_id"]) for block in overlapping_blocks]
-            fathom_manifest[meeting_id].update({
-                "status": "exception",
-                "reason": "meeting_overlap",
-                "fixed_block_ids": block_ids,
-            })
-            meeting_conflicts.append(
-                {
-                    "id": meeting_id,
-                    "reason": "eligible Fathom meeting overlaps fixed Clockify time without a reciprocal meeting match",
-                    "exception_kind": "fixed_block_conflict",
-                    "conflict_reason": "meeting_overlap",
-                    "evidence_ids": entry["source_evidence_ids"],
-                    "fixed_block_ids": block_ids,
-                }
-            )
-            continue
-        fixed.append(
-            {
+        if len(matching_existing) == 1:
+            matching_block = matching_existing[0]
+            unrelated_blocks = [
+                block for block in overlapping_blocks if block is not matching_block
+            ]
+            fixed.append({
                 "block_id": meeting_id,
                 "start": start,
                 "end": end,
                 "kind": "fathom_meeting",
-            }
-        )
+            })
+            fathom_manifest[meeting_id].update({
+                "status": "reconciled",
+                "reason": "existing_clockify_meeting_match",
+                "fixed_block_ids": [matching_block["block_id"], meeting_id],
+            })
+            if unrelated_blocks:
+                fathom_manifest[meeting_id]["overlap_diagnostics"] = [
+                    {
+                        "type": "existing_clockify_overlap",
+                        "counterpart_id": str(block["block_id"]),
+                        **({
+                            "counterpart_project_suffix": str(
+                                block.get("project_id_suffix")
+                            ),
+                        } if block.get("project_id_suffix") else {}),
+                        "overlap_start": _iso(max(start, block["start"])),
+                        "overlap_end": _iso(min(end, block["end"])),
+                        "overlap_duration_seconds": int((
+                            min(end, block["end"]) - max(start, block["start"])
+                        ).total_seconds()),
+                    }
+                    for block in unrelated_blocks
+                ]
+            continue
+        fixed.append({
+            "block_id": meeting_id,
+            "start": start,
+            "end": end,
+            "kind": "fathom_meeting",
+        })
+        if overlapping_blocks:
+            block_ids = [str(block["block_id"]) for block in overlapping_blocks]
+            fathom_manifest[meeting_id].update({
+                "fixed_block_ids": block_ids,
+            })
+            meeting_overlap_blocks[meeting_id] = overlapping_blocks
+            continue
         fathom_manifest[meeting_id].update({"fixed_block_ids": [meeting_id]})
 
     workstream_envelopes = _workstream_daily_envelopes(
@@ -1229,10 +1606,10 @@ def run_accounting(
     ambiguous: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     meeting_proposals: list[dict[str, Any]] = []
+    correction_observations: list[dict[str, Any]] = []
     meeting_activities: dict[str, list[dict[str, Any]]] = {}
     meeting_attempts: dict[str, list[dict[str, Any]]] = {}
 
-    ambiguous.extend(meeting_conflicts)
     ambiguous.extend({
         "id": exception["source_evidence_ids"][0] if exception["source_evidence_ids"] else "canonical-reconciliation",
         "reason": exception["reason"],
@@ -1291,7 +1668,16 @@ def run_accounting(
                 continue
             attempt = {"activity_id": activity_id, "evidence_ids": evidence_ids, "failures": []}
             meeting_attempts.setdefault(meeting_id, []).append(attempt)
-        route, route_error = resolve_route(activity, cited, routing)
+        corrected_route = _route_from_review_correction(
+            activity, regression_cases, routing
+        )
+        if corrected_route is not None:
+            route, route_error = (
+                _apply_prefix_override(corrected_route, cited, routing),
+                None,
+            )
+        else:
+            route, route_error = resolve_route(activity, cited, routing)
         if route_error or route is None:
             if attempt is not None:
                 attempt["failures"].append(str(route_error or "meeting route is unavailable"))
@@ -1365,23 +1751,59 @@ def run_accounting(
             attempt["candidate"] = True
             continue
 
-        spans = _authoritative_spans(cited)
-        intervals = _allowed_intervals(
-            cited,
-            workstream_envelopes.get(str(activity.get("workstream_id") or ""), {}),
-        )
-        if not spans or not intervals:
-            ambiguous.append({"id": activity_id, "reason": "no observed working-day envelope for cited evidence", "exception_kind": "timing_evidence", "evidence_ids": evidence_ids})
+        intervals = _activity_observed_intervals(cited)
+        if not intervals:
+            ambiguous.append({"id": activity_id, "reason": "cited evidence has timestamps but no positive observed interval", "exception_kind": "timing_evidence", "evidence_ids": evidence_ids})
+            if corrected_route is not None:
+                correction_observations.append({
+                    "activity_id": activity_id,
+                    "client_project": route.get("project_name"),
+                    "tag_names": list(route.get("tag_names", [])),
+                    "description": description,
+                    "provenance": {"evidence_ids": evidence_ids},
+                })
             continue
+        spans = [
+            {
+                "evidence_id": evidence_ids[min(index, len(evidence_ids) - 1)],
+                "start": interval["start"],
+                "end": interval["end"],
+            }
+            for index, interval in enumerate(intervals)
+        ]
+        requested_effort = dict(activity.get("effort") or {})
+        requested_minutes = int(requested_effort.get("recommended_minutes") or 0)
+        observed_capacity = _interval_capacity_minutes(intervals)
+        review_warnings: list[dict[str, Any]] = []
+        demand_effort = requested_effort
+        if requested_minutes > observed_capacity:
+            demand_effort = {
+                "minimum_minutes": observed_capacity,
+                "recommended_minutes": observed_capacity,
+                "maximum_minutes": observed_capacity,
+            }
+            review_warnings.append({
+                "type": "observed_capacity_cap",
+                "requested_minutes": requested_minutes,
+                "observed_capacity_minutes": observed_capacity,
+                "proposed_minutes": observed_capacity,
+            })
         demand = {
             **activity,
             "evidence_spans": spans,
             "allowed_intervals": intervals,
+            "effort": demand_effort,
             "confidence": activity.get("semantic_confidence"),
             "attention_signal": sum(2 if str(_attributes(event).get("role")).lower() == "user" else 1 for event in cited),
         }
         allocation_demands.append(demand)
-        activity_context[activity_id] = {"activity": activity, "route": route, "description": description, "evidence_ids": evidence_ids}
+        activity_context[activity_id] = {
+            "activity": activity,
+            "route": route,
+            "description": description,
+            "evidence_ids": evidence_ids,
+            "review_warnings": review_warnings,
+        }
 
     for meeting_id, attempts in meeting_attempts.items():
         failures = sorted({
@@ -1412,10 +1834,12 @@ def run_accounting(
         if len(candidates) == 1:
             candidate = candidates[0]
             start, end = _canonical_meeting_span(meeting, representative)
-            meeting_proposals.append(_proposal(
+            proposal = _proposal(
                 candidate["activity"], candidate["route"], candidate["description"],
                 start, end, entry["source_evidence_ids"], 1,
-            ))
+            )
+            proposal["provenance"]["canonical_meeting_id"] = meeting_id
+            meeting_proposals.append(proposal)
             fathom_manifest[meeting_id].update({
                 "status": "proposed", "activity_id": str(candidate["activity"].get("activity_id") or ""),
             })
@@ -1471,8 +1895,161 @@ def run_accounting(
                 segment.end,
                 context["evidence_ids"],
                 activity_segment_counts[segment.activity_id],
+                review_warnings=context["review_warnings"],
             )
         )
+
+    demands_by_activity = {
+        demand.activity_id: demand for demand in allocation.evidence
+    }
+    recovery_proposal_ids: set[str] = set()
+    recovery_identities = {
+        (
+            str(proposal.get("activity_id") or ""),
+            str(proposal.get("start") or ""),
+            str(proposal.get("end") or ""),
+        )
+        for proposal in proposals
+    }
+    recovery_records: list[dict[str, Any]] = []
+    residual_conflicts: list[work_allocator.ContestedTime] = []
+    for conflict in allocation.contested_time:
+        demand = demands_by_activity[conflict.activity_id]
+        context = activity_context[conflict.activity_id]
+        slices = _capacity_recovery_slices(
+            demand,
+            allocation.allocations,
+            conflict.unallocated_minutes,
+        )
+        unique_slices: list[tuple[dt.datetime, dt.datetime]] = []
+        for start, end in slices:
+            identity = (conflict.activity_id, _iso(start), _iso(end))
+            if identity in recovery_identities:
+                continue
+            recovery_identities.add(identity)
+            unique_slices.append((start, end))
+        recovered_minutes = sum(
+            _minutes(start, end) for start, end in unique_slices
+        )
+        residual_minutes = max(
+            0,
+            conflict.requested_minutes
+            - conflict.allocated_minutes
+            - recovered_minutes,
+        )
+        if recovered_minutes:
+            recovery_warning = {
+                "type": "allocation_capacity_recovery",
+                "requested_minutes": conflict.requested_minutes,
+                "allocator_allocated_minutes": conflict.allocated_minutes,
+                "recovered_minutes": recovered_minutes,
+                "residual_minutes": residual_minutes,
+            }
+            for recovery_index, (start, end) in enumerate(unique_slices):
+                activity_segment_counts[conflict.activity_id] = (
+                    activity_segment_counts.get(conflict.activity_id, 0) + 1
+                )
+                proposal = _proposal(
+                    context["activity"],
+                    context["route"],
+                    context["description"],
+                    start,
+                    end,
+                    context["evidence_ids"],
+                    activity_segment_counts[conflict.activity_id],
+                    review_warnings=[
+                        *context["review_warnings"],
+                        *([recovery_warning] if recovery_index == 0 else []),
+                    ],
+                )
+                proposal["provenance"]["allocation_capacity_recovery"] = True
+                proposals.append(proposal)
+                recovery_proposal_ids.add(proposal["candidate_key"])
+            recovery_records.append({
+                "activity_id": conflict.activity_id,
+                "requested_minutes": conflict.requested_minutes,
+                "allocator_allocated_minutes": conflict.allocated_minutes,
+                "recovered_minutes": recovered_minutes,
+                "residual_minutes": residual_minutes,
+            })
+        if residual_minutes:
+            residual_conflicts.append(dataclasses.replace(
+                conflict,
+                allocated_minutes=(
+                    conflict.allocated_minutes + recovered_minutes
+                ),
+                unallocated_minutes=residual_minutes,
+            ))
+    allocation = dataclasses.replace(
+        allocation,
+        contested_time=tuple(residual_conflicts),
+    )
+
+    meeting_proposal_ids = {
+        str(proposal.get("candidate_key") or "")
+        for proposal in meeting_proposals
+    }
+    for proposal in proposals:
+        is_meeting = proposal.get("candidate_key") in meeting_proposal_ids
+        is_recovery = proposal.get("candidate_key") in recovery_proposal_ids
+        if not is_meeting and not is_recovery:
+            continue
+        proposal_start = _parse_dt(proposal.get("start"))
+        proposal_end = _parse_dt(proposal.get("end"))
+        if proposal_start is None or proposal_end is None:
+            continue
+        warnings = proposal["review_warnings"]
+        canonical_id = str(
+            (proposal.get("provenance") or {}).get("canonical_meeting_id") or ""
+        )
+        overlap_blocks = (
+            meeting_overlap_blocks.get(canonical_id, [])
+            if is_meeting
+            else fixed
+        )
+        for block in overlap_blocks:
+            if block.get("kind") != "existing_clockify":
+                continue
+            overlap_start = max(proposal_start, block["start"])
+            overlap_end = min(proposal_end, block["end"])
+            if overlap_end <= overlap_start:
+                continue
+            warnings.append({
+                "type": "existing_clockify_overlap",
+                "counterpart_id": str(block["block_id"]),
+                **({
+                    "counterpart_project_suffix": str(block.get("project_id_suffix")),
+                } if block.get("project_id_suffix") else {}),
+                "overlap_start": _iso(overlap_start),
+                "overlap_end": _iso(overlap_end),
+                "overlap_duration_seconds": int((overlap_end - overlap_start).total_seconds()),
+            })
+        for counterpart in proposals:
+            if counterpart is proposal:
+                continue
+            counterpart_start = _parse_dt(counterpart.get("start"))
+            counterpart_end = _parse_dt(counterpart.get("end"))
+            if (
+                counterpart_start is None
+                or counterpart_end is None
+                or proposal_start >= counterpart_end
+                or counterpart_start >= proposal_end
+            ):
+                continue
+            overlap_start = max(proposal_start, counterpart_start)
+            overlap_end = min(proposal_end, counterpart_end)
+            warnings.append({
+                "type": "meeting_proposal_overlap" if counterpart.get("candidate_key") in meeting_proposal_ids else "review_proposal_overlap",
+                "counterpart_id": str(counterpart.get("candidate_key") or counterpart.get("id") or ""),
+                **({
+                    "counterpart_project_suffix": str(
+                        counterpart.get("clockify_project_suffix")
+                    ),
+                } if counterpart.get("clockify_project_suffix") else {}),
+                "overlap_start": _iso(overlap_start),
+                "overlap_end": _iso(overlap_end),
+                "overlap_duration_seconds": int((overlap_end - overlap_start).total_seconds()),
+            })
     for conflict in allocation.contested_time:
         ambiguous.append({
             "id": conflict.activity_id,
@@ -1492,7 +2069,7 @@ def run_accounting(
 
     proposals.sort(key=lambda value: (value["start"], value["candidate_key"]))
     correction_regression = review_corrections.evaluate_regression_cases(
-        regression_cases, proposals
+        regression_cases, [*proposals, *correction_observations]
     )
     failed_targets: dict[tuple[str, str], dict[str, Any]] = {}
     for regression in correction_regression["results"]:
@@ -1588,6 +2165,15 @@ def run_accounting(
             return {str(key): serialize(item) for key, item in value.items()}
         return value
 
+    serialized_allocation = serialize(allocation)
+    serialized_allocation["capacity_recoveries"] = copy.deepcopy(
+        recovery_records
+    )
+    serialized_allocation["deterministic_inputs"] = {
+        "point_observation_clustering": copy.deepcopy(
+            POINT_OBSERVATION_CLUSTERING_INPUT
+        )
+    }
     result = {
         "schema_version": SCHEMA_VERSION,
         "allocation_mode": ALLOCATION_MODE,
@@ -1604,7 +2190,7 @@ def run_accounting(
         "proposals": proposals,
         "ambiguous": ambiguous,
         "skipped": skipped,
-        "allocation": serialize(allocation),
+        "allocation": serialized_allocation,
         "fathom_reconciliation": [
             {"evidence_id": value["source_evidence_ids"][0], **value}
             for key, value in sorted(fathom_manifest.items())

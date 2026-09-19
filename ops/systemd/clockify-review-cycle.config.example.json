@@ -1,0 +1,17 @@
+{
+  "root": "/srv/serenichron/clockify-review-cycle",
+  "state_dir": "/srv/serenichron/clockify-review-cycle/state",
+  "cache": "/srv/serenichron/clockify-review-cycle/state/analyzer-cache.jsonl",
+  "routing": "/srv/serenichron/clockify-review-cycle/config/routing.json",
+  "corrections": "/srv/serenichron/clockify-review-cycle/config/review-corrections.jsonl",
+  "acceptance": "/srv/serenichron/clockify-review-cycle/config/review-acceptance.jsonl",
+  "workspace_id": "replace-with-workspace-id",
+  "member_id": "replace-with-member-id",
+  "recovery_since": "2026-01-01",
+  "timezone": "Etc/UTC",
+  "spreadsheet_id": "replace-with-spreadsheet-id",
+  "monthly_sheet_title_template": "{month_name} {year} portfolio review",
+  "calendly_optional": true,
+  "max_slices": 1,
+  "total_child_budget_seconds": 7200
+}

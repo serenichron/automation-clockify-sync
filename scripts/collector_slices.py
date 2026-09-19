@@ -140,6 +140,17 @@ class BacklogStore:
             identity, tuple(slices), directory, self._read_manifest(manifest_path)
         )
 
+    def read_existing(
+        self, identity: BacklogIdentity, slices: tuple[CollectionSlice, ...]
+    ) -> BacklogState:
+        """Validate an existing backlog without entering the creation path."""
+        plan = _plan_document(identity, slices)
+        directory = self.root / _digest(plan)[7:]
+        manifest_path = directory / "backlog-manifest.json"
+        return self._state_from_manifest(
+            identity, tuple(slices), directory, self._read_manifest(manifest_path)
+        )
+
     def record_complete(
         self,
         state: BacklogState,

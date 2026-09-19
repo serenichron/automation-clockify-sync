@@ -24,9 +24,11 @@ from typing import Any
 
 try:
     from scripts import clockify_sync_collect, review_acceptance, semantic_analyzer
+    from scripts import clockify_source_debt_recover
     from scripts import collector_receipts, reconciliation_manifest
 except ModuleNotFoundError:  # direct script execution
     import clockify_sync_collect  # type: ignore[no-redef]
+    import clockify_source_debt_recover  # type: ignore[no-redef]
     import review_acceptance  # type: ignore[no-redef]
     import semantic_analyzer  # type: ignore[no-redef]
     import collector_receipts  # type: ignore[no-redef]
@@ -530,6 +532,7 @@ def _reconciliation_binding(
     routing: Path,
     corrections: Path,
     acceptance: Path,
+    completion_source: Path | None = None,
 ) -> dict[str, str]:
     """Return only stable identities required to replay a reconciled period.
 
@@ -541,8 +544,36 @@ def _reconciliation_binding(
     if not run_dir.is_dir() or run_dir.is_symlink():
         raise ReviewRunError("reconciliation run is missing or unsafe")
     manifest_document, manifest, bundle_records, manifest_content = (
-        _validated_period_manifest(Path(period_manifest))
+        _validated_period_manifest(Path(period_manifest), allow_collecting_bootstrap=True)
     )
+    if not bundle_records:
+        # The immutable input precedes accounting, so it cannot name its own
+        # future completion bundle. Bind that verified output separately. A
+        # distinct replay uses the completed SOURCE, never a fabricated bundle
+        # or its own not-yet-completed output, and input snapshots stay intact.
+        completed = _run_child(completion_source or run_dir, label="bootstrap completion source")
+        try:
+            bundle_path = completed / "completion-bundle.json"
+            bundle = collector_receipts.load_completion_bundle(bundle_path, run_dir=completed)
+        except (OSError, ValueError, collector_receipts.CollectorReceiptError) as exc:
+            raise ReviewRunError("bootstrap source completion bundle is invalid") from exc
+        period = manifest.identity.document()
+        if bundle.replay or (bundle.since_utc, bundle.until_utc) != (
+            period["since_utc"], period["until_utc"],
+        ):
+            raise ReviewRunError("bootstrap source completion does not match exact period")
+        if completed != run_dir and (
+            _ledger_identity(completed) != _ledger_identity(run_dir)
+            or _accounting_identity(completed) != _accounting_identity(run_dir)
+        ):
+            raise ReviewRunError("bootstrap source completion does not match replay outputs")
+        bundle_records = [{
+            "slice_id": bundle.slice_id,
+            "since_utc": bundle.since_utc,
+            "until_utc": bundle.until_utc,
+            "bundle_digest": bundle.bundle_digest,
+            "artifact_sha256": _file_sha256(bundle_path, label="bootstrap completion bundle"),
+        }]
     digests = {
         "period_manifest": "sha256:" + hashlib.sha256(manifest_content).hexdigest(),
         "routing": _file_sha256(Path(routing), label="reconciliation routing"),
@@ -848,6 +879,194 @@ def _replay_analysis_fixture(source: Path, replay: Path) -> Path:
     return fixture
 
 
+def _prepare_repair_run(source: Path) -> Path:
+    """Derive a new accounting run without recollection or changing its source."""
+    source, snapshots = _resume_source(source)
+    if _adopt_completed_resume(source) is None:
+        raise ReviewRunError("repair requires a verified completed source")
+    _validated_period_manifest(snapshots["period-manifest.json"], allow_collecting_bootstrap=True)
+    target = Path(tempfile.mkdtemp(
+        prefix=dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ") + "-repair-",
+        dir=RUNS.resolve(),
+    ))
+    # All source reads are verified before a destination is eligible for resume.
+    for filename in ("run-report.md", "evidence/evidence-ledger.json", *_RECONCILIATION_INPUTS.values()):
+        content = _read_snapshot_source(source / filename, label=f"repair source {filename}")
+        (target / filename).parent.mkdir(parents=True, exist_ok=True)
+        _write_snapshot(target / filename, content, label=f"repair {filename}")
+    report = dict(_read_json(source / "run-report.json"))
+    report.update(run_id=target.name, repair_of_run_id=source.name)
+    _write_json(target / "run-report.json", report)
+    _write_snapshot(target / "repair-source.json", json.dumps({
+        "schema_version": 1,
+        "source_run_id": source.name,
+        "source_completion_sha256": _file_sha256(source / "completion-bundle.json", label="repair source completion"),
+        "ledger_identity": _ledger_identity(source),
+    }, sort_keys=True).encode("utf-8") + b"\n", label="repair provenance")
+    return target
+
+
+def _finalize_repair_completion(run_dir: Path) -> collector_receipts.SliceCompletionBundle:
+    """Seal derived output without replacing any collector/backlog receipt."""
+    lineage = _read_json(run_dir / "repair-source.json")
+    source = _run_child(RUNS / str(lineage.get("source_run_id", "")), label="repair source")
+    source_bundle_path = source / "completion-bundle.json"
+    if _file_sha256(source_bundle_path, label="repair source completion") != lineage.get("source_completion_sha256"):
+        raise ReviewRunError("repair source completion changed")
+    original = collector_receipts.load_completion_bundle(source_bundle_path, run_dir=source)
+    if _ledger_identity(run_dir) != lineage.get("ledger_identity"):
+        raise ReviewRunError("repair immutable evidence changed")
+    for filename in _RECONCILIATION_INPUTS.values():
+        if _read_snapshot_source(source / filename, label="repair original input") != _read_snapshot_source(run_dir / filename, label="repair snapshot input"):
+            raise ReviewRunError("repair reconciliation snapshot changed")
+    slice_ = argparse.Namespace(
+        slice_id=original.slice_id,
+        since=dt.datetime.fromisoformat(original.since_utc.replace("Z", "+00:00")),
+        until=dt.datetime.fromisoformat(original.until_utc.replace("Z", "+00:00")),
+    )
+    bundle = collector_receipts.build_completion_bundle(run_dir, slice_=slice_)
+    path = run_dir / "completion-bundle.json"
+    if path.exists():
+        if collector_receipts.load_completion_bundle(path, run_dir=run_dir).bundle_digest != bundle.bundle_digest:
+            raise ReviewRunError("repair completion bundle differs")
+    else:
+        collector_receipts.write_completion_bundle(path, bundle)
+    return collector_receipts.load_completion_bundle(path, run_dir=run_dir)
+
+
+def _snapshot_recovery_inputs(run_dir: Path, parent: Path) -> dict[str, Path]:
+    """Copy only byte-identical immutable reconciliation inputs from the parent."""
+    verified = clockify_source_debt_recover.verify_recovery_run(run_dir)
+    parent = _run_child(parent, label="recovery parent")
+    if verified.parent_run_dir != parent:
+        raise ReviewRunError("recovery parent differs from its transition")
+    snapshots: dict[str, Path] = {}
+    for filename in clockify_source_debt_recover.RECONCILIATION_SNAPSHOTS:
+        content = _read_snapshot_source(parent / filename, label=f"recovery parent {filename}")
+        target = verified.run_dir / filename
+        _write_snapshot(target, content, label=f"recovery {filename}")
+        snapshots[filename] = target
+    return snapshots
+
+
+def _recovery_source_status(
+    bundle: collector_receipts.SliceCompletionBundle, source: str
+) -> str:
+    coverage = collector_receipts.completion_coverage(bundle)
+    incomplete = coverage.get("incomplete_sources")
+    sources = coverage.get("sources")
+    record = sources.get(source) if isinstance(sources, dict) else None
+    if not isinstance(incomplete, list) or not isinstance(record, dict):
+        raise ReviewRunError("recovery bundle has no canonical requested-source identity")
+    if record.get("status") == "excluded":
+        raise ReviewRunError("recovery requested source is excluded rather than collected")
+    if source not in incomplete and record.get("status") == "complete":
+        return "complete"
+    if source in incomplete and record.get("status") != "complete":
+        return "incomplete"
+    raise ReviewRunError("recovery requested-source coverage is contradictory")
+
+
+def _finalize_recovery_completion(
+    run_dir: Path,
+) -> collector_receipts.SliceCompletionBundle:
+    """Seal one derived attempt without modifying either backlog receipt."""
+    verified = clockify_source_debt_recover.verify_recovery_run(run_dir)
+    parent_bundle = collector_receipts.load_completion_bundle(
+        verified.parent_run_dir / "completion-bundle.json",
+        run_dir=verified.parent_run_dir,
+    )
+    for filename in clockify_source_debt_recover.RECONCILIATION_SNAPSHOTS:
+        if _read_snapshot_source(
+            verified.parent_run_dir / filename, label=f"recovery parent {filename}"
+        ) != _read_snapshot_source(verified.run_dir / filename, label=f"recovery snapshot {filename}"):
+            raise ReviewRunError("recovery reconciliation snapshot changed")
+    slice_ = argparse.Namespace(
+        slice_id=parent_bundle.slice_id,
+        since=dt.datetime.fromisoformat(parent_bundle.since_utc.replace("Z", "+00:00")),
+        until=dt.datetime.fromisoformat(parent_bundle.until_utc.replace("Z", "+00:00")),
+    )
+    bundle = collector_receipts.build_completion_bundle(verified.run_dir, slice_=slice_)
+    path = verified.run_dir / "completion-bundle.json"
+    if path.exists():
+        existing = collector_receipts.load_completion_bundle(path, run_dir=verified.run_dir)
+        if existing.bundle_digest != bundle.bundle_digest:
+            raise ReviewRunError("recovery completion bundle differs")
+    else:
+        collector_receipts.write_completion_bundle(path, bundle)
+    sealed = collector_receipts.load_completion_bundle(path, run_dir=verified.run_dir)
+    _recovery_source_status(sealed, str(verified.transition["source"]))
+    return sealed
+
+
+def verify_source_debt_recovery_completion(
+    run_dir: Path,
+    *,
+    parent_run_dir: Path,
+    source: str,
+    attempt_id: str,
+    _visited: frozenset[Path] | None = None,
+) -> tuple[collector_receipts.SliceCompletionBundle, str]:
+    """Read-only verification boundary for Task 3's explicit durable debt."""
+    try:
+        verified = clockify_source_debt_recover.verify_recovery_run(
+            run_dir, _visited=_visited
+        )
+    except clockify_source_debt_recover.SourceDebtRecoveryError as exc:
+        raise ReviewRunError("source-debt recovery transition is invalid") from exc
+    parent = _run_child(parent_run_dir, label="recovery completion parent")
+    if verified.parent_run_dir != parent:
+        raise ReviewRunError("recovery completion parent differs")
+    if verified.transition.get("source") != source:
+        raise ReviewRunError("recovery completion source differs")
+    if verified.transition.get("attempt_id") != attempt_id:
+        raise ReviewRunError("recovery completion attempt differs")
+    for filename in clockify_source_debt_recover.RECONCILIATION_SNAPSHOTS:
+        if _read_snapshot_source(
+            parent / filename, label=f"recovery completion parent {filename}"
+        ) != _read_snapshot_source(
+            verified.run_dir / filename, label=f"recovery completion snapshot {filename}"
+        ):
+            raise ReviewRunError("recovery completion snapshot differs")
+    try:
+        parent_bundle = collector_receipts.load_completion_bundle(
+            parent / "completion-bundle.json", run_dir=parent
+        )
+        bundle = collector_receipts.load_completion_bundle(
+            verified.run_dir / "completion-bundle.json", run_dir=verified.run_dir
+        )
+        slice_ = argparse.Namespace(
+            slice_id=parent_bundle.slice_id,
+            since=dt.datetime.fromisoformat(parent_bundle.since_utc.replace("Z", "+00:00")),
+            until=dt.datetime.fromisoformat(parent_bundle.until_utc.replace("Z", "+00:00")),
+        )
+        rebuilt = collector_receipts.build_completion_bundle(verified.run_dir, slice_=slice_)
+    except (OSError, ValueError, collector_receipts.CollectorReceiptError) as exc:
+        raise ReviewRunError("recovery completion bundle is invalid") from exc
+    if bundle.bundle_digest != rebuilt.bundle_digest:
+        raise ReviewRunError("recovery completion bundle differs from verified artifacts")
+    status = _recovery_source_status(bundle, source)
+    result_path = verified.run_dir / "autopilot-result.json"
+    try:
+        result = _read_json(result_path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise ReviewRunError("recovery terminal result is invalid") from exc
+    expected_result_identity = {
+        "source": source,
+        "attempt_id": attempt_id,
+        "status": status,
+        "transition_digest": verified.transition["transition_digest"],
+    }
+    if (
+        not isinstance(result, dict)
+        or result.get("quality_status") != "pass"
+        or result.get("completion_bundle_digest") != bundle.bundle_digest
+        or result.get("source_debt_recovery") != expected_result_identity
+    ):
+        raise ReviewRunError("recovery terminal result identity differs")
+    return bundle, status
+
+
 def _analysis_versions(document: dict[str, Any]) -> list[str]:
     versions: set[str] = set()
     prompt_version = str(document.get("prompt_version") or "")
@@ -972,7 +1191,8 @@ def _analysis_cache_records(document: dict[str, Any]) -> list[dict[str, str]]:
     return sorted(normalized, key=lambda value: value["cache_key"])
 
 
-def _verify_replay_integrity(source: Path, replay: Path) -> dict[str, Any]:
+def derive_replay_integrity(source: Path, replay: Path) -> dict[str, Any]:
+    """Derive replay integrity without writing into either sealed run."""
     source = _run_child(source, label="replay source")
     replay = _run_child(replay, label="replay run")
     source_identity = _ledger_identity(source)
@@ -1013,6 +1233,7 @@ def _verify_replay_integrity(source: Path, replay: Path) -> dict[str, Any]:
         )
         replay_reconciliation_binding = _reconciliation_binding(
             replay,
+            completion_source=source,
             **{name: replay / filename for name, filename in _RECONCILIATION_INPUTS.items()},
         )
         if source_reconciliation_binding != replay_reconciliation_binding:
@@ -1034,9 +1255,15 @@ def _verify_replay_integrity(source: Path, replay: Path) -> dict[str, Any]:
     report["integrity_digest"] = "sha256:" + hashlib.sha256(
         json.dumps(report, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+    return report
+
+
+def _verify_replay_integrity(source: Path, replay: Path) -> dict[str, Any]:
+    report = derive_replay_integrity(source, replay)
+    replay = _run_child(replay, label="replay run")
     _write_json(replay / "replay-integrity.json", report)
-    if failures:
-        raise ValueError("; ".join(failures))
+    if report["failures"]:
+        raise ValueError("; ".join(report["failures"]))
     return report
 
 
@@ -1054,6 +1281,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         help="Reuse a completed run's immutable evidence ledger in a distinct replay run.",
     )
+    parser.add_argument(
+        "--resume-from", type=Path,
+        help="Resume accounting for one existing, locally snapshotted source run.",
+    )
+    parser.add_argument("--repair-from", type=Path, help="Re-derive accounting in a distinct run from a completed source's exact snapshots and validated cache.")
+    parser.add_argument(
+        "--recover-source-debt-from", type=Path,
+        help="Recollect one exact incomplete source from a verified immutable parent run.",
+    )
+    parser.add_argument("--recover-source")
+    parser.add_argument("--recover-attempt-id")
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--period-manifest", type=Path)
     parser.add_argument("--routing", type=Path, default=DEFAULT_ROUTING)
@@ -1202,12 +1440,23 @@ def _process_run(
         acceptance_gate=acceptance_gate,
     )
     completion_error = None
-    if (run_dir / "slice-finalization.json").is_file() and snapshot is not None:
+    has_repair_source = (run_dir / "repair-source.json").is_file()
+    report_document = _read_json(run_dir / "run-report.json")
+    has_recovery_source = (
+        isinstance(report_document, dict)
+        and isinstance(report_document.get("source_debt_recovery"), dict)
+    )
+    if ((run_dir / "slice-finalization.json").is_file() or has_repair_source) and snapshot is not None:
         if quality.get("status") == "pass":
             try:
-                bundle = _finalize_backlog_completion(
-                    run_dir, replay=replay_source is not None
-                )
+                if has_repair_source:
+                    bundle = _finalize_repair_completion(run_dir)
+                elif has_recovery_source:
+                    bundle = _finalize_recovery_completion(run_dir)
+                else:
+                    bundle = _finalize_backlog_completion(
+                        run_dir, replay=replay_source is not None
+                    )
             except (OSError, ValueError, collector_receipts.CollectorReceiptError) as exc:
                 completion_error = str(exc)
             else:
@@ -1220,6 +1469,14 @@ def _process_run(
                 }
                 result["completion_bundle_digest"] = bundle.bundle_digest
                 result["completion_bundle"] = bundle.document()
+                if has_recovery_source:
+                    transition = report_document["source_debt_recovery"]
+                    result["source_debt_recovery"] = {
+                        "source": transition["source"],
+                        "attempt_id": transition["attempt_id"],
+                        "status": _recovery_source_status(bundle, transition["source"]),
+                        "transition_digest": transition["transition_digest"],
+                    }
         else:
             result["completion_bundle_digest"] = None
     if completion_error is not None:
@@ -1282,24 +1539,112 @@ def _option_was_supplied(argv: list[str], option: str) -> bool:
     return option in argv or any(value.startswith(option + "=") for value in argv)
 
 
+def _resume_source(path: Path) -> tuple[Path, dict[str, Path]]:
+    """Validate an interrupted normal run before accounting can resume it."""
+    if path.is_symlink():
+        raise ValueError("resume source must not be a symlink")
+    run_dir = _run_child(path, label="resume source")
+    for required in ("run-report.json", "evidence/evidence-ledger.json"):
+        if not (run_dir / required).is_file():
+            raise ValueError(f"resume source is incomplete; missing {required}")
+    snapshots: dict[str, Path] = {}
+    for filename in _RECONCILIATION_INPUTS.values():
+        candidate = run_dir / filename
+        try:
+            _read_snapshot_source(candidate, label=f"resume source {filename}")
+        except ReviewRunError as exc:
+            raise ValueError(f"resume source missing reconciliation snapshot: {filename}") from exc
+        snapshots[filename] = candidate
+    if (run_dir / "replay-source.json").is_file():
+        raise ValueError("resume source must not be an immutable replay run")
+    return run_dir, snapshots
+
+
+def _adopt_completed_resume(source: Path) -> Path | None:
+    """Return only a digest-bound completed normal source result."""
+    result_path = source / "autopilot-result.json"
+    if not result_path.is_file() or not (source / "review-snapshot.json").is_file():
+        return None
+    try:
+        result = _read_json(result_path)
+        bundle = collector_receipts.load_completion_bundle(
+            source / "completion-bundle.json", run_dir=source
+        )
+        coverage = collector_receipts.completion_coverage(bundle)
+    except (OSError, ValueError, json.JSONDecodeError, collector_receipts.CollectorReceiptError) as exc:
+        raise ValueError("completed resume source cannot be verified") from exc
+    if (
+        bundle.replay
+        or not isinstance(result, dict)
+        or result.get("quality_status") != "pass"
+        or coverage.get("status") != "complete"
+        or coverage.get("incomplete_sources") != []
+    ):
+        raise ValueError("completed resume source does not prove normal completion")
+    return result_path
+
+
+def _adopt_completed_recovery(source: Path) -> Path | None:
+    """Reuse either trustworthy terminal outcome for the exact same attempt."""
+    result_path = source / "autopilot-result.json"
+    if not result_path.is_file() or not (source / "review-snapshot.json").is_file():
+        return None
+    try:
+        verified = clockify_source_debt_recover.verify_recovery_run(source)
+        bundle, status = verify_source_debt_recovery_completion(
+            source,
+            parent_run_dir=verified.parent_run_dir,
+            source=str(verified.transition["source"]),
+            attempt_id=str(verified.transition["attempt_id"]),
+        )
+    except (
+        OSError, ValueError, json.JSONDecodeError,
+        collector_receipts.CollectorReceiptError,
+        clockify_source_debt_recover.SourceDebtRecoveryError,
+    ) as exc:
+        raise ValueError("completed recovery terminal result cannot be verified") from exc
+    if (
+        bundle.replay
+        or status not in {"complete", "incomplete"}
+    ):
+        raise ValueError("completed recovery attempt does not prove a terminal outcome")
+    return result_path
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(raw_argv)
     reconciliation_options = (
         "--period-manifest", "--routing", "--corrections", "--acceptance-ledger",
     )
-    if args.replay_from and (
+    recovery_values = (
+        args.recover_source_debt_from,
+        args.recover_source,
+        args.recover_attempt_id,
+    )
+    recovery_mode = all(value is not None for value in recovery_values)
+    if any(value is not None for value in recovery_values) and not recovery_mode:
+        print(
+            "clockify review run: source-debt recovery requires --recover-source-debt-from, "
+            "--recover-source and --recover-attempt-id together",
+            file=sys.stderr,
+        )
+        return 2
+    if sum((args.replay_from is not None, args.resume_from is not None, args.repair_from is not None, recovery_mode)) > 1:
+        print("clockify review run: replay, resume, repair and recovery modes are mutually exclusive", file=sys.stderr)
+        return 2
+    if (args.replay_from or args.resume_from or args.repair_from or recovery_mode) and (
         args.since or args.until or args.no_enrich or args.calendly_optional
         or args.analysis_fixture
         or any(_option_was_supplied(raw_argv, option) for option in reconciliation_options)
     ):
         print(
-            "clockify review run: --replay-from cannot be combined with collection "
+            "clockify review run: --replay-from/--resume-from cannot be combined with collection "
             "range/enrichment options, --analysis-fixture, or reconciliation input overrides",
             file=sys.stderr,
         )
         return 2
-    if not args.replay_from and args.period_manifest is None:
+    if not args.replay_from and not args.resume_from and not args.repair_from and not recovery_mode and args.period_manifest is None:
         print(
             "clockify review run: every fresh run requires --period-manifest",
             file=sys.stderr,
@@ -1307,7 +1652,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     reconciliation_contents: dict[str, bytes] | None = None
-    if not args.replay_from:
+    if not args.replay_from and not args.resume_from and not args.repair_from and not recovery_mode:
         try:
             reconciliation_contents = {
                 filename: _read_snapshot_source(
@@ -1332,7 +1677,47 @@ def main(argv: list[str] | None = None) -> int:
 
     collector_code = 0
     collector_error = ""
-    if args.replay_from:
+    if recovery_mode:
+        try:
+            recovered = clockify_source_debt_recover.recover(
+                args.recover_source_debt_from,
+                args.recover_source,
+                args.recover_attempt_id,
+            )
+            snapshots = _snapshot_recovery_inputs(
+                recovered.run_dir, recovered.parent_run_dir
+            )
+            existing = _adopt_completed_recovery(recovered.run_dir)
+            if existing is not None:
+                print(existing)
+                return 0
+            run_dirs = (recovered.run_dir,)
+            args._recovery_snapshots = snapshots
+        except (
+            OSError, ValueError, json.JSONDecodeError,
+            clockify_source_debt_recover.SourceDebtRecoveryError,
+        ) as exc:
+            print(f"clockify review run: cannot recover source debt: {exc}", file=sys.stderr)
+            return 2
+    elif args.repair_from:
+        try:
+            run_dirs = (_prepare_repair_run(args.repair_from),)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"clockify review run: cannot prepare repair: {exc}", file=sys.stderr)
+            return 2
+    elif args.resume_from:
+        try:
+            source, snapshots = _resume_source(args.resume_from)
+            existing = _adopt_completed_resume(source)
+            if existing is not None:
+                print(existing)
+                return 0
+            run_dirs = (source,)
+            args._resume_snapshots = snapshots
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"clockify review run: cannot resume source: {exc}", file=sys.stderr)
+            return 2
+    elif args.replay_from:
         try:
             replay_source = _run_child(args.replay_from, label="replay source")
             run_dirs = (_prepare_replay_run(replay_source),)
@@ -1369,10 +1754,14 @@ def main(argv: list[str] | None = None) -> int:
 
     for run_dir in run_dirs:
         run_args = argparse.Namespace(**vars(args))
-        if args.replay_from:
+        if args.replay_from or args.repair_from:
             snapshots = {
                 filename: run_dir / filename for filename in _RECONCILIATION_INPUTS.values()
             }
+        elif args.resume_from:
+            snapshots = args._resume_snapshots
+        elif recovery_mode:
+            snapshots = args._recovery_snapshots
         else:
             try:
                 snapshots = _snapshot_reconciliation_inputs(

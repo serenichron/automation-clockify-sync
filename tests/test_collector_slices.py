@@ -4,6 +4,7 @@ import datetime as dt
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from zoneinfo import ZoneInfo
@@ -200,6 +201,19 @@ class BacklogReceiptTests(unittest.TestCase):
 
             with self.assertRaises(collector_slices.BacklogError):
                 store.open(self.identity, self.slices)
+
+    def test_read_existing_never_recreates_disappeared_provenance(self) -> None:
+        """Catches verification entering the create-on-missing backlog path."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = collector_slices.BacklogStore(Path(directory))
+            state = store.open(self.identity, self.slices)
+            shutil.rmtree(state.directory)
+            reader = getattr(store, "read_existing", None)
+
+            self.assertIsNotNone(reader)
+            with self.assertRaises(collector_slices.BacklogError):
+                reader(self.identity, self.slices)
+            self.assertFalse(state.directory.exists())
 
     def test_record_complete_rejects_a_non_prefix_slice(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -62,6 +62,18 @@ def write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def run_tree_snapshot(*roots: Path) -> dict[str, dict[str, str]]:
+    """Inventory exact file membership and bytes beneath synthetic run roots."""
+    return {
+        root.name: {
+            str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(root.rglob("*"))
+            if path.is_file()
+        }
+        for root in roots
+    }
+
+
 class ReviewRunResultTests(unittest.TestCase):
     def test_finalization_records_only_a_verified_downstream_bundle(self):
         """Collector output stays pending until all downstream artifacts bind one slice."""
@@ -628,6 +640,48 @@ class ReviewRunResultTests(unittest.TestCase):
                     review_run._verify_replay_integrity(source, replay)
             self.assertEqual("blocked", json.loads((replay / "replay-integrity.json").read_text())["status"])
 
+    def test_derive_replay_integrity_passes_without_writing_report(self):
+        """Catches a shared derivation API that mutates the sealed replay directory."""
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            source, replay = self._complete_replay_fixture(runs)
+            report_path = replay / "replay-integrity.json"
+            derive = getattr(review_run, "derive_replay_integrity", None)
+            self.assertIsNotNone(derive, "non-writing replay derivation API is missing")
+            before = run_tree_snapshot(source, replay)
+            self.assertTrue(all(before.values()), "synthetic run trees must be nonempty")
+
+            with mock.patch.object(review_run, "RUNS", runs):
+                report = derive(source, replay)
+
+            self.assertEqual("pass", report["status"])
+            self.assertEqual([], report["failures"])
+            self.assertFalse(report_path.exists())
+            self.assertEqual(before, run_tree_snapshot(source, replay))
+
+    def test_derive_replay_integrity_returns_blocked_report_without_writing(self):
+        """Catches pure derivation raising or writing before its caller chooses policy."""
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            source, replay = self._complete_replay_fixture(runs)
+            analysis_path = replay / "semantic-analysis.json"
+            analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
+            analysis["activities"][0]["analyzer_model"] = "model-drifted"
+            write_json(analysis_path, analysis)
+            report_path = replay / "replay-integrity.json"
+            derive = getattr(review_run, "derive_replay_integrity", None)
+            self.assertIsNotNone(derive, "non-writing replay derivation API is missing")
+            before = run_tree_snapshot(source, replay)
+            self.assertTrue(all(before.values()), "synthetic run trees must be nonempty")
+
+            with mock.patch.object(review_run, "RUNS", runs):
+                report = derive(source, replay)
+
+            self.assertEqual("blocked", report["status"])
+            self.assertEqual(["analyzer route or version differs"], report["failures"])
+            self.assertFalse(report_path.exists())
+            self.assertEqual(before, run_tree_snapshot(source, replay))
+
     def test_replay_rejects_reconciliation_input_or_slice_bundle_drift(self):
         """Catches replay accepting a changed period contract or completed slice."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -663,6 +717,55 @@ class ReviewRunResultTests(unittest.TestCase):
                 with self.assertRaises(ValueError, msg="completion-bundle.json"):
                     review_run._verify_replay_integrity(source, replay)
                 bundle_path.write_bytes(original)
+
+    @staticmethod
+    def _bootstrap_snapshots(source: Path, replay: Path, *, until: str | None = None) -> bytes:
+        manifest = json.loads((source / "period-manifest.json").read_text())
+        manifest.update(state="collecting", event_count=1, artifacts=[], blockers=[])
+        if until:
+            manifest["period"]["until_utc"] = until
+        unsigned = {key: value for key, value in manifest.items() if key != "manifest_digest"}
+        manifest["manifest_digest"] = reconciliation_manifest._digest(unsigned)
+        write_json(source / "period-manifest.json", manifest)
+        content = (source / "period-manifest.json").read_bytes()
+        (replay / "period-manifest.json").write_bytes(content)
+        return content
+
+    def test_bootstrap_replay_binds_completed_source_without_rewriting_input_snapshots(self):
+        """Catches the fresh-run circular requirement for pre-existing completion output."""
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            source, replay = self._complete_replay_fixture(runs)
+            snapshot = self._bootstrap_snapshots(source, replay)
+            # A distinct replay has not produced its own completion bundle yet.
+            (replay / "completion-bundle.json").unlink()
+            with mock.patch.object(review_run, "RUNS", runs):
+                result = review_run._verify_replay_integrity(source, replay)
+            self.assertEqual("pass", result["status"])
+            self.assertEqual("1", result["reconciliation_binding"]["slice_completion_bundle_count"])
+            self.assertEqual(snapshot, (source / "period-manifest.json").read_bytes())
+            self.assertEqual(snapshot, (replay / "period-manifest.json").read_bytes())
+
+    def test_bootstrap_replay_rejects_missing_or_drifted_source_completion(self):
+        for failure in ("missing", "drift"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
+                runs = Path(tmp) / "runs"
+                source, replay = self._complete_replay_fixture(runs)
+                self._bootstrap_snapshots(source, replay)
+                if failure == "missing":
+                    (source / "completion-bundle.json").unlink()
+                else:
+                    write_json(source / "quality_report.json", {"status": "blocked"})
+                with mock.patch.object(review_run, "RUNS", runs), self.assertRaises(ValueError):
+                    review_run._verify_replay_integrity(source, replay)
+
+    def test_bootstrap_replay_rejects_completion_for_different_period(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            source, replay = self._complete_replay_fixture(runs)
+            self._bootstrap_snapshots(source, replay, until="2026-08-03T00:00:00Z")
+            with mock.patch.object(review_run, "RUNS", runs), self.assertRaises(ValueError):
+                review_run._verify_replay_integrity(source, replay)
 
     def test_replay_rejects_drift_or_loss_of_every_manifest_artifact(self):
         """Catches binding that validates bundles but trusts other manifest references."""
