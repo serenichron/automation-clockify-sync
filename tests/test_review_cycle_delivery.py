@@ -605,15 +605,45 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
             )
         self.assertEqual(1, len(commands))
 
-    def test_workspace_member_identity_mismatch_blocks_before_child(self):
-        """Catches opening a period whose identity disagrees with routing."""
-        config = {**self.config, "member_id": "member-2"}
+    def assert_identity_rejected_before_child_or_sheet(
+        self, config: dict[str, object]
+    ) -> None:
         with mock.patch.object(
             cycle, "run_child_bounded", side_effect=AssertionError("child invoked")
+        ), mock.patch.object(
+            cycle, "_publisher_command", side_effect=AssertionError("publisher invoked")
         ), self.assertRaisesRegex(cycle.CycleError, "identity"):
             cycle.run_cycle(
                 config, enable_sheet_write=True, today=dt.date(2026, 9, 10)
             )
+
+    def test_workspace_mismatch_blocks_before_child_or_sheet_action(self):
+        """Catches a config workspace that disagrees with immutable routing."""
+        self.assert_identity_rejected_before_child_or_sheet(
+            {**self.config, "workspace_id": "workspace-2"}
+        )
+
+    def test_workspace_missing_blocks_before_child_or_sheet_action(self):
+        """Catches release routing without a pinned workspace identity."""
+        routing_path = self.root / "routing.json"
+        routing = json.loads(routing_path.read_text(encoding="utf-8"))
+        routing.pop("workspace_id")
+        write_json(routing_path, routing)
+        self.assert_identity_rejected_before_child_or_sheet(self.config)
+
+    def test_member_mismatch_blocks_before_child_or_sheet_action(self):
+        """Catches a config member that disagrees with immutable routing."""
+        self.assert_identity_rejected_before_child_or_sheet(
+            {**self.config, "member_id": "member-2"}
+        )
+
+    def test_member_missing_blocks_before_child_or_sheet_action(self):
+        """Catches release routing without a pinned member identity."""
+        routing_path = self.root / "routing.json"
+        routing = json.loads(routing_path.read_text(encoding="utf-8"))
+        routing.pop("member_id")
+        write_json(routing_path, routing)
+        self.assert_identity_rejected_before_child_or_sheet(self.config)
 
     def test_manifest_history_drift_blocks_delivered_repeat(self):
         """Catches an altered append-only period contract being silently reused."""

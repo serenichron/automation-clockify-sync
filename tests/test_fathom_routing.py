@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import json
 import unittest
 from pathlib import Path
+
+from scripts.clockify_sheet_publish import project_allowlist
 
 
 MODULE_PATH = Path(__file__).parents[1] / "scripts" / "clockify_sync_collect.py"
@@ -44,6 +48,23 @@ def meeting(title: str = "Daily Meet", recording_id: int = 42):
 
 
 class FathomRoutingTests(unittest.TestCase):
+    def test_release_routing_pins_clockify_identity_and_has_stable_digest(self):
+        """Catches a release routing artifact that cannot pass the cycle identity gate."""
+        path = MODULE_PATH.parents[1] / "routing.json"
+        raw = path.read_bytes()
+        routing = json.loads(raw)
+
+        self.assertEqual("5f5b532dcec6824135aa9a85", routing["workspace_id"])
+        self.assertEqual("5f5b5121a551633f6dfa31e6", routing["member_id"])
+        self.assertEqual(routing["clockify_user_id"], routing["member_id"])
+        self.assertEqual(
+            "a5afb262f0039fc9e7de59c11cb7f7c1039d06b9f3d66a49f29a803374da99ad",
+            hashlib.sha256(raw).hexdigest(),
+        )
+        self.assertEqual(
+            "Serenichron Level 2", project_allowlist(routing)["775f9f"]
+        )
+
     def test_lens_title_routes_without_client_domain_invitee(self):
         routing = collector.load_json(MODULE_PATH.parents[1] / "routing.json")
         lens_meeting = meeting("Serenichron × Lens of Alex — Sync")
