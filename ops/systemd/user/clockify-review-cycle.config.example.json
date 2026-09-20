@@ -1,0 +1,18 @@
+{
+  "root": "/home/blackthorne/Work/automation-clockify-sync-releases/REPLACE_WITH_GIT_SHA",
+  "runs_dir": "/home/blackthorne/Work/automation-clockify-sync/runs",
+  "state_dir": "/home/blackthorne/Work/automation-clockify-sync/state",
+  "cache": "/home/blackthorne/Work/automation-clockify-sync/state/analyzer-cache.jsonl",
+  "routing": "/home/blackthorne/Work/automation-clockify-sync-releases/REPLACE_WITH_GIT_SHA/routing.json",
+  "corrections": "/home/blackthorne/Work/automation-clockify-sync/state/review-corrections.jsonl",
+  "acceptance": "/home/blackthorne/Work/automation-clockify-sync/state/review-acceptance.jsonl",
+  "workspace_id": "replace-with-workspace-id",
+  "member_id": "replace-with-member-id",
+  "recovery_since": "2026-01-01",
+  "timezone": "Europe/Bucharest",
+  "spreadsheet_id": "replace-with-spreadsheet-id",
+  "monthly_sheet_title_template": "{month_name} {year} portfolio review",
+  "calendly_optional": true,
+  "max_slices": 1,
+  "total_child_budget_seconds": 7200
+}

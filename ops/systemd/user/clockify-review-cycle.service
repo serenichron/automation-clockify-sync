@@ -1,0 +1,34 @@
+[Unit]
+Description=Clockify bounded review-cycle coordinator (user manager)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/
+Environment=PYTHONUNBUFFERED=1 GOOGLE_WORKSPACE_CLI_CONFIG_DIR=%h/.config/gws CLOCKIFY_AUTOPILOT_ROOT=%h/Work/automation-clockify-sync-releases/REPLACE_WITH_GIT_SHA CLOCKIFY_REVIEW_CYCLE_CONFIG=%h/.config/serenichron/clockify-review-cycle.REPLACE_WITH_GIT_SHA.json
+EnvironmentFile=%h/.config/serenichron/clockify-review-cycle.env
+EnvironmentFile=%h/.config/serenichron/precision-inference-client.env
+# This final file contains activation pointers only, never credentials.
+EnvironmentFile=%h/.config/serenichron/clockify-review-cycle-override.env
+UnsetEnvironment=CLOCKIFY_ANALYZER_FALLBACK_URL CLOCKIFY_ANALYZER_FALLBACK_MODEL CLOCKIFY_ANALYZER_FALLBACK_API_KEY CLOCKIFY_ANALYZER_FALLBACK_TIMEOUT_SECONDS CLOCKIFY_ANALYZER_FALLBACK_REVISION
+ExecStartPre=/usr/bin/python3 ${CLOCKIFY_AUTOPILOT_ROOT}/ops/systemd/user/clockify_review_cycle_release.py preflight --release ${CLOCKIFY_AUTOPILOT_ROOT} --config ${CLOCKIFY_REVIEW_CYCLE_CONFIG} --environment %h/.config/serenichron/clockify-review-cycle.env --credential-environment %h/.config/serenichron/precision-inference-client.env --override %h/.config/serenichron/clockify-review-cycle-override.env --gws %h/.config/gws
+ExecStart=/usr/bin/flock --nonblock %h/Work/automation-clockify-sync/state/autopilot-runner.lock /usr/bin/python3 ${CLOCKIFY_AUTOPILOT_ROOT}/scripts/clockify_review_cycle.py --config ${CLOCKIFY_REVIEW_CYCLE_CONFIG} --enable-sheet-write
+Restart=no
+KillMode=control-group
+TimeoutStartSec=7500
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/Work/automation-clockify-sync/runs
+ReadWritePaths=%h/Work/automation-clockify-sync/state
+ReadWritePaths=%h/.config/gws
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=clockify-review-cycle
+
+[Install]
+WantedBy=default.target
