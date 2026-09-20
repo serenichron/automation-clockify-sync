@@ -15,6 +15,7 @@ import json
 import os
 from contextlib import contextmanager
 from pathlib import Path
+import stat
 import string
 import sys
 from typing import Any, Iterator, Mapping
@@ -127,6 +128,87 @@ def _canonical_runtime_path(raw: str | Path, *, label: str) -> Path:
     return resolved
 
 
+def _collector_checkpoint_root(
+    config: Mapping[str, Any], environment: Mapping[str, str]
+) -> Path:
+    """Bind collector provenance to one canonical durable state subtree."""
+    raw_state = config.get("state_dir")
+    if not isinstance(raw_state, str) or not raw_state:
+        raise CycleError("state_dir must be an absolute path")
+    state_dir = Path(raw_state)
+    if not state_dir.is_absolute() or state_dir != state_dir.resolve():
+        raise CycleError("collector checkpoint root requires a canonical state_dir")
+    if state_dir.exists() and (state_dir.is_symlink() or not state_dir.is_dir()):
+        raise CycleError("collector checkpoint root requires a safe state_dir")
+    raw_override = str(
+        environment.get("CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT") or ""
+    ).strip()
+    requested = Path(raw_override) if raw_override else state_dir / "collector-checkpoints"
+    if not requested.is_absolute():
+        raise CycleError("collector checkpoint root must be absolute")
+    resolved = requested.resolve()
+    if requested != resolved:
+        raise CycleError(
+            "collector checkpoint root must be canonical and contain no symlink components"
+        )
+    try:
+        resolved.relative_to(state_dir)
+    except ValueError as exc:
+        raise CycleError("collector checkpoint root must be within state_dir") from exc
+    if resolved.exists():
+        if resolved.is_symlink() or not resolved.is_dir():
+            raise CycleError("collector checkpoint root must be a safe directory")
+        details = resolved.stat()
+        if details.st_uid != os.getuid():
+            raise CycleError("collector checkpoint root must be owned by the service user")
+        if stat.S_IMODE(details.st_mode) != 0o700:
+            raise CycleError("collector checkpoint root must have exact mode 0700")
+    elif raw_override:
+        parent = resolved.parent
+        if parent.is_symlink() or not parent.is_dir():
+            raise CycleError(
+                "collector checkpoint root parent must be an existing nonsymlink directory"
+            )
+        details = parent.stat()
+        if details.st_uid != os.getuid():
+            raise CycleError(
+                "collector checkpoint root parent must be owned by the service user"
+            )
+        if stat.S_IMODE(details.st_mode) != 0o700:
+            raise CycleError(
+                "collector checkpoint root parent must have exact mode 0700"
+            )
+    return resolved
+
+
+def _ensure_collector_checkpoint_root(path: Path) -> None:
+    created = False
+    try:
+        path.mkdir(mode=0o700)
+        created = True
+    except FileExistsError:
+        pass
+    if path.is_symlink() or not path.is_dir():
+        raise CycleError("collector checkpoint root must be a safe directory")
+    details = path.stat()
+    if details.st_uid != os.getuid():
+        raise CycleError("collector checkpoint root must be owned by the service user")
+    if stat.S_IMODE(details.st_mode) != 0o700:
+        raise CycleError("collector checkpoint root must have exact mode 0700")
+    if created:
+        for directory in (path, path.parent):
+            descriptor = os.open(
+                directory,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+
+
 def _validate_runtime_root(
     config: Mapping[str, Any],
     environment: Mapping[str, str],
@@ -179,6 +261,7 @@ def load_config(path: Path) -> dict[str, Any]:
         raise CycleError("total_child_budget_seconds must be a positive integer")
     for key in ("root", "state_dir", "cache"):
         _path(config, key)
+    _collector_checkpoint_root(config, os.environ)
     _runs_dir(config)
     for key in ("routing", "corrections", "acceptance"):
         _path(config, key, file=True)
@@ -855,7 +938,7 @@ def _recovery_command(
 
 def _run_budgeted_child(
     command: list[str], *, root: Path, budget: list[float], cap: int, grace: int,
-    runs_dir: Path | None = None,
+    runs_dir: Path | None = None, checkpoint_root: Path | None = None,
 ):
     total = min(cap, int(budget[0]))
     if total <= grace:
@@ -864,6 +947,9 @@ def _run_budgeted_child(
     child_environment["CLOCKIFY_AUTOPILOT_RUNS_ROOT"] = str(
         (runs_dir or root / "runs").resolve()
     )
+    if checkpoint_root is not None:
+        _ensure_collector_checkpoint_root(checkpoint_root)
+        child_environment["CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT"] = str(checkpoint_root)
     child = run_child_bounded(
         command, cwd=root, timeout=ChildTimeoutConfig(total, grace),
         environment=child_environment,
@@ -1035,14 +1121,7 @@ def _interval_from_stage(
     compatibility = identity.compatibility_version
     if not isinstance(compatibility, str) or not compatibility:
         raise CycleError("slice finalization compatibility lineage is invalid")
-    configured_root = os.environ.get("CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT", "").strip()
-    checkpoint_root = (
-        Path(configured_root).expanduser()
-        if configured_root
-        else _path(config, "root") / "state" / "collector-checkpoints"
-    )
-    if not checkpoint_root.is_absolute() or checkpoint_root.is_symlink():
-        raise CycleError("collector checkpoint root is unsafe")
+    checkpoint_root = _collector_checkpoint_root(config, os.environ)
     try:
         backlog = collector_slices.BacklogStore(checkpoint_root).read_existing(
             identity, tuple(planned)
@@ -1770,6 +1849,7 @@ def _run_exact_recovery(
             child = _run_budgeted_child(
                 command, root=root, runs_dir=_runs_dir(config),
                 budget=budget, cap=2700, grace=30,
+                checkpoint_root=_collector_checkpoint_root(config, os.environ),
             )
         except _BudgetExhausted:
             record["status"] = "incomplete"
@@ -1861,6 +1941,7 @@ def _run_slice(
             child = _run_budgeted_child(
                 review_command, root=root, budget=budget, cap=2700, grace=30,
                 runs_dir=_runs_dir(config),
+                checkpoint_root=_collector_checkpoint_root(config, os.environ),
             )
         except _BudgetExhausted:
             record["status"] = "incomplete"
@@ -1943,6 +2024,7 @@ def _run_slice(
                 _replay_command(config, Path(str(source["run_dir"]))),
                 root=root, runs_dir=_runs_dir(config),
                 budget=budget, cap=2700, grace=30,
+                checkpoint_root=_collector_checkpoint_root(config, os.environ),
             )
         except _BudgetExhausted:
             record["status"] = "source_verified"
@@ -1977,6 +2059,7 @@ def _run_slice(
                 _publisher_command(config, source, replay, sheet_title=sheet_title),
                 root=root, runs_dir=_runs_dir(config),
                 budget=budget, cap=900, grace=30,
+                checkpoint_root=_collector_checkpoint_root(config, os.environ),
             )
         except _BudgetExhausted:
             record["status"] = "replay_verified"

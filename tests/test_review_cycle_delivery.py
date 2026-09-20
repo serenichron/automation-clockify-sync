@@ -3,7 +3,9 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import os
 import shutil
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -193,7 +195,10 @@ def make_run(
             max_days=2,
             compatibility_version=compatibility_version,
         )
-        store = collector_slices.BacklogStore(root / "state" / "collector-checkpoints")
+        checkpoint_root = root / "state" / "collector-checkpoints"
+        checkpoint_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        checkpoint_root.chmod(0o700)
+        store = collector_slices.BacklogStore(checkpoint_root)
         backlog = store.open(identity, (slice_,))
         bundle_file_digest = "sha256:" + hashlib.sha256(
             (run_dir / "completion-bundle.json").read_bytes()
@@ -273,6 +278,122 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
             "calendly_optional": True,
             "max_slices": 1,
         }
+
+    def test_checkpoint_root_defaults_to_durable_state_and_is_injected_into_child(self):
+        """Catches collector checkpoints falling back under an immutable release."""
+        release = self.root / "immutable-release"
+        release.mkdir()
+        release.chmod(0o555)
+        state_dir = self.root / "durable-state"
+        state_dir.mkdir()
+        config = {**self.config, "root": str(release), "state_dir": str(state_dir)}
+        captured: dict[str, object] = {}
+
+        def child(command, **kwargs):
+            captured.update(kwargs)
+            checkpoint = Path(kwargs["environment"]["CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT"])
+            self.assertTrue(checkpoint.is_dir())
+            return ChildResult(0, "", "", False, 0.25)
+
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=child):
+            result = cycle._run_budgeted_child(
+                ["fixture"], root=release, budget=[10.0], cap=9, grace=1,
+                runs_dir=self.root / "runs", checkpoint_root=cycle._collector_checkpoint_root(
+                    config, {}
+                ),
+            )
+
+        expected = state_dir / "collector-checkpoints"
+        self.assertEqual(expected, cycle._collector_checkpoint_root(config, {}))
+        self.assertEqual(str(expected), captured["environment"]["CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT"])
+        self.assertTrue(expected.is_dir())
+        self.assertEqual(0o700, stat.S_IMODE(expected.stat().st_mode))
+        self.assertEqual(0, result.returncode)
+        self.assertEqual([], list(release.iterdir()))
+
+    def test_existing_checkpoint_root_rejects_group_or_other_access(self):
+        """Catches collector provenance stored in a directory accessible by other users."""
+        state_dir = self.root / "durable-state"
+        checkpoint = state_dir / "collector-checkpoints"
+        checkpoint.mkdir(parents=True)
+        checkpoint.chmod(0o777)
+        config = {**self.config, "state_dir": str(state_dir)}
+
+        with self.assertRaisesRegex(cycle.CycleError, "0700"):
+            cycle._collector_checkpoint_root(config, {})
+
+    def test_existing_checkpoint_root_rejects_wrong_owner(self):
+        """Catches trusting collector provenance owned by another user."""
+        state_dir = self.root / "durable-state"
+        checkpoint = state_dir / "collector-checkpoints"
+        checkpoint.mkdir(parents=True)
+        checkpoint.chmod(0o700)
+        config = {**self.config, "state_dir": str(state_dir)}
+
+        with mock.patch.object(cycle.os, "getuid", return_value=os.getuid() + 1), \
+                self.assertRaisesRegex(cycle.CycleError, "owned"):
+            cycle._collector_checkpoint_root(config, {})
+
+    def test_checkpoint_override_must_be_canonical_and_within_durable_state(self):
+        """Catches symlinked, noncanonical, relative, or wrong-root checkpoint overrides."""
+        state_dir = self.root / "durable-state"
+        state_dir.mkdir()
+        state_dir.chmod(0o700)
+        allowed = state_dir / "alternate-checkpoints"
+        config = {**self.config, "state_dir": str(state_dir)}
+        self.assertEqual(
+            allowed,
+            cycle._collector_checkpoint_root(
+                config, {"CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT": str(allowed)}
+            ),
+        )
+
+        outside = self.root / "outside-checkpoints"
+        alias = state_dir / "checkpoint-alias"
+        outside.mkdir()
+        alias.symlink_to(outside, target_is_directory=True)
+        for override in (
+            "relative/checkpoints",
+            str(outside),
+            str(alias),
+            str(state_dir / "nested" / ".." / "alternate-checkpoints"),
+        ):
+            with self.subTest(override=override), self.assertRaisesRegex(
+                cycle.CycleError, "checkpoint root"
+            ):
+                cycle._collector_checkpoint_root(
+                    config, {"CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT": override}
+                )
+
+    def test_absent_checkpoint_override_requires_an_existing_secure_parent(self):
+        """Catches accepting an override that cannot be created without unsafe recursion."""
+        state_dir = self.root / "durable-state"
+        state_dir.mkdir(mode=0o700)
+        config = {**self.config, "state_dir": str(state_dir)}
+        missing_parent = state_dir / "missing" / "checkpoints"
+        with self.assertRaisesRegex(cycle.CycleError, "parent"):
+            cycle._collector_checkpoint_root(
+                config, {"CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT": str(missing_parent)}
+            )
+
+        unsafe_parent = state_dir / "unsafe"
+        unsafe_parent.mkdir(mode=0o700)
+        unsafe_parent.chmod(0o755)
+        with self.assertRaisesRegex(cycle.CycleError, "0700"):
+            cycle._collector_checkpoint_root(
+                config,
+                {"CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT": str(unsafe_parent / "checkpoints")},
+            )
+
+        safe_parent = state_dir / "safe"
+        safe_parent.mkdir(mode=0o700)
+        expected = safe_parent / "checkpoints"
+        self.assertEqual(
+            expected,
+            cycle._collector_checkpoint_root(
+                config, {"CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT": str(expected)}
+            ),
+        )
 
     def child_for_runs(
         self,

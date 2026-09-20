@@ -257,6 +257,127 @@ def _validated_config(release: Path, config: Path) -> tuple[Path, dict[str, obje
     return config, document
 
 
+def _ledger_file(path: Path, label: str) -> Path:
+    if path.is_symlink():
+        raise ValueError(f"{label} must not be a symlink")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ValueError(f"{label} must be an existing regular mode-0600 file") from exc
+    try:
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode):
+            raise ValueError(f"{label} must be a regular mode-0600 file")
+        if details.st_uid != os.getuid():
+            raise ValueError(f"{label} must be owned by the service user")
+        if stat.S_IMODE(details.st_mode) != 0o600:
+            raise ValueError(f"{label} must have exact mode 0600")
+    finally:
+        os.close(descriptor)
+    return path
+
+
+def _ledger_paths(
+    document: dict[str, object], *, require_exists: bool
+) -> tuple[Path, Path]:
+    raw_state = document.get("state_dir")
+    if not isinstance(raw_state, str) or not raw_state:
+        raise ValueError("review-cycle state directory is missing")
+    state = _secure_directory(Path(raw_state).expanduser().absolute(), "state directory")
+    paths: list[Path] = []
+    for key, label in (("corrections", "corrections ledger"), ("acceptance", "acceptance ledger")):
+        raw = document.get(key)
+        if not isinstance(raw, str) or not raw:
+            raise ValueError(f"{label} path is missing")
+        requested = Path(raw).expanduser().absolute()
+        if requested.is_symlink():
+            raise ValueError(f"{label} must not be a symlink")
+        resolved = requested.resolve(strict=False)
+        if requested != resolved:
+            raise ValueError(f"{label} path must be canonical")
+        try:
+            resolved.relative_to(state)
+        except ValueError as exc:
+            raise ValueError(f"{label} must be within the state directory") from exc
+        _secure_directory(resolved.parent, f"{label} parent")
+        if resolved.exists() or require_exists:
+            _ledger_file(resolved, label)
+        paths.append(resolved)
+    return paths[0], paths[1]
+
+
+def _checkpoint_root(document: dict[str, object]) -> Path:
+    raw_state = document.get("state_dir")
+    if not isinstance(raw_state, str) or not raw_state:
+        raise ValueError("collector checkpoint root requires a state directory")
+    state = _secure_directory(Path(raw_state).expanduser().absolute(), "state directory")
+    raw_override = os.environ.get("CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT", "").strip()
+    requested = (
+        Path(raw_override).expanduser().absolute()
+        if raw_override
+        else state / "collector-checkpoints"
+    )
+    if not Path(raw_override).is_absolute() and raw_override:
+        raise ValueError("collector checkpoint root must be absolute")
+    if requested.is_symlink():
+        raise ValueError("collector checkpoint root must not be a symlink")
+    resolved = requested.resolve(strict=False)
+    if requested != resolved:
+        raise ValueError("collector checkpoint root path must be canonical")
+    try:
+        resolved.relative_to(state)
+    except ValueError as exc:
+        raise ValueError("collector checkpoint root must be within state directory") from exc
+    if resolved.exists():
+        _secure_directory(
+            resolved, "collector checkpoint root", exact_mode=0o700
+        )
+    elif raw_override:
+        try:
+            _secure_directory(
+                resolved.parent, "collector checkpoint root parent", exact_mode=0o700
+            )
+        except OSError as exc:
+            raise ValueError(
+                "collector checkpoint root parent must be an existing directory"
+            ) from exc
+    return resolved
+
+
+def bootstrap_ledgers(release: Path, config: Path) -> tuple[Path, Path]:
+    """Create absent private ledgers without following links or touching existing bytes."""
+    release = _canonical(release)
+    _identity(release, _release_sha(release))
+    _, document = _validated_config(release, config)
+    ledgers = _ledger_paths(document, require_exists=False)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    for path, label in zip(ledgers, ("corrections ledger", "acceptance ledger")):
+        if path.exists() or path.is_symlink():
+            _ledger_file(path, label)
+            continue
+        try:
+            descriptor = os.open(path, flags, 0o600)
+        except FileExistsError:
+            _ledger_file(path, label)
+            continue
+        try:
+            details = os.fstat(descriptor)
+            if not stat.S_ISREG(details.st_mode):
+                raise ValueError(f"{label} creation did not produce a regular file")
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        _fsync_directory(path.parent)
+        _ledger_file(path, label)
+    return ledgers
+
+
 def _private_tree(path: Path, label: str) -> Path:
     path = _secure_directory(path, label, exact_mode=0o700)
     for item in path.rglob("*"):
@@ -284,7 +405,9 @@ def verify_runtime(
     release = _canonical(release)
     expected_sha = _release_sha(release)
     identity = _identity(release, expected_sha)
-    config, _ = _validated_config(release, config)
+    config, document = _validated_config(release, config)
+    _checkpoint_root(document)
+    _ledger_paths(document, require_exists=True)
     _private_file(environment, "review-cycle environment")
     _private_file(credential_environment, "credential environment")
     override = _private_file(override, "activation override")
@@ -390,6 +513,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         select.add_argument("--sha", required=True)
         select.add_argument("--config", type=Path, required=True)
         select.add_argument("--override", type=Path, required=True)
+    bootstrap = commands.add_parser("bootstrap-ledgers")
+    bootstrap.add_argument("--release", type=Path, required=True)
+    bootstrap.add_argument("--config", type=Path, required=True)
     check = commands.add_parser("preflight")
     check.add_argument("--release", type=Path, required=True)
     check.add_argument("--config", type=Path, required=True)
@@ -403,6 +529,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(materialize(arguments.source_repository, arguments.releases_root, arguments.sha))
         elif arguments.command in {"activate", "rollback"}:
             activate(arguments.release, arguments.sha, arguments.config, arguments.override)
+        elif arguments.command == "bootstrap-ledgers":
+            bootstrap_ledgers(arguments.release, arguments.config)
         else:
             verify_runtime(
                 arguments.release,

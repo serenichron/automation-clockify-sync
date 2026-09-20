@@ -11,6 +11,19 @@ does not copy credentials or durable evidence into a release.
   `/home/blackthorne/Work/automation-clockify-sync-releases/<git-sha>`.
 - Durable data remains at
   `/home/blackthorne/Work/automation-clockify-sync/{runs,state}`.
+- Collector checkpoint provenance is always rooted below the config's canonical
+  `state_dir`. With no environment override, both the collector child and the
+  coordinator's sealed-backlog verifier use
+  `/home/blackthorne/Work/automation-clockify-sync/state/collector-checkpoints`.
+  An explicit `CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT` is accepted only when it is
+  absolute, canonical, free of symlink components, and contained by that same
+  durable `state_dir`; it must never point into the immutable release. An
+  existing checkpoint root must be current-user-owned with exact mode `0700`.
+  When absent, the coordinator creates it as mode `0700` and fsyncs it and its
+  parent before starting any child. For an absent explicit override, its
+  immediate parent must already exist as a canonical, nonsymlink,
+  current-user-owned, exact-mode-`0700` directory; the coordinator never
+  recursively creates arbitrary descendants.
 - Private config and environment files remain mode `0600` under
   `/home/blackthorne/.config/serenichron`.
 - The existing `/home/blackthorne/.config/gws` directory is reused in place.
@@ -101,6 +114,30 @@ Its `root` must be the exact release directory and its `routing` must be that
 directory's `routing.json`. Operational paths must continue to name the
 existing `automation-clockify-sync/runs` and `automation-clockify-sync/state`.
 
+After the release-specific config is atomically installed, bootstrap the two
+private ledgers before activation or any preflight/canary. This command is
+idempotent: it preserves valid existing files byte-for-byte and creates only
+missing files as zero-byte, current-user-owned, exact-mode-`0600` regular files
+using no-follow/exclusive creation with file and parent-directory fsyncs.
+
+```bash
+config=/home/blackthorne/.config/serenichron/clockify-review-cycle.$release_sha.json
+python3 "$source_repo/ops/systemd/user/clockify_review_cycle_release.py" \
+  bootstrap-ledgers --release "$release_root" --config "$config"
+stat -c '%a %U %G %s %n' \
+  /home/blackthorne/Work/automation-clockify-sync/state/review-corrections.jsonl \
+  /home/blackthorne/Work/automation-clockify-sync/state/review-acceptance.jsonl
+```
+
+Both paths must be canonical descendants of `state_dir`. Existing symlinks,
+non-regular files, wrong ownership, or any mode other than `0600` stop the
+bootstrap without rewriting them. If one valid ledger already exists and the
+other is absent, only the absent ledger is created. A safe partial result after
+an OS-level interruption is intentionally rerunnable. The service preflight
+independently requires both ledgers to be present and safe before execution;
+empty ledgers load as empty lists, while malformed nonempty JSONL remains a
+loader error.
+
 Install `clockify-review-cycle.env.example` as
 `~/.config/serenichron/clockify-review-cycle.env` with mode `0600`, replacing
 only the pinned approved Flash revision. Keep credentials in the already
@@ -134,7 +171,6 @@ validates the release identity plus config root/routing before replacing the
 pointer; a failed validation leaves the current pointer unchanged.
 
 ```bash
-config=/home/blackthorne/.config/serenichron/clockify-review-cycle.$release_sha.json
 override=/home/blackthorne/.config/serenichron/clockify-review-cycle-override.env
 python3 "$source_repo/ops/systemd/user/clockify_review_cycle_release.py" \
   activate --release "$release_root" --sha "$release_sha" \

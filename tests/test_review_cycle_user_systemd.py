@@ -12,6 +12,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+from scripts import review_acceptance, work_accounting_pipeline
+
 
 ROOT = Path(__file__).resolve().parents[1]
 USER_SYSTEMD = ROOT / "ops/systemd/user"
@@ -235,15 +237,251 @@ class UserSystemdReleaseToolTests(unittest.TestCase):
     def config(self, release: Path, sha: str, name: str) -> Path:
         path = self.root / "config" / f"{name}.{sha}.json"
         path.parent.mkdir(mode=0o700, exist_ok=True)
+        state = self.root / "state"
+        state.mkdir(mode=0o700, exist_ok=True)
+        corrections = state / "review-corrections.jsonl"
+        acceptance = state / "review-acceptance.jsonl"
+        for ledger in (corrections, acceptance):
+            if not ledger.exists():
+                ledger.write_bytes(b"")
+                ledger.chmod(0o600)
         path.write_text(
             json.dumps({
                 "root": str(release),
                 "routing": str(release / "routing.json"),
+                "state_dir": str(state),
+                "corrections": str(corrections),
+                "acceptance": str(acceptance),
             }) + "\n",
             encoding="utf-8",
         )
         path.chmod(0o600)
         return path
+
+    def test_bootstrap_ledgers_is_idempotent_and_preserves_existing_bytes(self) -> None:
+        """Catches rollout requiring hand-created ledgers or truncating an existing ledger."""
+        source, sha = self.repository()
+        release = self.tool.materialize(source, self.root / "releases", sha)
+        config = self.config(release, sha, "bootstrap")
+        document = json.loads(config.read_text(encoding="utf-8"))
+        corrections = Path(document["corrections"])
+        acceptance = Path(document["acceptance"])
+        existing = b'{"review_id":"preserve-me"}\n'
+        corrections.write_bytes(existing)
+        acceptance.unlink()
+
+        self.tool.bootstrap_ledgers(release, config)
+        self.tool.bootstrap_ledgers(release, config)
+
+        self.assertEqual(existing, corrections.read_bytes())
+        self.assertEqual(b"", acceptance.read_bytes())
+        self.assertEqual(0o600, stat.S_IMODE(corrections.stat().st_mode))
+        self.assertEqual(0o600, stat.S_IMODE(acceptance.stat().st_mode))
+        self.assertEqual(os.getuid(), corrections.stat().st_uid)
+        self.assertEqual(os.getuid(), acceptance.stat().st_uid)
+
+    def test_bootstrapped_empty_ledgers_load_as_separate_empty_lists(self) -> None:
+        """Catches passing the acceptance ledger to the corrections loader."""
+        source, sha = self.repository()
+        release = self.tool.materialize(source, self.root / "releases", sha)
+        config = self.config(release, sha, "empty-loaders")
+        document = json.loads(config.read_text(encoding="utf-8"))
+        corrections = Path(document["corrections"])
+        acceptance = Path(document["acceptance"])
+        corrections.unlink()
+        acceptance.unlink()
+
+        self.tool.bootstrap_ledgers(release, config)
+
+        self.assertEqual([], work_accounting_pipeline._load_corrections(corrections))
+        self.assertEqual([], review_acceptance.load_ledger(acceptance))
+
+    def test_bootstrap_ledgers_leaves_a_safe_rerunnable_partial_result(self) -> None:
+        """Catches a second-ledger failure corrupting or removing the first creation."""
+        source, sha = self.repository()
+        release = self.tool.materialize(source, self.root / "releases", sha)
+        config = self.config(release, sha, "partial-bootstrap")
+        document = json.loads(config.read_text(encoding="utf-8"))
+        corrections = Path(document["corrections"])
+        acceptance = Path(document["acceptance"])
+        corrections.unlink()
+        acceptance.unlink()
+        real_open = self.tool.os.open
+
+        def fail_second(path, flags, mode=0o777):
+            if Path(path) == acceptance and flags & os.O_EXCL:
+                raise OSError("synthetic second-ledger failure")
+            return real_open(path, flags, mode)
+
+        with mock.patch.object(self.tool.os, "open", side_effect=fail_second), \
+                self.assertRaisesRegex(OSError, "second-ledger"):
+            self.tool.bootstrap_ledgers(release, config)
+
+        self.assertEqual(b"", corrections.read_bytes())
+        self.assertEqual(0o600, stat.S_IMODE(corrections.stat().st_mode))
+        self.assertFalse(acceptance.exists())
+        self.tool.bootstrap_ledgers(release, config)
+        self.assertEqual(b"", acceptance.read_bytes())
+
+    def test_bootstrap_ledgers_rejects_unsafe_existing_and_wrong_root_before_creation(self) -> None:
+        """Catches partial bootstrap through symlinks, special files, or paths outside state."""
+        source, sha = self.repository()
+        release = self.tool.materialize(source, self.root / "releases", sha)
+        config = self.config(release, sha, "unsafe-bootstrap")
+        document = json.loads(config.read_text(encoding="utf-8"))
+        corrections = Path(document["corrections"])
+        acceptance = Path(document["acceptance"])
+        acceptance.unlink()
+        corrections.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "0600"):
+            self.tool.bootstrap_ledgers(release, config)
+        self.assertFalse(acceptance.exists())
+
+        corrections.chmod(0o600)
+        target = corrections.with_name("target.jsonl")
+        target.write_bytes(b"")
+        target.chmod(0o600)
+        corrections.unlink()
+        corrections.symlink_to(target)
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            self.tool.bootstrap_ledgers(release, config)
+        self.assertFalse(acceptance.exists())
+
+        corrections.unlink()
+        document["corrections"] = str(self.root / "outside.jsonl")
+        config.write_text(json.dumps(document) + "\n", encoding="utf-8")
+        config.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "state directory"):
+            self.tool.bootstrap_ledgers(release, config)
+        self.assertFalse(Path(document["corrections"]).exists())
+        self.assertFalse(acceptance.exists())
+
+    def test_runtime_preflight_rejects_either_missing_or_unsafe_ledger(self) -> None:
+        """Catches service execution reaching loaders before ledger readiness checks."""
+        source, sha = self.repository()
+        release = self.tool.materialize(source, self.root / "releases", sha)
+        config = self.config(release, sha, "ledger-preflight")
+        private = self.root / "ledger-private"
+        private.mkdir(mode=0o700)
+        environment = private / "clockify-review-cycle.env"
+        credential = private / "precision-inference-client.env"
+        override = private / "clockify-review-cycle-override.env"
+        for path in (environment, credential):
+            path.write_text("SAFE_FIXTURE=value\n", encoding="utf-8")
+            path.chmod(0o600)
+        self.tool.activate(release, sha, config, override)
+        gws = self.root / "ledger-gws"
+        gws.mkdir(mode=0o700)
+        document = json.loads(config.read_text(encoding="utf-8"))
+        corrections = Path(document["corrections"])
+        acceptance = Path(document["acceptance"])
+
+        corrections.unlink()
+        with self.assertRaisesRegex(ValueError, "corrections ledger"):
+            self.tool.verify_runtime(
+                release, config, environment, credential, override, gws
+            )
+        corrections.write_bytes(b"")
+        corrections.chmod(0o600)
+        acceptance.chmod(0o640)
+        with self.assertRaisesRegex(ValueError, "acceptance ledger"):
+            self.tool.verify_runtime(
+                release, config, environment, credential, override, gws
+            )
+        acceptance.chmod(0o600)
+        outside = self.root / "outside-checkpoints"
+        outside.mkdir()
+        checkpoint = Path(document["state_dir"]) / "collector-checkpoints"
+        checkpoint.symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "checkpoint root"):
+            self.tool.verify_runtime(
+                release, config, environment, credential, override, gws
+            )
+        checkpoint.unlink()
+        with mock.patch.dict(
+            self.tool.os.environ,
+            {"CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT": str(outside)},
+        ), self.assertRaisesRegex(ValueError, "checkpoint root"):
+            self.tool.verify_runtime(
+                release, config, environment, credential, override, gws
+            )
+
+    def test_ledger_validation_rejects_nonregular_and_wrong_owner(self) -> None:
+        """Catches accepting a special inode or a ledger owned by another user."""
+        fifo = self.root / "ledger-fifo"
+        os.mkfifo(fifo, 0o600)
+        with self.assertRaisesRegex(ValueError, "regular"):
+            self.tool._ledger_file(fifo, "fixture ledger")
+
+        ledger = self.root / "owned-ledger.jsonl"
+        ledger.write_bytes(b"")
+        ledger.chmod(0o600)
+        with mock.patch.object(self.tool.os, "getuid", return_value=os.getuid() + 1):
+            with self.assertRaisesRegex(ValueError, "owned"):
+                self.tool._ledger_file(ledger, "fixture ledger")
+
+    def test_checkpoint_preflight_rejects_group_or_other_access(self) -> None:
+        """Catches preflight accepting a checkpoint root accessible by other users."""
+        state = self.root / "checkpoint-state"
+        checkpoint = state / "collector-checkpoints"
+        checkpoint.mkdir(parents=True)
+        state.chmod(0o700)
+        checkpoint.chmod(0o777)
+
+        with self.assertRaisesRegex(ValueError, "writable|0700"):
+            self.tool._checkpoint_root({"state_dir": str(state)})
+
+    def test_checkpoint_preflight_rejects_wrong_owner(self) -> None:
+        """Catches preflight trusting a checkpoint root owned by another user."""
+        state = self.root / "owned-checkpoint-state"
+        checkpoint = state / "collector-checkpoints"
+        checkpoint.mkdir(parents=True)
+        state.chmod(0o700)
+        checkpoint.chmod(0o700)
+        real_stat = Path.stat
+
+        def wrong_checkpoint_owner(path: Path, *args, **kwargs):
+            details = real_stat(path, *args, **kwargs)
+            if path == checkpoint:
+                fields = list(details)
+                fields[4] = os.getuid() + 1
+                return os.stat_result(fields)
+            return details
+
+        with mock.patch.object(Path, "stat", wrong_checkpoint_owner), \
+                self.assertRaisesRegex(ValueError, "owned"):
+            self.tool._checkpoint_root({"state_dir": str(state)})
+
+    def test_checkpoint_preflight_requires_secure_parent_for_absent_override(self) -> None:
+        """Catches preflight accepting an override that needs unsafe recursive creation."""
+        state = self.root / "override-parent-state"
+        state.mkdir(mode=0o700)
+        missing_parent = state / "missing" / "checkpoints"
+        with mock.patch.dict(
+            self.tool.os.environ,
+            {"CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT": str(missing_parent)},
+        ), self.assertRaisesRegex(ValueError, "parent"):
+            self.tool._checkpoint_root({"state_dir": str(state)})
+
+        unsafe_parent = state / "unsafe"
+        unsafe_parent.mkdir(mode=0o700)
+        unsafe_parent.chmod(0o755)
+        with mock.patch.dict(
+            self.tool.os.environ,
+            {"CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT": str(unsafe_parent / "checkpoints")},
+        ), self.assertRaisesRegex(ValueError, "0700"):
+            self.tool._checkpoint_root({"state_dir": str(state)})
+
+        safe_parent = state / "safe"
+        safe_parent.mkdir(mode=0o700)
+        expected = safe_parent / "checkpoints"
+        with mock.patch.dict(
+            self.tool.os.environ,
+            {"CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT": str(expected)},
+        ):
+            self.assertEqual(
+                expected, self.tool._checkpoint_root({"state_dir": str(state)})
+            )
 
     def test_materialize_binds_exact_commit_and_publishes_directory_atomically(self) -> None:
         """Catches a mutable working tree or wrong commit becoming a release."""
