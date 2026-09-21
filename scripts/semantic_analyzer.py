@@ -3089,8 +3089,9 @@ def _call_semantic_review_once(
     response = cache.lookup(endpoint, body) if cache is not None else None
     if response is None and cache is not None and repair_failure_code is not None:
         # Preserve accepted repairs sealed before the explicit response contract.
-        # A prior rejection is not a valid response and may receive the newly
-        # specified single repair; cache corruption and identity errors still fail.
+        # A prior rejection is not a valid response and may receive the current
+        # attempt from the bounded two-repair budget; cache corruption and
+        # identity errors still fail.
         legacy_body = _review_body(events, **request_options, include_repair_contract=False)
         try:
             response = cache.lookup(endpoint, legacy_body)
