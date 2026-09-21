@@ -172,7 +172,7 @@ class SourceCoverageTests(unittest.TestCase):
         self.assertEqual((), store.eligible(LATER))
         reopened = store.record_failure(
             debt, failure_class="offline", retryable=True,
-            resume_state_digest="sha256:r", attempted_at=LATER,
+            resume_state_digest="sha256:r2", attempted_at=LATER,
         )
         self.assertEqual(1, reopened.retry_count)
         self.assertIsNone(reopened.terminal_reason)
@@ -208,6 +208,42 @@ class SourceCoverageTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             source_coverage.SourceDebtStore.from_document(document)
+
+    def test_exhausted_debt_reactivates_once_only_for_changed_transition_epoch(self):
+        """Catches unchanged unhealthy state busy-looping after retry exhaustion."""
+        store = source_coverage.SourceDebtStore()
+        debt = interval("sessions/omarchy-desktop", "2026-08-01", "2026-08-03")
+        store.record_failure(
+            debt, failure_class="offline", retryable=True,
+            resume_state_digest="sha256:old-epoch", attempted_at=NOW,
+        )
+        store.exhaust(debt.debt_id, terminal_reason="retry_limit")
+
+        unchanged = store.record_failure(
+            debt, failure_class="offline", retryable=True,
+            resume_state_digest="sha256:old-epoch", attempted_at="2026-08-12T11:00:00Z",
+        )
+        changed = store.record_failure(
+            debt, failure_class="offline", retryable=True,
+            resume_state_digest="sha256:new-epoch", attempted_at="2026-08-12T12:00:00Z",
+        )
+        repeated = store.record_failure(
+            debt, failure_class="offline", retryable=True,
+            resume_state_digest="sha256:new-epoch", attempted_at="2026-08-12T13:00:00Z",
+        )
+
+        self.assertEqual("exhausted", unchanged.status)
+        self.assertEqual(1, changed.retry_count)
+        self.assertEqual(2, repeated.retry_count)
+        store.exhaust(debt.debt_id, terminal_reason="retry_limit")
+        unchanged_again = store.record_failure(
+            debt, failure_class="offline", retryable=True,
+            resume_state_digest="sha256:new-epoch", attempted_at="2026-08-12T14:00:00Z",
+        )
+        self.assertEqual("exhausted", unchanged_again.status)
+        self.assertEqual(["failure", "exhausted", "failure", "failure", "exhausted"], [
+            event["event"] for event in store.document()["events"]
+        ])
 
     def test_replay_rejects_a_string_retryable_flag_as_ineligible_state(self):
         """Catches bool() coercion that turns persisted JSON \"false\" into retryable debt."""

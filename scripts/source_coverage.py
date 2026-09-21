@@ -20,7 +20,7 @@ from typing import Any
 SCHEMA_VERSION = 2
 LEGACY_SCHEMA_VERSION = 1
 LEGACY_COMPATIBILITY_VERSION = "legacy/source-coverage/v1"
-PEER_PREFIXES = ("sessions/", "repositories/")
+PEER_PREFIXES = ("sessions/", "repositories/", "peer/")
 
 
 def _utc_timestamp(value: str) -> str:
@@ -210,6 +210,14 @@ class SourceDebtStore:
         _safe_digest(resume_state_digest, "resume state")
         attempted_at = _utc_timestamp(attempted_at)
         previous = self._items.get(interval.debt_id)
+        if (
+            previous is not None
+            and previous.status == "exhausted"
+            and previous.failure_class == failure_class
+            and previous.retryable is retryable
+            and previous.resume_state_digest == resume_state_digest
+        ):
+            return previous
         retries = 1 if previous is None or previous.status == "exhausted" else previous.retry_count + 1
         item = DebtItem(
             interval=interval,

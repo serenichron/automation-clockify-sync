@@ -17,6 +17,7 @@ from contextlib import contextmanager
 from pathlib import Path
 import stat
 import string
+import subprocess
 import sys
 from typing import Any, Iterator, Mapping
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -25,6 +26,7 @@ try:
     from scripts.autopilot_process import ChildTimeoutConfig, run_child_bounded
     from scripts import (
         clockify_review_run,
+        clockify_source_debt_recover,
         collector_receipts,
         collector_slices,
         reconciliation_manifest,
@@ -38,6 +40,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     from autopilot_process import ChildTimeoutConfig, run_child_bounded  # type: ignore[no-redef]
     import clockify_review_run  # type: ignore[no-redef]
+    import clockify_source_debt_recover  # type: ignore[no-redef]
     import collector_receipts  # type: ignore[no-redef]
     import collector_slices  # type: ignore[no-redef]
     import reconciliation_manifest  # type: ignore[no-redef]
@@ -53,7 +56,16 @@ SCHEMA_VERSION = "clockify-review-cycle/v1"
 RECEIPT_SCHEMA_VERSION = "clockify-review-delivery/v1"
 GENERIC_COMPATIBILITY_VERSION = "runner-unclassified/v1"
 GENERIC_RETRY_LIMIT = 2
+EXACT_RETRY_LIMIT = 2
 RECOVERY_ATTEMPT_SCHEMA_VERSION = "review-cycle-source-recovery-attempt/v1"
+HEALTH_PROBE_TIMEOUT_SECONDS = 3
+HEALTH_PROBE_BUDGET_SECONDS = 9
+_HEALTH_SSH_OPTIONS = frozenset({
+    "batchmode", "connectionattempts", "connecttimeout", "controlmaster",
+    "controlpath", "controlpersist", "identitiesonly", "identityfile",
+    "loglevel", "serveralivecountmax", "serveraliveinterval",
+    "stricthostkeychecking", "userknownhostsfile",
+})
 _MONTH_NAMES = (
     "", "January", "February", "March", "April", "May", "June",
     "July", "August", "September", "October", "November", "December",
@@ -375,6 +387,164 @@ def _source_debt(path: Path) -> tuple[source_coverage.SourceDebtStore, list[dict
     return store, [dict(item) for item in warnings if isinstance(item, Mapping)]
 
 
+def _health_ssh_options(raw: object) -> list[str]:
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        raise ValueError("health SSH options must be strings")
+    checked: list[str] = []
+    config_count = 0
+    index = 0
+    while index < len(raw):
+        option = raw[index]
+        if option == "-F":
+            if index + 1 >= len(raw) or raw[index + 1] != "/dev/null":
+                raise ValueError("health SSH config must be /dev/null")
+            config_count += 1
+            if config_count != 1:
+                raise ValueError("health SSH config must appear exactly once")
+            checked.extend((option, raw[index + 1]))
+            index += 2
+            continue
+        if option == "-o":
+            if index + 1 >= len(raw):
+                raise ValueError("health SSH option value is missing")
+            value = raw[index + 1]
+            index += 2
+        elif option.startswith("-o") and len(option) > 2:
+            value = option[2:]
+            index += 1
+        else:
+            raise ValueError("health SSH option is not allowlisted")
+        key, separator, setting = value.partition("=")
+        if (
+            separator != "=" or key.casefold() not in _HEALTH_SSH_OPTIONS
+            or not setting or any(character in setting for character in "\r\n\x00")
+        ):
+            raise ValueError("health SSH option is not allowlisted")
+        checked.extend(("-o", value))
+    if config_count != 1:
+        raise ValueError("health SSH config must appear exactly once")
+    return checked
+
+
+def _probe_source_health(
+    config: Mapping[str, Any], source: str, *,
+    timeout_seconds: int = HEALTH_PROBE_TIMEOUT_SECONDS,
+) -> str:
+    """Return a bounded non-private peer health state without collecting evidence."""
+    _category, separator, machine_name = source.partition("/")
+    if separator != "/" or not machine_name:
+        return "offline"
+    try:
+        fleet = _json_file(_path(config, "root") / "fleet.json", "fleet")
+        machines = fleet.get("machines") if isinstance(fleet, Mapping) else None
+        machine = next(
+            item for item in machines or ()
+            if isinstance(item, Mapping) and item.get("name") == machine_name
+            and item.get("enabled", True)
+        )
+        if machine.get("kind") == "local":
+            return "online"
+        host = str(machine.get("host") or "").strip()
+        options = _health_ssh_options(fleet.get("ssh_options", []))
+        if (
+            not host or host.startswith("-")
+            or any(character.isspace() or character in "\r\n\x00@" for character in host)
+            or isinstance(timeout_seconds, bool) or timeout_seconds <= 0
+        ):
+            return "offline"
+        checked = subprocess.run(
+            ["ssh", *options, host, "true"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=timeout_seconds, check=False,
+        )
+        return "online" if checked.returncode == 0 else "offline"
+    except (CycleError, OSError, StopIteration, subprocess.SubprocessError, ValueError):
+        return "offline"
+
+
+def _reactivate_health_transitions(
+    config: Mapping[str, Any], state: dict[str, Any],
+    store: source_coverage.SourceDebtStore,
+) -> bool:
+    """Reactivate exhausted exact debt once for each offline-to-online epoch."""
+    raw_epochs = state.get("source_health_epochs", {})
+    if not isinstance(raw_epochs, Mapping) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in raw_epochs.items()
+    ):
+        raise CycleError("source health epochs are invalid")
+    epochs = dict(raw_epochs)
+    changed = False
+    items = sorted(store.active(), key=lambda debt: debt.debt_id)
+    for item in items:
+        previous = epochs.get(item.debt_id, "offline:0")
+        if previous in {"offline", "online"}:
+            previous_health, epoch = previous, 0
+        else:
+            previous_health, separator, raw_epoch = previous.partition(":")
+            if (
+                separator != ":" or previous_health not in {"offline", "online"}
+                or not raw_epoch.isdigit()
+            ):
+                raise CycleError("source health epoch value is invalid")
+            epoch = int(raw_epoch)
+        transition_digest = _value_digest({
+            "contract": "source-health-epoch/v1",
+            "source": item.interval.source,
+            "health": "online",
+            "epoch": epoch,
+        })
+        if (
+            item.failure_class == "source_health_transition"
+            and item.resume_state_digest == transition_digest
+            and previous_health == "offline"
+        ):
+            epochs[item.debt_id] = f"online:{epoch}"
+            changed = True
+
+    by_machine: dict[str, list[source_coverage.DebtItem]] = {}
+    for item in items:
+        if item.status != "exhausted" or item.interval.source == "runner/unclassified":
+            continue
+        _category, separator, machine = item.interval.source.partition("/")
+        if separator == "/" and machine:
+            by_machine.setdefault(machine, []).append(item)
+    maximum_probes = HEALTH_PROBE_BUDGET_SECONDS // HEALTH_PROBE_TIMEOUT_SECONDS
+    for machine in sorted(by_machine)[:maximum_probes]:
+        health = _probe_source_health(
+            config, f"peer/{machine}",
+            timeout_seconds=HEALTH_PROBE_TIMEOUT_SECONDS,
+        )
+        for item in by_machine[machine]:
+            previous = epochs.get(item.debt_id, "offline:0")
+            if previous in {"offline", "online"}:
+                previous_health, epoch = previous, 0
+            else:
+                previous_health, _separator, raw_epoch = previous.partition(":")
+                epoch = int(raw_epoch)
+            if previous_health == "online" and health == "offline":
+                epoch += 1
+            epochs[item.debt_id] = f"{health}:{epoch}"
+            if previous_health == "offline" and health == "online":
+                store.record_failure(
+                    item.interval,
+                    failure_class="source_health_transition",
+                    retryable=True,
+                    resume_state_digest=_value_digest({
+                        "contract": "source-health-epoch/v1",
+                        "source": item.interval.source,
+                        "health": health,
+                        "epoch": epoch,
+                    }),
+                    attempted_at=_attempted_at(),
+                )
+                changed = True
+    if epochs != raw_epochs:
+        state["source_health_epochs"] = epochs
+        changed = True
+    return changed
+
+
 def _eligible_interval_dates(
     config: Mapping[str, Any], interval: source_coverage.SourceInterval,
     *, today: dt.date,
@@ -436,6 +606,26 @@ def _generic_is_suppressed(
     )
 
 
+def _runtime_transition_unlocks_generic(
+    config: Mapping[str, Any], state: Mapping[str, Any],
+    item: source_coverage.DebtItem, *, today: dt.date,
+) -> bool:
+    """Allow one historical generic classification pass under a new runtime."""
+    runtime = config.get("_runtime_identity")
+    if not isinstance(runtime, Mapping):
+        return False
+    dates = _eligible_interval_dates(config, item.interval, today=today)
+    if dates is None:
+        return False
+    record = state.get("slices", {}).get(dates[0], {})
+    source = record.get("source") if isinstance(record, Mapping) else None
+    return (
+        isinstance(source, Mapping)
+        and isinstance(source.get("runtime_identity_digest"), str)
+        and source["runtime_identity_digest"] != _value_digest(dict(runtime))
+    )
+
+
 def _select_work(
     config: Mapping[str, Any], state: Mapping[str, Any],
     store: source_coverage.SourceDebtStore, *, today: dt.date,
@@ -479,6 +669,9 @@ def _select_work(
                     item.status == "exhausted"
                     and item.retryable
                     and item.terminal_reason == "retry_limit"
+                    and _runtime_transition_unlocks_generic(
+                        config, state, item, today=today
+                    )
                 )
             )
             and not _generic_is_suppressed(item, active)
@@ -757,6 +950,9 @@ def _validate_stage(
     config: Mapping[str, Any], result_path: Path, since: str, until: str, *, replay: bool,
     expected_snapshot_digests: Mapping[str, str],
     source_run_id: str | None = None, source_run_dir: str | None = None,
+    allow_historical_runtime: bool = False,
+    expected_runtime_digest: str | None = None,
+    historical_state_validation: bool = False,
 ) -> dict[str, Any]:
     result_path = _safe_run_file(
         _runs_dir(config), str(result_path), "result"
@@ -788,6 +984,40 @@ def _validate_stage(
         or result.get("completion_bundle") != bundle.document()
     ):
         raise CycleError("review completion bundle identity does not match the result")
+    expected_runtime = config.get("_runtime_identity")
+    current_runtime = True
+    if expected_runtime is not None:
+        if not isinstance(expected_runtime, Mapping):
+            raise CycleError("configured runtime identity is invalid")
+        current_runtime = bundle.runtime_identity_digest == _value_digest(
+            dict(expected_runtime)
+        )
+        if (
+            expected_runtime_digest is not None
+            and bundle.runtime_identity_digest != expected_runtime_digest
+        ):
+            raise CycleError("review runtime identity does not match stored runtime")
+        if (
+            expected_runtime_digest is None
+            and not current_runtime
+            and not allow_historical_runtime
+        ):
+            raise CycleError("review runtime identity does not match current runtime")
+        if not current_runtime and not historical_state_validation:
+            incomplete = coverage.get("incomplete_sources")
+            coordinator = str(config.get("coordinator") or "omarchy-precision")
+            if (
+                replay
+                or not isinstance(incomplete, list)
+                or not incomplete
+                or not all(
+                    isinstance(source, str)
+                    and source.split("/", 1)[0] in {"sessions", "repositories"}
+                    and source.rsplit("/", 1)[-1] != coordinator
+                    for source in incomplete
+                )
+            ):
+                raise CycleError("historical runtime bundle is not an actionable peer gap")
     artifacts = {item.kind: item for item in bundle.artifacts}
     paths = result.get("paths")
     if not isinstance(paths, Mapping):
@@ -843,7 +1073,7 @@ def _validate_stage(
             or replay_integrity.get("source_run_id") != source_run_id
         ):
             raise CycleError("replay integrity does not bind the exact source run")
-    return {
+    stage = {
         "result_path": str(result_path),
         "result_digest": _digest(result_path),
         "run_dir": str(run_dir),
@@ -861,6 +1091,9 @@ def _validate_stage(
         "review_ids": review_ids,
         "exception_ids": exception_ids,
     }
+    if expected_runtime is not None:
+        stage["runtime_identity_digest"] = bundle.runtime_identity_digest
+    return stage
 
 
 def _stage_from_state(
@@ -868,20 +1101,86 @@ def _stage_from_state(
     since: str, until: str, *, replay: bool,
     expected_snapshot_digests: Mapping[str, str],
     source_run_id: str | None = None, source_run_dir: str | None = None,
+    allow_historical_runtime: bool = False,
 ) -> dict[str, Any] | None:
     stored = record.get(key)
     if stored is None:
         return None
     if not isinstance(stored, Mapping) or not isinstance(stored.get("result_path"), str):
         raise CycleError(f"stored {key} stage is invalid")
+    stored_runtime_digest = stored.get("runtime_identity_digest")
+    if stored_runtime_digest is not None and not _valid_digest(stored_runtime_digest):
+        raise CycleError(f"stored {key} runtime identity is invalid")
     verified = _validate_stage(
         config, Path(stored["result_path"]), since, until,
         replay=replay, expected_snapshot_digests=expected_snapshot_digests,
         source_run_id=source_run_id, source_run_dir=source_run_dir,
+        allow_historical_runtime=allow_historical_runtime,
+        expected_runtime_digest=stored_runtime_digest,
+        historical_state_validation=stored_runtime_digest is not None,
     )
-    if dict(stored) != verified:
+    comparable = dict(verified)
+    if stored_runtime_digest is None:
+        comparable.pop("runtime_identity_digest", None)
+    if dict(stored) != comparable:
         raise CycleError(f"stored {key} stage identity has drifted")
     return verified
+
+
+def _migrate_legacy_stage_runtime(
+    config: Mapping[str, Any], state: dict[str, Any], state_path: Path,
+) -> None:
+    """Bind bab6 stage shapes once to their bundle-bound historical runtime."""
+    for since, raw_record in list(state.get("slices", {}).items()):
+        if not isinstance(raw_record, Mapping):
+            continue
+        record = dict(raw_record)
+        source = record.get("source")
+        replay = record.get("replay")
+        if not (
+            isinstance(source, Mapping) and "runtime_identity_digest" not in source
+            or isinstance(replay, Mapping) and "runtime_identity_digest" not in replay
+        ):
+            continue
+        until = record.get("until")
+        if not isinstance(until, str):
+            raise CycleError("legacy source stage interval is invalid")
+        changed = False
+        if isinstance(source, Mapping) and "runtime_identity_digest" not in source:
+            verified_source = _validate_stage(
+                config, Path(str(source.get("result_path"))), str(since), until,
+                replay=False,
+                expected_snapshot_digests=_stored_snapshot_digests(record),
+                allow_historical_runtime=True,
+                historical_state_validation=True,
+            )
+            legacy_shape = dict(verified_source)
+            legacy_shape.pop("runtime_identity_digest", None)
+            if dict(source) != legacy_shape:
+                raise CycleError("legacy source stage identity has drifted")
+            record["source"] = verified_source
+            source = verified_source
+            changed = True
+        if isinstance(replay, Mapping) and "runtime_identity_digest" not in replay:
+            if not isinstance(source, Mapping):
+                raise CycleError("legacy replay source stage is invalid")
+            verified_replay = _validate_stage(
+                config, Path(str(replay.get("result_path"))), str(since), until,
+                replay=True,
+                expected_snapshot_digests=source["snapshot_digests"],
+                source_run_id=str(source["run_id"]),
+                source_run_dir=str(source["run_dir"]),
+                allow_historical_runtime=True,
+                historical_state_validation=True,
+            )
+            legacy_shape = dict(verified_replay)
+            legacy_shape.pop("runtime_identity_digest", None)
+            if dict(replay) != legacy_shape:
+                raise CycleError("legacy replay stage identity has drifted")
+            record["replay"] = verified_replay
+            changed = True
+        if changed:
+            _persist_state(state_path, state, str(since), record)
 
 
 def completion_status(result: Mapping[str, Any]) -> dict[str, Any]:
@@ -1189,11 +1488,18 @@ def _record_exact_debts(
         isinstance(item, str) and item for item in incomplete
     ):
         return False
+    peers: dict[str, list[str]] = {}
     for name in incomplete:
-        interval = _interval_from_stage(config, name, source)
+        category, separator, machine = name.partition("/")
+        if separator != "/" or category not in {"sessions", "repositories"} or not machine:
+            return False
+        peers.setdefault(machine, []).append(name)
+    for machine, required_sources in sorted(peers.items()):
+        interval = _interval_from_stage(config, f"peer/{machine}", source)
         resume_digest = _value_digest({
             "bundle_digest": source["bundle_digest"],
             "debt_id": interval.debt_id,
+            "required_sources": sorted(required_sources),
             "run_id": source["run_id"],
         })
         _record_failure_once(
@@ -1437,7 +1743,8 @@ def _validate_recovery_attempt(
     }
     verified = {
         "result_path", "result_digest", "returned_bundle_digest",
-        "requested_source_outcome",
+        "requested_source_outcome", "recovery_receipt_path",
+        "recovery_receipt_digest",
     }
     phase = raw.get("phase")
     expected_keys = base if phase == "started" else base | verified
@@ -1464,6 +1771,9 @@ def _validate_recovery_attempt(
         not isinstance(raw.get("result_path"), str)
         or not _valid_digest(raw.get("result_digest"))
         or not _valid_digest(raw.get("returned_bundle_digest"))
+        or not isinstance(raw.get("recovery_receipt_path"), str)
+        or not Path(str(raw.get("recovery_receipt_path"))).is_absolute()
+        or not _valid_digest(raw.get("recovery_receipt_digest"))
         or raw.get("requested_source_outcome") not in {"complete", "incomplete"}
         or not phase.endswith(str(raw.get("requested_source_outcome")))
     ):
@@ -1535,7 +1845,13 @@ def _validate_recovery_stage(
             Path(str(stage["run_dir"])), parent_run_dir=Path(str(parent["run_dir"])),
             source=debt.interval.source, attempt_id=attempt_id,
         )
-    except (OSError, ValueError, clockify_review_run.ReviewRunError) as exc:
+        receipt = clockify_source_debt_recover.verify_recovery_receipt(
+            Path(str(stage["run_dir"]))
+        )
+    except (
+        OSError, ValueError, clockify_review_run.ReviewRunError,
+        clockify_source_debt_recover.SourceDebtRecoveryError,
+    ) as exc:
         raise CycleError("recovery completion identity is invalid") from exc
     if (
         bundle.bundle_digest != stage["bundle_digest"]
@@ -1544,7 +1860,11 @@ def _validate_recovery_stage(
         or bundle.slice_id != debt.interval.slice_id
     ):
         raise CycleError("recovery completion does not match exact debt interval")
-    return stage, status
+    return {
+        **stage,
+        "recovery_receipt_path": str(receipt.path),
+        "recovery_receipt_digest": receipt.digest,
+    }, status
 
 
 def _active_exact_for_interval(
@@ -1582,7 +1902,19 @@ def _bind_incomplete_recovery_parents(
         return False
     parents = _stored_recovery_parents(record)
     changed = False
+    peer_sources: list[str] = []
+    seen_peers: set[str] = set()
     for source in incomplete:
+        category, separator, machine = source.partition("/")
+        if separator != "/" or category not in {"sessions", "repositories"}:
+            continue
+        if not machine:
+            raise CycleError("incomplete recovery source identity is invalid")
+        peer = f"peer/{machine}"
+        if peer not in seen_peers:
+            peer_sources.append(peer)
+            seen_peers.add(peer)
+    for source in peer_sources:
         interval = (
             source_coverage.SourceInterval(
                 source=source,
@@ -1596,7 +1928,10 @@ def _bind_incomplete_recovery_parents(
         )
         current = debt_store.get(interval.debt_id)
         if interval.debt_id not in parents or current is None or current.status != "active":
-            candidate = dict(stage)
+            candidate = {
+                key: value for key, value in stage.items()
+                if key not in {"recovery_receipt_path", "recovery_receipt_digest"}
+            }
             if parents.get(interval.debt_id) != candidate:
                 parents[interval.debt_id] = candidate
                 changed = True
@@ -1630,6 +1965,7 @@ def _recovery_parent(
     parent = _stage_from_state(
         config, holder, "_recovery_parent", since, until, replay=False,
         expected_snapshot_digests=_stored_snapshot_digests(record),
+        allow_historical_runtime=True,
     )
     if parent is None:
         raise CycleError("recovery parent source stage is missing")
@@ -1653,6 +1989,14 @@ def _recovery_parent_matches_debt(
         "slice finalization",
     )
     identity = finalization.get("backlog_identity") if isinstance(finalization, Mapping) else None
+    incomplete = parent["coverage"].get("incomplete_sources", [])
+    required_gap = debt.interval.source in incomplete
+    if debt.interval.source.startswith("peer/"):
+        machine = debt.interval.source.split("/", 1)[1]
+        required_gap = any(
+            source in incomplete
+            for source in (f"sessions/{machine}", f"repositories/{machine}")
+        )
     return (
         bundle.bundle_digest == parent.get("bundle_digest")
         and bundle.since_utc == debt.interval.since_utc
@@ -1660,7 +2004,7 @@ def _recovery_parent_matches_debt(
         and bundle.slice_id == debt.interval.slice_id
         and isinstance(identity, Mapping)
         and identity.get("compatibility_version") == debt.interval.compatibility_version
-        and debt.interval.source in parent["coverage"].get("incomplete_sources", [])
+        and required_gap
     )
 
 
@@ -1700,6 +2044,8 @@ def _apply_verified_recovery(
         checked["result_digest"] != stage["result_digest"]
         or checked["returned_bundle_digest"] != stage["bundle_digest"]
         or checked["requested_source_outcome"] != status
+        or checked["recovery_receipt_path"] != stage["recovery_receipt_path"]
+        or checked["recovery_receipt_digest"] != stage["recovery_receipt_digest"]
     ):
         raise CycleError("verified recovery journal evidence has drifted")
     current = debt_store.get(debt.debt_id)
@@ -1724,16 +2070,27 @@ def _apply_verified_recovery(
         })
         current = debt_store.get(debt.debt_id)
         if current is None or current.resume_state_digest != resume_digest:
-            debt_store.record_failure(
+            failed = debt_store.record_failure(
                 debt.interval, failure_class="recovery_incomplete", retryable=True,
                 resume_state_digest=resume_digest, attempted_at=_attempted_at(),
             )
+            retry_limit = (
+                EXACT_RETRY_LIMIT + 1
+                if debt.interval.source.startswith("peer/")
+                else EXACT_RETRY_LIMIT
+            )
+            if failed.retry_count >= retry_limit:
+                debt_store.exhaust(failed.debt_id, terminal_reason="retry_limit")
     coverage = stage["coverage"]
     if _bind_incomplete_recovery_parents(
         config, record, debt_store, stage, interval_template=debt.interval,
     ):
         _persist_state(state_path, state, since, record)
-    for source in coverage.get("incomplete_sources", []):
+    incomplete_peers = sorted({
+        f"peer/{source.split('/', 1)[1]}"
+        for source in coverage.get("incomplete_sources", [])
+    })
+    for source in incomplete_peers:
         if source == debt.interval.source:
             continue
         interval = source_coverage.SourceInterval(
@@ -1765,10 +2122,14 @@ def _apply_verified_recovery(
         and overall_complete
         and not _active_exact_for_interval(debt_store, debt.interval)
     ):
+        promoted_stage = {
+            key: value for key, value in stage.items()
+            if key not in {"recovery_receipt_path", "recovery_receipt_digest"}
+        }
         if record.get("source_parent") is None:
             record["source_parent"] = dict(parent)
         record.update({
-            "status": "source_verified", "source": stage,
+            "status": "source_verified", "source": promoted_stage,
             "source_completeness": stage["coverage"],
             "exception_ids": stage["exception_ids"],
             "exceptions_complete": not stage["exception_ids"],
@@ -1873,6 +2234,8 @@ def _run_exact_recovery(
             "result_digest": stage["result_digest"],
             "returned_bundle_digest": stage["bundle_digest"],
             "requested_source_outcome": status,
+            "recovery_receipt_path": stage["recovery_receipt_path"],
+            "recovery_receipt_digest": stage["recovery_receipt_digest"],
         }
         attempts[debt.debt_id] = verified
         record["recovery_attempts"] = attempts
@@ -1914,10 +2277,35 @@ def _run_slice(
         _persist_state(state_path, state, since, record)
     expected_snapshots = _stored_snapshot_digests(record)
 
-    source = _stage_from_state(
-        config, record, "source", since, until, replay=False,
-        expected_snapshot_digests=expected_snapshots,
+    source: dict[str, Any] | None
+    stored_source = record.get("source")
+    historical_generic_gate = (
+        generic is not None
+        and generic.status == "exhausted"
+        and isinstance(stored_source, Mapping)
+        and isinstance(stored_source.get("result_path"), str)
+        and isinstance(config.get("_runtime_identity"), Mapping)
+        and isinstance(stored_source.get("runtime_identity_digest"), str)
+        and stored_source["runtime_identity_digest"]
+        != _value_digest(dict(config["_runtime_identity"]))
     )
+    if historical_generic_gate:
+        source = _validate_stage(
+            config, Path(stored_source["result_path"]), since, until, replay=False,
+            expected_snapshot_digests=expected_snapshots,
+            allow_historical_runtime=True,
+        )
+        if source.get("runtime_identity_digest") == _value_digest(
+            dict(config["_runtime_identity"])
+        ):
+            raise CycleError("generic runtime transition did not select a historical source")
+        record["source"] = source
+        _persist_state(state_path, state, since, record)
+    else:
+        source = _stage_from_state(
+            config, record, "source", since, until, replay=False,
+            expected_snapshot_digests=expected_snapshots,
+        )
     attempt: dict[str, Any] | None = None
     if source is None:
         review_command = _review_command(config, since, until)
@@ -1953,10 +2341,19 @@ def _run_slice(
             except CycleError:
                 result_path = None
             if result_path is not None:
-                source = _validate_stage(
-                    config, result_path, since, until, replay=False,
-                    expected_snapshot_digests=expected_snapshots,
-                )
+                try:
+                    source = _validate_stage(
+                        config, result_path, since, until, replay=False,
+                        expected_snapshot_digests=expected_snapshots,
+                    )
+                except CycleError as exc:
+                    if "runtime identity" not in str(exc):
+                        raise
+                    source = _validate_stage(
+                        config, result_path, since, until, replay=False,
+                        expected_snapshot_digests=expected_snapshots,
+                        allow_historical_runtime=True,
+                    )
         if source is None:
             failure_class = (
                 "child_timeout" if child.timed_out
@@ -1988,7 +2385,8 @@ def _run_slice(
     if coverage.get("status") != "complete" or coverage.get("incomplete_sources") != []:
         if _bind_incomplete_recovery_parents(config, record, debt_store, source):
             _persist_state(state_path, state, since, record)
-        if not _record_exact_debts(config, debt_store, source):
+        exact_recorded = _record_exact_debts(config, debt_store, source)
+        if not exact_recorded:
             interval = generic.interval if generic is not None else _generic_interval(
                 config, since, until
             )
@@ -2001,6 +2399,8 @@ def _run_slice(
                 debt_store, interval, failure_class="coverage_unclassified",
                 resume_state_digest=resume_digest,
             )
+        elif generic is not None and historical_generic_gate:
+            _resolve_generic(debt_store, generic, source)
         source_coverage.write(debt_path, debt_store.document())
         record["status"] = "recovery_blocked"
         _persist_state(state_path, state, since, record)
@@ -2112,8 +2512,12 @@ def run_cycle(config: Mapping[str, Any], *, enable_sheet_write: bool, today: dt.
         if not acquired:
             return {"status": "locked", "slices": []}
         state = _state(state_path, recovery_since=str(config["recovery_since"]))
+        _migrate_legacy_stage_runtime(config, state, state_path)
         debt_store, migration_warnings = _source_debt(debt_path)
         state["source_debt_warnings"] = migration_warnings
+        if _reactivate_health_transitions(config, state, debt_store):
+            source_coverage.write(debt_path, debt_store.document())
+            _atomic(state_path, state)
         _validate_delivered_state(config, state)
         selected = _select_work(
             config,
@@ -2207,6 +2611,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config)
+        config["_runtime_identity"] = (
+            clockify_review_run.clockify_sync_collect.collector_runtime_identity()
+        )
         _validate_runtime_root(config, os.environ)
         result = run_cycle(
             config, enable_sheet_write=args.enable_sheet_write

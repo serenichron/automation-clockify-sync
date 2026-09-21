@@ -252,10 +252,13 @@ class ReviewCycleSourceDebtEndToEndTests(unittest.TestCase):
             shutil.copyfile(parent / name, derived / name)
         bundle = review._finalize_recovery_completion(derived)
         transition = json.loads((derived / "run-report.json").read_text())["source_debt_recovery"]
-        return self._write_result(derived, bundle, recovery_identity={
-            "source": source, "attempt_id": attempt_id, "status": "complete",
+        status = review._recovery_source_status(bundle, source)
+        result = self._write_result(derived, bundle, recovery_identity={
+            "source": source, "attempt_id": attempt_id, "status": status,
             "transition_digest": transition["transition_digest"],
         })
+        recovery.seal_recovery_receipt(derived)
+        return result
 
     def _make_replay(self, source_dir: Path, number: int) -> Path:
         source_bundle = collector_receipts.load_completion_bundle(
@@ -287,6 +290,93 @@ class ReviewCycleSourceDebtEndToEndTests(unittest.TestCase):
         collector_receipts.write_completion_bundle(replay_dir / "completion-bundle.json", bundle)
         return self._write_result(replay_dir, bundle, replay=True)
 
+    def test_new_runtime_classifies_exhausted_generic_parent_once(self) -> None:
+        """Persisted generic debt converges into exact recovery without retry loops."""
+        old_runtime = {
+            "collector_path": "/repo/collector.py", "git_sha": "fixture", "dirty": False,
+        }
+        self._seed_real_parent()
+        legacy_state = json.loads(
+            (self.state_dir / "review-cycle-state.json").read_text(encoding="utf-8")
+        )
+        self.assertNotIn(
+            "runtime_identity_digest", legacy_state["slices"]["2026-09-07"]["source"]
+        )
+
+        generic = cycle._generic_interval(self.config, "2026-09-07", "2026-09-09")
+        debts = source_coverage.SourceDebtStore()
+        debts.record_failure(
+            generic, failure_class="result_unverified", retryable=True,
+            resume_state_digest="sha256:generic-attempt-1",
+            attempted_at="2026-09-10T00:00:00Z",
+        )
+        exhausted = debts.record_failure(
+            generic, failure_class="result_unverified", retryable=True,
+            resume_state_digest="sha256:generic-attempt-2",
+            attempted_at="2026-09-11T00:00:00Z",
+        )
+        debts.exhaust(exhausted.debt_id, terminal_reason="retry_limit")
+        debt_path = self.state_dir / "source-coverage.json"
+        source_coverage.write(debt_path, debts.document())
+
+        self.config["_runtime_identity"] = {
+            **old_runtime, "git_sha": "new-release",
+        }
+        self.config["catchup_until"] = "2026-09-09"
+        commands: list[list[str]] = []
+        with mock.patch.object(
+            cycle, "run_child_bounded",
+            side_effect=lambda command, **_kwargs: commands.append(list(command)),
+        ):
+            first = cycle.run_cycle(
+                self.config, enable_sheet_write=True, today=dt.date(2026, 9, 14)
+            )
+
+        self.assertEqual("recovery_blocked", first["status"])
+        self.assertEqual([], commands)
+        after_gate = source_coverage.SourceDebtStore.from_document(
+            source_coverage.read(debt_path)
+        )
+        self.assertEqual("resolved", after_gate.get(generic.debt_id).status)
+        exact = [
+            item for item in after_gate.active()
+            if item.interval.source != "runner/unclassified"
+        ]
+        self.assertEqual(
+            ["peer/macbook"],
+            sorted(item.interval.source for item in exact),
+        )
+        state = json.loads(
+            (self.state_dir / "review-cycle-state.json").read_text(encoding="utf-8")
+        )
+        record = state["slices"]["2026-09-07"]
+        self.assertEqual(
+            cycle._value_digest(old_runtime),
+            record["source"]["runtime_identity_digest"],
+        )
+        self.assertEqual(
+            {item.debt_id for item in exact}, set(record["recovery_parents"]),
+        )
+
+        later_commands: list[list[str]] = []
+        timed_out = ChildResult(None, "", "suppressed", True, 0.1)
+
+        def later_child(command, **_kwargs):
+            later_commands.append(list(command))
+            return timed_out
+
+        state["next_work_class"] = "exact"
+        cycle._atomic(self.state_dir / "review-cycle-state.json", state)
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=later_child):
+            second = cycle.run_cycle(
+                self.config, enable_sheet_write=True, today=dt.date(2026, 9, 14)
+            )
+
+        self.assertEqual("incomplete", second["status"])
+        self.assertEqual(1, len(later_commands))
+        self.assertIn("--recover-source-debt-from", later_commands[0])
+        self.assertNotIn("--since", later_commands[0])
+
     def test_real_recovery_reopens_incomplete_resolved_peer_before_restart(self) -> None:
         parent = self._seed_real_parent()
         commands: list[list[str]] = []
@@ -299,7 +389,7 @@ class ReviewCycleSourceDebtEndToEndTests(unittest.TestCase):
             commands.append(command)
             source = command[command.index("--recover-source") + 1]
             attempt = command[command.index("--recover-attempt-id") + 1]
-            self.assertEqual("repositories/macbook", source)
+            self.assertEqual("peer/macbook", source)
             result = self._finish_real_recovery(
                 parent, source, attempt, peer=self.repository_only_peer()
             )
@@ -312,7 +402,7 @@ class ReviewCycleSourceDebtEndToEndTests(unittest.TestCase):
             first = cycle.run_cycle(
                 self.config, enable_sheet_write=True, today=dt.date(2026, 9, 14)
             )
-        self.assertEqual("recovery_blocked", first["status"])
+        self.assertEqual("incomplete", first["status"])
 
         real_debt_write = source_coverage.write
         interrupted = False
@@ -320,11 +410,12 @@ class ReviewCycleSourceDebtEndToEndTests(unittest.TestCase):
         def write_reopened_then_interrupt(path, document):
             nonlocal interrupted
             real_debt_write(path, document)
-            active_sources = {
-                item.interval.source
-                for item in source_coverage.SourceDebtStore.from_document(document).active()
-            }
-            if "repositories/macbook" in active_sources and not interrupted:
+            completed_peer = any(
+                event["event"] == "complete"
+                and event["interval"]["source"] == "peer/macbook"
+                for event in document["events"]
+            )
+            if completed_peer and not interrupted:
                 interrupted = True
                 raise RuntimeError("after real peer reopen write")
 
@@ -334,12 +425,12 @@ class ReviewCycleSourceDebtEndToEndTests(unittest.TestCase):
             commands.append(command)
             source = command[command.index("--recover-source") + 1]
             attempt = command[command.index("--recover-attempt-id") + 1]
-            self.assertEqual("sessions/macbook", source)
+            self.assertEqual("peer/macbook", source)
             recovery_parent = Path(
                 command[command.index("--recover-source-debt-from") + 1]
             )
             result = self._finish_real_recovery(
-                recovery_parent, source, attempt, peer=self.session_only_peer()
+                recovery_parent, source, attempt, peer=self.healthy_peer()
             )
             reopened_parent = result.parent
             return ChildResult(0, str(result) + "\n", "", False, 1.0)
@@ -357,10 +448,7 @@ class ReviewCycleSourceDebtEndToEndTests(unittest.TestCase):
         after_crash = source_coverage.SourceDebtStore.from_document(
             source_coverage.read(self.state_dir / "source-coverage.json")
         )
-        self.assertEqual(
-            ["repositories/macbook"],
-            [item.interval.source for item in after_crash.active()],
-        )
+        self.assertEqual((), after_crash.active())
 
         def converging_child(command, **_kwargs):
             nonlocal recovery_number, replay_number
@@ -403,25 +491,22 @@ class ReviewCycleSourceDebtEndToEndTests(unittest.TestCase):
             command[command.index("--recover-source") + 1]
             for command in recovery_commands
         ]
-        repository_attempts = [
+        peer_attempts = [
             command[command.index("--recover-attempt-id") + 1]
             for command in recovery_commands
-            if command[command.index("--recover-source") + 1] == "repositories/macbook"
+            if command[command.index("--recover-source") + 1] == "peer/macbook"
         ]
-        repository_events = [
+        peer_events = [
             event["event"] for event in debt_store.document()["events"]
-            if event["interval"]["source"] == "repositories/macbook"
+            if event["interval"]["source"] == "peer/macbook"
         ]
         self.assertEqual("delivered", final["status"])
         self.assertEqual((), debt_store.active())
+        self.assertEqual(["peer/macbook", "peer/macbook"], recovery_sources)
+        self.assertEqual(2, len(peer_attempts))
+        self.assertEqual(2, len(set(peer_attempts)))
         self.assertEqual(
-            ["repositories/macbook", "sessions/macbook", "repositories/macbook"],
-            recovery_sources,
-        )
-        self.assertEqual(2, len(repository_attempts))
-        self.assertNotEqual(repository_attempts[0], repository_attempts[1])
-        self.assertEqual(
-            ["failure", "complete", "failure", "complete"], repository_events
+            ["failure", "failure", "complete"], peer_events
         )
         self.assertEqual(1, replay_number)
         self.assertEqual(1, len(list((self.state_dir / "delivery-receipts").glob("*.json"))))
@@ -443,14 +528,14 @@ class ReviewCycleSourceDebtEndToEndTests(unittest.TestCase):
             nonlocal first_derived
             command = list(command)
             commands.append(command)
-            self.assertEqual("sessions/macbook", command[command.index("--recover-source") + 1])
+            self.assertEqual("peer/macbook", command[command.index("--recover-source") + 1])
             self.assertEqual(
                 original_parent,
                 Path(command[command.index("--recover-source-debt-from") + 1]),
             )
             attempt = command[command.index("--recover-attempt-id") + 1]
             result = self._finish_real_recovery(
-                original_parent, "sessions/macbook", attempt,
+                original_parent, "peer/macbook", attempt,
                 peer=self.session_only_peer(),
             )
             first_derived = result.parent
@@ -463,7 +548,7 @@ class ReviewCycleSourceDebtEndToEndTests(unittest.TestCase):
                 item.interval.source
                 for item in source_coverage.SourceDebtStore.from_document(document).active()
             }
-            if "repositories/macbook" in active_sources and not interrupted:
+            if "peer/macbook" in active_sources and not interrupted:
                 interrupted = True
                 raise RuntimeError("after rotated peer debt write")
 
@@ -476,16 +561,16 @@ class ReviewCycleSourceDebtEndToEndTests(unittest.TestCase):
 
         self.assertIsNotNone(first_derived)
         crashed_state = json.loads(state_path.read_text())
-        repo_debt = next(
+        peer_debt = next(
             item for item in source_coverage.SourceDebtStore.from_document(
                 source_coverage.read(debt_path)
             ).active()
-            if item.interval.source == "repositories/macbook"
+            if item.interval.source == "peer/macbook"
         )
         self.assertEqual(
             str(first_derived),
             crashed_state["slices"]["2026-09-07"]["recovery_parents"][
-                repo_debt.debt_id
+                peer_debt.debt_id
             ]["run_dir"],
         )
         crashed_state["next_work_class"] = "exact"
@@ -499,7 +584,7 @@ class ReviewCycleSourceDebtEndToEndTests(unittest.TestCase):
             commands.append(command)
             if "--recover-source-debt-from" in command:
                 source = command[command.index("--recover-source") + 1]
-                self.assertEqual("repositories/macbook", source)
+                self.assertEqual("peer/macbook", source)
                 self.assertEqual(
                     first_derived,
                     Path(command[command.index("--recover-source-debt-from") + 1]),
@@ -530,22 +615,16 @@ class ReviewCycleSourceDebtEndToEndTests(unittest.TestCase):
             command[command.index("--recover-source") + 1]
             for command in recovery_commands
         ]
-        events_by_source = {
-            source: [
-                event["event"] for event in final_store.document()["events"]
-                if event["interval"]["source"] == source
-            ]
-            for source in ("sessions/macbook", "repositories/macbook")
-        }
+        peer_events = [
+            event["event"] for event in final_store.document()["events"]
+            if event["interval"]["source"] == "peer/macbook"
+        ]
         self.assertEqual("delivered", final["status"])
         self.assertEqual((), final_store.active())
         self.assertEqual(
-            ["sessions/macbook", "repositories/macbook"], recovery_sources
+            ["peer/macbook", "peer/macbook"], recovery_sources
         )
-        self.assertEqual(["failure", "complete"], events_by_source["sessions/macbook"])
-        self.assertEqual(
-            ["failure", "complete"], events_by_source["repositories/macbook"]
-        )
+        self.assertEqual(["failure", "failure", "complete"], peer_events)
         self.assertEqual(1, replay_number)
         self.assertEqual(1, len(list((self.state_dir / "delivery-receipts").glob("*.json"))))
 
@@ -607,6 +686,44 @@ class ReviewCycleSourceDebtEndToEndTests(unittest.TestCase):
         self.assertEqual("idle", repeat["status"])
         self.assertEqual(calls_after_delivery, len(commands))
 
+    def test_exact_source_chain_preserves_completed_unrequested_peer(self) -> None:
+        parent = self._seed_real_parent()
+        first = self._finish_real_recovery(
+            parent, "peer/macbook", "sha256:" + "3" * 64,
+            peer=self.repository_only_peer(),
+        ).parent
+        first_bundle = collector_receipts.load_completion_bundle(
+            first / "completion-bundle.json", run_dir=first
+        )
+        self.assertEqual(
+            ["sessions/macbook"],
+            collector_receipts.completion_coverage(first_bundle)["incomplete_sources"],
+        )
+
+        second = self._finish_real_recovery(
+            first, "peer/macbook", "sha256:" + "4" * 64,
+            peer=self.session_only_peer(),
+        ).parent
+        second_bundle = collector_receipts.load_completion_bundle(
+            second / "completion-bundle.json", run_dir=second
+        )
+        second_coverage = collector_receipts.completion_coverage(second_bundle)
+        self.assertEqual(
+            ["repositories/macbook"], second_coverage["incomplete_sources"]
+        )
+
+        third = self._finish_real_recovery(
+            second, "peer/macbook", "sha256:" + "5" * 64,
+            peer=self.healthy_peer(),
+        ).parent
+        third_bundle = collector_receipts.load_completion_bundle(
+            third / "completion-bundle.json", run_dir=third
+        )
+        coverage = collector_receipts.completion_coverage(third_bundle)
+        self.assertEqual([], coverage["incomplete_sources"])
+        self.assertEqual("complete", coverage["sources"]["repositories/macbook"]["status"])
+        self.assertEqual(second, recovery.verify_recovery_run(third).parent_run_dir)
+
     def test_three_slice_lifecycle_uses_real_recovery_verifier_and_converges(self) -> None:
         parent = self._seed_real_parent()
         commands: list[list[str]] = []
@@ -624,7 +741,10 @@ class ReviewCycleSourceDebtEndToEndTests(unittest.TestCase):
                     return ChildResult(None, "", "suppressed", True, 1.0)
                 source = command[command.index("--recover-source") + 1]
                 attempt = command[command.index("--recover-attempt-id") + 1]
-                result = self._finish_real_recovery(parent, source, attempt)
+                recovery_parent = Path(
+                    command[command.index("--recover-source-debt-from") + 1]
+                )
+                result = self._finish_real_recovery(recovery_parent, source, attempt)
                 return ChildResult(0, str(result) + "\n", "", False, 1.0)
             if "--replay-from" in command:
                 replay_number += 1
@@ -680,7 +800,7 @@ class ReviewCycleSourceDebtEndToEndTests(unittest.TestCase):
         self.assertEqual("2026-09-13", state["scheduled_through"])
         self.assertEqual("2026-09-13", state["completed_through"])
         self.assertEqual((), debt_store.active())
-        self.assertEqual(2, sum(event["event"] == "complete" for event in events))
+        self.assertEqual(1, sum(event["event"] == "complete" for event in events))
         self.assertEqual(3, len(list((self.state_dir / "delivery-receipts").glob("*.json"))))
         self.assertEqual("idle", repeat["status"])
         self.assertEqual(before_repeat, len(commands))

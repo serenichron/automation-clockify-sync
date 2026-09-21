@@ -30,6 +30,20 @@ COMPLETE_CALENDLY = {
 
 
 class ProcessIntegrationTests(unittest.TestCase):
+    def test_backlog_evidence_compatibility_does_not_include_release_sha(self) -> None:
+        routing = {"skip_rules": {}, "session_routes": [], "meeting_routes": []}
+        fleet = {"machines": [], "ssh_options": []}
+        with mock.patch.object(
+            collector, "collector_script_sha256", return_value="old-release"
+        ):
+            old = collector._backlog_compatibility_version(routing, fleet)
+        with mock.patch.object(
+            collector, "collector_script_sha256", return_value="new-release"
+        ):
+            new = collector._backlog_compatibility_version(routing, fleet)
+
+        self.assertEqual(old, new)
+
     def test_recovery_attempt_marker_survives_partial_os_writes(self) -> None:
         """A short write must not leave a truncated durable attempt identity."""
         with tempfile.TemporaryDirectory() as tmp:

@@ -278,6 +278,11 @@ class ReviewCycleEntrypointTests(unittest.TestCase):
         if enable_write:
             argv.append("--enable-sheet-write")
         with mock.patch.object(cycle, "_validate_runtime_root", return_value=self.root), \
+             mock.patch.object(
+                 cycle.clockify_review_run.clockify_sync_collect,
+                 "collector_runtime_identity",
+                 return_value={"git_sha": "fixture-sha"},
+             ), \
              redirect_stdout(stdout), redirect_stderr(stderr):
             code = cycle.main(argv)
         lines = stdout.getvalue().splitlines()

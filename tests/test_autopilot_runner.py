@@ -655,7 +655,7 @@ class AutopilotRunnerTests(unittest.TestCase):
         self.assertEqual("blocked", status["state"])
         self.assertIn("source interval", status["reason"])
 
-    def test_next_scheduled_run_retries_debt_after_prior_retry_exhaustion(self):
+    def test_next_scheduled_run_does_not_retry_unchanged_exhausted_debt(self):
         with tempfile.TemporaryDirectory() as directory:
             environment, result = self.fixture(
                 directory,
@@ -669,10 +669,10 @@ class AutopilotRunnerTests(unittest.TestCase):
                 runner.run(environment)
                 runner.run(environment)
                 self.assertEqual(0, runner.run(environment))
-                self.assertEqual(runner.TEMPORARY_COVERAGE_EXIT, runner.run(environment))
+                self.assertEqual(0, runner.run(environment))
             status = json.loads(Path(environment["CLOCKIFY_AUTOPILOT_STATUS"]).read_text())
-        self.assertEqual("retry_scheduled", status["state"])
-        self.assertEqual(1, status["coverage_retry_attempts"])
+        self.assertEqual("coverage_exhausted", status["state"])
+        self.assertEqual(3, status["coverage_retry_attempts"])
 
     def test_first_deploy_bootstraps_prior_missed_interval_into_command(self):
         with tempfile.TemporaryDirectory() as directory:

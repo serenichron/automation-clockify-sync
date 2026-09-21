@@ -1622,15 +1622,15 @@ class CollectorBurstContextTests(unittest.TestCase):
         self.assertEqual(1, run.call_count)
         self.assertIn("script digest mismatch", result["errors"][0])
 
-    def test_canonical_export_attestation_retries_allowlisted_exporter_digest(self) -> None:
+    def test_canonical_export_attestation_negotiates_unsynchronized_bab6_exporter(self) -> None:
         machine = {
             "name": "precision",
             "host": "precision.example.test",
             "collector_root": "/work/clockify",
         }
-        compatible_digest = next(iter(
-            collector.COMPATIBLE_CANONICAL_EXPORT_DIGESTS
-        ))
+        compatible_digest = (
+            "df85b284c6d99f34e4c68f2012ee052e27bdceea73de1bf3382c4ef49efacccd"
+        )
         mismatch = {
             "machine": "precision",
             "status": "unavailable",

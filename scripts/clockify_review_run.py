@@ -984,14 +984,21 @@ def _recovery_source_status(
     coverage = collector_receipts.completion_coverage(bundle)
     incomplete = coverage.get("incomplete_sources")
     sources = coverage.get("sources")
-    record = sources.get(source) if isinstance(sources, dict) else None
-    if not isinstance(incomplete, list) or not isinstance(record, dict):
+    if not isinstance(incomplete, list) or not isinstance(sources, dict):
         raise ReviewRunError("recovery bundle has no canonical requested-source identity")
-    if record.get("status") == "excluded":
+    if source.startswith("peer/"):
+        machine = source.split("/", 1)[1]
+        names = (f"sessions/{machine}", f"repositories/{machine}")
+    else:
+        names = (source,)
+    records = [sources.get(name) for name in names]
+    if not all(isinstance(record, dict) for record in records):
+        raise ReviewRunError("recovery bundle has no canonical requested-source identity")
+    if any(record.get("status") == "excluded" for record in records):
         raise ReviewRunError("recovery requested source is excluded rather than collected")
-    if source not in incomplete and record.get("status") == "complete":
+    if all(name not in incomplete and record.get("status") == "complete" for name, record in zip(names, records)):
         return "complete"
-    if source in incomplete and record.get("status") != "complete":
+    if any(name in incomplete and record.get("status") != "complete" for name, record in zip(names, records)):
         return "incomplete"
     raise ReviewRunError("recovery requested-source coverage is contradictory")
 
@@ -1093,6 +1100,12 @@ def verify_source_debt_recovery_completion(
         or result.get("source_debt_recovery") != expected_result_identity
     ):
         raise ReviewRunError("recovery terminal result identity differs")
+    try:
+        clockify_source_debt_recover.verify_recovery_receipt(
+            verified.run_dir, verified=verified
+        )
+    except clockify_source_debt_recover.SourceDebtRecoveryError as exc:
+        raise ReviewRunError("external recovery receipt is invalid") from exc
     return bundle, status
 
 
@@ -1541,6 +1554,18 @@ def _process_run(
     else:
         result["paths"]["review_current_csv"] = None
     _write_json(result_path, result)
+    if has_recovery_source and completion_error is None and quality.get("status") == "pass":
+        try:
+            clockify_source_debt_recover.seal_recovery_receipt(run_dir)
+        except (OSError, ValueError, clockify_source_debt_recover.SourceDebtRecoveryError) as exc:
+            result["quality_status"] = "blocked"
+            result["quality_summary"] = {
+                "recovery_receipt": "invalid_or_unavailable",
+                "reason": str(exc),
+            }
+            _write_json(result_path, result)
+            write_summary(summary_path, result)
+            return 2, result_path
     write_summary(summary_path, result)
     return (2 if completion_error is not None else 0), result_path
 

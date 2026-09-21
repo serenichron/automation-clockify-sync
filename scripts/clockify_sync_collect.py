@@ -114,7 +114,7 @@ CLOCKIFY_CHECKPOINT_COMPATIBILITY_VERSION = "clockify-pagination/v1"
 FATHOM_CHECKPOINT_COMPATIBILITY_VERSION = "fathom-cursor-pagination/v2"
 MULTICA_PAGE_SIZE = 100
 MULTICA_CHECKPOINT_COMPATIBILITY_VERSION = "multica-offset-pagination/v1"
-BACKLOG_COMPATIBILITY_VERSION = "collector-slice-bundles/v1"
+BACKLOG_COMPATIBILITY_VERSION = "collector-evidence-compatibility/v2"
 _MACHINE_NAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
 CANONICAL_EXPORT_TIMEOUT_SECONDS = 900
 CANONICAL_EXPORT_TIMEOUT_MIN_SECONDS = 60
@@ -127,6 +127,9 @@ COMPATIBLE_CANONICAL_EXPORT_DIGESTS = frozenset({
     # Approved f3dd189 fleet exporter. Direct compatibility probes confirmed
     # the canonical evidence and attestation contract is unchanged.
     "6550287f05bd8bdd8bf1e133a6edd6d0d58be469e47f9d0c54c6811d16f4c240",
+    # Approved bab6bdf8 fleet exporter. Repository comparison confirms its
+    # canonical export envelope and two-step attestation protocol are unchanged.
+    "df85b284c6d99f34e4c68f2012ee052e27bdceea73de1bf3382c4ef49efacccd",
 })
 BUCHAREST = ZoneInfo("Europe/Bucharest")
 
@@ -3769,7 +3772,9 @@ def _backlog_compatibility_version(
         raise ValueError("collector coordinator identity is invalid")
     payload = {
         "contract": BACKLOG_COMPATIBILITY_VERSION,
-        "collector_sha256": collector_script_sha256(),
+        "completion_bundle_schema": "collector-completion-bundle/v1",
+        "evidence_ledger_schema": "evidence-ledger/v1",
+        "peer_export_contract": "canonical_export_v1",
         "routing": routing,
         "fleet": fleet,
         "calendly_optional": calendly_optional,
@@ -4007,6 +4012,9 @@ def _collect_slice(
     *,
     calendly_env: dict[str, str] | None = None,
     coordinator: str | None = None,
+    evidence_override: Mapping[str, Any] | None = None,
+    ledger_override: object | None = None,
+    preclaimed_run_dir: bool = False,
 ) -> tuple[Path, dict[str, object]]:
     requested_slices = plan_slices(since, until, zone=BUCHAREST)
     if len(requested_slices) != 1:
@@ -4015,7 +4023,7 @@ def _collect_slice(
     coordinator = coordinator or _current_coordinator_identity()
     if not _machine_name_is_valid(coordinator):
         raise ValueError("collector coordinator identity is invalid")
-    claimed_run_dir = _claim_slice_run_dir(run_dir)
+    claimed_run_dir = preclaimed_run_dir or _claim_slice_run_dir(run_dir)
     if not claimed_run_dir:
         return _verified_existing_slice_bundle(
             run_dir, since, until, reason,
@@ -4026,7 +4034,17 @@ def _collect_slice(
     runtime_identity = collector_runtime_identity()
     run_id = run_dir.name
 
-    if calendly_optional:
+    if evidence_override is not None:
+        required = {"clockify", "fathom", "calendly", "multica_issues", "sessions"}
+        if set(evidence_override) != required or not isinstance(
+            evidence_override.get("sessions"), list
+        ):
+            raise ValueError("adopted collector evidence shape is invalid")
+        evidence = {
+            key: json.loads(json.dumps(evidence_override[key]))
+            for key in sorted(required)
+        }
+    elif calendly_optional:
         calendly_result = {
             "status": "excluded",
             "complete": True,
@@ -4041,32 +4059,33 @@ def _collect_slice(
             until,
             checkpoint_store=checkpoint_store,
         )
-    evidence = {
-        "clockify": fetch_clockify(
-            cenv, routing, since, until, checkpoint_store=checkpoint_store
-        ),
-        "fathom": fetch_fathom(fenv, since, until, checkpoint_store=checkpoint_store),
-        "calendly": calendly_result,
-        "multica_issues": fetch_multica_issues(
-            since, until, checkpoint_store=checkpoint_store
-        ),
-        "sessions": [],
-    }
-    for m in fleet.get("machines", []):
-        if not m.get("enabled", True):
-            continue
-        if machine_is_local(m):
-            evidence["sessions"].append(collect_local_sessions(m, since, until))
-        elif m.get("kind") in ("ssh", "auto"):
-            evidence["sessions"].append(
-                collect_remote_sessions(
-                    m,
-                    since,
-                    until,
-                    fleet.get("ssh_options", []),
-                    coordinator_identity=runtime_identity,
+    if evidence_override is None:
+        evidence = {
+            "clockify": fetch_clockify(
+                cenv, routing, since, until, checkpoint_store=checkpoint_store
+            ),
+            "fathom": fetch_fathom(fenv, since, until, checkpoint_store=checkpoint_store),
+            "calendly": calendly_result,
+            "multica_issues": fetch_multica_issues(
+                since, until, checkpoint_store=checkpoint_store
+            ),
+            "sessions": [],
+        }
+        for m in fleet.get("machines", []):
+            if not m.get("enabled", True):
+                continue
+            if machine_is_local(m):
+                evidence["sessions"].append(collect_local_sessions(m, since, until))
+            elif m.get("kind") in ("ssh", "auto"):
+                evidence["sessions"].append(
+                    collect_remote_sessions(
+                        m,
+                        since,
+                        until,
+                        fleet.get("ssh_options", []),
+                        coordinator_identity=runtime_identity,
+                    )
                 )
-            )
 
     # Enriched session context (user messages with prev/next assistant)
     if getattr(args, 'enrich', False):
@@ -4135,12 +4154,17 @@ def _collect_slice(
             normalize_collector_snapshot,
             source_inventory_from_collector,
         )
-    ledger = EvidenceLedger(
-        tuple(normalize_collector_snapshot(evidence)),
-        source_inventory_from_collector(evidence),
-        BUCHAREST.key,
-        tuple(routing.get("member_identities") or ("vlad@serenichron.com",)),
-    )
+    if ledger_override is not None:
+        if not isinstance(ledger_override, EvidenceLedger):
+            raise ValueError("collector ledger override is invalid")
+        ledger = ledger_override
+    else:
+        ledger = EvidenceLedger(
+            tuple(normalize_collector_snapshot(evidence)),
+            source_inventory_from_collector(evidence),
+            BUCHAREST.key,
+            tuple(routing.get("member_identities") or ("vlad@serenichron.com",)),
+        )
     ledger_path = run_dir / "evidence" / "evidence-ledger.json"
     write_json(
         ledger_path,

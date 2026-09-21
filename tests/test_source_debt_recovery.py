@@ -23,7 +23,7 @@ from scripts import work_accounting_pipeline as pipeline
 TZ = dt.timezone(dt.timedelta(hours=3))
 SINCE = dt.datetime(2026, 7, 1, tzinfo=TZ)
 UNTIL = dt.datetime(2026, 7, 2, tzinfo=TZ)
-SOURCE = "sessions/macbook"
+SOURCE = "peer/macbook"
 ATTEMPT_1 = "sha256:" + "1" * 64
 ATTEMPT_2 = "sha256:" + "2" * 64
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -267,7 +267,7 @@ class SourceDebtRecoveryTests(unittest.TestCase):
 
     def make_terminal_recovery(
         self, parent: Path, source: str, attempt: str,
-        *, peer: dict[str, object],
+        *, peer: dict[str, object], seal: bool = True,
     ) -> tuple[Path, collector_receipts.SliceCompletionBundle]:
         with mock.patch.object(collector, "collect_remote_sessions", return_value=peer):
             derived = recovery.recover(parent, source, attempt).run_dir
@@ -290,6 +290,8 @@ class SourceDebtRecoveryTests(unittest.TestCase):
                 "transition_digest": transition["transition_digest"],
             },
         }) + "\n")
+        if seal:
+            recovery.seal_recovery_receipt(derived)
         return derived, bundle
 
     def make_parent(self) -> Path:
@@ -354,6 +356,59 @@ class SourceDebtRecoveryTests(unittest.TestCase):
         self.assertEqual(SOURCE, transition["source"])
         self.assertEqual(ATTEMPT_1, transition["attempt_id"])
 
+    def test_recovery_collects_peer_once_and_binds_rebuilt_ledger(self) -> None:
+        """Only bundle-bound ledger events may cross the parent boundary."""
+        parent = self.make_parent()
+        before = tree_hashes(parent)
+        recovered_peer = self.healthy_peer()
+        recovered_peer["codex_sessions"] = [{
+            "session_id": "stable-session", "start": "2026-07-01 09:00",
+            "end": "2026-07-01 09:10", "machine": "macbook",
+        }]
+        with mock.patch.object(
+            collector, "fetch_clockify", side_effect=AssertionError("must adopt clockify")
+        ), mock.patch.object(
+            collector, "fetch_fathom", side_effect=AssertionError("must adopt fathom")
+        ), mock.patch.object(
+            collector, "fetch_multica_issues", side_effect=AssertionError("must adopt multica")
+        ), mock.patch.object(
+            collector, "fetch_calendly", side_effect=AssertionError("must adopt calendly")
+        ), mock.patch.object(
+            collector, "collect_remote_sessions", return_value=recovered_peer
+        ) as peer_transport:
+            result = recovery.recover(parent, SOURCE, ATTEMPT_1)
+
+        self.assertEqual(1, peer_transport.call_count)
+        self.assertEqual(before, tree_hashes(parent))
+        self.assertFalse((result.run_dir / "source-adoption.json").exists())
+        lineage = json.loads((result.run_dir / "ledger-recovery.json").read_text())
+        self.assertEqual("source-recovery-ledger/v1", lineage["schema_version"])
+        self.assertEqual(parent.name, lineage["parent_run_id"])
+        self.assertEqual(SOURCE, lineage["requested_source"])
+        self.assertEqual(
+            "sha256:" + hashlib.sha256(
+                (parent / "evidence" / "evidence-ledger.json").read_bytes()
+            ).hexdigest(),
+            lineage["parent_ledger_digest"],
+        )
+
+    def test_mutated_parent_raw_peer_evidence_is_rejected_before_transport(self) -> None:
+        parent = self.make_parent()
+        sessions_path = parent / "evidence" / "sessions.json"
+        sessions = json.loads(sessions_path.read_text(encoding="utf-8"))
+        sessions[0]["codex_sessions"] = [{
+            "source": "codex", "machine": "macbook", "session_id": "forged",
+            "start": "2026-07-01 09:00",
+        }]
+        sessions_path.write_text(json.dumps(sessions) + "\n", encoding="utf-8")
+
+        with mock.patch.object(collector, "collect_remote_sessions") as transport:
+            with self.assertRaisesRegex(
+                recovery.SourceDebtRecoveryError, "raw evidence.*bound ledger"
+            ):
+                recovery.recover(parent, SOURCE, ATTEMPT_1)
+        transport.assert_not_called()
+
     def test_invalid_attempt_and_compatibility_drift_block_before_collection(self) -> None:
         """Unsafe identity or opaque compatibility drift must never reach transport."""
         parent = self.make_parent()
@@ -365,6 +420,87 @@ class SourceDebtRecoveryTests(unittest.TestCase):
             with self.assertRaisesRegex(recovery.SourceDebtRecoveryError, "compatibility"):
                 recovery.recover(parent, SOURCE, ATTEMPT_1)
         transport.assert_not_called()
+
+    def test_verified_legacy_release_parent_uses_schema_compatibility_adapter(self) -> None:
+        """Catches release SHA churn blocking a bundle-bound bab6 parent."""
+        bab6_runtime = {
+            "collector_path": "/repo/scripts/clockify_sync_collect.py",
+            "canonical_root": "/repo",
+            "git_sha": "bab6bdf8c05e8a37790d90cda5810bd902ca0371",
+            "git_dirty": False,
+        }
+        with mock.patch.object(
+            collector, "collector_runtime_identity", return_value=bab6_runtime
+        ):
+            parent = self.make_parent()
+        finalization_path = parent / "slice-finalization.json"
+        finalization = json.loads(finalization_path.read_text(encoding="utf-8"))
+        compatibility_payload = {
+            "contract": "collector-slice-bundles/v1",
+            "collector_sha256": (
+                "df85b284c6d99f34e4c68f2012ee052e27bdceea73de1bf3382c4ef49efacccd"
+            ),
+            "routing": self.routing,
+            "fleet": self.fleet,
+            "calendly_optional": True,
+            "coordinator": "omarchy-precision",
+        }
+        legacy_compatibility = "collector-slice-bundles/v1:" + hashlib.sha256(
+            json.dumps(
+                compatibility_payload, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        finalization["backlog_identity"]["compatibility_version"] = legacy_compatibility
+        finalization_path.write_text(json.dumps(finalization) + "\n", encoding="utf-8")
+        identity = collector.BacklogIdentity(**finalization["backlog_identity"])
+        slices = collector.plan_slices(
+            SINCE, UNTIL, zone=collector.BUCHAREST, max_days=identity.max_days
+        )
+        store = collector.BacklogStore(self.checkpoints)
+        legacy = store.open(identity, slices)
+        bundle_path = (parent / "completion-bundle.json").resolve()
+        store.record_complete(
+            legacy, slices[0].slice_id, bundle_path,
+            "sha256:" + hashlib.sha256(bundle_path.read_bytes()).hexdigest(),
+        )
+
+        with mock.patch.object(
+            collector, "collect_remote_sessions", return_value=self.healthy_peer()
+        ) as transport:
+            result = recovery.recover(parent, SOURCE, ATTEMPT_1)
+
+        self.assertEqual(parent, result.parent_run_dir)
+        self.assertEqual(1, transport.call_count)
+
+        bundle = collector_receipts.load_completion_bundle(
+            parent / "completion-bundle.json", run_dir=parent
+        )
+        coverage = collector_receipts.completion_coverage(bundle)
+        self.assertFalse(recovery._legacy_parent_compatibility_matches(
+            legacy_compatibility,
+            routing=self.routing,
+            fleet=self.fleet,
+            coverage_sources=coverage["sources"],
+            coordinator="omarchy-precision",
+            current_coordinator="omarchy-precision",
+            calendly_optional=True,
+            runtime_identity={**bab6_runtime, "git_dirty": True},
+        ))
+
+        drifted = {
+            **self.fleet,
+            "machines": [{"name": "desktop", "enabled": True, "kind": "ssh"}],
+        }
+        (self.root / "fleet.json").write_text(
+            json.dumps(drifted) + "\n", encoding="utf-8"
+        )
+        with mock.patch.object(collector, "collect_remote_sessions") as blocked:
+            with self.assertRaisesRegex(
+                recovery.SourceDebtRecoveryError, "fleet.*parent"
+            ):
+                recovery._validate_parent(parent, SOURCE)
+        blocked.assert_not_called()
 
     def test_current_coordinator_drift_blocks_before_collection(self) -> None:
         """Using the parent's coordinator in current compatibility bypasses environment drift."""
@@ -381,7 +517,7 @@ class SourceDebtRecoveryTests(unittest.TestCase):
         parent = self.make_parent()
         with mock.patch.object(collector, "collect_remote_sessions") as transport:
             with self.assertRaisesRegex(recovery.SourceDebtRecoveryError, "incomplete"):
-                recovery.recover(parent, "sessions/desktop", ATTEMPT_1)
+                recovery.recover(parent, "peer/desktop", ATTEMPT_1)
             with self.assertRaisesRegex(recovery.SourceDebtRecoveryError, "source"):
                 recovery.recover(parent, "sessions/../macbook", ATTEMPT_1)
         transport.assert_not_called()
@@ -437,16 +573,11 @@ class SourceDebtRecoveryTests(unittest.TestCase):
         validated = recovery._validate_parent(parent, SOURCE)
         _transition, locator = recovery._transition(validated, ATTEMPT_1)
         run_dir = self.runs / ("source-debt-recovery-" + locator.rsplit("/", 1)[1])
-        checkpoint_roots: list[Path] = []
-
-        def clockify_result(*_args, **kwargs):
-            checkpoint_roots.append(kwargs["checkpoint_store"].root)
-            return {"status": "ok", "complete": True, "entries": []}
-
-        with mock.patch.object(collector, "fetch_clockify", side_effect=clockify_result), \
+        with mock.patch.object(collector, "fetch_clockify") as clockify, \
              mock.patch.object(collector, "collect_remote_sessions", side_effect=RuntimeError("crash")):
             with self.assertRaisesRegex(RuntimeError, "crash"):
                 recovery.recover(parent, SOURCE, ATTEMPT_1)
+        clockify.assert_not_called()
         real_replace = recovery.os.replace
         archived: list[Path] = []
 
@@ -454,7 +585,7 @@ class SourceDebtRecoveryTests(unittest.TestCase):
             archived.append(Path(target))
             real_replace(source, target)
 
-        with mock.patch.object(collector, "fetch_clockify", side_effect=clockify_result), \
+        with mock.patch.object(collector, "fetch_clockify") as clockify, \
              mock.patch.object(collector, "collect_remote_sessions", return_value=self.healthy_peer()), \
              mock.patch.object(recovery.os, "replace", side_effect=observe_replace):
             result = recovery.recover(parent, SOURCE, ATTEMPT_1)
@@ -462,8 +593,11 @@ class SourceDebtRecoveryTests(unittest.TestCase):
         self.assertEqual(run_dir, result.run_dir)
         self.assertEqual(1, len(archived))
         self.assertTrue(archived[0].is_dir())
-        self.assertEqual(2, len(checkpoint_roots))
-        self.assertEqual(checkpoint_roots[0], checkpoint_roots[1])
+        clockify.assert_not_called()
+        self.assertEqual(
+            result.checkpoint_dir.parent / "attempt-marker.json",
+            next(self.checkpoints.glob("source-debt-recovery/*/attempt-marker.json")),
+        )
 
     def test_same_attempt_preserves_two_identical_crash_partials_before_success(self) -> None:
         """An existing archive name must not strand a later identical crash replay."""
@@ -596,6 +730,7 @@ class SourceDebtRecoveryTests(unittest.TestCase):
                 "transition_digest": transition["transition_digest"],
             },
         }) + "\n")
+        recovery.seal_recovery_receipt(derived)
         before = tree_hashes(self.root)
 
         verified, status = review.verify_source_debt_recovery_completion(
@@ -607,6 +742,130 @@ class SourceDebtRecoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(review.ReviewRunError, "attempt"):
             review.verify_source_debt_recovery_completion(
                 derived, parent_run_dir=parent, source=SOURCE, attempt_id=ATTEMPT_2
+            )
+
+    def test_external_recovery_receipt_is_required_secure_and_idempotent(self) -> None:
+        """Run-local terminal documents alone must never authorize another hop."""
+        parent = self.make_parent()
+        derived, _bundle = self.make_terminal_recovery(
+            parent, SOURCE, ATTEMPT_1, peer=self.session_only_peer(), seal=False
+        )
+        with mock.patch.object(
+            collector, "collect_remote_sessions", return_value=self.healthy_peer()
+        ):
+            with self.assertRaisesRegex(
+                recovery.SourceDebtRecoveryError, "external recovery receipt"
+            ):
+                recovery.recover(derived, SOURCE, ATTEMPT_2)
+
+        seal = getattr(recovery, "seal_recovery_receipt", None)
+        self.assertIsNotNone(seal, "external receipt sealing is required")
+        receipt = seal(derived)
+        receipt_path = receipt.path
+        root = receipt_path.parent
+        self.assertNotEqual(derived, root)
+        self.assertEqual(0o700, stat.S_IMODE(root.stat().st_mode))
+        self.assertEqual(0o444, stat.S_IMODE(receipt_path.stat().st_mode))
+        self.assertEqual(recovery.os.getuid(), receipt_path.stat().st_uid)
+        self.assertNotIn("Existing work", receipt_path.read_text())
+        before = (receipt_path.stat().st_ino, receipt_path.stat().st_mtime_ns, receipt_path.read_bytes())
+        repeated = seal(derived)
+        self.assertEqual(receipt.digest, repeated.digest)
+        self.assertEqual(
+            before,
+            (receipt_path.stat().st_ino, receipt_path.stat().st_mtime_ns, receipt_path.read_bytes()),
+        )
+
+        with mock.patch.object(
+            collector, "collect_remote_sessions", return_value=self.healthy_peer()
+        ):
+            second = recovery.recover(derived, SOURCE, ATTEMPT_2)
+        self.assertEqual(derived, second.parent_run_dir)
+
+        verify = getattr(recovery, "verify_recovery_receipt")
+        original = receipt_path.read_bytes()
+        cases = ("mode", "owner", "symlink", "tamper", "missing")
+        for case in cases:
+            with self.subTest(case=case):
+                if case == "mode":
+                    receipt_path.chmod(0o644)
+                elif case == "owner":
+                    pass
+                elif case == "symlink":
+                    receipt_path.unlink()
+                    target = root / "receipt-target"
+                    target.write_bytes(original)
+                    target.chmod(0o444)
+                    receipt_path.symlink_to(target)
+                elif case == "tamper":
+                    receipt_path.chmod(0o644)
+                    receipt_path.write_text('{}\n')
+                    receipt_path.chmod(0o444)
+                else:
+                    receipt_path.unlink()
+                uid_patch = (
+                    mock.patch.object(recovery.os, "getuid", return_value=recovery.os.getuid() + 1)
+                    if case == "owner" else mock.patch.object(recovery.os, "getuid", wraps=recovery.os.getuid)
+                )
+                with uid_patch, self.assertRaisesRegex(
+                    recovery.SourceDebtRecoveryError, "external recovery receipt"
+                ):
+                    verify(derived)
+                if receipt_path.is_symlink() or receipt_path.exists():
+                    receipt_path.unlink()
+                receipt_path.write_bytes(original)
+                receipt_path.chmod(0o444)
+                target = root / "receipt-target"
+                if target.exists():
+                    target.chmod(0o600)
+                    target.unlink()
+
+    def test_same_attempt_recollects_unreceipted_terminal_run_after_crash(self) -> None:
+        parent = self.make_parent()
+        derived, _bundle = self.make_terminal_recovery(
+            parent, SOURCE, ATTEMPT_1, peer=self.session_only_peer(), seal=False
+        )
+
+        with mock.patch.object(
+            collector, "collect_remote_sessions", return_value=self.healthy_peer()
+        ) as transport:
+            restarted = recovery.recover(parent, SOURCE, ATTEMPT_1)
+
+        self.assertFalse(restarted.collection_reused)
+        self.assertEqual(1, transport.call_count)
+        self.assertEqual(derived, restarted.run_dir)
+        self.assertFalse((derived / "autopilot-result.json").exists())
+        self.assertEqual(
+            1,
+            len(list(self.runs.glob(derived.name + "-incomplete-*"))),
+        )
+
+    def test_external_receipt_blocks_semantically_coherent_run_local_rewrite(self) -> None:
+        parent = self.make_parent()
+        derived, _bundle = self.make_terminal_recovery(
+            parent, SOURCE, ATTEMPT_1, peer=self.session_only_peer()
+        )
+        rewritten = [
+            *(derived / relative for relative in recovery._EVIDENCE_FILES.values()),
+            derived / "evidence" / "evidence-ledger.json",
+            derived / "ledger-recovery.json",
+            derived / "run-report.json",
+            derived / "autopilot-result.json",
+            derived / "completion-bundle.json",
+        ]
+        for path in rewritten:
+            document = json.loads(path.read_text(encoding="utf-8"))
+            path.write_text(
+                json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+        with self.assertRaisesRegex(review.ReviewRunError, "external recovery receipt"):
+            review.verify_source_debt_recovery_completion(
+                derived,
+                parent_run_dir=parent,
+                source=SOURCE,
+                attempt_id=ATTEMPT_1,
             )
 
     def test_parent_bundle_finalization_snapshot_and_receipt_tampering_block_collection(self) -> None:
@@ -644,21 +903,135 @@ class SourceDebtRecoveryTests(unittest.TestCase):
     def test_verified_terminal_recovery_can_parent_newly_incomplete_peer(self) -> None:
         root = self.make_parent()
         first, _bundle = self.make_terminal_recovery(
-            root, "sessions/macbook", ATTEMPT_1, peer=self.session_only_peer()
+            root, SOURCE, ATTEMPT_1, peer=self.session_only_peer()
         )
 
         with mock.patch.object(
             collector, "collect_remote_sessions", return_value=self.healthy_peer()
         ) as transport:
-            second = recovery.recover(first, "repositories/macbook", ATTEMPT_2)
+            second = recovery.recover(first, SOURCE, ATTEMPT_2)
 
         self.assertEqual(first, second.parent_run_dir)
         self.assertEqual(1, transport.call_count)
 
+    def test_multi_hop_recovery_preserves_bound_non_peer_raw_evidence(self) -> None:
+        """Derived parents must round-trip retained providers without recollection."""
+        providers = {
+            "clockify": {
+                "status": "ok", "complete": True,
+                "entries": [{
+                    "id_suffix": "clock-1", "description": "Existing work",
+                    "project_id_suffix": "project-1", "tag_id_suffixes": [],
+                    "start": "2026-07-01T09:00:00+03:00",
+                    "end": "2026-07-01T09:30:00+03:00", "running": False,
+                    "running_snapshot": None, "duration": "PT30M", "billable": True,
+                }],
+            },
+            "fathom": {
+                "status": "ok", "complete": True,
+                "meetings": [{
+                    "recording_id": "meeting-1", "title": "Planning",
+                    "start": "2026-07-01T10:00:00+03:00",
+                    "end": "2026-07-01T10:30:00+03:00",
+                    "summary": "Agreed the recovery boundary.",
+                    "action_items": [{"text": "Verify the derived run"}],
+                    "transcript": [{"speaker": "Owner", "text": "Proceed."}],
+                    "semantic_evidence_status": "available",
+                }],
+            },
+            "multica_issues": {
+                "status": "ok", "complete": True,
+                "issues": [{
+                    "id": "SER-1", "key": "SER-1", "title": "Recovery",
+                    "status": "in_progress",
+                    "created_at": "2026-07-01T08:00:00+03:00",
+                    "updated_at": "2026-07-01T08:30:00+03:00",
+                }],
+            },
+        }
+        with (
+            mock.patch.object(
+                collector, "fetch_clockify", return_value=providers["clockify"]
+            ),
+            mock.patch.object(
+                collector, "fetch_fathom", return_value=providers["fathom"]
+            ),
+            mock.patch.object(
+                collector, "fetch_multica_issues",
+                return_value=providers["multica_issues"],
+            ),
+        ):
+            root = self.make_parent()
+
+        provider_files = {
+            "clockify": "clockify-existing.json",
+            "fathom": "fathom-meetings.json",
+            "calendly": "calendly-recordings.json",
+            "multica_issues": "multica-issues.json",
+        }
+        expected = {
+            name: json.loads((root / "evidence" / filename).read_text())
+            for name, filename in provider_files.items()
+        }
+        with (
+            mock.patch.object(
+                collector, "fetch_clockify",
+                side_effect=AssertionError("must retain bound clockify evidence"),
+            ),
+            mock.patch.object(
+                collector, "fetch_fathom",
+                side_effect=AssertionError("must retain bound fathom evidence"),
+            ),
+            mock.patch.object(
+                collector, "fetch_calendly",
+                side_effect=AssertionError("must retain bound calendly evidence"),
+            ),
+            mock.patch.object(
+                collector, "fetch_multica_issues",
+                side_effect=AssertionError("must retain bound multica evidence"),
+            ),
+        ):
+            first, _first_bundle = self.make_terminal_recovery(
+                root, SOURCE, ATTEMPT_1, peer=self.session_only_peer()
+            )
+            for name, filename in provider_files.items():
+                self.assertEqual(
+                    expected[name],
+                    json.loads((first / "evidence" / filename).read_text()),
+                )
+            second, _second_bundle = self.make_terminal_recovery(
+                first, SOURCE, ATTEMPT_2, peer=self.healthy_peer()
+            )
+
+        raw, _digests = recovery._parent_evidence(
+            type("RawParent", (), {"run_dir": second})()
+        )
+        ledger = recovery._verified_parent_ledger(second)
+        reconstructed = recovery.evidence_ledger.EvidenceLedger(
+            tuple(recovery.evidence_ledger.normalize_collector_snapshot(raw)),
+            recovery.evidence_ledger.source_inventory_from_collector(raw),
+            ledger.timezone,
+            ledger.member_identities,
+        )
+        self.assertEqual(ledger.manifest.document(), reconstructed.manifest.document())
+
+        for filename in provider_files.values():
+            path = second / "evidence" / filename
+            original = path.read_bytes()
+            try:
+                path.write_text('{"status":"ok","complete":true}\n')
+                with self.subTest(filename=filename), self.assertRaisesRegex(
+                    recovery.SourceDebtRecoveryError,
+                    "external recovery receipt",
+                ):
+                    recovery._validate_parent(second, SOURCE)
+            finally:
+                path.write_bytes(original)
+
     def test_derived_parent_tampered_terminal_result_blocks_before_collection(self) -> None:
         root = self.make_parent()
         first, _bundle = self.make_terminal_recovery(
-            root, "sessions/macbook", ATTEMPT_1, peer=self.session_only_peer()
+            root, SOURCE, ATTEMPT_1, peer=self.session_only_peer()
         )
         result_path = first / "autopilot-result.json"
         result = json.loads(result_path.read_text())
@@ -667,13 +1040,13 @@ class SourceDebtRecoveryTests(unittest.TestCase):
 
         with mock.patch.object(collector, "collect_remote_sessions") as transport:
             with self.assertRaisesRegex(recovery.SourceDebtRecoveryError, "terminal"):
-                recovery.recover(first, "repositories/macbook", ATTEMPT_2)
+                recovery.recover(first, SOURCE, ATTEMPT_2)
         transport.assert_not_called()
 
     def test_derived_parent_cycle_blocks_before_collection(self) -> None:
         root = self.make_parent()
         first, _bundle = self.make_terminal_recovery(
-            root, "sessions/macbook", ATTEMPT_1, peer=self.session_only_peer()
+            root, SOURCE, ATTEMPT_1, peer=self.session_only_peer()
         )
         report_path = first / "run-report.json"
         report = json.loads(report_path.read_text())
@@ -682,7 +1055,7 @@ class SourceDebtRecoveryTests(unittest.TestCase):
 
         with mock.patch.object(collector, "collect_remote_sessions") as transport:
             with self.assertRaises(recovery.SourceDebtRecoveryError) as caught:
-                recovery.recover(first, "repositories/macbook", ATTEMPT_2)
+                recovery.recover(first, SOURCE, ATTEMPT_2)
         transport.assert_not_called()
         causes: list[str] = []
         error: BaseException | None = caught.exception
@@ -694,10 +1067,10 @@ class SourceDebtRecoveryTests(unittest.TestCase):
     def test_public_chain_verifier_rejects_tampered_ancestor_artifacts(self) -> None:
         root = self.make_parent()
         first, _first_bundle = self.make_terminal_recovery(
-            root, "sessions/macbook", ATTEMPT_1, peer=self.session_only_peer()
+            root, SOURCE, ATTEMPT_1, peer=self.session_only_peer()
         )
         second, _second_bundle = self.make_terminal_recovery(
-            first, "repositories/macbook", ATTEMPT_2, peer=self.healthy_peer()
+            first, SOURCE, ATTEMPT_2, peer=self.healthy_peer()
         )
         cases: list[tuple[str, Path, bytes]] = [
             ("bundle", first / "completion-bundle.json", b"{}\n"),
@@ -716,7 +1089,7 @@ class SourceDebtRecoveryTests(unittest.TestCase):
                     review.verify_source_debt_recovery_completion(
                         second,
                         parent_run_dir=first,
-                        source="repositories/macbook",
+                        source=SOURCE,
                         attempt_id=ATTEMPT_2,
                     )
             finally:
@@ -725,7 +1098,7 @@ class SourceDebtRecoveryTests(unittest.TestCase):
     def test_direct_script_context_uses_shared_terminal_verifier_for_chain(self) -> None:
         root = self.make_parent()
         first, _bundle = self.make_terminal_recovery(
-            root, "sessions/macbook", ATTEMPT_1, peer=self.session_only_peer()
+            root, SOURCE, ATTEMPT_1, peer=self.session_only_peer()
         )
         direct = runpy.run_path(str(Path(recovery.__file__)))
         direct_globals = direct["_validate_parent"].__globals__
@@ -733,7 +1106,7 @@ class SourceDebtRecoveryTests(unittest.TestCase):
         direct_globals["RUNS"] = self.runs
 
         with mock.patch.dict(sys.modules, {"clockify_review_run": review}):
-            parent = direct["_validate_parent"](first, "repositories/macbook")
+            parent = direct["_validate_parent"](first, SOURCE)
 
         self.assertEqual(first, parent.run_dir)
 
@@ -745,7 +1118,24 @@ class SourceDebtRecoveryTests(unittest.TestCase):
         (self.root / "routing.json").write_text(
             json.dumps(self.routing) + "\n", encoding="utf-8"
         )
-        parent = self.make_parent()
+        clockify = {
+            "status": "ok",
+            "complete": True,
+            "entries": [{
+                "id_suffix": "overlap1",
+                "description": "Different existing work",
+                "project_id_suffix": "775f9f",
+                "tag_id_suffixes": [],
+                "start": "2026-07-01T09:05:00+03:00",
+                "end": "2026-07-01T09:15:00+03:00",
+                "running": False,
+                "running_snapshot": None,
+                "duration": "PT10M",
+                "billable": True,
+            }],
+        }
+        with mock.patch.object(collector, "fetch_clockify", return_value=clockify):
+            parent = self.make_parent()
         peer = self.healthy_peer()
         peer["codex_sessions"] = [
             {
@@ -763,25 +1153,8 @@ class SourceDebtRecoveryTests(unittest.TestCase):
                 "title": "Recovered second interval",
             },
         ]
-        clockify = {
-            "status": "ok",
-            "complete": True,
-            "entries": [{
-                "id_suffix": "overlap1",
-                "description": "Different existing work",
-                "project_id_suffix": "775f9f",
-                "tag_id_suffixes": [],
-                "start": "2026-07-01T09:05:00+03:00",
-                "end": "2026-07-01T09:15:00+03:00",
-                "running": False,
-                "running_snapshot": None,
-                "duration": "PT10M",
-                "billable": True,
-            }],
-        }
-        with (
-            mock.patch.object(collector, "collect_remote_sessions", return_value=peer),
-            mock.patch.object(collector, "fetch_clockify", return_value=clockify),
+        with mock.patch.object(
+            collector, "collect_remote_sessions", return_value=peer
         ):
             recovered = recovery.recover(parent, SOURCE, ATTEMPT_1)
         snapshots = review._snapshot_recovery_inputs(

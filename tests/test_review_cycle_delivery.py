@@ -61,6 +61,7 @@ def make_run(
     accounting_overrides: dict[str, object] | None = None,
     accounting_remove: tuple[str, ...] = (),
     compatibility_version: str = "fixture-collector-lineage/v1",
+    runtime_identity: dict[str, object] | None = None,
 ) -> Path:
     run_dir = (runs_dir or root / "runs") / name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -78,7 +79,7 @@ def make_run(
     write_json(
         run_dir / "run-report.json",
         {
-            "runtime_identity": {"git_sha": "fixture-sha"},
+            "runtime_identity": runtime_identity or {"git_sha": "fixture-sha"},
             "date_range": {"since": since_utc, "until": until_utc},
             "evidence_ledger": {"source_completeness": coverage},
         },

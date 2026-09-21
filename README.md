@@ -646,6 +646,27 @@ only the approved pinned Flash route. It restarts unexpected crashes, but
 authentication, integrity, or route error from looping indefinitely. Logs remain
 in the Precision user journal.
 
+Deterministic slice paths are not release identities. The review coordinator
+rejects a structurally valid completion bundle whose bound runtime differs from
+the active release. A historical bundle with actionable peer gaps is retained
+only as an immutable recovery parent: canonical coverage creates exact source
+debt, while replay and publication remain blocked. Exact recovery creates a
+current-runtime derived run, reuses compatible complete provider evidence via a
+digest-bound `source-adoption.json`, and recollects only the requested
+`sessions/<peer>` or `repositories/<peer>` facet. Stable record identities make
+repeated merges idempotent; compatibility, snapshot, adoption, or lineage drift
+fails closed.
+
+Exhausted exact debt uses a bounded metadata-only peer probe (`ssh ... true`,
+with no activity evidence) to observe health epochs. Offline-to-online
+reactivates that debt once. Repeated offline or online observations do not reset
+its budget, and runtime change alone is not treated as source recovery. An
+exhausted generic `runner/unclassified` record is likewise not retried under an
+unchanged runtime. When a new runtime can validate its immutable historical
+bundle, one classification pass replaces the generic record with exact peer
+debts; subsequent cycles recover those exact sources rather than rerunning the
+full provider.
+
 Set `CLOCKIFY_ANALYZER_PRIMARY_REASONING_EFFORT=none` for the current Flash
 alias. Ollama otherwise enables a reasoning stream that can spend minutes on a
 small contract request. The setting remains model inference, is bound to new

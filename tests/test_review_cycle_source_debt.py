@@ -32,6 +32,18 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
         runs_patch = mock.patch.object(review_run, "RUNS", self.root / "runs")
         runs_patch.start()
         self.addCleanup(runs_patch.stop)
+        receipt_patch = mock.patch.object(
+            cycle.clockify_source_debt_recover,
+            "verify_recovery_receipt",
+            side_effect=lambda run_dir: cycle.clockify_source_debt_recover.RecoveryReceipt(
+                self.root / "checkpoints" / "source-debt-recovery-receipts"
+                / (Path(run_dir).name + ".json"),
+                "sha256:" + "a" * 64,
+                {},
+            ),
+        )
+        receipt_patch.start()
+        self.addCleanup(receipt_patch.stop)
         self.state_dir = self.root / "state"
         self.cache = self.root / "cache"
         self.cache.mkdir()
@@ -68,6 +80,54 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
     def debts(self):
         document = source_coverage.read(self.state_dir / "source-coverage.json")
         return source_coverage.SourceDebtStore.from_document(document).active()
+
+    def test_verified_recovery_attempt_requires_external_receipt_identity(self):
+        parent = {
+            "run_dir": str((self.root / "runs" / "parent").resolve()),
+            "bundle_digest": "sha256:" + "1" * 64,
+        }
+        debt_id = "sha256:" + "2" * 64
+        attempt = {
+            "schema_version": cycle.RECOVERY_ATTEMPT_SCHEMA_VERSION,
+            "debt_id": debt_id,
+            "attempt_ordinal": 1,
+            "attempt_id": cycle._attempt_id(debt_id, 1),
+            "parent_run_dir": parent["run_dir"],
+            "parent_bundle_digest": parent["bundle_digest"],
+            "command_digest": "sha256:" + "3" * 64,
+            "phase": "verified_complete",
+            "result_path": str((self.root / "runs" / "derived" / "autopilot-result.json").resolve()),
+            "result_digest": "sha256:" + "4" * 64,
+            "returned_bundle_digest": "sha256:" + "5" * 64,
+            "requested_source_outcome": "complete",
+            "recovery_receipt_path": str((self.root / "checkpoints" / "source-debt-recovery-receipts" / ("6" * 64 + ".json")).resolve()),
+            "recovery_receipt_digest": "sha256:" + "7" * 64,
+        }
+
+        checked = cycle._validate_recovery_attempt(
+            attempt, debt_id=debt_id, parent=parent
+        )
+        self.assertEqual(attempt["recovery_receipt_path"], checked["recovery_receipt_path"])
+        self.assertEqual(attempt["recovery_receipt_digest"], checked["recovery_receipt_digest"])
+
+        for field in ("recovery_receipt_path", "recovery_receipt_digest"):
+            with self.subTest(field=field):
+                damaged = dict(attempt)
+                damaged.pop(field)
+                with self.assertRaisesRegex(cycle.CycleError, "shape"):
+                    cycle._validate_recovery_attempt(
+                        damaged, debt_id=debt_id, parent=parent
+                    )
+        for field, value in (
+            ("recovery_receipt_path", "relative/receipt.json"),
+            ("recovery_receipt_digest", "sha256:not-a-digest"),
+        ):
+            with self.subTest(corrupt=field):
+                damaged = {**attempt, field: value}
+                with self.assertRaisesRegex(cycle.CycleError, "verified recovery outcome"):
+                    cycle._validate_recovery_attempt(
+                        damaged, debt_id=debt_id, parent=parent
+                    )
 
     def child_with_first_gap(self, commands: list[list[str]]):
         def child(command, **_kwargs):
@@ -152,7 +212,7 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
         self.assertEqual(["2026-09-07", "2026-09-09"], attempts)
         self.assertEqual("2026-09-11", self.state()["scheduled_through"])
         self.assertIsNone(self.state()["completed_through"])
-        self.assertEqual(["sessions/macbook"], [item.interval.source for item in self.debts()])
+        self.assertEqual(["peer/macbook"], [item.interval.source for item in self.debts()])
         self.assertEqual("delivered", result["status"])
 
     def test_trusted_exact_debt_is_blocked_without_re_adoption_or_resume(self):
@@ -235,10 +295,330 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
             )
 
         self.assertEqual(
-            ["repositories/desktop", "sessions/macbook"],
+            ["peer/desktop", "peer/macbook"],
             sorted(item.interval.source for item in self.debts()),
         )
         self.assertEqual([1, 1], sorted(item.retry_count for item in self.debts()))
+
+    def test_two_facets_for_one_machine_coalesce_into_one_peer_debt(self):
+        """One combined peer exporter must never create two transport attempts."""
+        store = source_coverage.SourceDebtStore()
+        coverage = {
+            "status": "incomplete",
+            "sources": {
+                "sessions/macbook": {"status": "unavailable"},
+                "repositories/macbook": {"status": "unavailable"},
+            },
+            "incomplete_sources": [
+                "repositories/macbook", "sessions/macbook",
+            ],
+        }
+        manifest = cycle._ensure_period(
+            self.config, self.state_dir, "2026-09-07", "2026-09-09",
+            bind_inputs=True,
+        )
+        result = make_run(
+            self.root, "peer-parent", replay=False, coverage=coverage,
+        )
+        source = cycle._validate_stage(
+            self.config, result, "2026-09-07", "2026-09-09", replay=False,
+            expected_snapshot_digests=cycle._expected_snapshot_digests(
+                self.config, manifest
+            ),
+        )
+
+        self.assertTrue(cycle._record_exact_debts(self.config, store, source))
+
+        debts = store.active()
+        self.assertEqual(1, len(debts))
+        self.assertEqual("peer/macbook", debts[0].interval.source)
+
+    def test_old_release_incomplete_bundle_is_recovery_parent_not_current_source(self):
+        """Catches direct adoption/publication of a deterministic old-release bundle."""
+        coverage = {
+            "status": "incomplete",
+            "sources": {
+                "sessions/omarchy-desktop": {"status": "unavailable"},
+                "repositories/omarchy-desktop": {"status": "partial"},
+            },
+            "incomplete_sources": [
+                "repositories/omarchy-desktop", "sessions/omarchy-desktop",
+            ],
+        }
+        manifest = cycle._ensure_period(
+            self.config, self.state_dir, "2026-09-07", "2026-09-09",
+            bind_inputs=True,
+        )
+        expected = cycle._expected_snapshot_digests(self.config, manifest)
+        result_path = make_run(
+            self.root, "old-release-source", replay=False, coverage=coverage,
+            since=dt.date(2026, 9, 7), until=dt.date(2026, 9, 9),
+            runtime_identity={"git_sha": "6092f453"},
+        )
+
+        with self.assertRaisesRegex(cycle.CycleError, "runtime identity"):
+            cycle._validate_stage(
+                {**self.config, "_runtime_identity": {"git_sha": "bab6bdf8"}},
+                result_path, "2026-09-07", "2026-09-09", replay=False,
+                expected_snapshot_digests=expected,
+            )
+
+        historical = cycle._validate_stage(
+            {**self.config, "_runtime_identity": {"git_sha": "bab6bdf8"}},
+            result_path, "2026-09-07", "2026-09-09", replay=False,
+            expected_snapshot_digests=expected, allow_historical_runtime=True,
+        )
+        self.assertNotEqual(
+            cycle._value_digest({"git_sha": "bab6bdf8"}),
+            historical["runtime_identity_digest"],
+        )
+        self.assertEqual(
+            coverage["incomplete_sources"],
+            historical["coverage"]["incomplete_sources"],
+        )
+
+    def test_delivered_legacy_source_and_replay_bind_historical_runtime_once(self):
+        """A runtime upgrade must not invalidate already delivered bab6 history."""
+        old_runtime = {"git_sha": "bab6bdf8"}
+        old_config = {
+            **self.config,
+            "catchup_until": "2026-09-09",
+            "max_slices": 1,
+            "_runtime_identity": old_runtime,
+        }
+
+        def historical_child(command, **_kwargs):
+            command = list(command)
+            if "clockify_sheet_publish.py" in command[1]:
+                return ChildResult(0, "", "", False, 0.1)
+            if "--replay-from" in command:
+                source_dir = Path(command[command.index("--replay-from") + 1])
+                path = make_run(
+                    self.root, "legacy-replay", replay=True,
+                    source_name=source_dir.name,
+                    since=dt.date(2026, 9, 7), until=dt.date(2026, 9, 9),
+                    snapshots_from=source_dir, runtime_identity=old_runtime,
+                )
+            else:
+                path = make_run(
+                    self.root, "legacy-source", replay=False,
+                    since=dt.date(2026, 9, 7), until=dt.date(2026, 9, 9),
+                    runtime_identity=old_runtime,
+                )
+            return ChildResult(0, str(path) + "\n", "", False, 0.1)
+
+        with mock.patch.object(
+            cycle, "run_child_bounded", side_effect=historical_child
+        ):
+            delivered = cycle.run_cycle(
+                old_config, enable_sheet_write=True, today=dt.date(2026, 9, 12)
+            )
+        self.assertEqual("delivered", delivered["status"])
+
+        state_path = self.state_dir / "review-cycle-state.json"
+        legacy_state = self.state()
+        record = legacy_state["slices"]["2026-09-07"]
+        record["source"].pop("runtime_identity_digest")
+        record["replay"].pop("runtime_identity_digest")
+        write_json(state_path, legacy_state)
+
+        new_config = {
+            **old_config,
+            "_runtime_identity": {"git_sha": "new-release"},
+        }
+        with mock.patch.object(
+            cycle, "run_child_bounded",
+            side_effect=AssertionError("delivered history must not rerun children"),
+        ) as child:
+            result = cycle.run_cycle(
+                new_config, enable_sheet_write=True, today=dt.date(2026, 9, 12)
+            )
+
+        self.assertEqual("idle", result["status"])
+        child.assert_not_called()
+        migrated = self.state()["slices"]["2026-09-07"]
+        expected = cycle._value_digest(old_runtime)
+        self.assertEqual(expected, migrated["source"]["runtime_identity_digest"])
+        self.assertEqual(expected, migrated["replay"]["runtime_identity_digest"])
+
+    def test_offline_to_online_health_epoch_reactivates_exhausted_exact_debt_once(self):
+        """Catches runtime-only retries or repeated retries while health is unchanged."""
+        store = source_coverage.SourceDebtStore()
+        interval = source_coverage.SourceInterval(
+            source="sessions/omarchy-desktop",
+            since_utc="2026-09-06T21:00:00Z",
+            until_utc="2026-09-08T21:00:00Z",
+            slice_id="slice-health-fixture",
+            compatibility_version="collector-backlog/v1:fixture",
+        )
+        failed = store.record_failure(
+            interval, failure_class="offline", retryable=True,
+            resume_state_digest="sha256:offline-fixture",
+            attempted_at="2026-09-09T00:00:00Z",
+        )
+        store.exhaust(failed.debt_id, terminal_reason="retry_limit")
+        state: dict[str, object] = {}
+
+        with mock.patch.object(cycle, "_probe_source_health", return_value="offline"):
+            self.assertTrue(cycle._reactivate_health_transitions(self.config, state, store))
+        self.assertEqual("exhausted", store.get(failed.debt_id).status)
+        with mock.patch.object(cycle, "_probe_source_health", return_value="online"):
+            self.assertTrue(cycle._reactivate_health_transitions(self.config, state, store))
+            events_after_online = len(store.document()["events"])
+            self.assertFalse(cycle._reactivate_health_transitions(self.config, state, store))
+
+        self.assertEqual("active", store.get(failed.debt_id).status)
+        self.assertEqual(events_after_online, len(store.document()["events"]))
+        self.assertEqual("source_health_transition", store.get(failed.debt_id).failure_class)
+
+        store.exhaust(failed.debt_id, terminal_reason="retry_limit")
+        events_before_second_epoch = len(store.document()["events"])
+        with mock.patch.object(cycle, "_probe_source_health", return_value="offline"):
+            self.assertTrue(cycle._reactivate_health_transitions(self.config, state, store))
+        self.assertEqual("exhausted", store.get(failed.debt_id).status)
+        self.assertEqual(events_before_second_epoch, len(store.document()["events"]))
+        with mock.patch.object(cycle, "_probe_source_health", return_value="online"):
+            self.assertTrue(cycle._reactivate_health_transitions(self.config, state, store))
+        self.assertEqual("active", store.get(failed.debt_id).status)
+        self.assertEqual(events_before_second_epoch + 1, len(store.document()["events"]))
+
+    def test_health_probe_rejects_unsafe_ssh_configuration_before_spawn(self):
+        """Catches health checks accepting command-executing SSH directives."""
+        cases = (
+            [],
+            ["-o", "BatchMode=yes"],
+            ["/dev/null", "-F"],
+            ["-F", "/dev/null", "-F", "/dev/null"],
+            ["-F", "/tmp/config"],
+            ["-F", "/dev/null", "-o", "ProxyCommand=sh -c exploit"],
+            ["-F", "/dev/null", "-oLocalCommand=sh -c exploit"],
+        )
+        for index, options in enumerate(cases):
+            with self.subTest(options=options):
+                write_json(self.root / "fleet.json", {
+                    "machines": [{
+                        "name": "macbook", "enabled": True, "kind": "ssh",
+                        "host": "macbook.example.test",
+                    }],
+                    "ssh_options": options,
+                })
+                with mock.patch.object(cycle.subprocess, "run") as spawned:
+                    self.assertEqual(
+                        "offline", cycle._probe_source_health(
+                            self.config, "peer/macbook", timeout_seconds=1 + index,
+                        )
+                    )
+                spawned.assert_not_called()
+
+        with mock.patch.object(cycle.subprocess, "run") as spawned:
+            self.assertEqual(
+                "offline", cycle._probe_source_health(
+                    self.config, "peer/not-in-fleet", timeout_seconds=1,
+                )
+            )
+        spawned.assert_not_called()
+
+    def test_health_probe_uses_allowlisted_host_and_suppresses_all_output(self):
+        """Catches arbitrary destinations or retained probe output."""
+        write_json(self.root / "fleet.json", {
+            "machines": [{
+                "name": "macbook", "enabled": True, "kind": "ssh",
+                "host": "macbook.example.test",
+            }],
+            "ssh_options": ["-F", "/dev/null", "-o", "BatchMode=yes"],
+        })
+        completed = mock.Mock(returncode=0)
+        with mock.patch.object(
+            cycle.subprocess, "run", return_value=completed
+        ) as spawned:
+            self.assertEqual(
+                "online", cycle._probe_source_health(
+                    self.config, "peer/macbook", timeout_seconds=2,
+                )
+            )
+
+        command = spawned.call_args.args[0]
+        self.assertEqual("macbook.example.test", command[-2])
+        self.assertEqual("true", command[-1])
+        self.assertIs(cycle.subprocess.DEVNULL, spawned.call_args.kwargs["stdout"])
+        self.assertIs(cycle.subprocess.DEVNULL, spawned.call_args.kwargs["stderr"])
+        self.assertEqual(2, spawned.call_args.kwargs["timeout"])
+
+    def test_health_probes_dedupe_machine_and_respect_aggregate_budget(self):
+        """Catches per-debt probing and unbounded fleet health latency."""
+        store = source_coverage.SourceDebtStore()
+        sources = ["peer/macbook", "sessions/macbook", "peer/desktop", "peer/laptop"]
+        for index, source in enumerate(sources):
+            interval = source_coverage.SourceInterval(
+                source=source,
+                since_utc="2026-09-06T21:00:00Z",
+                until_utc="2026-09-08T21:00:00Z",
+                slice_id=f"slice-health-{index}",
+                compatibility_version="collector-backlog/v1:fixture",
+            )
+            failed = store.record_failure(
+                interval, failure_class="offline", retryable=True,
+                resume_state_digest=f"sha256:offline-{index}",
+                attempted_at="2026-09-09T00:00:00Z",
+            )
+            store.exhaust(failed.debt_id, terminal_reason="retry_limit")
+
+        state: dict[str, object] = {}
+        with mock.patch.object(
+            cycle, "_probe_source_health", return_value="offline"
+        ) as probe:
+            cycle._reactivate_health_transitions(self.config, state, store)
+
+        self.assertEqual(3, probe.call_count)
+        self.assertEqual(
+            {"peer/macbook", "peer/desktop", "peer/laptop"},
+            {call.args[1] for call in probe.call_args_list},
+        )
+        self.assertLessEqual(
+            sum(call.kwargs["timeout_seconds"] for call in probe.call_args_list),
+            cycle.HEALTH_PROBE_BUDGET_SECONDS,
+        )
+
+    def test_health_transition_reconciles_debt_first_crash_without_duplicate(self):
+        """Catches a crash between durable debt and epoch-state writes."""
+        store = source_coverage.SourceDebtStore()
+        interval = source_coverage.SourceInterval(
+            source="peer/macbook",
+            since_utc="2026-09-06T21:00:00Z",
+            until_utc="2026-09-08T21:00:00Z",
+            slice_id="slice-health-crash",
+            compatibility_version="collector-backlog/v1:fixture",
+        )
+        failed = store.record_failure(
+            interval, failure_class="offline", retryable=True,
+            resume_state_digest="sha256:offline-crash",
+            attempted_at="2026-09-09T00:00:00Z",
+        )
+        store.exhaust(failed.debt_id, terminal_reason="retry_limit")
+        with mock.patch.object(cycle, "_probe_source_health", return_value="online"):
+            state_before_crash: dict[str, object] = {}
+            self.assertTrue(
+                cycle._reactivate_health_transitions(
+                    self.config, state_before_crash, store
+                )
+            )
+        durable = store.document()
+        event_count = len(durable["events"])
+
+        restarted = source_coverage.SourceDebtStore.from_document(durable)
+        restarted_state: dict[str, object] = {}
+        with mock.patch.object(cycle, "_probe_source_health", return_value="online"):
+            self.assertTrue(
+                cycle._reactivate_health_transitions(
+                    self.config, restarted_state, restarted
+                )
+            )
+
+        self.assertEqual(event_count, len(restarted.document()["events"]))
+        self.assertEqual(
+            f"online:0",
+            restarted_state["source_health_epochs"][interval.debt_id],
+        )
 
     def test_generic_retry_resolves_only_after_verified_complete_bundle(self):
         """Catches clearing an unclassified failure without verified complete coverage."""
@@ -261,7 +641,7 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
         self.assertEqual("recovery_blocked", result["status"])
         active_sources = [item.interval.source for item in self.debts()]
         self.assertIn("runner/unclassified", active_sources)
-        self.assertIn("sessions/macbook", active_sources)
+        self.assertIn("peer/macbook", active_sources)
 
     def test_generic_retry_is_resolved_by_verified_complete_bundle(self):
         """Catches leaving a generic obligation active after exact complete proof."""
@@ -456,8 +836,8 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
         self.assertEqual("exhausted", debt.status)
         self.assertEqual("retry_limit", debt.terminal_reason)
 
-    def test_later_cycle_recovers_exhausted_generic_debt(self):
-        """Catches retry exhaustion permanently hiding unresolved generic debt."""
+    def test_later_cycle_does_not_retry_exhausted_generic_without_runtime_change(self):
+        """Catches unchanged exhausted generic debt looping indefinitely."""
         config = {**self.config, "catchup_until": "2026-09-09", "max_slices": 1}
         timed_out = ChildResult(None, "", "suppressed", True, 0.1)
         commands: list[list[str]] = []
@@ -471,19 +851,18 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
             cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 12))
 
         self.assertEqual("exhausted", self.debts()[0].status)
-        with mock.patch.object(
-            cycle, "run_child_bounded", side_effect=self.child_complete(commands)
-        ):
+        with mock.patch.object(cycle, "run_child_bounded") as child:
             result = cycle.run_cycle(
                 config, enable_sheet_write=True, today=dt.date(2026, 9, 12)
             )
 
         source_commands = [command for command in commands if "--since" in command]
-        self.assertEqual(3, len(source_commands))
-        self.assertEqual("delivered", result["status"])
-        self.assertEqual([], list(self.debts()))
+        self.assertEqual(2, len(source_commands))
+        child.assert_not_called()
+        self.assertEqual("idle", result["status"])
+        self.assertEqual("exhausted", self.debts()[0].status)
         events = source_coverage.read(self.state_dir / "source-coverage.json")["events"]
-        self.assertEqual(["failure", "failure", "exhausted", "complete"], [
+        self.assertEqual(["failure", "failure", "exhausted"], [
             event["event"] for event in events
         ])
 
@@ -1083,19 +1462,19 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
                 if invocation == 0:
                     with self.assertRaisesRegex(RuntimeError, "after verified recovery result"):
                         cycle.run_cycle(
-                            {**self.config, "max_slices": 1}, enable_sheet_write=True,
+                            {**self.config, "max_slices": 1, "catchup_until": "2026-09-09"}, enable_sheet_write=True,
                             today=dt.date(2026, 9, 12),
                         )
                 else:
                     cycle.run_cycle(
-                        {**self.config, "max_slices": 1}, enable_sheet_write=True,
+                        {**self.config, "max_slices": 1, "catchup_until": "2026-09-09"}, enable_sheet_write=True,
                         today=dt.date(2026, 9, 12),
                     )
 
         self.assertEqual([1, 2], [ordinal for _identity, ordinal in observed])
-        self.assertNotEqual(observed[0][0], observed[1][0])
         attempt = self.state()["slices"]["2026-09-07"]["recovery_attempts"][self.debts()[0].debt_id]
         self.assertEqual("finished_incomplete", attempt["phase"])
+        self.assertEqual("exhausted", self.debts()[0].status)
 
     def test_recovery_incomplete_debt_write_crash_finishes_before_next_ordinal(self):
         """Catches replaying a terminal-incomplete debt event after its durable write."""
@@ -1109,8 +1488,11 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
         parent = Path(self.state()["slices"]["2026-09-07"]["source"]["run_dir"])
         coverage = {
             "status": "incomplete",
-            "sources": {debt.interval.source: {"status": "unavailable"}},
-            "incomplete_sources": [debt.interval.source],
+            "sources": {
+                "sessions/macbook": {"status": "unavailable"},
+                "repositories/macbook": {"status": "complete"},
+            },
+            "incomplete_sources": ["sessions/macbook"],
         }
         spawned_attempt_ids: list[str] = []
 
@@ -1221,7 +1603,8 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
         state = self.state()
         state["next_work_class"] = "exact"
         write_json(self.state_dir / "review-cycle-state.json", state)
-        with mock.patch.object(cycle, "run_child_bounded", side_effect=later_timeout):
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=later_timeout), \
+             mock.patch.object(cycle, "_probe_source_health", return_value="online"):
             cycle.run_cycle(
                 config, enable_sheet_write=True, today=dt.date(2026, 9, 12)
             )
@@ -1230,9 +1613,16 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
         self.assertEqual(2, second_attempt["attempt_ordinal"])
         self.assertEqual([second_attempt["attempt_id"]], later_attempts)
         self.assertNotEqual(first_attempt["attempt_id"], second_attempt["attempt_id"])
+        after_transition = source_coverage.read(
+            self.state_dir / "source-coverage.json"
+        )
         self.assertEqual(
-            reconciled_document,
-            source_coverage.read(self.state_dir / "source-coverage.json"),
+            len(reconciled_document["events"]),
+            len(after_transition["events"]),
+        )
+        self.assertEqual(
+            "recovery_incomplete",
+            after_transition["events"][-1]["failure_class"],
         )
 
     def test_complete_recovery_resolves_only_selected_source_when_peer_debt_remains(self):
@@ -1259,11 +1649,14 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
             )
         parent = Path(self.state()["slices"]["2026-09-07"]["source"]["run_dir"])
         selected_source = sorted(item.interval.source for item in self.debts())[0]
+        selected_machine = selected_source.split("/", 1)[1]
         recovered_coverage = {
             "status": "incomplete",
             "sources": {
-                selected_source: {"status": "complete"},
+                f"sessions/{selected_machine}": {"status": "complete"},
+                f"repositories/{selected_machine}": {"status": "complete"},
                 "sessions/macbook": {"status": "unavailable"},
+                "repositories/macbook": {"status": "complete"},
             },
             "incomplete_sources": ["sessions/macbook"],
         }
@@ -1305,7 +1698,7 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
             for item in self.debts()
         }
         self.assertNotIn(selected_source, [item.interval.source for item in self.debts()])
-        self.assertEqual("active", items["sessions/macbook"])
+        self.assertEqual("active", items["peer/macbook"])
         self.assertEqual("recovery_blocked", self.state()["slices"]["2026-09-07"]["status"])
 
     def test_complete_recovery_reopens_incomplete_peer_before_promoted_state_write(self):
@@ -1340,15 +1733,26 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
         def recover_with(remaining_source: str, run_name: str):
             def child(command, **_kwargs):
                 selected = command[command.index("--recover-source") + 1]
-                incomplete = [remaining_source] if remaining_source else []
+                remaining_machine = (
+                    remaining_source.split("/", 1)[1] if remaining_source else ""
+                )
+                incomplete = (
+                    [f"sessions/{remaining_machine}"] if remaining_machine else []
+                )
                 recovered_coverage = {
                     "status": "incomplete" if incomplete else "complete",
                     "sources": {
                         "repositories/desktop": {
-                            "status": "unavailable" if remaining_source == "repositories/desktop" else "complete"
+                            "status": "complete"
+                        },
+                        "sessions/desktop": {
+                            "status": "unavailable" if remaining_machine == "desktop" else "complete"
                         },
                         "sessions/macbook": {
-                            "status": "unavailable" if remaining_source == "sessions/macbook" else "complete"
+                            "status": "unavailable" if remaining_machine == "macbook" else "complete"
+                        },
+                        "repositories/macbook": {
+                            "status": "complete"
                         },
                     },
                     "incomplete_sources": incomplete,
