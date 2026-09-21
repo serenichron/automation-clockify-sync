@@ -1290,6 +1290,7 @@ def _review_messages(
     candidate: Mapping[str, Any],
     taxonomy: list[dict[str, Any]],
     repair_failure_code: str | None = None,
+    repair_attempt: int | None = None,
     transport_recovery_attempt: int | None = None,
     transport_failure_code: str | None = None,
     review_scope: str = "extraction",
@@ -1435,6 +1436,15 @@ between 8 and 14 words.
     elif review_scope != "extraction":
         raise AnalyzerError("semantic review scope is invalid")
     if repair_failure_code is not None:
+        if (
+            repair_attempt is not None
+            and (
+                isinstance(repair_attempt, bool)
+                or not isinstance(repair_attempt, int)
+                or not 1 <= repair_attempt <= MAX_CONTRACT_REPAIR_ATTEMPTS
+            )
+        ):
+            raise AnalyzerError("semantic review repair attempt is invalid")
         system += (
             "\n\nSTRUCTURAL REPAIR: The prior review could not be consumed under "
             f"{repair_failure_code}. {_repair_instruction(repair_failure_code)} "
@@ -1510,6 +1520,14 @@ between 8 and 14 words.
                 "inside its bundle's allowed_member_range."
             ),
         }
+        # Keep the first repair byte-for-byte compatible with the historical
+        # cache identity. Only the newly available second attempt needs an
+        # explicit ordinal to distinguish its deterministic request.
+        if repair_attempt is not None and repair_attempt > 1:
+            payload["repair_feedback"].update({
+                "attempt": repair_attempt,
+                "maximum_attempts": MAX_CONTRACT_REPAIR_ATTEMPTS,
+            })
         if include_repair_contract:
             payload["repair_response_contract"] = {
                 "top_level": {"activities": "list", "exceptions": "list", "omissions": "list"},
@@ -1559,6 +1577,7 @@ def _review_body(
     taxonomy: list[dict[str, Any]],
     model: str,
     repair_failure_code: str | None = None,
+    repair_attempt: int | None = None,
     transport_recovery_attempt: int | None = None,
     transport_failure_code: str | None = None,
     review_scope: str = "extraction",
@@ -1571,7 +1590,11 @@ def _review_body(
         "seed": (
             4_000 + transport_recovery_attempt
             if transport_recovery_attempt is not None
-            else 101 if repair_failure_code is None else 102
+            else 101
+            if repair_failure_code is None
+            else 102
+            if repair_attempt in (None, 1)
+            else 101 + repair_attempt
         ),
         "response_format": {"type": "json_object"},
         "messages": _review_messages(
@@ -1579,6 +1602,7 @@ def _review_body(
             candidate=candidate,
             taxonomy=taxonomy,
             repair_failure_code=repair_failure_code,
+            repair_attempt=repair_attempt,
             transport_recovery_attempt=transport_recovery_attempt,
             transport_failure_code=transport_failure_code,
             review_scope=review_scope,
@@ -3041,6 +3065,7 @@ def _call_semantic_review_once(
     before_transport: Callable[[AnalyzerEndpoint], None] | None,
     cancelled: Callable[[], bool] | None,
     repair_failure_code: str | None = None,
+    repair_attempt: int | None = None,
     transport_recovery_attempt: int | None = None,
     transport_failure_code: str | None = None,
     review_scope: str = "extraction",
@@ -3051,6 +3076,7 @@ def _call_semantic_review_once(
         taxonomy=taxonomy,
         model=endpoint.model,
         repair_failure_code=repair_failure_code,
+        repair_attempt=repair_attempt,
         transport_recovery_attempt=transport_recovery_attempt,
         transport_failure_code=transport_failure_code,
         review_scope=review_scope,
@@ -3203,30 +3229,35 @@ def _call_semantic_review(
                 review_prompt_version=review_prompt_version,
             )
         except AnalyzerContractError as exc:
-            try:
-                return _call_semantic_review_once(
-                    endpoint,
-                    events,
-                    candidate=candidate,
-                    taxonomy=taxonomy,
-                    tier=tier,
-                    transport=transport,
-                    known_evidence_ids=known_evidence_ids,
-                    evidence_time_spans=evidence_time_spans,
-                    cache=cache,
-                    before_transport=before_transport,
-                    cancelled=cancelled,
-                    repair_failure_code=_contract_failure_code(exc),
-                    transport_recovery_attempt=transport_recovery_attempt,
-                    transport_failure_code=transport_failure_code,
-                    review_scope=review_scope,
-                    review_prompt_version=review_prompt_version,
-                )
-            except AnalyzerContractError as repair_error:
-                return failure(
-                    "Flash reviewer exhausted one structural repair: "
-                    + _contract_failure_code(repair_error)
-                )
+            repair_error = exc
+            for repair_attempt in range(1, MAX_CONTRACT_REPAIR_ATTEMPTS + 1):
+                try:
+                    return _call_semantic_review_once(
+                        endpoint,
+                        events,
+                        candidate=candidate,
+                        taxonomy=taxonomy,
+                        tier=tier,
+                        transport=transport,
+                        known_evidence_ids=known_evidence_ids,
+                        evidence_time_spans=evidence_time_spans,
+                        cache=cache,
+                        before_transport=before_transport,
+                        cancelled=cancelled,
+                        repair_failure_code=_contract_failure_code(repair_error),
+                        repair_attempt=repair_attempt,
+                        transport_recovery_attempt=transport_recovery_attempt,
+                        transport_failure_code=transport_failure_code,
+                        review_scope=review_scope,
+                        review_prompt_version=review_prompt_version,
+                    )
+                except AnalyzerContractError as error:
+                    repair_error = error
+                    continue
+            return failure(
+                "Flash reviewer exhausted bounded structural repair: "
+                + _contract_failure_code(repair_error)
+            )
 
     try:
         return call_with_structural_repair()

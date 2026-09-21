@@ -440,10 +440,52 @@ class SemanticAnalyzerTests(unittest.TestCase):
             review_taxonomy=taxonomy,
         )
 
-        self.assertEqual(["extract", "review", "review"], calls)
+        self.assertEqual(["extract", "review", "review", "review"], calls)
         self.assertEqual([], result["activities"])
         self.assertEqual("analyzer_review_failure", result["exceptions"][0]["kind"])
         self.assertIn("structural repair", result["exceptions"][0]["reason"])
+
+    def test_flash_review_can_use_second_bounded_structural_repair(self):
+        calls: list[tuple[str, int, int | None]] = []
+        taxonomy = [{
+            "project_name": "Serenichron Level 2",
+            "prefix": "SC",
+            "tag_names": ["Processes"],
+            "billable": True,
+        }]
+
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            mode = payload["mode"]
+            repair_attempt = (payload.get("repair_feedback") or {}).get("attempt")
+            calls.append((mode, body["seed"], repair_attempt))
+            response = provider_response(payload)
+            if mode == "review" and body["seed"] < 103:
+                response["activities"][0]["evidence_partitions"] *= 2
+            return response
+
+        result = semantic.analyze_tiered(
+            [event("ev-1")],
+            primary=semantic.AnalyzerEndpoint(
+                "primary", "http://primary", "flash-review-test"
+            ),
+            transport=transport,
+            review_taxonomy=taxonomy,
+        )
+
+        self.assertEqual(
+            [
+                ("extract", 0, None),
+                ("review", 101, None),
+                ("review", 102, None),
+                ("review", 103, 2),
+            ],
+            calls,
+        )
+        self.assertEqual(1, len(result["activities"]))
+        self.assertEqual([], result["exceptions"])
 
     def test_flash_review_timeout_recovers_without_rerunning_extractor_and_replays(self):
         taxonomy = [{
@@ -574,7 +616,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
             review_taxonomy=taxonomy,
         )
 
-        self.assertEqual(["extract", "review", "review"], calls)
+        self.assertEqual(["extract", "review", "review", "review"], calls)
         self.assertEqual([], result["activities"])
         self.assertEqual("analyzer_review_failure", result["exceptions"][0]["kind"])
 

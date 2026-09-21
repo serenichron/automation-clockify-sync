@@ -82,7 +82,7 @@ class RepairContractTests(unittest.TestCase):
             self.assertEqual(1, len(calls))
             self.assertEqual(first["activities"], second["activities"])
 
-    def test_bad_coverage_still_fails_after_single_repair_with_sanitized_reason(self):
+    def test_bad_coverage_still_fails_after_bounded_repairs_with_sanitized_reason(self):
         for corruption in ("unknown", "duplicate", "omitted"):
             with self.subTest(corruption=corruption):
                 calls = []
@@ -97,7 +97,7 @@ class RepairContractTests(unittest.TestCase):
                         response["activities"] = []
                     return response
                 result = self.review(transport)
-                self.assertEqual(2, len(calls))
+                self.assertEqual(3, len(calls))
                 self.assertEqual([], result["activities"])
                 self.assertIn("contract_rejected_", result["exceptions"][0]["reason"])
 
