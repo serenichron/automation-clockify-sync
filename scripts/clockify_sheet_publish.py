@@ -897,6 +897,77 @@ def publish(
     }
 
 
+def _publication_receipt(
+    *, spreadsheet_id: str, sheet_title: str, rows: Sequence[Sequence[Any]],
+) -> dict[str, Any]:
+    payload = {
+        "spreadsheet_id": spreadsheet_id,
+        "sheet_title": sheet_title,
+        "row_ids": [str(row[0]) for row in rows],
+        "rows_sha256": "sha256:" + hashlib.sha256(
+            json.dumps(list(rows), separators=(",", ":"), sort_keys=True).encode("utf-8")
+        ).hexdigest(),
+    }
+    identity = hashlib.sha256(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return {**payload, "receipt_id": f"sheet-publication/{identity}"}
+
+
+def publish_proposal_partitions(
+    gateway: SheetsGateway,
+    *,
+    spreadsheet_id: str,
+    sheet_title: str,
+    template_title: str,
+    proposals: Sequence[Mapping[str, Any]],
+    run_id: str,
+    project_allowlist: Mapping[str, str],
+) -> dict[str, Any]:
+    proposal_partitions: tuple[tuple[str, list[Mapping[str, Any]]], ...] = (
+        (sheet_title, [
+            proposal for proposal in proposals
+            if proposal.get("routing_disposition") != "unresolved-routing"
+        ]),
+        ("unresolved-evidence", [
+            proposal for proposal in proposals
+            if proposal.get("routing_disposition") == "unresolved-routing"
+        ]),
+    )
+    partitions = [
+        (
+            destination,
+            [
+                proposal_row(proposal, run_id, project_allowlist=project_allowlist)
+                for proposal in members
+            ],
+        )
+        for destination, members in proposal_partitions
+        if members
+    ]
+    ids = [str(row[0]) for _destination, rows in partitions for row in rows]
+    if len(ids) != len(set(ids)):
+        raise PublicationError("proposal input contains duplicate stable review IDs")
+    publications: list[dict[str, Any]] = []
+    for destination, rows in partitions:
+        result = publish(
+            gateway,
+            spreadsheet_id=spreadsheet_id,
+            sheet_title=destination,
+            template_title=template_title,
+            rows=rows,
+        )
+        publications.append({
+            "sheet_title": destination,
+            "row_count": len(rows),
+            **_publication_receipt(
+                spreadsheet_id=spreadsheet_id, sheet_title=destination, rows=rows,
+            ),
+            **result,
+        })
+    return {"publications": publications, "clockify_writes": 0}
+
+
 def _json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -961,13 +1032,25 @@ def main(argv: list[str] | None = None) -> int:
             "rows": len(rows),
         }, sort_keys=True))
         return 0
-    result = publish(
-        GwsSheetsGateway(),
-        spreadsheet_id=args.spreadsheet_id,
-        sheet_title=args.sheet_title,
-        template_title=args.template_title,
-        rows=rows,
-    )
+    gateway = GwsSheetsGateway()
+    if args.proposals is not None:
+        result = publish_proposal_partitions(
+            gateway,
+            spreadsheet_id=args.spreadsheet_id,
+            sheet_title=args.sheet_title,
+            template_title=args.template_title,
+            proposals=proposals,
+            run_id=args.run_id,
+            project_allowlist=projects,
+        )
+    else:
+        result = publish(
+            gateway,
+            spreadsheet_id=args.spreadsheet_id,
+            sheet_title=args.sheet_title,
+            template_title=args.template_title,
+            rows=rows,
+        )
     print(json.dumps({"status": "published", "external_writes": True, **result}, sort_keys=True))
     return 0
 

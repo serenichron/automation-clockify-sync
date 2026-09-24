@@ -1896,6 +1896,39 @@ def source_interval_coverage_audit(config: Mapping[str, Any]) -> dict[str, Any]:
                 source, inventory.get(source), snapshotted_optional,
             ):
                 continue
+            covering = [
+                item for item in items.values()
+                if _audit_debt_covers_gap(item, source, identity)
+            ]
+            if not covering:
+                continue
+            covering.sort(key=lambda item: (
+                item.interval.source == "runner/unclassified",
+                item.interval.source.startswith("peer/"),
+                item.debt_id,
+            ))
+            item = covering[0]
+            projected = {
+                "source": source,
+                **identity,
+                "status": "resolved" if item.status == "resolved" else "active",
+                "operational_debt_id": item.debt_id,
+            }
+            if item.status == "resolved":
+                projected["completion_bundle_digest"] = item.completion_bundle_digest
+            else:
+                projected["resume_state_digest"] = item.resume_state_digest
+            projected_interval = source_coverage.SourceInterval(**{
+                field: projected[field] for field in SOURCE_INTERVAL_FIELDS
+            })
+            intervals[projected_interval.debt_id] = projected
+
+    for identity, inventory, _bundle_digest, snapshotted_optional in verified:
+        for source in configured:
+            if _audit_inventory_complete(
+                source, inventory.get(source), snapshotted_optional,
+            ):
+                continue
             if not any(
                 _audit_debt_covers_gap(item, source, identity)
                 for item in items.values()

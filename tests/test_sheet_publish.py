@@ -126,6 +126,70 @@ class AppendCorruptingGateway(StatefulGateway):
         self.rows[-1][8] = "incorrect appended machine field"
 
 
+class MultiSheetGateway(StatefulGateway):
+    """Stateful model with independent rows for each destination tab."""
+
+    def __init__(self):
+        super().__init__(include_target=False)
+        self.sheets = {"Proposals": {"sheet_id": 1, "rows": [publisher.HEADER]}}
+        self.next_sheet_id = 2
+
+    def spreadsheet(self, _spreadsheet_id):
+        return {"sheets": [{"properties": {
+            "title": title,
+            "sheetId": details["sheet_id"],
+            "gridProperties": {"rowCount": self.row_count},
+        }} for title, details in self.sheets.items()]}
+
+    @staticmethod
+    def _title(range_name):
+        return range_name.split("!", 1)[0].strip("'").replace("''", "'")
+
+    def values(self, _spreadsheet_id, range_name):
+        title = self._title(range_name)
+        rows = self.sheets[title]["rows"]
+        start = int(range_name.rsplit("!A", 1)[1].split(":", 1)[0])
+        end = int(range_name.rsplit("O", 1)[1])
+        return [list(row) for row in rows[start - 1:end]]
+
+    def duplicate_sheet(self, spreadsheet_id, source_sheet_id, title):
+        sheet_id = self.next_sheet_id
+        self.next_sheet_id += 1
+        self.created.append((source_sheet_id, title))
+        self.sheets[title] = {"sheet_id": sheet_id, "rows": [publisher.HEADER]}
+        return sheet_id
+
+    def clear_values(self, spreadsheet_id, range_name):
+        self.cleared.append(range_name)
+        title = self._title(range_name)
+        self.sheets[title]["rows"] = self.sheets[title]["rows"][:1]
+
+    def update_values(self, spreadsheet_id, ranges):
+        self.updated.extend(ranges)
+        for item in ranges:
+            title = self._title(item["range"])
+            rows = self.sheets[title]["rows"]
+            start_cell = item["range"].rsplit("!", 1)[1].split(":", 1)[0]
+            column = "".join(char for char in start_cell if char.isalpha())
+            start = int("".join(char for char in start_cell if char.isdigit()))
+            for offset, row in enumerate(item["values"]):
+                row_index = start - 1 + offset
+                while len(rows) <= row_index:
+                    rows.append([])
+                if column == "A" and ":I" in item["range"]:
+                    rows[row_index][0:9] = list(row)
+                elif column == "K":
+                    while len(rows[row_index]) < 13:
+                        rows[row_index].append("")
+                    rows[row_index][10:13] = list(row)
+                else:
+                    rows[row_index] = list(row)
+
+    def append_values(self, spreadsheet_id, range_name, rows):
+        self.appended.append((range_name, list(rows)))
+        self.sheets[self._title(range_name)]["rows"].extend(list(row) for row in rows)
+
+
 def proposal(segment=1):
     return {
         "review_activity_key": "wka-1234567890abcdef12345678",
@@ -1132,6 +1196,178 @@ class SheetPublicationTests(unittest.TestCase):
                 ])
         self.assertEqual(0, result)
         self.assertEqual(1, json.loads(output.getvalue())["rows"])
+
+    def test_mixed_proposals_publish_to_distinct_tabs_with_independent_receipts(self):
+        routed = proposal(1)
+        unresolved = proposal(2)
+        unresolved.update({
+            "client_project": "",
+            "clockify_project_suffix": "",
+            "tag_suffixes": [],
+            "tag_names": [],
+            "billable": False,
+            "routing_disposition": "unresolved-routing",
+            "review_warnings": [{
+                "type": "unresolved_routing",
+                "disposition": "unresolved-routing",
+                "reason_code": "no_deterministic_route",
+            }],
+        })
+        gateway = MultiSheetGateway()
+
+        result = publisher.publish_proposal_partitions(
+            gateway,
+            spreadsheet_id="sheet",
+            sheet_title="September 2026 review",
+            template_title="Proposals",
+            proposals=[routed, unresolved],
+            run_id="run-1",
+            project_allowlist={},
+        )
+
+        self.assertEqual(
+            ["September 2026 review", "unresolved-evidence"],
+            [item["sheet_title"] for item in result["publications"]],
+        )
+        self.assertEqual(
+            [publisher.stable_review_id(routed)],
+            [row[0] for row in gateway.sheets["September 2026 review"]["rows"][1:]],
+        )
+        self.assertEqual(
+            [publisher.stable_review_id(unresolved)],
+            [row[0] for row in gateway.sheets["unresolved-evidence"]["rows"][1:]],
+        )
+        self.assertTrue(all(item["receipt_id"].startswith("sheet-publication/") for item in result["publications"]))
+        self.assertTrue(all(item["row_count"] == 1 for item in result["publications"]))
+        self.assertEqual(0, result["clockify_writes"])
+
+        retried = publisher.publish_proposal_partitions(
+            gateway,
+            spreadsheet_id="sheet",
+            sheet_title="September 2026 review",
+            template_title="Proposals",
+            proposals=[routed, unresolved],
+            run_id="run-1",
+            project_allowlist={},
+        )
+        self.assertEqual(
+            [1, 1], [item["unchanged"] for item in retried["publications"]]
+        )
+        self.assertEqual(
+            [item["receipt_id"] for item in result["publications"]],
+            [item["receipt_id"] for item in retried["publications"]],
+        )
+
+    def test_only_nonempty_proposal_partition_is_published(self):
+        unresolved = proposal()
+        unresolved.update({
+            "client_project": "", "clockify_project_suffix": "",
+            "tag_suffixes": [], "tag_names": [], "billable": False,
+            "routing_disposition": "unresolved-routing",
+            "review_warnings": [{
+                "type": "unresolved_routing",
+                "disposition": "unresolved-routing",
+                "reason_code": "no_deterministic_route",
+            }],
+        })
+        for candidate, destination, absent in (
+            (proposal(), "September 2026 review", "unresolved-evidence"),
+            (unresolved, "unresolved-evidence", "September 2026 review"),
+        ):
+            with self.subTest(destination=destination):
+                gateway = MultiSheetGateway()
+                result = publisher.publish_proposal_partitions(
+                    gateway,
+                    spreadsheet_id="sheet",
+                    sheet_title="September 2026 review",
+                    template_title="Proposals",
+                    proposals=[candidate],
+                    run_id="run-1",
+                    project_allowlist={},
+                )
+                self.assertEqual(
+                    [destination],
+                    [item["sheet_title"] for item in result["publications"]],
+                )
+                self.assertNotIn(absent, gateway.sheets)
+                self.assertEqual(0, result["clockify_writes"])
+
+    def test_proposal_cli_routes_mixed_payload_to_actual_destination_titles(self):
+        unresolved = proposal(2)
+        unresolved.update({
+            "client_project": "",
+            "clockify_project_suffix": "",
+            "tag_suffixes": [],
+            "tag_names": [],
+            "billable": False,
+            "routing_disposition": "unresolved-routing",
+            "review_warnings": [{
+                "type": "unresolved_routing",
+                "disposition": "unresolved-routing",
+                "reason_code": "no_deterministic_route",
+            }],
+        })
+        gateway = MultiSheetGateway()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "proposals.json").write_text(json.dumps([proposal(1), unresolved]))
+            routing_path = root / "routing.json"
+            routing_path.write_text(json.dumps({
+                "session_routes": [], "meeting_routes": [], "evidence_routes": [],
+            }))
+            routing_digest = "sha256:" + hashlib.sha256(routing_path.read_bytes()).hexdigest()
+            (root / "quality.json").write_text(json.dumps({
+                "status": "pass", "summary": {"total_proposals": 2},
+            }))
+            (root / "replay.json").write_text(json.dumps({
+                "status": "pass", "failures": [], "source_run_id": "run-1",
+                "reconciliation_binding": {"routing_sha256": routing_digest},
+            }))
+            output = io.StringIO()
+            with mock.patch.object(publisher, "GwsSheetsGateway", return_value=gateway), \
+                 contextlib.redirect_stdout(output):
+                publisher.main([
+                    "--spreadsheet-id", "sheet",
+                    "--sheet-title", "September 2026 review",
+                    "--proposals", str(root / "proposals.json"),
+                    "--quality-report", str(root / "quality.json"),
+                    "--replay-integrity", str(root / "replay.json"),
+                    "--routing-snapshot", str(routing_path),
+                    "--run-id", "run-1",
+                    "--enable-write",
+                ])
+
+        result = json.loads(output.getvalue())
+        self.assertEqual(
+            ["September 2026 review", "unresolved-evidence"],
+            [item["sheet_title"] for item in result["publications"]],
+        )
+        self.assertEqual(0, result["clockify_writes"])
+
+    def test_all_partitions_validate_before_the_first_sheet_mutation(self):
+        invalid_unresolved = proposal(2)
+        invalid_unresolved.update({
+            "client_project": "", "clockify_project_suffix": "",
+            "tag_suffixes": [], "tag_names": [], "billable": False,
+            "routing_disposition": "unresolved-routing",
+            "review_warnings": [],
+        })
+        gateway = MultiSheetGateway()
+
+        with self.assertRaisesRegex(publisher.PublicationError, "unresolved nonbillable"):
+            publisher.publish_proposal_partitions(
+                gateway,
+                spreadsheet_id="sheet",
+                sheet_title="September 2026 review",
+                template_title="Proposals",
+                proposals=[proposal(1), invalid_unresolved],
+                run_id="run-1",
+                project_allowlist={},
+            )
+
+        self.assertEqual([], gateway.created)
+        self.assertEqual([], gateway.updated)
+        self.assertEqual([], gateway.appended)
 
 
 if __name__ == "__main__":

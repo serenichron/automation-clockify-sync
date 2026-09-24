@@ -87,6 +87,7 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
         calendly_status: str = "complete", calendly_optional: bool,
         fathom_status: str = "complete",
         machines: tuple[str, ...] = (),
+        machine_statuses: dict[str, tuple[str, str]] | None = None,
         compatibility_version: str = "source-debt/v1",
     ) -> dict[str, object]:
         """Create a real, raw-evidence-bound collector bundle for audit tests."""
@@ -115,8 +116,13 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
             "multica_issues": {"status": "complete", "issues": []},
             "sessions": [
                 {
-                    "machine": machine, "status": "complete",
-                    "repository_evidence_status": "complete",
+                    "machine": machine,
+                    "status": (machine_statuses or {}).get(
+                        machine, ("complete", "complete")
+                    )[0],
+                    "repository_evidence_status": (machine_statuses or {}).get(
+                        machine, ("complete", "complete")
+                    )[1],
                     "repository_events": [],
                 }
                 for machine in machines
@@ -864,6 +870,61 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
         debts = store.active()
         self.assertEqual(1, len(debts))
         self.assertEqual("peer/macbook", debts[0].interval.source)
+
+    def test_peer_recovery_projects_each_missing_facet_into_audit_frontiers(self):
+        """Shared transport debt must not hide either configured source facet."""
+        write_json(self.root / "fleet.json", {
+            "machines": [{"name": "macbook", "enabled": True}],
+        })
+        source = self.verified_audit_stage(
+            "audit-peer-gap", since=dt.date(2026, 9, 7),
+            until=dt.date(2026, 9, 9), calendly_optional=False,
+            machines=("macbook",),
+            machine_statuses={"macbook": ("unavailable", "unavailable")},
+        )
+        self.write_audit_state([source])
+        store = source_coverage.SourceDebtStore()
+        peer_interval = source_coverage.SourceInterval(
+            source="peer/macbook",
+            since_utc=str(source["since_utc"]),
+            until_utc=str(source["until_utc"]),
+            slice_id=str(source["slice_id"]),
+            compatibility_version=str(source["compatibility_version"]),
+        )
+        store.record_failure(
+            peer_interval,
+            failure_class="coverage_incomplete",
+            retryable=True,
+            resume_state_digest="sha256:" + "8" * 64,
+            attempted_at="2026-09-08T00:00:00Z",
+        )
+        peer = store.active()[0]
+        store.record_complete(
+            peer.interval,
+            completion_bundle_digest="sha256:" + "9" * 64,
+            completed_at="2026-09-09T00:00:00Z",
+        )
+        source_coverage.write(
+            self.state_dir / "source-coverage.json", store.document()
+        )
+
+        report = cycle.source_interval_coverage_audit(self.config)
+
+        facets = {
+            row["source"]: row for row in report["intervals"]
+            if row["source"] in {"sessions/macbook", "repositories/macbook"}
+        }
+        self.assertEqual(
+            {"sessions/macbook", "repositories/macbook"}, set(facets)
+        )
+        self.assertEqual({"resolved"}, {row["status"] for row in facets.values()})
+        self.assertEqual({peer.debt_id}, {row["operational_debt_id"] for row in facets.values()})
+        self.assertEqual(
+            "2026-09-08T21:00:00Z", report["frontiers"]["sessions/macbook"]
+        )
+        self.assertEqual(
+            "2026-09-08T21:00:00Z", report["frontiers"]["repositories/macbook"]
+        )
 
     def test_old_release_incomplete_bundle_is_recovery_parent_not_current_source(self):
         """Catches direct adoption/publication of a deterministic old-release bundle."""

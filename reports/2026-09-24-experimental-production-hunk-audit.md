@@ -5,58 +5,61 @@ Bounded range: `1a09002f4450d24ea399ef8ed8afece82fe77495..5dc10eb61405751672856b
 Production-only diff SHA-256: `a9eedd80bb1944d62b57050f46b4c2f1e0796b7aea7142ca98fe13c34504a88d`
 
 Every retained production hunk in the bounded range is listed once below. The
-guarantee number refers to the six guarantees in
+behavior names and acceptance examples come from the current
 `docs/superpowers/specs/2026-09-22-clockify-consumer-owned-verification-design.md`.
 No hunk is treated as justified merely by broad-suite coverage.
 
-| File and hunk | Guarantee | Focused regression test |
-|---|---:|---|
-| `clockify_review_cycle.py @@ -83,0 +84,4` | 2 | `test_quality_failure_persists_exact_peer_debt_from_verified_collector_source` |
-| `clockify_review_cycle.py @@ -965 +969` | 2 | `test_quality_failure_persists_exact_peer_debt_from_verified_collector_source` |
-| `clockify_review_cycle.py @@ -1098,0 +1103,173` | 2 | `test_quality_failure_persists_exact_peer_debt_from_verified_collector_source` |
-| `clockify_review_cycle.py @@ -1114,8 +1291,22` | 2 | `test_delivered_legacy_source_and_replay_bind_historical_runtime_once` |
-| `clockify_review_cycle.py @@ -1150,11 +1341,28` | 2 | `test_old_release_incomplete_bundle_is_recovery_parent_not_current_source` |
-| `clockify_review_cycle.py @@ -1377,0 +1586,11` | 2 | `test_exact_debt_preserves_verified_opaque_collector_compatibility` |
-| `clockify_review_cycle.py @@ -1620,2 +1839,8` | 2 | `test_generic_retry_resolves_only_after_verified_complete_bundle` |
-| `clockify_review_cycle.py @@ -1980,2 +2205,8` | 2 | `test_recovery_accepts_raw_parent_after_only_derived_artifact_drift` |
-| `clockify_review_cycle.py @@ -2001 +2232,5` | 2 | `test_recovery_accepts_raw_parent_after_only_derived_artifact_drift` |
-| `clockify_review_cycle.py @@ -2293,2 +2528,2` | 2 | `test_old_release_incomplete_bundle_is_recovery_parent_not_current_source` |
-| `clockify_review_cycle.py @@ -2297,0 +2533,2` | 2 | `test_old_release_incomplete_bundle_is_recovery_parent_not_current_source` |
-| `clockify_review_cycle.py @@ -2309,0 +2547` | 2 | `test_quality_failure_persists_exact_peer_debt_from_verified_collector_source` |
-| `clockify_review_cycle.py @@ -2348,0 +2587,8` | 2 | `test_quality_failure_persists_exact_peer_debt_from_verified_collector_source` |
-| `clockify_review_cycle.py @@ -2350 +2596,7` | 2 | `test_delivered_legacy_source_and_replay_bind_historical_runtime_once` |
-| `clockify_review_cycle.py @@ -2352,5 +2604,22` | 2 | `test_quality_failure_persists_exact_peer_debt_from_verified_collector_source` |
-| `clockify_review_run.py @@ -23 +23` | 4 | `test_reused_collector_bundle_derives_in_immutable_attempt_with_split_runtime_provenance` |
-| `clockify_review_run.py @@ -53,0 +54,7` | 4 | `test_reused_collector_bundle_derives_in_immutable_attempt_with_split_runtime_provenance` |
-| `clockify_review_run.py @@ -518 +525,7` | 1 | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
-| `clockify_review_run.py @@ -531 +544` | 1 | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
-| `clockify_review_run.py @@ -645,2 +658,2` | 1 | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
-| `clockify_review_run.py @@ -656,0 +670` | 1 | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
-| `clockify_review_run.py @@ -658,0 +673` | 1 | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
-| `clockify_review_run.py @@ -666 +681` | 1 | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
-| `clockify_review_run.py @@ -670,0 +686,22` | 1 | `test_collector_derivation_verifier_rejects_symlinked_lineage_file` |
-| `clockify_review_run.py @@ -811,0 +849,345` | 5 | `test_reused_collector_bundle_derives_in_immutable_attempt_with_split_runtime_provenance`; `test_collector_derivation_successfully_finalizes_verified_completion` |
-| `clockify_review_run.py @@ -1491,0 +1874` | 5 | `test_collector_derivation_successfully_finalizes_verified_completion` |
-| `clockify_review_run.py @@ -1497 +1880,5` | 5 | `test_collector_derivation_successfully_finalizes_verified_completion` |
-| `clockify_review_run.py @@ -1501,0 +1889,2` | 5 | `test_collector_derivation_successfully_finalizes_verified_completion` |
-| `clockify_review_run.py @@ -1836,0 +2226,9` | 5 | `test_fresh_collection_adopts_terminal_derivation_without_overwrite` |
-| `clockify_source_debt_recover.py @@ -384 +384` | 5 | `test_recovery_accepts_raw_parent_after_only_derived_artifact_drift` |
-| `clockify_source_debt_recover.py @@ -441,2 +441,19` | 5 | `test_recovery_accepts_raw_parent_after_only_derived_artifact_drift` |
-| `clockify_sync_collect.py @@ -54,0 +55` | 1 | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
-| `clockify_sync_collect.py @@ -78,0 +80` | 1 | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
-| `clockify_sync_collect.py @@ -4299 +4301,3` | 1 | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
-| `collector_receipts.py @@ -10,0 +11` | 1 | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
-| `collector_receipts.py @@ -14,0 +16,5` | 1 | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
-| `collector_receipts.py @@ -30,0 +37,7` | 1 | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
-| `collector_receipts.py @@ -89,0 +103,24` | 1 | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
-| `collector_receipts.py @@ -270,0 +308,24` | 1 | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
-| `collector_receipts.py @@ -319,0 +381,9` | 1 | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
-| `collector_receipts.py @@ -483,0 +554,149` | 1 | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
+| File and hunk | Named behavior / acceptance example | Focused regression test |
+|---|---|---|
+| `clockify_review_cycle.py @@ -83,0 +84,4` | Explicit source gaps and contiguous progress (examples 1–2) | `test_quality_failure_persists_exact_peer_debt_from_verified_collector_source` |
+| `clockify_review_cycle.py @@ -965 +969` | Explicit source gaps and contiguous progress (examples 1–2) | `test_quality_failure_persists_exact_peer_debt_from_verified_collector_source` |
+| `clockify_review_cycle.py @@ -1098,0 +1103,173` | Explicit source gaps and contiguous progress (examples 1–2) | `test_quality_failure_persists_exact_peer_debt_from_verified_collector_source` |
+| `clockify_review_cycle.py @@ -1114,8 +1291,22` | Explicit source gaps and contiguous progress (examples 1–2) | `test_delivered_legacy_source_and_replay_bind_historical_runtime_once` |
+| `clockify_review_cycle.py @@ -1150,11 +1341,28` | Explicit source gaps and contiguous progress (examples 1–2) | `test_old_release_incomplete_bundle_is_recovery_parent_not_current_source` |
+| `clockify_review_cycle.py @@ -1377,0 +1586,11` | Explicit source gaps and contiguous progress (examples 1–2) | `test_exact_debt_preserves_verified_opaque_collector_compatibility` |
+| `clockify_review_cycle.py @@ -1620,2 +1839,8` | Explicit source gaps and contiguous progress (examples 1–2) | `test_generic_retry_resolves_only_after_verified_complete_bundle` |
+| `clockify_review_cycle.py @@ -1980,2 +2205,8` | Explicit source gaps and contiguous progress (examples 1–2) | `test_recovery_accepts_raw_parent_after_only_derived_artifact_drift` |
+| `clockify_review_cycle.py @@ -2001 +2232,5` | Explicit source gaps and contiguous progress (examples 1–2) | `test_recovery_accepts_raw_parent_after_only_derived_artifact_drift` |
+| `clockify_review_cycle.py @@ -2293,2 +2528,2` | Explicit source gaps and contiguous progress (examples 1–2) | `test_old_release_incomplete_bundle_is_recovery_parent_not_current_source` |
+| `clockify_review_cycle.py @@ -2297,0 +2533,2` | Explicit source gaps and contiguous progress (examples 1–2) | `test_old_release_incomplete_bundle_is_recovery_parent_not_current_source` |
+| `clockify_review_cycle.py @@ -2309,0 +2547` | Explicit source gaps and contiguous progress (examples 1–2) | `test_quality_failure_persists_exact_peer_debt_from_verified_collector_source` |
+| `clockify_review_cycle.py @@ -2348,0 +2587,8` | Explicit source gaps and contiguous progress (examples 1–2) | `test_quality_failure_persists_exact_peer_debt_from_verified_collector_source` |
+| `clockify_review_cycle.py @@ -2350 +2596,7` | Explicit source gaps and contiguous progress (examples 1–2) | `test_delivered_legacy_source_and_replay_bind_historical_runtime_once` |
+| `clockify_review_cycle.py @@ -2352,5 +2604,22` | Explicit source gaps and contiguous progress (examples 1–2) | `test_quality_failure_persists_exact_peer_debt_from_verified_collector_source` |
+| `clockify_review_run.py @@ -23 +23` | Snapshot-only replay with original-run lineage (example 5) | `test_reused_collector_bundle_derives_in_immutable_attempt_with_split_runtime_provenance` |
+| `clockify_review_run.py @@ -53,0 +54,7` | Snapshot-only replay with original-run lineage (example 5) | `test_reused_collector_bundle_derives_in_immutable_attempt_with_split_runtime_provenance` |
+| `clockify_review_run.py @@ -518 +525,7` | Exact saved evidence for reproducible replay (example 5) | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
+| `clockify_review_run.py @@ -531 +544` | Exact saved evidence for reproducible replay (example 5) | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
+| `clockify_review_run.py @@ -645,2 +658,2` | Exact saved evidence for reproducible replay (example 5) | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
+| `clockify_review_run.py @@ -656,0 +670` | Exact saved evidence for reproducible replay (example 5) | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
+| `clockify_review_run.py @@ -658,0 +673` | Exact saved evidence for reproducible replay (example 5) | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
+| `clockify_review_run.py @@ -666 +681` | Exact saved evidence for reproducible replay (example 5) | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
+| `clockify_review_run.py @@ -670,0 +686,22` | Exact saved evidence for reproducible replay (example 5) | `test_collector_derivation_verifier_rejects_symlinked_lineage_file` |
+| `clockify_review_run.py @@ -811,0 +849,345` | Distinct recovery attempts and completed-attempt adoption (example 5) | `test_reused_collector_bundle_derives_in_immutable_attempt_with_split_runtime_provenance`; `test_collector_derivation_successfully_finalizes_verified_completion` |
+| `clockify_review_run.py @@ -1491,0 +1874` | Distinct recovery attempts and completed-attempt adoption (example 5) | `test_collector_derivation_successfully_finalizes_verified_completion` |
+| `clockify_review_run.py @@ -1497 +1880,5` | Distinct recovery attempts and completed-attempt adoption (example 5) | `test_collector_derivation_successfully_finalizes_verified_completion` |
+| `clockify_review_run.py @@ -1501,0 +1889,2` | Distinct recovery attempts and completed-attempt adoption (example 5) | `test_collector_derivation_successfully_finalizes_verified_completion` |
+| `clockify_review_run.py @@ -1836,0 +2226,9` | Distinct recovery attempts and completed-attempt adoption (example 5) | `test_fresh_collection_adopts_terminal_derivation_without_overwrite` |
+| `clockify_source_debt_recover.py @@ -384 +384` | Distinct recovery attempts and completed-attempt adoption (example 5) | `test_recovery_accepts_raw_parent_after_only_derived_artifact_drift` |
+| `clockify_source_debt_recover.py @@ -441,2 +441,19` | Distinct recovery attempts and completed-attempt adoption (example 5) | `test_recovery_accepts_raw_parent_after_only_derived_artifact_drift` |
+| `clockify_sync_collect.py @@ -54,0 +55` | Exact saved evidence for reproducible replay (example 5) | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
+| `clockify_sync_collect.py @@ -78,0 +80` | Exact saved evidence for reproducible replay (example 5) | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
+| `clockify_sync_collect.py @@ -4299 +4301,3` | Exact saved evidence for reproducible replay (example 5) | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
+| `collector_receipts.py @@ -10,0 +11` | Exact saved evidence for reproducible replay (example 5) | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
+| `collector_receipts.py @@ -14,0 +16,5` | Exact saved evidence for reproducible replay (example 5) | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
+| `collector_receipts.py @@ -30,0 +37,7` | Exact saved evidence for reproducible replay (example 5) | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
+| `collector_receipts.py @@ -89,0 +103,24` | Exact saved evidence for reproducible replay (example 5) | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
+| `collector_receipts.py @@ -270,0 +308,24` | Exact saved evidence for reproducible replay (example 5) | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
+| `collector_receipts.py @@ -319,0 +381,9` | Exact saved evidence for reproducible replay (example 5) | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
+| `collector_receipts.py @@ -483,0 +554,149` | Exact saved evidence for reproducible replay (example 5) | `test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence` |
 
 Result: 41 of 41 production hunks are retained and mapped exactly once. No
-unmapped production hunk remains in the bounded range. Guarantees 3 and 6 are
-also locked by the exact reviewed Task 1 unresolved-routing port from commit
-`943bb23` and the publication delivery tests. Those additional schema,
+unmapped production hunk remains in the bounded range. The remaining current
+behaviors—exact-match suppression, full proposals for partial overlap,
+same-meeting deduplication without collapsing simultaneous work, separate
+unresolved-evidence publication, pending/unposted readback, retry convergence,
+and zero Clockify writes—are locked by the reviewed Task 1 port from commit
+`943bb23` and the publication/reconciliation tests. Those additional schema,
 accounting, quality, and publication hunks are outside this historical bounded
 range and are identified separately in the Task 3 report.
 
@@ -112,3 +115,27 @@ remain three visible singleton meetings with a `multiple_candidates` exception.
 Fresh verification for this variant: all 29 meeting reconciliation tests
 passed; the complete offline suite passed 1,324 tests with 2 skips; and
 `python -m compileall -q scripts tests` plus `git diff --check` both exited 0.
+
+## Combined-candidate review corrections
+
+The final combined-candidate review identified three remaining consistency
+gaps. Each is now tied to a current spec behavior and an executable example:
+
+| Review finding | Current behavior / example | Focused regression |
+|---|---|---|
+| Routed and unresolved proposals shared the monthly review destination. | Unresolved evidence remains visible on the separate `unresolved-evidence` tab; every row is pending/unposted, read back exactly, and receipt-bound (examples 6–8). | `test_mixed_proposals_publish_to_distinct_tabs_with_independent_receipts`; `test_proposal_cli_routes_mixed_payload_to_actual_destination_titles`; `test_only_nonempty_proposal_partition_is_published`; `test_all_partitions_validate_before_the_first_sheet_mutation` |
+| Shared `peer/<machine>` recovery hid its required session and repository facets in the audit and frontiers. | Operational retry identity stays shared, while every unavailable configured source is explicitly named and advances only after exact recovery (examples 1–2). | `test_peer_recovery_projects_each_missing_facet_into_audit_frontiers`; `test_two_facets_for_one_machine_coalesce_into_one_peer_debt` |
+| The historical hunk table referred to superseded numbered guarantees. | The table now names the current run, reconciliation, publication, and progress behaviors and cites their acceptance examples directly. | Human-readable audit consistency review plus `git diff --check` |
+
+The publication gateway regressions verify mixed, routed-only, unresolved-only,
+and retry paths against actual tab titles. Receipt identities bind the exact
+spreadsheet, destination, stable row IDs, and row-content digest; retries keep
+the same identity. Both partitions are validated before the first Sheet
+mutation. No Clockify adapter is present in this path, and the tests assert
+`clockify_writes == 0`.
+
+Fresh verification after these corrections: 49 Sheet publication tests, 135
+review-cycle tests, 13 review-acceptance tests, and 17 portfolio-review tests
+passed. The complete offline suite passed 1,329 tests with 2 expected skips.
+No network, inference, Google Sheets, Clockify, systemd, Multica, merge, push,
+deployment, or other external mutation was performed.
