@@ -195,6 +195,64 @@ class SheetPublicationTests(unittest.TestCase):
         self.assertEqual("unposted", row[13])
         self.assertEqual("", row[14])
 
+    def test_unresolved_routing_marker_is_validated_and_serialized_in_reason(self):
+        candidate = proposal()
+        candidate.update({
+            "client_project": "",
+            "clockify_project_suffix": "",
+            "tag_suffixes": [],
+            "tag_names": [],
+            "billable": False,
+            "routing_disposition": "unresolved-routing",
+            "review_warnings": [{
+                "type": "unresolved_routing",
+                "disposition": "unresolved-routing",
+                "reason_code": "no_deterministic_route",
+            }],
+        })
+
+        row = publisher.proposal_row(candidate, "run-1")
+
+        self.assertEqual("", row[4])
+        self.assertEqual("", row[5])
+        self.assertEqual("pending", row[9])
+        self.assertEqual(candidate["review_warnings"], json.loads(row[12]))
+        self.assertEqual("unposted", row[13])
+
+    def test_blank_route_fields_require_exact_unresolved_nonbillable_contract(self):
+        valid = proposal()
+        valid.update({
+            "client_project": "",
+            "tag_names": [],
+            "billable": False,
+            "routing_disposition": "unresolved-routing",
+            "review_warnings": [{
+                "type": "unresolved_routing",
+                "disposition": "unresolved-routing",
+                "reason_code": "no_deterministic_route",
+            }],
+        })
+        invalid = {
+            "missing marker": {key: value for key, value in valid.items() if key != "routing_disposition"},
+            "billable unresolved": {**valid, "billable": True},
+            "missing warning": {**valid, "review_warnings": []},
+            "extra unresolved warning": {**valid, "review_warnings": valid["review_warnings"] * 2},
+            "missing project suffix": {key: value for key, value in valid.items() if key != "clockify_project_suffix"},
+            "missing tag suffixes": {key: value for key, value in valid.items() if key != "tag_suffixes"},
+            "null project suffix": {**valid, "clockify_project_suffix": None},
+            "text tag suffixes": {**valid, "tag_suffixes": ""},
+        }
+
+        for name, candidate in invalid.items():
+            with self.subTest(name=name), self.assertRaises(publisher.PublicationError):
+                publisher.proposal_row(candidate, "run-1")
+
+    def test_routed_proposal_rejects_any_present_unknown_routing_disposition(self):
+        for value in (None, "", "unresolved_routing", "other"):
+            candidate = {**proposal(), "routing_disposition": value}
+            with self.subTest(value=value), self.assertRaises(publisher.PublicationError):
+                publisher.proposal_row(candidate, "run-1")
+
     def test_proposal_review_warnings_are_published_in_machine_owned_reason(self):
         candidate = proposal()
         candidate["review_warnings"] = [

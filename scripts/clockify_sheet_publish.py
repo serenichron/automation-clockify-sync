@@ -45,6 +45,9 @@ OVERLAP_WARNING_TYPES = frozenset({
     "review_proposal_overlap",
 })
 MAX_WARNING_TEXT_LENGTH = 256
+UNRESOLVED_ROUTING_WARNING_FIELDS = frozenset({
+    "type", "disposition", "reason_code",
+})
 
 
 class PublicationError(RuntimeError):
@@ -410,6 +413,20 @@ def _validate_review_warning(
         if suffix in projects:
             sanitized["counterpart_project"] = projects[suffix]
         return sanitized
+    elif warning_type == "unresolved_routing":
+        if set(warning) != UNRESOLVED_ROUTING_WARNING_FIELDS:
+            raise PublicationError(
+                "proposal unresolved routing warning has invalid fields"
+            )
+        if warning.get("disposition") != "unresolved-routing":
+            raise PublicationError(
+                "proposal unresolved routing warning has invalid disposition"
+            )
+        if warning.get("reason_code") != "no_deterministic_route":
+            raise PublicationError(
+                "proposal unresolved routing warning has invalid reason code"
+            )
+        return dict(warning)
     else:
         raise PublicationError(f"unsupported proposal review warning type: {warning_type}")
 
@@ -418,6 +435,11 @@ def proposal_row(
     proposal: Mapping[str, Any], run_id: str, *,
     project_allowlist: Mapping[str, str] | None = None,
 ) -> list[Any]:
+    if (
+        "routing_disposition" in proposal
+        and proposal["routing_disposition"] != "unresolved-routing"
+    ):
+        raise PublicationError("proposal routing disposition is invalid")
     tags = proposal.get("tag_names", [])
     if isinstance(tags, str):
         tag_text = tags
@@ -434,6 +456,33 @@ def proposal_row(
         _validate_review_warning(warning, project_allowlist or {})
         for warning in warnings
     ]
+    project = str(proposal.get("client_project") or "").strip()
+    route_is_blank = not project or not tag_text.strip()
+    unresolved = proposal.get("routing_disposition") == "unresolved-routing"
+    unresolved_warnings = [
+        warning for warning in sanitized_warnings
+        if warning.get("type") == "unresolved_routing"
+    ]
+    if route_is_blank:
+        if not (
+            unresolved
+            and proposal.get("client_project") == ""
+            and isinstance(proposal.get("clockify_project_suffix"), str)
+            and proposal["clockify_project_suffix"] == ""
+            and isinstance(proposal.get("tag_suffixes"), list)
+            and proposal["tag_suffixes"] == []
+            and isinstance(proposal.get("tag_names"), list)
+            and proposal["tag_names"] == []
+            and proposal.get("billable") is False
+            and len(unresolved_warnings) == 1
+        ):
+            raise PublicationError(
+                "blank proposal route requires the unresolved nonbillable contract"
+            )
+    elif unresolved or unresolved_warnings:
+        raise PublicationError(
+            "unresolved routing markers require blank proposal route fields"
+        )
     warning_text = (
         json.dumps(sanitized_warnings, ensure_ascii=False, sort_keys=True)
         if sanitized_warnings else ""
@@ -443,7 +492,7 @@ def proposal_row(
         _timestamp(proposal.get("start")),
         _timestamp(proposal.get("end")),
         int(proposal.get("duration_minutes") or 0),
-        str(proposal.get("client_project") or ""),
+        project,
         tag_text,
         str(proposal.get("activity_id") or ""),
         str(proposal.get("confidence") or ""),

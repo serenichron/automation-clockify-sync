@@ -167,6 +167,52 @@ class QualityMatchingTests(unittest.TestCase):
             report["reviews"][0]["issues"],
         )
 
+    def test_report_allows_exact_unresolved_routing_contract(self):
+        row = proposal(
+            client_project="",
+            clockify_project_suffix="",
+            tag_suffixes=[],
+            tag_names=[],
+            billable=False,
+            routing_disposition="unresolved-routing",
+            review_warnings=[{
+                "type": "unresolved_routing",
+                "disposition": "unresolved-routing",
+                "reason_code": "no_deterministic_route",
+            }],
+            description="SC — Preserved evidence-backed work for routing review",
+        )
+
+        report = quality.build_report("run-1", [row], {}, [])
+
+        self.assertEqual("pass", report["status"])
+        self.assertEqual([], report["reviews"][0]["issues"])
+
+    def test_report_blocks_unresolved_routing_warning_with_unknown_field(self):
+        row = proposal(
+            client_project="",
+            clockify_project_suffix="",
+            tag_suffixes=[],
+            tag_names=[],
+            billable=False,
+            routing_disposition="unresolved-routing",
+            review_warnings=[{
+                "type": "unresolved_routing",
+                "disposition": "unresolved-routing",
+                "reason_code": "no_deterministic_route",
+                "detail": "private routing context",
+            }],
+            description="SC — Preserved evidence-backed work for routing review",
+        )
+
+        report = quality.build_report("run-1", [row], {}, [])
+
+        self.assertEqual("blocked", report["status"])
+        self.assertIn(
+            "Unresolved routing contract is invalid",
+            report["reviews"][0]["issues"],
+        )
+
     def test_report_blocks_invalid_window_and_duplicate_candidate_key(self):
         first = proposal(
             id="P001",

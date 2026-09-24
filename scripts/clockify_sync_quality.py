@@ -379,6 +379,33 @@ def review_proposal(
     description = str(proposal.get("description") or "")
     flash_reviewed = bool(_provenance(proposal).get("semantic_reviewer_model"))
 
+    unresolved_warning = {
+        "type": "unresolved_routing",
+        "disposition": "unresolved-routing",
+        "reason_code": "no_deterministic_route",
+    }
+    warnings = proposal.get("review_warnings")
+    unresolved_warnings = (
+        [warning for warning in warnings if isinstance(warning, dict) and warning.get("type") == "unresolved_routing"]
+        if isinstance(warnings, list)
+        else []
+    )
+    has_unresolved_contract = (
+        proposal.get("client_project") == ""
+        or "routing_disposition" in proposal
+        or bool(unresolved_warnings)
+    )
+    if has_unresolved_contract and not (
+        proposal.get("client_project") == ""
+        and proposal.get("clockify_project_suffix") == ""
+        and proposal.get("tag_suffixes") == []
+        and proposal.get("tag_names") == []
+        and proposal.get("billable") is False
+        and proposal.get("routing_disposition") == "unresolved-routing"
+        and unresolved_warnings == [unresolved_warning]
+    ):
+        issues.append("Unresolved routing contract is invalid")
+
     if proposal.get("allocation_mode") == "non_overlapping_v1":
         try:
             caveman_renderer.validate_description(description)

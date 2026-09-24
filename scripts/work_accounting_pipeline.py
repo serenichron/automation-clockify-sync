@@ -854,6 +854,26 @@ def resolve_route(
     return _apply_prefix_override(route, cited_events, routing), None
 
 
+def _unresolved_route() -> tuple[dict[str, Any], dict[str, str]]:
+    disposition = "unresolved-routing"
+    return (
+        {
+            "project_name": "",
+            "project_suffix": "",
+            "tag_suffixes": [],
+            "tag_names": [],
+            "billable": False,
+            "prefix": "SC",
+            "routing_disposition": disposition,
+        },
+        {
+            "type": "unresolved_routing",
+            "disposition": disposition,
+            "reason_code": "no_deterministic_route",
+        },
+    )
+
+
 _MEETING_IDENTITY_FIELDS = (
     "canonical_meeting_id",
     "cross_provider_meeting_id",
@@ -1357,7 +1377,7 @@ def _proposal(
             "allocation_mode": ALLOCATION_MODE,
         },
     )
-    return {
+    proposal = {
         "id": f"S{segment:03d}",
         "candidate_key": candidate_key,
         "review_activity_key": review_activity_key,
@@ -1398,6 +1418,9 @@ def _proposal(
             "schema_version": activity.get("schema_version"),
         },
     }
+    if route.get("routing_disposition") == "unresolved-routing":
+        proposal["routing_disposition"] = "unresolved-routing"
+    return proposal
 
 
 def run_accounting(
@@ -1678,12 +1701,10 @@ def run_accounting(
             )
         else:
             route, route_error = resolve_route(activity, cited, routing)
+        routing_warnings: list[dict[str, Any]] = []
         if route_error or route is None:
-            if attempt is not None:
-                attempt["failures"].append(str(route_error or "meeting route is unavailable"))
-            else:
-                ambiguous.append({"id": activity_id, "reason": route_error, "exception_kind": "routing", "evidence_ids": evidence_ids})
-            continue
+            route, warning = _unresolved_route()
+            routing_warnings.append(warning)
         if activity.get("semantic_reviewer_model"):
             # The independent Flash reviewer owns semantic clarity and useful
             # wording. Python only assembles its reviewed fields with the
@@ -1747,6 +1768,7 @@ def run_accounting(
                 "description": description,
                 "evidence_ids": evidence_ids,
                 "entry": entry,
+                "review_warnings": routing_warnings,
             })
             attempt["candidate"] = True
             continue
@@ -1774,7 +1796,7 @@ def run_accounting(
         requested_effort = dict(activity.get("effort") or {})
         requested_minutes = int(requested_effort.get("recommended_minutes") or 0)
         observed_capacity = _interval_capacity_minutes(intervals)
-        review_warnings: list[dict[str, Any]] = []
+        review_warnings: list[dict[str, Any]] = list(routing_warnings)
         demand_effort = requested_effort
         if requested_minutes > observed_capacity:
             demand_effort = {
@@ -1837,6 +1859,7 @@ def run_accounting(
             proposal = _proposal(
                 candidate["activity"], candidate["route"], candidate["description"],
                 start, end, entry["source_evidence_ids"], 1,
+                review_warnings=candidate["review_warnings"],
             )
             proposal["provenance"]["canonical_meeting_id"] = meeting_id
             meeting_proposals.append(proposal)
@@ -1871,6 +1894,7 @@ def run_accounting(
             proposal = _proposal(
                 candidate["activity"], candidate["route"], candidate["description"],
                 start, end, candidate["evidence_ids"], segment.index + 1,
+                review_warnings=candidate["review_warnings"],
             )
             proposal["provenance"]["canonical_meeting_id"] = meeting_id
             proposal["provenance"]["timestamped_split_evidence_ids"] = list(segment.evidence_ids)

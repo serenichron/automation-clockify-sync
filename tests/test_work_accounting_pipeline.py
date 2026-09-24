@@ -54,9 +54,21 @@ def assert_schema_valid(schema, candidate) -> None:
             try:
                 validate(declaration["if"], value, path)
             except AssertionError:
-                pass
+                validate(declaration.get("else", {}), value, path)
             else:
                 validate(declaration.get("then", {}), value, path)
+        if "contains" in declaration and isinstance(value, list):
+            matches = 0
+            for index, item in enumerate(value):
+                try:
+                    validate(declaration["contains"], item, f"{path}[{index}]")
+                except AssertionError:
+                    continue
+                matches += 1
+            if matches < declaration.get("minContains", 1):
+                raise AssertionError(f"{path}: too few matching items")
+            if matches > declaration.get("maxContains", len(value)):
+                raise AssertionError(f"{path}: too many matching items")
         if "const" in declaration and value != declaration["const"]:
             raise AssertionError(f"{path}: expected schema constant")
         if "enum" in declaration and value not in declaration["enum"]:
@@ -68,6 +80,7 @@ def assert_schema_valid(schema, candidate) -> None:
             "array": lambda item: isinstance(item, list),
             "string": lambda item: isinstance(item, str),
             "integer": lambda item: isinstance(item, int) and not isinstance(item, bool),
+            "boolean": lambda item: isinstance(item, bool),
             "null": lambda item: item is None,
         }
         if kinds and not any(valid_type[item](value) for item in kinds):
@@ -87,6 +100,8 @@ def assert_schema_valid(schema, candidate) -> None:
         if isinstance(value, list):
             if len(value) < declaration.get("minItems", 0):
                 raise AssertionError(f"{path}: fewer items than schema minimum")
+            if len(value) > declaration.get("maxItems", len(value)):
+                raise AssertionError(f"{path}: more items than schema maximum")
             if declaration.get("uniqueItems") and len({json.dumps(item, sort_keys=True) for item in value}) != len(value):
                 raise AssertionError(f"{path}: duplicate array items")
             if "items" in declaration:
@@ -95,6 +110,8 @@ def assert_schema_valid(schema, candidate) -> None:
         if isinstance(value, str):
             if len(value) < declaration.get("minLength", 0):
                 raise AssertionError(f"{path}: string below schema minimum")
+            if len(value) > declaration.get("maxLength", len(value)):
+                raise AssertionError(f"{path}: string above schema maximum")
             if "pattern" in declaration and not re.search(declaration["pattern"], value):
                 raise AssertionError(f"{path}: string misses schema pattern")
         if isinstance(value, int) and not isinstance(value, bool):
@@ -811,6 +828,163 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             )
 
         self.assertEqual(1, len(result["proposals"]))
+
+    def test_unresolved_routing_emits_nonbillable_evidence_backed_proposal(self):
+        """Catches unrouted evidence being suppressed into an exception."""
+        event = session_event(
+            "unknown:event:1",
+            "2026-07-10T09:00:00+03:00",
+            content="Completed independently evidenced work",
+            span_end="2026-07-10T09:30:00+03:00",
+        )
+        analysis = analysis_for([event.evidence_id], recommended=10)
+        analysis["activities"][0]["project_recommendation"] = {
+            "name": "", "prefix": "", "tag_names": [],
+        }
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        routing_path = Path(temp.name) / "routing.json"
+        write_json(routing_path, {
+            "workspace_id": "workspace-1",
+            "member_id": "member-1",
+            "session_routes": [],
+            "meeting_routes": [],
+            "evidence_routes": [],
+        })
+
+        _run_dir, result = self.make_run(
+            [event], analysis, routing_path=routing_path,
+        )
+
+        self.assertEqual([], result["ambiguous"])
+        self.assertEqual(1, len(result["proposals"]))
+        proposal = result["proposals"][0]
+        self.assertEqual("", proposal["client_project"])
+        self.assertEqual([], proposal["tag_names"])
+        self.assertIs(proposal["billable"], False)
+        self.assertEqual("unresolved-routing", proposal["routing_disposition"])
+        self.assertEqual([f"evidence:{event.evidence_id}"], proposal["source"])
+        self.assertEqual([{
+            "type": "unresolved_routing",
+            "disposition": "unresolved-routing",
+            "reason_code": "no_deterministic_route",
+        }], proposal["review_warnings"])
+
+    def test_unresolved_routing_schema_rejects_incomplete_or_malformed_contracts(self):
+        event = session_event(
+            "unknown:schema:event",
+            "2026-07-10T09:00:00+03:00",
+            span_end="2026-07-10T09:30:00+03:00",
+        )
+        analysis = analysis_for([event.evidence_id], recommended=10)
+        analysis["activities"][0]["project_recommendation"] = {
+            "name": "", "prefix": "", "tag_names": [],
+        }
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        routing_path = Path(temp.name) / "routing.json"
+        write_json(routing_path, {
+            "workspace_id": "workspace-1", "member_id": "member-1",
+            "session_routes": [], "meeting_routes": [], "evidence_routes": [],
+        })
+        _run_dir, result = self.make_run(
+            [event], analysis, routing_path=routing_path,
+        )
+        schema = json.loads(
+            (ROOT / "schemas" / "work-accounting-result-v1.json").read_text()
+        )
+        assert_schema_valid(schema, result)
+        valid = result["proposals"][0]
+        warning = valid["review_warnings"][0]
+        invalid = {
+            "missing project suffix": {key: value for key, value in valid.items() if key != "clockify_project_suffix"},
+            "missing tag suffixes": {key: value for key, value in valid.items() if key != "tag_suffixes"},
+            "missing billable": {key: value for key, value in valid.items() if key != "billable"},
+            "missing disposition": {key: value for key, value in valid.items() if key != "routing_disposition"},
+            "wrong warning disposition": {**valid, "review_warnings": [{**warning, "disposition": "other"}]},
+            "wrong warning reason code": {**valid, "review_warnings": [{**warning, "reason_code": "other"}]},
+            "warning extra field": {**valid, "review_warnings": [{**warning, "private": "payload"}]},
+            "duplicate unresolved warning": {**valid, "review_warnings": [warning, warning]},
+            "valid plus malformed unresolved warning": {
+                **valid,
+                "review_warnings": [warning, {**warning, "private": "payload"}],
+            },
+        }
+
+        for name, proposal in invalid.items():
+            candidate = copy.deepcopy(result)
+            candidate["proposals"] = [proposal]
+            with self.subTest(name=name), self.assertRaises(AssertionError):
+                assert_schema_valid(schema, candidate)
+
+    def test_unresolved_routing_meeting_remains_a_full_fixed_proposal(self):
+        meeting = fathom_event(
+            "2026-07-10T13:00:00+03:00",
+            "2026-07-10T14:00:00+03:00",
+            status="available",
+        )
+        analysis = meeting_analysis(meeting)
+        analysis["activities"][0]["project_recommendation"] = {
+            "name": "", "prefix": "", "tag_names": [],
+        }
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        routing_path = Path(temp.name) / "routing.json"
+        write_json(routing_path, {
+            "workspace_id": "workspace-1", "member_id": "member-1",
+            "session_routes": [], "meeting_routes": [], "evidence_routes": [],
+        })
+
+        _run_dir, result = self.make_run(
+            [meeting], analysis, routing_path=routing_path,
+        )
+
+        self.assertEqual(1, len(result["proposals"]))
+        proposal = result["proposals"][0]
+        self.assertEqual(
+            ("2026-07-10T13:00:00+03:00", "2026-07-10T14:00:00+03:00"),
+            (proposal["start"], proposal["end"]),
+        )
+        self.assertEqual("unresolved-routing", proposal["routing_disposition"])
+        self.assertIs(proposal["billable"], False)
+        self.assertEqual(["unresolved_routing"], [
+            warning["type"] for warning in proposal["review_warnings"]
+        ])
+
+    def test_unresolved_routing_meeting_retains_partial_overlap_warning(self):
+        meeting = fathom_event(
+            "2026-07-10T13:00:00+03:00",
+            "2026-07-10T14:00:00+03:00",
+            status="available",
+        )
+        existing = clockify_event(
+            "2026-07-10T13:30:00+03:00", "2026-07-10T14:30:00+03:00"
+        )
+        analysis = meeting_analysis(meeting)
+        analysis["activities"][0]["project_recommendation"] = {
+            "name": "", "prefix": "", "tag_names": [],
+        }
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        routing_path = Path(temp.name) / "routing.json"
+        write_json(routing_path, {
+            "workspace_id": "workspace-1", "member_id": "member-1",
+            "session_routes": [], "meeting_routes": [], "evidence_routes": [],
+        })
+
+        _run_dir, result = self.make_run(
+            [meeting, existing], analysis, routing_path=routing_path,
+        )
+
+        proposal = result["proposals"][0]
+        self.assertEqual(
+            ["unresolved_routing", "existing_clockify_overlap"],
+            [warning["type"] for warning in proposal["review_warnings"]],
+        )
+        row = sheet_publisher.proposal_row(proposal, "run-unresolved-meeting")
+        self.assertEqual("pending", row[9])
+        self.assertEqual(proposal["review_warnings"], json.loads(row[12]))
+        self.assertEqual("unposted", row[13])
 
     def test_collector_snapshot_local_minute_fathom_reaches_accounting_in_ledger_timezone(self):
         """The collector's local Fathom minute evidence is normalized before deduplication."""

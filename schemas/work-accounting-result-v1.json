@@ -126,13 +126,67 @@
         "end": {"type": "string"},
         "duration_minutes": {"type": "integer", "minimum": 0},
         "duration_seconds": {"type": "integer", "minimum": 1},
-        "client_project": {"type": "string", "minLength": 1},
+        "client_project": {"type": "string"},
+        "clockify_project_suffix": {"type": ["string", "null"]},
+        "tag_suffixes": {"type": "array", "items": {"type": "string"}},
+        "tag_names": {"type": "array", "items": {"type": "string"}},
+        "billable": {"type": "boolean"},
+        "routing_disposition": {"enum": ["unresolved-routing"]},
+        "review_warnings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "if": {
+              "required": ["type"],
+              "properties": {"type": {"const": "unresolved_routing"}}
+            },
+            "then": {"$ref": "#/$defs/unresolvedRoutingWarning"}
+          }
+        },
         "description": {"type": "string", "minLength": 1},
         "rendered_description": {"type": "string", "minLength": 1},
         "source": {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^evidence:ev-[a-f0-9]{64}$"}},
         "allocation_mode": {"const": "non_overlapping_v1"},
         "effort": {"type": "object"},
         "provenance": {"type": "object"}
+      },
+      "allOf": [{
+        "if": {
+          "required": ["routing_disposition"],
+          "properties": {"routing_disposition": {"const": "unresolved-routing"}}
+        },
+        "then": {
+          "required": [
+            "client_project", "clockify_project_suffix", "tag_suffixes",
+            "tag_names", "billable", "routing_disposition", "review_warnings"
+          ],
+          "properties": {
+            "client_project": {"const": ""},
+            "clockify_project_suffix": {"const": ""},
+            "tag_suffixes": {"const": []},
+            "tag_names": {"const": []},
+            "billable": {"const": false},
+            "review_warnings": {
+              "type": "array",
+              "contains": {"$ref": "#/$defs/unresolvedRoutingWarning"},
+              "minContains": 1,
+              "maxContains": 1
+            }
+          }
+        },
+        "else": {
+          "properties": {"client_project": {"minLength": 1}}
+        }
+      }]
+    },
+    "unresolvedRoutingWarning": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "disposition", "reason_code"],
+      "properties": {
+        "type": {"const": "unresolved_routing"},
+        "disposition": {"const": "unresolved-routing"},
+        "reason_code": {"const": "no_deterministic_route"}
       }
     }
   }
