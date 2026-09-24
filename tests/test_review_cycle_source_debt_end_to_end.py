@@ -17,7 +17,9 @@ from scripts import clockify_source_debt_recover as recovery
 from scripts import clockify_sync_collect as collector
 from scripts import collector_receipts, collector_slices, source_coverage
 from scripts.autopilot_process import ChildResult
-from test_review_cycle_delivery import make_run, write_json
+from test_review_cycle_delivery import (
+    make_run, publisher_result_for_command, write_json,
+)
 
 
 class ReviewCycleSourceDebtEndToEndTests(unittest.TestCase):
@@ -500,7 +502,9 @@ class ReviewCycleSourceDebtEndToEndTests(unittest.TestCase):
                 result = self._make_replay(source_dir, replay_number)
                 return ChildResult(0, str(result) + "\n", "", False, 1.0)
             self.assertIn("clockify_sheet_publish.py", command[1])
-            return ChildResult(0, "", "", False, 1.0)
+            return publisher_result_for_command(
+                self.config, command, duration=1.0,
+            )
 
         state = json.loads((self.state_dir / "review-cycle-state.json").read_text())
         state["next_work_class"] = "exact"
@@ -628,7 +632,9 @@ class ReviewCycleSourceDebtEndToEndTests(unittest.TestCase):
                 result = self._make_replay(source_dir, replay_number)
                 return ChildResult(0, str(result) + "\n", "", False, 1.0)
             self.assertIn("clockify_sheet_publish.py", command[1])
-            return ChildResult(0, "", "", False, 1.0)
+            return publisher_result_for_command(
+                self.config, command, duration=1.0,
+            )
 
         with mock.patch.object(cycle, "run_child_bounded", side_effect=restarted_child):
             final = cycle.run_cycle(
@@ -694,7 +700,9 @@ class ReviewCycleSourceDebtEndToEndTests(unittest.TestCase):
                 result = self._make_replay(source_dir, replay_number)
                 return ChildResult(0, str(result) + "\n", "", False, 1.0)
             self.assertIn("clockify_sheet_publish.py", command[1])
-            return ChildResult(0, "", "", False, 1.0)
+            return publisher_result_for_command(
+                self.config, command, duration=1.0,
+            )
 
         with mock.patch.object(cycle, "run_child_bounded", side_effect=child):
             result = cycle.run_cycle(
@@ -782,7 +790,9 @@ class ReviewCycleSourceDebtEndToEndTests(unittest.TestCase):
                 result = self._make_replay(source_dir, replay_number)
                 return ChildResult(0, str(result) + "\n", "", False, 1.0)
             if "clockify_sheet_publish.py" in command[1]:
-                return ChildResult(0, "", "", False, 1.0)
+                return publisher_result_for_command(
+                    self.config, command, duration=1.0,
+                )
             since = dt.date.fromisoformat(command[command.index("--since") + 1])
             until = dt.date.fromisoformat(command[command.index("--until") + 1]) + dt.timedelta(days=1)
             result = make_run(

@@ -249,7 +249,7 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
             if "--recover-source-debt-from" in command:
                 return ChildResult(None, "", "suppressed", True, 0.1)
             if "clockify_sheet_publish.py" in command[1]:
-                return ChildResult(0, "", "", False, 0.1)
+                return _DELIVERY.publisher_result_for_command(self.config, command)
             if "--replay-from" in command:
                 source_dir = Path(command[command.index("--replay-from") + 1])
                 since = dt.date.fromisoformat(source_dir.name.removeprefix("source-"))
@@ -288,7 +288,7 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
             command = list(command)
             commands.append(command)
             if "clockify_sheet_publish.py" in command[1]:
-                return ChildResult(0, "", "", False, 0.1)
+                return _DELIVERY.publisher_result_for_command(self.config, command)
             if "--replay-from" in command:
                 source_dir = Path(command[command.index("--replay-from") + 1])
                 since = dt.date.fromisoformat(source_dir.name.removeprefix("source-"))
@@ -541,7 +541,7 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
             if "--recover-source-debt-from" in command:
                 return ChildResult(None, "", "suppressed", True, 0.1)
             if "clockify_sheet_publish.py" in command[1]:
-                return ChildResult(0, "", "", False, 0.1)
+                return _DELIVERY.publisher_result_for_command(self.config, command)
             if "--replay-from" in command:
                 source_dir = Path(command[command.index("--replay-from") + 1])
                 since = dt.date.fromisoformat(source_dir.name.removeprefix("source-"))
@@ -983,7 +983,7 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
         def historical_child(command, **_kwargs):
             command = list(command)
             if "clockify_sheet_publish.py" in command[1]:
-                return ChildResult(0, "", "", False, 0.1)
+                return _DELIVERY.publisher_result_for_command(self.config, command)
             if "--replay-from" in command:
                 source_dir = Path(command[command.index("--replay-from") + 1])
                 path = make_run(
@@ -1300,7 +1300,7 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
                 )
                 return ChildResult(0, str(result_path) + "\n", "", False, 0.1)
             self.assertIn("clockify_sheet_publish.py", command[1])
-            return ChildResult(0, "", "", False, 0.1)
+            return _DELIVERY.publisher_result_for_command(self.config, command)
 
         def verified(run_dir, **_kwargs):
             bundle = cycle.collector_receipts.load_completion_bundle(

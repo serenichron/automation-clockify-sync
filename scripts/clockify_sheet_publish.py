@@ -11,9 +11,11 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 from typing import Any, Mapping, Protocol, Sequence
 
 try:
@@ -816,6 +818,27 @@ def publish(
     template_title: str,
     rows: Sequence[Sequence[Any]],
 ) -> dict[str, Any]:
+    return _apply_publish_plan(
+        gateway,
+        spreadsheet_id=spreadsheet_id,
+        plan=_plan_publish(
+            gateway,
+            spreadsheet_id=spreadsheet_id,
+            sheet_title=sheet_title,
+            template_title=template_title,
+            rows=rows,
+        ),
+    )
+
+
+def _plan_publish(
+    gateway: SheetsGateway,
+    *,
+    spreadsheet_id: str,
+    sheet_title: str,
+    template_title: str,
+    rows: Sequence[Sequence[Any]],
+) -> dict[str, Any]:
     ids = [str(row[0]) for row in rows]
     if len(ids) != len(set(ids)):
         raise PublicationError("proposal input contains duplicate stable review IDs")
@@ -826,27 +849,19 @@ def publish(
     if created:
         if template_title not in sheets:
             raise PublicationError(f"template Sheet is missing: {template_title}")
-        sheet_id = gateway.duplicate_sheet(
-            spreadsheet_id, sheets[template_title], sheet_title
-        )
-        gateway.prepare_sheet(spreadsheet_id, sheet_id)
-        quoted = _a1_title(sheet_title)
-        row_count = _sheet_row_count(metadata, template_title)
-        gateway.clear_values(spreadsheet_id, f"{quoted}!A2:O{row_count}")
-        gateway.update_values(spreadsheet_id, [{
-            "range": f"{quoted}!A1:O{len(rows) + 1}",
-            "majorDimension": "ROWS",
-            "values": [HEADER, *rows],
-        }])
-        if rows:
-            gateway.prepare_new_rows(spreadsheet_id, sheet_id, 2, len(rows) + 1)
-        _verify_readback(
-            gateway, spreadsheet_id, quoted, max(row_count, len(rows) + 1), rows,
-            new_ids=frozenset(ids),
-        )
-        return {"created": True, "appended": len(rows), "updated": 0, "unchanged": 0}
+        return {
+            "created": True,
+            "sheet_title": sheet_title,
+            "template_sheet_id": sheets[template_title],
+            "quoted_title": _a1_title(sheet_title),
+            "row_count": _sheet_row_count(metadata, template_title),
+            "rows": [list(row) for row in rows],
+            "updates": [],
+            "appends": [],
+            "unchanged": 0,
+            "new_ids": frozenset(ids),
+        }
 
-    gateway.prepare_sheet(spreadsheet_id, sheets[sheet_title])
     quoted = _a1_title(sheet_title)
     row_count = _sheet_row_count(metadata, sheet_title)
     positions, existing = _scan_rows(gateway, spreadsheet_id, quoted, row_count)
@@ -874,18 +889,66 @@ def publish(
             {"range": f"{quoted}!A{row_number}:I{row_number}", "values": [list(row[:9])]},
             {"range": f"{quoted}!K{row_number}:M{row_number}", "values": [list(row[10:13])]},
         ])
+    new_ids = frozenset(str(row[0]) for row in appends)
+    return {
+        "created": False,
+        "sheet_title": sheet_title,
+        "sheet_id": sheets[sheet_title],
+        "quoted_title": quoted,
+        "row_count": row_count,
+        "rows": [list(row) for row in rows],
+        "updates": updates,
+        "appends": [list(row) for row in appends],
+        "unchanged": unchanged,
+        "new_ids": new_ids,
+        "existing_max_row": max(positions.values(), default=1),
+    }
+
+
+def _apply_publish_plan(
+    gateway: SheetsGateway,
+    *,
+    spreadsheet_id: str,
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    rows = plan["rows"]
+    quoted = str(plan["quoted_title"])
+    row_count = int(plan["row_count"])
+    new_ids = frozenset(plan["new_ids"])
+    if plan["created"]:
+        sheet_id = gateway.duplicate_sheet(
+            spreadsheet_id, int(plan["template_sheet_id"]), str(plan["sheet_title"])
+        )
+        gateway.prepare_sheet(spreadsheet_id, sheet_id)
+        gateway.clear_values(spreadsheet_id, f"{quoted}!A2:O{row_count}")
+        gateway.update_values(spreadsheet_id, [{
+            "range": f"{quoted}!A1:O{len(rows) + 1}",
+            "majorDimension": "ROWS",
+            "values": [HEADER, *rows],
+        }])
+        if rows:
+            gateway.prepare_new_rows(spreadsheet_id, sheet_id, 2, len(rows) + 1)
+        _verify_readback(
+            gateway, spreadsheet_id, quoted, max(row_count, len(rows) + 1), rows,
+            new_ids=new_ids,
+        )
+        return {"created": True, "appended": len(rows), "updated": 0, "unchanged": 0}
+
+    sheet_id = int(plan["sheet_id"])
+    gateway.prepare_sheet(spreadsheet_id, sheet_id)
+    updates = plan["updates"]
+    appends = plan["appends"]
     gateway.update_values(spreadsheet_id, updates)
     gateway.append_values(spreadsheet_id, f"{quoted}!A:O", appends)
-    new_ids = frozenset(str(row[0]) for row in appends)
     _prepare_appended_rows(
-        gateway, spreadsheet_id, sheets[sheet_title], quoted,
-        max(row_count, max(positions.values(), default=1) + len(appends)), new_ids,
+        gateway, spreadsheet_id, sheet_id, quoted,
+        max(row_count, int(plan["existing_max_row"]) + len(appends)), new_ids,
     )
     _verify_readback(
         gateway,
         spreadsheet_id,
         quoted,
-        max(row_count, max(positions.values(), default=1) + len(appends)),
+        max(row_count, int(plan["existing_max_row"]) + len(appends)),
         rows,
         new_ids=new_ids,
     )
@@ -893,7 +956,7 @@ def publish(
         "created": False,
         "appended": len(appends),
         "updated": len(updates) // 2,
-        "unchanged": unchanged,
+        "unchanged": int(plan["unchanged"]),
     }
 
 
@@ -911,7 +974,32 @@ def _publication_receipt(
     identity = hashlib.sha256(
         json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     ).hexdigest()
-    return {**payload, "receipt_id": f"sheet-publication/{identity}"}
+    return {
+        **payload,
+        "readback_id": f"sheet-readback/{identity}",
+        "receipt_id": f"sheet-publication/{identity}",
+    }
+
+
+def _write_result(path: Path, document: Mapping[str, Any]) -> None:
+    encoded = (json.dumps(document, sort_keys=True) + "\n").encode("utf-8")
+    if path.exists():
+        if path.is_symlink() or not path.is_file() or path.read_bytes() != encoded:
+            raise PublicationError("existing publication result differs")
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+            temporary = handle.name
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            Path(temporary).unlink(missing_ok=True)
 
 
 def publish_proposal_partitions(
@@ -948,14 +1036,20 @@ def publish_proposal_partitions(
     ids = [str(row[0]) for _destination, rows in partitions for row in rows]
     if len(ids) != len(set(ids)):
         raise PublicationError("proposal input contains duplicate stable review IDs")
-    publications: list[dict[str, Any]] = []
-    for destination, rows in partitions:
-        result = publish(
+    plans = [
+        _plan_publish(
             gateway,
             spreadsheet_id=spreadsheet_id,
             sheet_title=destination,
             template_title=template_title,
             rows=rows,
+        )
+        for destination, rows in partitions
+    ]
+    publications: list[dict[str, Any]] = []
+    for (destination, rows), plan in zip(partitions, plans, strict=True):
+        result = _apply_publish_plan(
+            gateway, spreadsheet_id=spreadsheet_id, plan=plan,
         )
         publications.append({
             "sheet_title": destination,
@@ -965,7 +1059,11 @@ def publish_proposal_partitions(
             ),
             **result,
         })
-    return {"publications": publications, "clockify_writes": 0}
+    return {
+        "schema_version": "sheet-publication-result/v1",
+        "publications": publications,
+        "clockify_writes": 0,
+    }
 
 
 def _json(path: Path) -> Any:
@@ -998,6 +1096,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--replay-integrity", type=Path, required=True)
     parser.add_argument("--routing-snapshot", type=Path)
     parser.add_argument("--run-id", required=True)
+    parser.add_argument("--result-output", type=Path)
     parser.add_argument("--enable-write", action="store_true")
     args = parser.parse_args(argv)
 
@@ -1051,7 +1150,28 @@ def main(argv: list[str] | None = None) -> int:
             template_title=args.template_title,
             rows=rows,
         )
-    print(json.dumps({"status": "published", "external_writes": True, **result}, sort_keys=True))
+    document = {"status": "published", "external_writes": True, **result}
+    if args.result_output is not None:
+        stable_document = document
+        if args.proposals is not None:
+            receipt_fields = (
+                "spreadsheet_id", "sheet_title", "row_ids", "rows_sha256",
+                "readback_id", "receipt_id",
+            )
+            stable_document = {
+                "schema_version": document["schema_version"],
+                "status": document["status"],
+                "external_writes": document["external_writes"],
+                "clockify_writes": document["clockify_writes"],
+                "publications": [
+                    {field: item[field] for field in receipt_fields}
+                    for item in document["publications"]
+                ],
+            }
+        _write_result(args.result_output, stable_document)
+        print(args.result_output.resolve())
+    else:
+        print(json.dumps(document, sort_keys=True))
     return 0
 
 

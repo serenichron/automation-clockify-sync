@@ -33,6 +33,7 @@ try:
         source_coverage,
     )
     from scripts.clockify_sheet_publish import (
+        _publication_receipt,
         project_allowlist,
         proposal_row,
         stable_review_id,
@@ -46,6 +47,7 @@ except ModuleNotFoundError:  # pragma: no cover
     import reconciliation_manifest  # type: ignore[no-redef]
     import source_coverage  # type: ignore[no-redef]
     from clockify_sheet_publish import (  # type: ignore[no-redef]
+        _publication_receipt,
         project_allowlist,
         proposal_row,
         stable_review_id,
@@ -1483,7 +1485,7 @@ def _replay_command(config: Mapping[str, Any], source: Path) -> list[str]:
 
 def _publisher_command(
     config: Mapping[str, Any], source: Mapping[str, Any], replay: Mapping[str, Any],
-    *, sheet_title: str,
+    *, sheet_title: str, result_path: Path,
 ) -> list[str]:
     root = _path(config, "root")
     source_dir = Path(str(source["run_dir"]))
@@ -1498,28 +1500,80 @@ def _publisher_command(
         "--replay-integrity", str(replay_dir / "replay-integrity.json"),
         "--routing-snapshot", str((source_dir / "routing.json").resolve()),
         "--run-id", str(source["run_id"]),
+        "--result-output", str(result_path),
         "--enable-write",
     ]
+
+
+def _expected_publication_receipts(
+    config: Mapping[str, Any], source: Mapping[str, Any], *, sheet_title: str,
+) -> list[dict[str, Any]]:
+    proposals, _exceptions = _validate_accounting(Path(str(source["run_dir"])))
+    source_dir = Path(str(source["run_dir"])).resolve()
+    routing_path = _safe_run_file(
+        source_dir, str(source_dir / "routing.json"), "source routing snapshot"
+    )
+    projects = project_allowlist(_json_file(routing_path, "source routing snapshot"))
+    partitions = (
+        (sheet_title, [
+            item for item in proposals
+            if item.get("routing_disposition") != "unresolved-routing"
+        ]),
+        ("unresolved-evidence", [
+            item for item in proposals
+            if item.get("routing_disposition") == "unresolved-routing"
+        ]),
+    )
+    return [
+        _publication_receipt(
+            spreadsheet_id=str(config["spreadsheet_id"]),
+            sheet_title=title,
+            rows=[
+                proposal_row(
+                    item, str(source["run_id"]), project_allowlist=projects,
+                )
+                for item in members
+            ],
+        )
+        for title, members in partitions if members
+    ]
+
+
+def _publisher_result(
+    stdout: str, runs: Path, expected: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    path = _result(stdout, runs)
+    document = _json_file(path, "publisher result")
+    publications = document.get("publications")
+    if (
+        document.get("schema_version") != "sheet-publication-result/v1"
+        or document.get("status") != "published"
+        or document.get("external_writes") is not True
+        or document.get("clockify_writes") != 0
+        or not isinstance(publications, list)
+    ):
+        raise CycleError("publisher result contract is invalid")
+    retained_fields = (
+        "spreadsheet_id", "sheet_title", "row_ids", "rows_sha256",
+        "readback_id", "receipt_id",
+    )
+    retained = [
+        {field: item.get(field) for field in retained_fields}
+        for item in publications if isinstance(item, Mapping)
+    ]
+    if len(retained) != len(publications) or retained != expected:
+        raise CycleError("publisher result destinations or readbacks differ")
+    return retained
 
 
 def _delivery_document(
     config: Mapping[str, Any], since: str, until: str,
     source: Mapping[str, Any], replay: Mapping[str, Any], *, sheet_title: str,
 ) -> dict[str, Any]:
-    proposals, _exceptions = _validate_accounting(Path(str(source["run_dir"])))
     try:
-        source_dir = Path(str(source["run_dir"])).resolve()
-        routing_path = _safe_run_file(
-            source_dir, str(source_dir / "routing.json"), "source routing snapshot"
+        publication_receipts = _expected_publication_receipts(
+            config, source, sheet_title=sheet_title,
         )
-        routing = _json_file(routing_path, "source routing snapshot")
-        projects = project_allowlist(routing)
-        rows = [
-            proposal_row(
-                item, str(source["run_id"]), project_allowlist=projects,
-            )
-            for item in proposals
-        ]
     except (TypeError, ValueError, RuntimeError) as exc:
         raise CycleError("proposal cannot produce the expected sheet row contract") from exc
     unsigned: dict[str, Any] = {
@@ -1545,7 +1599,7 @@ def _delivery_document(
             )
         },
         "review_ids": list(source["review_ids"]),
-        "expected_row_contract_digest": _value_digest(rows),
+        "publication_receipts": publication_receipts,
     }
     return {**unsigned, "receipt_digest": _value_digest(unsigned)}
 
@@ -2977,6 +3031,9 @@ def _run_slice(
         _persist_state(state_path, state, since, record)
 
     receipt_path = state_dir / "delivery-receipts" / f"{since}.json"
+    publisher_result_path = (
+        _runs_dir(config) / f"publication-{source['run_id']}" / "autopilot-result.json"
+    )
     receipt = _delivery_document(
         config, since, until, source, replay, sheet_title=sheet_title
     )
@@ -2988,7 +3045,10 @@ def _run_slice(
     else:
         try:
             child = _run_budgeted_child(
-                _publisher_command(config, source, replay, sheet_title=sheet_title),
+                _publisher_command(
+                    config, source, replay, sheet_title=sheet_title,
+                    result_path=publisher_result_path,
+                ),
                 root=root, runs_dir=_runs_dir(config),
                 budget=budget, cap=900, grace=30,
                 checkpoint_root=_collector_checkpoint_root(config, os.environ),
@@ -3001,6 +3061,9 @@ def _run_slice(
             record["status"] = "failed"
             _persist_state(state_path, state, since, record)
             return {"status": "failed", "slice": {"since": since, "until": until}}
+        _publisher_result(
+            child.stdout, _runs_dir(config), receipt["publication_receipts"]
+        )
         verified_source = _validate_stage(
             config, Path(str(source["result_path"])), since, until, replay=False,
             expected_snapshot_digests=expected_snapshots,

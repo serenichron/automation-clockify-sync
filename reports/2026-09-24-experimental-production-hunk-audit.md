@@ -139,3 +139,38 @@ review-cycle tests, 13 review-acceptance tests, and 17 portfolio-review tests
 passed. The complete offline suite passed 1,329 tests with 2 expected skips.
 No network, inference, Google Sheets, Clockify, systemd, Multica, merge, push,
 deployment, or other external mutation was performed.
+
+### Dual-tab transaction and durable readback follow-up
+
+A final review found that row validation happened before publication, but an
+existing-row conflict on the second destination could still be discovered only
+after the first destination had mutated. It also found that the scheduler's
+durable receipt still described one combined monthly target instead of the two
+verified publication outcomes.
+
+The publisher now builds complete read-only mutation plans for every nonempty
+partition before applying either plan. Existing-row conflicts, protected human
+decisions, append/update sets, destination existence, template requirements,
+and exact intended rows are therefore validated across both tabs before the
+first write. After application, each destination receives exact readback. The
+publisher writes an immutable, retry-stable result artifact containing the tab,
+stable row IDs, row-content digest, content receipt ID, and readback identity
+for each nonempty destination.
+
+The scheduler requires that artifact, verifies both destination results against
+the immutable source routing snapshot and exact expected rows, and persists the
+two destination receipts inside its delivery receipt. Restart verification
+recomputes and checks the same destination-specific identities; the obsolete
+single combined row-contract digest is no longer authoritative.
+
+Focused regressions:
+
+- `test_unresolved_existing_row_conflict_causes_zero_monthly_mutation`
+- `test_cli_result_artifact_is_stable_across_idempotent_retry`
+- `test_mixed_publication_receipt_binds_both_destinations_on_restart`
+- `test_mixed_publisher_readback_mismatch_blocks_durable_receipt`
+
+Routed-only, unresolved-only, mixed, and idempotent retry cases remain covered.
+All 51 Sheet publication tests and all 137 review-cycle tests pass locally. The
+complete offline suite passes 1,333 tests with 2 expected skips, with zero
+Clockify writes and no live external operation.

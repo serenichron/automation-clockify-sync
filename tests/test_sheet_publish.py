@@ -1344,6 +1344,47 @@ class SheetPublicationTests(unittest.TestCase):
         )
         self.assertEqual(0, result["clockify_writes"])
 
+    def test_cli_result_artifact_is_stable_across_idempotent_retry(self):
+        gateway = MultiSheetGateway()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "proposals.json").write_text(json.dumps([proposal()]))
+            routing_path = root / "routing.json"
+            routing_path.write_text(json.dumps({
+                "session_routes": [], "meeting_routes": [], "evidence_routes": [],
+            }))
+            routing_digest = "sha256:" + hashlib.sha256(routing_path.read_bytes()).hexdigest()
+            (root / "quality.json").write_text(json.dumps({
+                "status": "pass", "summary": {"total_proposals": 1},
+            }))
+            (root / "replay.json").write_text(json.dumps({
+                "status": "pass", "failures": [], "source_run_id": "run-1",
+                "reconciliation_binding": {"routing_sha256": routing_digest},
+            }))
+            result_path = root / "publication" / "autopilot-result.json"
+            argv = [
+                "--spreadsheet-id", "sheet",
+                "--sheet-title", "September 2026 review",
+                "--proposals", str(root / "proposals.json"),
+                "--quality-report", str(root / "quality.json"),
+                "--replay-integrity", str(root / "replay.json"),
+                "--routing-snapshot", str(routing_path),
+                "--run-id", "run-1",
+                "--result-output", str(result_path),
+                "--enable-write",
+            ]
+            with mock.patch.object(publisher, "GwsSheetsGateway", return_value=gateway), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                publisher.main(argv)
+                first = result_path.read_bytes()
+                publisher.main(argv)
+            self.assertEqual(first, result_path.read_bytes())
+            durable = json.loads(first)
+            self.assertEqual(
+                ["September 2026 review"],
+                [item["sheet_title"] for item in durable["publications"]],
+            )
+
     def test_all_partitions_validate_before_the_first_sheet_mutation(self):
         invalid_unresolved = proposal(2)
         invalid_unresolved.update({
@@ -1365,6 +1406,49 @@ class SheetPublicationTests(unittest.TestCase):
                 project_allowlist={},
             )
 
+        self.assertEqual([], gateway.created)
+        self.assertEqual([], gateway.updated)
+        self.assertEqual([], gateway.appended)
+
+    def test_unresolved_existing_row_conflict_causes_zero_monthly_mutation(self):
+        routed = proposal(1)
+        unresolved = proposal(2)
+        unresolved.update({
+            "client_project": "", "clockify_project_suffix": "",
+            "tag_suffixes": [], "tag_names": [], "billable": False,
+            "routing_disposition": "unresolved-routing",
+            "review_warnings": [{
+                "type": "unresolved_routing",
+                "disposition": "unresolved-routing",
+                "reason_code": "no_deterministic_route",
+            }],
+        })
+        prior = publisher.proposal_row(unresolved, "old-run", project_allowlist={})
+        prior[8] = "Immutable approved description"
+        prior[9] = "approved"
+        gateway = MultiSheetGateway()
+        gateway.sheets["unresolved-evidence"] = {
+            "sheet_id": 2, "rows": [publisher.HEADER, prior],
+        }
+        before = {
+            title: [list(row) for row in details["rows"]]
+            for title, details in gateway.sheets.items()
+        }
+
+        with self.assertRaisesRegex(publisher.PublicationError, "approved or posted"):
+            publisher.publish_proposal_partitions(
+                gateway,
+                spreadsheet_id="sheet",
+                sheet_title="September 2026 review",
+                template_title="Proposals",
+                proposals=[routed, unresolved],
+                run_id="run-1",
+                project_allowlist={},
+            )
+
+        self.assertEqual(before, {
+            title: details["rows"] for title, details in gateway.sheets.items()
+        })
         self.assertEqual([], gateway.created)
         self.assertEqual([], gateway.updated)
         self.assertEqual([], gateway.appended)

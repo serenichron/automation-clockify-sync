@@ -20,7 +20,9 @@ from scripts.autopilot_process import ChildResult
 TESTS = Path(__file__).resolve().parent
 if str(TESTS) not in sys.path:
     sys.path.insert(0, str(TESTS))
-from test_review_cycle_delivery import make_run, write_json  # noqa: E402
+from test_review_cycle_delivery import (  # noqa: E402
+    make_run, publisher_result_for_command, write_json,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -317,7 +319,9 @@ class ReviewCycleEntrypointTests(unittest.TestCase):
                 )
                 return ChildResult(0, str(path) + "\n", "", False, 0.1)
             if Path(command[1]).name == "clockify_sheet_publish.py":
-                return ChildResult(remaining_publish_codes.pop(0), "", "", False, 0.1)
+                return publisher_result_for_command(
+                    self.config, command, code=remaining_publish_codes.pop(0),
+                )
             path = make_run(
                 self.root,
                 "source-run",

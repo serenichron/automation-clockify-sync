@@ -44,6 +44,32 @@ def proposal() -> dict[str, object]:
     }
 
 
+def publisher_result_for_command(
+    config: dict[str, object], command: list[str], *, code: int = 0,
+    duration: float = 0.1,
+) -> ChildResult:
+    if code:
+        return ChildResult(code, "", "", False, duration)
+    source_dir = Path(command[command.index("--proposals") + 1]).parent
+    source = {
+        "run_dir": str(source_dir),
+        "run_id": command[command.index("--run-id") + 1],
+    }
+    title = command[command.index("--sheet-title") + 1]
+    publications = cycle._expected_publication_receipts(
+        config, source, sheet_title=title,
+    )
+    path = Path(command[command.index("--result-output") + 1])
+    write_json(path, {
+        "schema_version": "sheet-publication-result/v1",
+        "status": "published",
+        "external_writes": True,
+        "clockify_writes": 0,
+        "publications": publications,
+    })
+    return ChildResult(0, str(path) + "\n", "", False, duration)
+
+
 def make_run(
     root: Path,
     name: str,
@@ -449,13 +475,16 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
                 return ChildResult(0, str(path) + "\n", "", False, 0.1)
             if "clockify_sheet_publish.py" in command[1]:
                 code = remaining_publish_codes.pop(0)
-                return ChildResult(code, "", "", False, 0.1)
+                return self.publisher_child_result(command, code=code)
             path = make_run(
                 self.root, "source-run", replay=False, **(source_options or {})
             )
             return ChildResult(0, str(path) + "\n", "", False, 0.1)
 
         return child
+
+    def publisher_child_result(self, command: list[str], *, code: int = 0) -> ChildResult:
+        return publisher_result_for_command(self.config, command, code=code)
 
     def test_first_success_delivers_once_and_repeat_validates_without_children(self):
         """Catches stopping after review or publishing the same verified slice twice."""
@@ -473,7 +502,7 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
                 )
                 return ChildResult(0, str(path) + "\n", "", False, 0.1)
             if "clockify_sheet_publish.py" in command[1]:
-                return ChildResult(0, "", "", False, 0.1)
+                return self.publisher_child_result(command)
             path = make_run(self.root, "source-run", replay=False)
             return ChildResult(0, str(path) + "\n", "", False, 0.1)
 
@@ -593,6 +622,89 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
                 "clockify_post_approved_portfolio.py" in command[1]
                 for command in commands
             ),
+        )
+
+    def test_mixed_publication_receipt_binds_both_destinations_on_restart(self):
+        """A monthly-only receipt must not hide unresolved-tab durability."""
+        routed = proposal()
+        unresolved = {**proposal(),
+            "review_activity_key": "wka-unresolved",
+            "allocation_segment": 2,
+            "client_project": "",
+            "clockify_project_suffix": "",
+            "tag_suffixes": [],
+            "tag_names": [],
+            "billable": False,
+            "routing_disposition": "unresolved-routing",
+            "review_warnings": [{
+                "type": "unresolved_routing",
+                "disposition": "unresolved-routing",
+                "reason_code": "no_deterministic_route",
+            }],
+        }
+        commands: list[list[str]] = []
+        with mock.patch.object(
+            cycle, "run_child_bounded",
+            side_effect=self.child_for_runs(
+                commands, source_options={"proposals": [routed, unresolved]},
+            ),
+        ):
+            result = cycle.run_cycle(
+                self.config, enable_sheet_write=True, today=dt.date(2026, 9, 10)
+            )
+        self.assertEqual("delivered", result["status"])
+        receipt_path = self.state_dir / "delivery-receipts" / "2026-09-07.json"
+        receipt = json.loads(receipt_path.read_text())
+        self.assertEqual(
+            ["September 2026 portfolio review", "unresolved-evidence"],
+            [item["sheet_title"] for item in receipt["publication_receipts"]],
+        )
+        self.assertTrue(all(item["row_ids"] for item in receipt["publication_receipts"]))
+        self.assertTrue(all(item["readback_id"].startswith("sheet-readback/") for item in receipt["publication_receipts"]))
+
+        receipt["publication_receipts"][1]["readback_id"] = "sheet-readback/tampered"
+        write_json(receipt_path, receipt)
+        with mock.patch.object(
+            cycle, "run_child_bounded", side_effect=AssertionError("child invoked")
+        ), self.assertRaisesRegex(cycle.CycleError, "receipt"):
+            cycle.run_cycle(
+                self.config, enable_sheet_write=True, today=dt.date(2026, 9, 10)
+            )
+
+    def test_mixed_publisher_readback_mismatch_blocks_durable_receipt(self):
+        """The scheduler must parse both publisher readbacks, not infer success."""
+        unresolved = {**proposal(),
+            "review_activity_key": "wka-unresolved",
+            "allocation_segment": 2,
+            "client_project": "", "clockify_project_suffix": "",
+            "tag_suffixes": [], "tag_names": [], "billable": False,
+            "routing_disposition": "unresolved-routing",
+            "review_warnings": [{
+                "type": "unresolved_routing",
+                "disposition": "unresolved-routing",
+                "reason_code": "no_deterministic_route",
+            }],
+        }
+        ordinary = self.child_for_runs(
+            [], source_options={"proposals": [proposal(), unresolved]},
+        )
+
+        def child(command, **kwargs):
+            result = ordinary(command, **kwargs)
+            if "clockify_sheet_publish.py" in list(command)[1]:
+                path = Path(result.stdout.strip())
+                document = json.loads(path.read_text())
+                document["publications"][1]["readback_id"] = "sheet-readback/tampered"
+                write_json(path, document)
+            return result
+
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=child), \
+             self.assertRaisesRegex(cycle.CycleError, "readbacks differ"):
+            cycle.run_cycle(
+                self.config, enable_sheet_write=True, today=dt.date(2026, 9, 10)
+            )
+        self.assertFalse(
+            (self.state_dir / "delivery-receipts" / "2026-09-07.json").exists()
         )
 
     def test_replay_failure_blocks_before_publisher(self):
@@ -1047,7 +1159,14 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
             "SC — review-cycle delivery", "pending", 1, "source-run",
             expected_warning, "unposted", "",
         ]]
-        self.assertEqual(cycle._value_digest(expected_row), receipt["expected_row_contract_digest"])
+        self.assertEqual(
+            cycle._publication_receipt(
+                spreadsheet_id="sheet-1",
+                sheet_title="September 2026 portfolio review",
+                rows=expected_row,
+            ),
+            receipt["publication_receipts"][0],
+        )
         publisher = commands[-1]
         self.assertEqual(
             str((self.root / "runs" / "source-run" / "routing.json").resolve()),
@@ -1067,7 +1186,7 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
             command = list(command)
             commands.append(command)
             if "clockify_sheet_publish.py" in command[1]:
-                return ChildResult(0, "", "", False, 0.1)
+                return self.publisher_child_result(command)
             if "--replay-from" in command:
                 source_dir = Path(command[command.index("--replay-from") + 1])
                 since = dt.date.fromisoformat(source_dir.name.removeprefix("source-"))
