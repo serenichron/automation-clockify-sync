@@ -11,8 +11,9 @@ import unittest
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from scripts import collector_receipts
+from scripts import collector_receipts, evidence_ledger
 from scripts.collector_slices import CollectionSlice
+from task3_scenario_contract import assert_scenario_contract
 
 
 BUCHAREST = ZoneInfo("Europe/Bucharest")
@@ -80,6 +81,41 @@ class CompletionBundleTests(unittest.TestCase):
             "evidence_ledger": {"source_completeness": coverage},
         }) + "\n", encoding="utf-8")
 
+    def _write_bound_collector_raw(self, run_dir: Path) -> None:
+        raw = {
+            "clockify": {"status": "complete", "entries": []},
+            "fathom": {"status": "complete", "meetings": []},
+            "calendly": {"status": "complete", "recordings": []},
+            "multica_issues": {"status": "complete", "issues": []},
+            "sessions": [],
+        }
+        filenames = {
+            "clockify": "clockify-existing.json",
+            "fathom": "fathom-meetings.json",
+            "calendly": "calendly-recordings.json",
+            "multica_issues": "multica-issues.json",
+            "sessions": "sessions.json",
+        }
+        for key, filename in filenames.items():
+            (run_dir / "evidence" / filename).write_text(
+                json.dumps(raw[key]) + "\n", encoding="utf-8"
+            )
+        ledger = evidence_ledger.EvidenceLedger(
+            tuple(evidence_ledger.normalize_collector_snapshot(raw)),
+            evidence_ledger.source_inventory_from_collector(raw),
+        )
+        manifest = ledger.manifest.document()
+        (run_dir / "evidence" / "evidence-ledger.json").write_text(json.dumps({
+            "schema_version": evidence_ledger.SCHEMA_VERSION,
+            "manifest": manifest,
+            "events": [event.document() for event in ledger.events],
+        }) + "\n", encoding="utf-8")
+        report = json.loads((run_dir / "run-report.json").read_text())
+        report["evidence_ledger"] = {
+            "source_completeness": manifest["source_completeness"]
+        }
+        (run_dir / "run-report.json").write_text(json.dumps(report) + "\n")
+
     def test_bundle_binds_every_downstream_artifact_and_rejects_drift(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "run"
@@ -90,6 +126,92 @@ class CompletionBundleTests(unittest.TestCase):
             (run_dir / "quality_report.json").write_text("{}\n", encoding="utf-8")
             with self.assertRaises(collector_receipts.CollectorReceiptError):
                 collector_receipts.verify_completion_bundle(bundle)
+
+    def test_collector_source_bundle_survives_derived_drift_but_binds_raw_evidence(self) -> None:
+        """Catches a later executor making a reusable collector source unverifiable."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            self._write_required_artifacts(run_dir)
+            self._write_bound_collector_raw(run_dir)
+            bundle = collector_receipts.build_completion_bundle(run_dir, slice_=self.slice)
+            bundle_path = run_dir / "completion-bundle.json"
+            collector_receipts.write_completion_bundle(bundle_path, bundle)
+            parent_before = {"completion-bundle.json": bundle_path.read_bytes()}
+
+            (run_dir / "quality_report.json").write_text('{"status":"blocked"}\n')
+            source = collector_receipts.load_collector_source_bundle(
+                bundle_path, run_dir=run_dir
+            )
+
+            self.assertEqual(bundle.bundle_digest, source.legacy_completion_bundle_digest)
+            self.assertEqual({"git_sha": "fixture"}, source.collector_runtime_identity)
+            self.assertEqual(bundle.slice_id, source.slice_id)
+            raw_path = run_dir / "evidence" / "clockify-existing.json"
+            originally_opened = raw_path.read_bytes()
+            replacement = b'{"status":"complete","entries":[{"id":"replacement"}]}\n'
+            real_read = collector_receipts.os.read
+            replaced = False
+
+            def replace_path_after_open(descriptor: int, size: int) -> bytes:
+                nonlocal replaced
+                content = real_read(descriptor, size)
+                if (
+                    not replaced
+                    and content
+                    and collector_receipts.os.fstat(descriptor).st_ino
+                    == raw_path.stat().st_ino
+                ):
+                    replaced = True
+                    displaced = raw_path.with_suffix(".opened")
+                    raw_path.replace(displaced)
+                    raw_path.write_bytes(replacement)
+                return content
+
+            with mock.patch.object(
+                collector_receipts.os, "read", side_effect=replace_path_after_open
+            ):
+                opened = collector_receipts.load_collector_source_bundle(
+                    bundle_path, run_dir=run_dir
+                )
+            self.assertTrue(replaced)
+            self.assertEqual(
+                originally_opened,
+                opened.verified_artifact_bytes["evidence/clockify-existing.json"],
+            )
+            self.assertNotEqual(
+                replacement,
+                opened.verified_artifact_bytes["evidence/clockify-existing.json"],
+            )
+            raw_path.unlink()
+            raw_path.with_suffix(".opened").replace(raw_path)
+            (run_dir / "evidence" / "clockify-existing.json").write_text(
+                '{"status":"complete","entries":[{"id":"mutated"}]}\n'
+            )
+            with self.assertRaisesRegex(
+                collector_receipts.CollectorReceiptError, "raw evidence"
+            ):
+                collector_receipts.load_collector_source_bundle(
+                    bundle_path, run_dir=run_dir
+                )
+            self._write_bound_collector_raw(run_dir)
+            (run_dir / "run-report.json").write_text("{}\n")
+            with self.assertRaisesRegex(
+                collector_receipts.CollectorReceiptError, "collector source"
+            ):
+                collector_receipts.load_collector_source_bundle(
+                    bundle_path, run_dir=run_dir
+                )
+            assert_scenario_contract(
+                self,
+                stable_ids=[source.bundle_digest, source.slice_id],
+                parent_before=parent_before,
+                parent_after={"completion-bundle.json": bundle_path.read_bytes()},
+                emitted_ids=[
+                    f"{artifact.kind}:{artifact.digest}" for artifact in bundle.artifacts
+                ],
+                # This pure receipt path has no Clockify write adapter boundary.
+                clockify_adapter_calls=0,
+            )
 
     def test_replay_bundle_requires_replay_integrity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

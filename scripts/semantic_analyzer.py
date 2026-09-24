@@ -2650,6 +2650,18 @@ class AnalyzerResponseCache:
         self._load()
 
     @staticmethod
+    def _route_identity(endpoint: AnalyzerEndpoint) -> dict[str, str]:
+        route = {
+            "name": endpoint.name,
+            "url": endpoint.url,
+            "model": endpoint.model,
+            "revision": endpoint.revision,
+        }
+        if endpoint.reasoning_effort:
+            route["reasoning_effort"] = endpoint.reasoning_effort
+        return route
+
+    @staticmethod
     def _request_identity(
         endpoint: AnalyzerEndpoint,
         body: Mapping[str, Any],
@@ -2657,14 +2669,9 @@ class AnalyzerResponseCache:
         include_reasoning_effort: bool = True,
     ) -> dict[str, str]:
         body_digest = hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
-        route = {
-            "name": endpoint.name,
-            "url": endpoint.url,
-            "model": endpoint.model,
-            "revision": endpoint.revision,
-        }
-        if include_reasoning_effort and endpoint.reasoning_effort:
-            route["reasoning_effort"] = endpoint.reasoning_effort
+        route = AnalyzerResponseCache._route_identity(endpoint)
+        if not include_reasoning_effort:
+            route.pop("reasoning_effort", None)
         route_digest = hashlib.sha256(
             canonical_json(route).encode("utf-8")
         ).hexdigest()
@@ -2705,7 +2712,10 @@ class AnalyzerResponseCache:
         }
         status = str(value.get("status") or "")
         variant_field = "response" if status == "accepted" else "failure_code"
-        if status not in {"accepted", "rejected"} or set(value) != required | {variant_field}:
+        allowed = required | {variant_field}
+        if "route" in value:
+            allowed.add("route")
+        if status not in {"accepted", "rejected"} or set(value) != allowed:
             raise AnalyzerError(f"analyzer cache line {line_number} has unsupported fields")
         if value.get("schema_version") != ANALYZER_CACHE_SCHEMA_VERSION:
             raise AnalyzerError(f"analyzer cache line {line_number} has an unsupported schema")
@@ -2718,6 +2728,20 @@ class AnalyzerResponseCache:
         for name in ("body_digest", "route_digest", "decision_digest"):
             if not re.fullmatch(r"[a-f0-9]{64}", str(value.get(name) or "")):
                 raise AnalyzerError(f"analyzer cache line {line_number} has an invalid {name}")
+        route = value.get("route")
+        if route is not None:
+            if not isinstance(route, dict) or set(route) not in (
+                {"name", "url", "model", "revision"},
+                {"name", "url", "model", "revision", "reasoning_effort"},
+            ) or any(not isinstance(item, str) for item in route.values()):
+                raise AnalyzerError(f"analyzer cache line {line_number} route is invalid")
+            if route["model"] != value.get("model"):
+                raise AnalyzerError(f"analyzer cache line {line_number} route model differs")
+            expected_route_digest = hashlib.sha256(
+                canonical_json(route).encode("utf-8")
+            ).hexdigest()
+            if expected_route_digest != value.get("route_digest"):
+                raise AnalyzerError(f"analyzer cache line {line_number} route digest differs")
         if not re.fullmatch(r"arc-[a-f0-9]{64}", str(value.get("cache_key") or "")):
             raise AnalyzerError(f"analyzer cache line {line_number} has an invalid cache key")
         expected_key = stable_digest(
@@ -2884,6 +2908,7 @@ class AnalyzerResponseCache:
             "semantic_schema_version": SCHEMA_VERSION,
             "status": "accepted",
             "decision_digest": self._decision_digest(decision),
+            "route": self._route_identity(endpoint),
             "response": response_value,
         }
         self._store_record(record)
@@ -2908,9 +2933,78 @@ class AnalyzerResponseCache:
                 "semantic_schema_version": SCHEMA_VERSION,
                 "status": "rejected",
                 "decision_digest": self._decision_digest(decision),
+                "route": self._route_identity(endpoint),
                 "failure_code": failure_code,
             }
         )
+
+    def sealed_endpoints(self) -> tuple[AnalyzerEndpoint, ...]:
+        """Return credential-free routes sealed into cache records."""
+        routes = {
+            canonical_json(record["route"]): record["route"]
+            for record in self._records.values()
+            if isinstance(record.get("route"), dict)
+        }
+        return tuple(
+            AnalyzerEndpoint(
+                name=route["name"], url=route["url"], model=route["model"],
+                revision=route["revision"],
+                reasoning_effort=route.get("reasoning_effort", ""),
+            )
+            for route in (routes[key] for key in sorted(routes))
+        )
+
+    def records_for_snapshot(
+        self,
+        references: Iterable[Mapping[str, Any]],
+        *,
+        configured_endpoints: Iterable[AnalyzerEndpoint] = (),
+    ) -> tuple[dict[str, Any], ...]:
+        """Return exactly the referenced, route-sealed decisions for one run."""
+        with self._lock:
+            if self.path.exists():
+                self._load()
+            configured_routes: dict[str, dict[str, str]] = {}
+            for endpoint in configured_endpoints:
+                route = self._route_identity(endpoint)
+                variants = [route]
+                if "reasoning_effort" in route:
+                    variants.append({
+                        key: value
+                        for key, value in route.items()
+                        if key != "reasoning_effort"
+                    })
+                for variant in variants:
+                    digest = hashlib.sha256(
+                        canonical_json(variant).encode("utf-8")
+                    ).hexdigest()
+                    configured_routes[digest] = variant
+            selected: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for reference in references:
+                if not isinstance(reference, Mapping) or set(reference) != {
+                    "cache_key", "decision_digest"
+                }:
+                    raise AnalyzerError("analyzer cache snapshot reference is invalid")
+                key = str(reference["cache_key"])
+                digest = str(reference["decision_digest"])
+                if key in seen:
+                    raise AnalyzerError("analyzer cache snapshot reference is duplicated")
+                seen.add(key)
+                record = self._records.get(key)
+                if record is None or record.get("decision_digest") != digest:
+                    raise AnalyzerError("analyzer cache snapshot decision is unavailable")
+                sealed = copy.deepcopy(record)
+                if not isinstance(sealed.get("route"), dict):
+                    route = configured_routes.get(str(sealed.get("route_digest") or ""))
+                    if route is None or route.get("model") != sealed.get("model"):
+                        raise AnalyzerError(
+                            "legacy analyzer cache decision does not match a configured analyzer route"
+                        )
+                    sealed["route"] = copy.deepcopy(route)
+                    sealed = self._validate_record(sealed, line_number=0)
+                selected.append(sealed)
+            return tuple(sorted(selected, key=lambda value: str(value["cache_key"])))
 
     def summary(self) -> dict[str, Any]:
         with self._lock:

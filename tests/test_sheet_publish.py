@@ -195,6 +195,18 @@ class SheetPublicationTests(unittest.TestCase):
         self.assertEqual("unposted", row[13])
         self.assertEqual("", row[14])
 
+    def test_routed_tagless_project_publishes_as_pending(self):
+        """A valid project route must not become unresolved only because tags are empty."""
+        candidate = proposal()
+        candidate["tag_names"] = []
+
+        row = publisher.proposal_row(candidate, "run-1")
+
+        self.assertEqual("Serenichron Level 2", row[4])
+        self.assertEqual("", row[5])
+        self.assertEqual("pending", row[9])
+        self.assertEqual("unposted", row[13])
+
     def test_unresolved_routing_marker_is_validated_and_serialized_in_reason(self):
         candidate = proposal()
         candidate.update({
@@ -213,6 +225,7 @@ class SheetPublicationTests(unittest.TestCase):
 
         row = publisher.proposal_row(candidate, "run-1")
 
+        self.assertEqual("wka-1234567890abcdef12345678-s01", row[0])
         self.assertEqual("", row[4])
         self.assertEqual("", row[5])
         self.assertEqual("pending", row[9])

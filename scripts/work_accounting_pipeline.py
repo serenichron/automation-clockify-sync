@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import tempfile
 from typing import Any, Iterable, Mapping
 
 try:
@@ -84,6 +85,59 @@ def _write_json(path: Path, value: Any) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _write_bytes(path: Path, content: bytes) -> None:
+    """Atomically replace one run-local immutable snapshot."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _seal_analyzer_cache_snapshot(
+    run_dir: Path, analyzer_cache_path: Path, analysis: Mapping[str, Any]
+) -> dict[str, Any]:
+    cache_summary = analysis.get("analyzer_cache")
+    if not isinstance(cache_summary, Mapping) or not isinstance(
+        cache_summary.get("records"), list
+    ):
+        raise WorkAccountingError("semantic analysis lacks used analyzer cache records")
+    primary = semantic_analyzer.AnalyzerEndpoint.from_env(
+        "CLOCKIFY_ANALYZER_PRIMARY",
+        default_model=semantic_analyzer.DEFAULT_PRIMARY_MODEL,
+    )
+    fallback = semantic_analyzer.AnalyzerEndpoint.from_env(
+        "CLOCKIFY_ANALYZER_FALLBACK"
+    )
+    configured_endpoints = tuple(
+        endpoint for endpoint in (primary, fallback) if endpoint is not None
+    )
+    records = semantic_analyzer.AnalyzerResponseCache(
+        analyzer_cache_path
+    ).records_for_snapshot(
+        cache_summary["records"], configured_endpoints=configured_endpoints
+    )
+    content = b"".join(
+        (semantic_analyzer.canonical_json(record) + "\n").encode("utf-8")
+        for record in records
+    )
+    target = run_dir / "analyzer-cache-used.jsonl"
+    _write_bytes(target, content)
+    return {
+        "path": target.name,
+        "record_count": len(records),
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
 
 
 def _parse_dt(value: Any) -> dt.datetime | None:
@@ -1478,6 +1532,10 @@ def run_accounting(
         review_taxonomy=_semantic_review_taxonomy(routing),
         review_routing=routing,
     )
+    if analysis_fixture is None and analyzer_cache_path is not None:
+        analysis["analyzer_cache"]["snapshot"] = _seal_analyzer_cache_snapshot(
+            run_dir, analyzer_cache_path, analysis
+        )
     analysis.setdefault("ledger_event_count", len(analysis_events))
     analysis.setdefault("ledger_evidence_digest", semantic_analyzer.stable_digest(
         "led-", sorted(event["evidence_id"] for event in analysis_events)

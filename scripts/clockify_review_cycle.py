@@ -60,6 +60,10 @@ EXACT_RETRY_LIMIT = 2
 RECOVERY_ATTEMPT_SCHEMA_VERSION = "review-cycle-source-recovery-attempt/v1"
 HEALTH_PROBE_TIMEOUT_SECONDS = 3
 HEALTH_PROBE_BUDGET_SECONDS = 9
+SOURCE_INTERVAL_COVERAGE_AUDIT_SCHEMA_VERSION = "source-interval-coverage-audit/v1"
+SOURCE_INTERVAL_FIELDS = (
+    "source", "since_utc", "until_utc", "slice_id", "compatibility_version",
+)
 _HEALTH_SSH_OPTIONS = frozenset({
     "batchmode", "connectionattempts", "connecttimeout", "controlmaster",
     "controlpath", "controlpersist", "identitiesonly", "identityfile",
@@ -79,6 +83,10 @@ _REQUIRED = frozenset({
 
 class CycleError(RuntimeError):
     pass
+
+
+class _QualityBlocked(CycleError):
+    """A verified collector derivation reached only the quality gate."""
 
 
 class _BudgetExhausted(RuntimeError):
@@ -962,7 +970,7 @@ def _validate_stage(
     run_dir = result_path.parent
     result = _json_file(result_path, "review result")
     if not isinstance(result, Mapping) or result.get("quality_status") != "pass":
-        raise CycleError("review result did not pass quality")
+        raise _QualityBlocked("review result did not pass quality")
     if result.get("run_id") != run_dir.name or result.get("run_dir") != str(run_dir):
         raise CycleError("review result run identity does not match its path")
     expected_since, expected_until = _expected_interval(config, since, until)
@@ -1096,6 +1104,179 @@ def _validate_stage(
     return stage
 
 
+def _validate_collector_source_stage(
+    config: Mapping[str, Any], result_path: Path, since: str, until: str, *,
+    expected_snapshot_digests: Mapping[str, str],
+) -> dict[str, Any]:
+    """Verify collection provenance independently of downstream quality."""
+    result_path = _safe_run_file(_runs_dir(config), str(result_path), "result")
+    if result_path.name != "autopilot-result.json":
+        raise CycleError("collector derivation result filename is invalid")
+    derived = result_path.parent
+    try:
+        source, identity, lineage = clockify_review_run._verified_collector_derivation(
+            derived
+        )
+    except (
+        OSError, ValueError, json.JSONDecodeError,
+        collector_receipts.CollectorReceiptError,
+    ) as exc:
+        raise CycleError("collector derivation provenance is invalid") from exc
+    expected_since, expected_until = _expected_interval(config, since, until)
+    if (
+        identity.since_utc != expected_since
+        or identity.until_utc != expected_until
+    ):
+        raise CycleError("collector source interval does not match selected slice")
+    snapshot_digests = {
+        filename: _digest(derived / filename)
+        for filename in (
+            "period-manifest.json", "routing.json", "review-corrections.jsonl",
+            "review-acceptance.jsonl",
+        )
+    }
+    if snapshot_digests != dict(expected_snapshot_digests):
+        raise CycleError("collector derivation snapshots differ")
+    ledger = _json_file(
+        source / "evidence" / "evidence-ledger.json", "collector source ledger"
+    )
+    manifest = ledger.get("manifest") if isinstance(ledger, Mapping) else None
+    coverage = (
+        manifest.get("source_completeness") if isinstance(manifest, Mapping) else None
+    )
+    if not isinstance(coverage, Mapping):
+        raise CycleError("collector source coverage is invalid")
+    finalization = _json_file(
+        source / "slice-finalization.json", "collector source finalization"
+    )
+    backlog_identity = (
+        finalization.get("backlog_identity")
+        if isinstance(finalization, Mapping) else None
+    )
+    compatibility = (
+        backlog_identity.get("compatibility_version")
+        if isinstance(backlog_identity, Mapping) else None
+    )
+    if not isinstance(compatibility, str) or not compatibility:
+        raise CycleError("collector source compatibility is invalid")
+    collector_runtime = lineage["collector_runtime_identity"]
+    executor_runtime = lineage["executor_runtime_identity"]
+    return {
+        "stage_kind": "collector_source",
+        "result_path": str(result_path),
+        "result_digest": _digest(result_path),
+        "run_dir": str(source),
+        "run_id": source.name,
+        "bundle_digest": identity.source_bundle_digest,
+        "legacy_completion_bundle_digest": identity.legacy_completion_bundle_digest,
+        "runtime_identity_digest": _value_digest(collector_runtime),
+        "collector_runtime_identity_digest": _value_digest(collector_runtime),
+        "executor_runtime_identity_digest": _value_digest(executor_runtime),
+        "snapshot_digests": snapshot_digests,
+        "coverage": dict(coverage),
+        "slice_id": identity.slice_id,
+        "since_utc": identity.since_utc,
+        "until_utc": identity.until_utc,
+        "compatibility_version": compatibility,
+    }
+
+
+def _validate_raw_collector_source_stage(
+    config: Mapping[str, Any], result_path: Path, since: str, until: str, *,
+    expected_snapshot_digests: Mapping[str, str],
+) -> dict[str, Any]:
+    """Migrate a legacy collector source even if downstream artifacts drifted."""
+    result_path = _safe_run_file(_runs_dir(config), str(result_path), "result")
+    run_dir = result_path.parent
+    try:
+        identity = collector_receipts.load_collector_source_bundle(
+            run_dir / "completion-bundle.json", run_dir=run_dir
+        )
+    except collector_receipts.CollectorReceiptError as exc:
+        raise CycleError("legacy collector source bundle is invalid") from exc
+    expected_since, expected_until = _expected_interval(config, since, until)
+    if identity.since_utc != expected_since or identity.until_utc != expected_until:
+        raise CycleError("legacy collector source interval differs")
+    snapshot_digests = {
+        filename: _digest(run_dir / filename)
+        for filename in (
+            "period-manifest.json", "routing.json", "review-corrections.jsonl",
+            "review-acceptance.jsonl",
+        )
+    }
+    if snapshot_digests != dict(expected_snapshot_digests):
+        raise CycleError("legacy collector source snapshots differ")
+    ledger = _json_file(
+        run_dir / "evidence" / "evidence-ledger.json", "legacy collector ledger"
+    )
+    manifest = ledger.get("manifest") if isinstance(ledger, Mapping) else None
+    coverage = (
+        manifest.get("source_completeness") if isinstance(manifest, Mapping) else None
+    )
+    finalization = _json_file(
+        run_dir / "slice-finalization.json", "legacy collector finalization"
+    )
+    backlog_identity = (
+        finalization.get("backlog_identity")
+        if isinstance(finalization, Mapping) else None
+    )
+    compatibility = (
+        backlog_identity.get("compatibility_version")
+        if isinstance(backlog_identity, Mapping) else None
+    )
+    if not isinstance(coverage, Mapping) or not isinstance(compatibility, str):
+        raise CycleError("legacy collector source identity is invalid")
+    try:
+        parsed_identity = collector_slices.BacklogIdentity(**dict(backlog_identity))
+        planned = collector_slices.plan_slices(
+            dt.datetime.fromisoformat(
+                parsed_identity.since_utc.replace("Z", "+00:00")
+            ),
+            dt.datetime.fromisoformat(
+                parsed_identity.until_utc.replace("Z", "+00:00")
+            ),
+            zone=ZoneInfo(parsed_identity.timezone),
+            max_days=parsed_identity.max_days,
+        )
+        backlog = collector_slices.BacklogStore(
+            _collector_checkpoint_root(config, os.environ)
+        ).read_existing(parsed_identity, tuple(planned))
+    except (
+        TypeError, ValueError, KeyError, ZoneInfoNotFoundError,
+        collector_slices.BacklogError,
+    ) as exc:
+        raise CycleError("legacy collector backlog binding is invalid") from exc
+    receipt = next(
+        (item for item in backlog.completed if item.slice_id == identity.slice_id), None
+    )
+    bundle_path = (run_dir / "completion-bundle.json").resolve()
+    if (
+        receipt is None
+        or receipt.result_path.resolve() != bundle_path
+        or receipt.result_digest != _digest(bundle_path)
+    ):
+        raise CycleError("legacy collector backlog receipt differs")
+    runtime_digest = _value_digest(identity.collector_runtime_identity)
+    return {
+        "stage_kind": "collector_source",
+        "result_path": str(result_path),
+        "result_digest": _digest(result_path),
+        "run_dir": str(run_dir),
+        "run_id": run_dir.name,
+        "bundle_digest": identity.source_bundle_digest,
+        "legacy_completion_bundle_digest": identity.legacy_completion_bundle_digest,
+        "runtime_identity_digest": runtime_digest,
+        "collector_runtime_identity_digest": runtime_digest,
+        "executor_runtime_identity_digest": runtime_digest,
+        "snapshot_digests": snapshot_digests,
+        "coverage": dict(coverage),
+        "slice_id": identity.slice_id,
+        "since_utc": identity.since_utc,
+        "until_utc": identity.until_utc,
+        "compatibility_version": compatibility,
+    }
+
+
 def _stage_from_state(
     config: Mapping[str, Any], record: Mapping[str, Any], key: str,
     since: str, until: str, *, replay: bool,
@@ -1111,14 +1292,28 @@ def _stage_from_state(
     stored_runtime_digest = stored.get("runtime_identity_digest")
     if stored_runtime_digest is not None and not _valid_digest(stored_runtime_digest):
         raise CycleError(f"stored {key} runtime identity is invalid")
-    verified = _validate_stage(
-        config, Path(stored["result_path"]), since, until,
-        replay=replay, expected_snapshot_digests=expected_snapshot_digests,
-        source_run_id=source_run_id, source_run_dir=source_run_dir,
-        allow_historical_runtime=allow_historical_runtime,
-        expected_runtime_digest=stored_runtime_digest,
-        historical_state_validation=stored_runtime_digest is not None,
-    )
+    if stored.get("stage_kind") == "collector_source":
+        if replay:
+            raise CycleError("collector source stage cannot be a replay")
+        result_path = Path(stored["result_path"])
+        validator = (
+            _validate_raw_collector_source_stage
+            if result_path.parent == Path(str(stored.get("run_dir")))
+            else _validate_collector_source_stage
+        )
+        verified = validator(
+            config, result_path, since, until,
+            expected_snapshot_digests=expected_snapshot_digests,
+        )
+    else:
+        verified = _validate_stage(
+            config, Path(stored["result_path"]), since, until,
+            replay=replay, expected_snapshot_digests=expected_snapshot_digests,
+            source_run_id=source_run_id, source_run_dir=source_run_dir,
+            allow_historical_runtime=allow_historical_runtime,
+            expected_runtime_digest=stored_runtime_digest,
+            historical_state_validation=stored_runtime_digest is not None,
+        )
     comparable = dict(verified)
     if stored_runtime_digest is None:
         comparable.pop("runtime_identity_digest", None)
@@ -1147,17 +1342,34 @@ def _migrate_legacy_stage_runtime(
             raise CycleError("legacy source stage interval is invalid")
         changed = False
         if isinstance(source, Mapping) and "runtime_identity_digest" not in source:
-            verified_source = _validate_stage(
-                config, Path(str(source.get("result_path"))), str(since), until,
-                replay=False,
-                expected_snapshot_digests=_stored_snapshot_digests(record),
-                allow_historical_runtime=True,
-                historical_state_validation=True,
-            )
-            legacy_shape = dict(verified_source)
-            legacy_shape.pop("runtime_identity_digest", None)
-            if dict(source) != legacy_shape:
-                raise CycleError("legacy source stage identity has drifted")
+            try:
+                verified_source = _validate_stage(
+                    config, Path(str(source.get("result_path"))), str(since), until,
+                    replay=False,
+                    expected_snapshot_digests=_stored_snapshot_digests(record),
+                    allow_historical_runtime=True,
+                    historical_state_validation=True,
+                )
+            except CycleError:
+                verified_source = _validate_raw_collector_source_stage(
+                    config, Path(str(source.get("result_path"))), str(since), until,
+                    expected_snapshot_digests=_stored_snapshot_digests(record),
+                )
+                if (
+                    source.get("run_dir") != verified_source["run_dir"]
+                    or source.get("run_id") != verified_source["run_id"]
+                    or source.get("bundle_digest")
+                    != verified_source["legacy_completion_bundle_digest"]
+                    or source.get("snapshot_digests")
+                    != verified_source["snapshot_digests"]
+                    or source.get("coverage") != verified_source["coverage"]
+                ):
+                    raise CycleError("legacy collector source identity has drifted")
+            else:
+                legacy_shape = dict(verified_source)
+                legacy_shape.pop("runtime_identity_digest", None)
+                if dict(source) != legacy_shape:
+                    raise CycleError("legacy source stage identity has drifted")
             record["source"] = verified_source
             source = verified_source
             changed = True
@@ -1375,6 +1587,17 @@ def _attempted_at() -> str:
 def _interval_from_stage(
     config: Mapping[str, Any], source: str, stage: Mapping[str, Any],
 ) -> source_coverage.SourceInterval:
+    if stage.get("stage_kind") == "collector_source":
+        try:
+            return source_coverage.SourceInterval(
+                source=source,
+                since_utc=str(stage["since_utc"]),
+                until_utc=str(stage["until_utc"]),
+                slice_id=str(stage["slice_id"]),
+                compatibility_version=str(stage["compatibility_version"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise CycleError("collector source interval is invalid") from exc
     run_dir = Path(str(stage["run_dir"]))
     try:
         bundle = collector_receipts.load_completion_bundle(
@@ -1509,6 +1732,232 @@ def _record_exact_debts(
     return True
 
 
+def _audit_configured_sources(config: Mapping[str, Any]) -> set[str]:
+    configured = {"clockify", "fathom", "multica_issues"}
+    if config["calendly_optional"] is False:
+        configured.add("calendly")
+    fleet_path = _path(config, "root") / "fleet.json"
+    if not fleet_path.exists():
+        return configured
+    fleet = _json_file(fleet_path, "fleet")
+    machines = fleet.get("machines") if isinstance(fleet, Mapping) else None
+    if not isinstance(machines, list):
+        raise CycleError("fleet machines are invalid")
+    for machine in machines:
+        if not isinstance(machine, Mapping) or machine.get("enabled", True) is False:
+            continue
+        name = machine.get("name")
+        if not isinstance(name, str) or not name:
+            raise CycleError("fleet machine identity is invalid")
+        configured.update((f"sessions/{name}", f"repositories/{name}"))
+    return configured
+
+
+def _audit_bundle(stage: Mapping[str, Any]) -> tuple[
+    dict[str, str], Mapping[str, Any], str, bool | None,
+]:
+    run_dir = Path(str(stage.get("run_dir") or ""))
+    try:
+        bundle = collector_receipts.load_collector_source_bundle(
+            run_dir / "completion-bundle.json", run_dir=run_dir
+        )
+        ledger = json.loads(
+            bundle.verified_artifact_bytes["evidence/evidence-ledger.json"]
+        )
+        report = json.loads(bundle.verified_artifact_bytes["run-report.json"])
+    except (
+        collector_receipts.CollectorReceiptError, KeyError, json.JSONDecodeError,
+    ) as exc:
+        raise CycleError("coverage audit collector bundle is invalid") from exc
+    manifest = ledger.get("manifest") if isinstance(ledger, Mapping) else None
+    inventory = manifest.get("source_inventory") if isinstance(manifest, Mapping) else None
+    compatibility = stage.get("compatibility_version")
+    bundle_digest = stage.get("bundle_digest")
+    if (
+        not isinstance(inventory, Mapping)
+        or not isinstance(compatibility, str)
+        or not isinstance(bundle_digest, str)
+    ):
+        raise CycleError("coverage audit source identity is invalid")
+    if (
+        stage.get("slice_id") != bundle.slice_id
+        or stage.get("since_utc") != bundle.since_utc
+        or stage.get("until_utc") != bundle.until_utc
+        or bundle_digest not in {
+            bundle.source_bundle_digest,
+            bundle.legacy_completion_bundle_digest,
+        }
+    ):
+        raise CycleError("coverage audit collector bundle identity drifted")
+    mode = report.get("collection_mode") if isinstance(report, Mapping) else None
+    snapshotted_optional = (
+        mode.get("calendly_optional") if isinstance(mode, Mapping) else None
+    )
+    if snapshotted_optional is not None and not isinstance(snapshotted_optional, bool):
+        raise CycleError("coverage audit collection mode is invalid")
+    return ({
+        "since_utc": bundle.since_utc,
+        "until_utc": bundle.until_utc,
+        "slice_id": bundle.slice_id,
+        "compatibility_version": compatibility,
+    }, inventory, bundle_digest, snapshotted_optional)
+
+
+def _audit_inventory_complete(
+    source: str, details: object, snapshotted_optional: bool | None,
+) -> bool:
+    if not isinstance(details, Mapping):
+        return False
+    if details.get("status") == "complete":
+        return True
+    if details.get("status") == "excluded":
+        if source == "calendly" and snapshotted_optional is True:
+            return True
+    return False
+
+
+def _audit_debt_covers_gap(
+    item: source_coverage.DebtItem, source: str, identity: Mapping[str, str],
+) -> bool:
+    machine = source.partition("/")[2]
+    allowed_sources = {source}
+    if machine:
+        allowed_sources.add(f"peer/{machine}")
+    if item.interval.source == "runner/unclassified":
+        compatible = (
+            item.interval.compatibility_version == GENERIC_COMPATIBILITY_VERSION
+        )
+    else:
+        compatible = (
+            item.interval.compatibility_version == identity["compatibility_version"]
+        )
+    return (
+        item.interval.source in allowed_sources | {"runner/unclassified"}
+        and item.interval.since_utc == identity["since_utc"]
+        and item.interval.until_utc == identity["until_utc"]
+        and item.interval.slice_id == identity["slice_id"]
+        and compatible
+    )
+
+
+def source_interval_coverage_audit(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Derive a transient observer report from verified bundles and debt state."""
+    state_dir = _path(config, "state_dir")
+    state = _state(
+        state_dir / "review-cycle-state.json",
+        recovery_since=str(config["recovery_since"]),
+    )
+    store = source_coverage.SourceDebtStore.from_document(
+        source_coverage.read(state_dir / "source-coverage.json")
+    )
+    configured = _audit_configured_sources(config)
+    verified: list[tuple[dict[str, str], Mapping[str, Any], str, bool | None]] = []
+    for raw in state["slices"].values():
+        if not isinstance(raw, Mapping):
+            raise CycleError("cycle state slice is invalid")
+        stage = raw.get("source") or raw.get("source_parent")
+        if isinstance(stage, Mapping):
+            verified.append(_audit_bundle(stage))
+
+    intervals: dict[str, dict[str, Any]] = {}
+    for identity, inventory, bundle_digest, snapshotted_optional in verified:
+        for raw_source, details in inventory.items():
+            source = str(raw_source)
+            if _audit_inventory_complete(source, details, snapshotted_optional):
+                row = {
+                    "source": source, **identity, "status": "complete",
+                    "completion_bundle_digest": bundle_digest,
+                }
+                interval = source_coverage.SourceInterval(**{
+                    field: row[field] for field in SOURCE_INTERVAL_FIELDS
+                })
+                intervals[interval.debt_id] = row
+
+    items: dict[str, source_coverage.DebtItem] = {}
+    for event in store.document()["events"]:
+        debt_id = str(event["debt_id"])
+        item = store.get(debt_id)
+        if item is not None:
+            items[debt_id] = item
+    for debt_id, item in items.items():
+        row: dict[str, Any] = item.interval.document()
+        if item.status == "resolved":
+            row.update(
+                status="resolved",
+                completion_bundle_digest=item.completion_bundle_digest,
+            )
+        else:
+            row.update(status="active", resume_state_digest=item.resume_state_digest)
+        intervals[debt_id] = row
+
+    for identity, inventory, _bundle_digest, snapshotted_optional in verified:
+        for source in configured:
+            if _audit_inventory_complete(
+                source, inventory.get(source), snapshotted_optional,
+            ):
+                continue
+            if not any(
+                _audit_debt_covers_gap(item, source, identity)
+                for item in items.values()
+            ):
+                raise CycleError("verified cycle evidence has an unbound source interval gap")
+
+    ordered = sorted(
+        intervals.values(),
+        key=lambda row: tuple(str(row[field]) for field in SOURCE_INTERVAL_FIELDS),
+    )
+    windows = sorted({
+        (str(row["since_utc"]), str(row["until_utc"]), str(row["slice_id"]))
+        for row in ordered
+    })
+    frontiers: dict[str, str | None] = {}
+    for source in sorted(configured):
+        frontier: str | None = None
+        for since_utc, until_utc, slice_id in windows:
+            rows = [
+                row for row in ordered
+                if row["source"] == source
+                and row["since_utc"] == since_utc
+                and row["until_utc"] == until_utc
+                and row["slice_id"] == slice_id
+            ]
+            if (
+                len(rows) != 1
+                or rows[0]["status"] not in {"complete", "resolved"}
+                or (frontier is not None and since_utc != frontier)
+            ):
+                break
+            frontier = until_utc
+        frontiers[source] = frontier
+    return {
+        "schema_version": SOURCE_INTERVAL_COVERAGE_AUDIT_SCHEMA_VERSION,
+        "horizon_until_utc": max(
+            (str(row["until_utc"]) for row in ordered), default=None,
+        ),
+        "configured_sources": sorted(configured),
+        "frontiers": frontiers,
+        "intervals": ordered,
+        "active_debt_ids": sorted(item.debt_id for item in store.active()),
+    }
+
+
+def _coverage_audit_output_path(
+    config: Mapping[str, Any], requested: Path,
+) -> Path:
+    expected = (
+        _path(config, "root") / "reports" / "source-interval-coverage-audit.json"
+    )
+    if (
+        not requested.is_absolute()
+        or requested != expected
+        or requested.resolve() != expected
+    ):
+        raise CycleError(
+            "audit coverage output must be the configured transient reports path"
+        )
+    return expected
+
+
 def _generic_interval(
     config: Mapping[str, Any], since: str, until: str,
 ) -> source_coverage.SourceInterval:
@@ -1617,8 +2066,14 @@ def _resolve_generic(
         return
     run_dir = Path(str(source["run_dir"]))
     try:
-        bundle = collector_receipts.load_completion_bundle(
-            run_dir / "completion-bundle.json", run_dir=run_dir
+        bundle = (
+            collector_receipts.load_collector_source_bundle(
+                run_dir / "completion-bundle.json", run_dir=run_dir
+            )
+            if source.get("stage_kind") == "collector_source"
+            else collector_receipts.load_completion_bundle(
+                run_dir / "completion-bundle.json", run_dir=run_dir
+            )
         )
     except collector_receipts.CollectorReceiptError as exc:
         raise CycleError("generic completion bundle cannot be verified") from exc
@@ -1977,8 +2432,14 @@ def _recovery_parent_matches_debt(
 ) -> bool:
     run_dir = Path(str(parent["run_dir"]))
     try:
-        bundle = collector_receipts.load_completion_bundle(
-            run_dir / "completion-bundle.json", run_dir=run_dir
+        bundle = (
+            collector_receipts.load_collector_source_bundle(
+                run_dir / "completion-bundle.json", run_dir=run_dir
+            )
+            if parent.get("stage_kind") == "collector_source"
+            else collector_receipts.load_completion_bundle(
+                run_dir / "completion-bundle.json", run_dir=run_dir
+            )
         )
     except collector_receipts.CollectorReceiptError as exc:
         raise CycleError("recovery parent completion bundle cannot be reloaded") from exc
@@ -1998,7 +2459,11 @@ def _recovery_parent_matches_debt(
             for source in (f"sessions/{machine}", f"repositories/{machine}")
         )
     return (
-        bundle.bundle_digest == parent.get("bundle_digest")
+        (
+            getattr(bundle, "source_bundle_digest", None)
+            if parent.get("stage_kind") == "collector_source"
+            else bundle.bundle_digest
+        ) == parent.get("bundle_digest")
         and bundle.since_utc == debt.interval.since_utc
         and bundle.until_utc == debt.interval.until_utc
         and bundle.slice_id == debt.interval.slice_id
@@ -2290,11 +2755,13 @@ def _run_slice(
         != _value_digest(dict(config["_runtime_identity"]))
     )
     if historical_generic_gate:
-        source = _validate_stage(
-            config, Path(stored_source["result_path"]), since, until, replay=False,
+        source = _stage_from_state(
+            config, record, "source", since, until, replay=False,
             expected_snapshot_digests=expected_snapshots,
             allow_historical_runtime=True,
         )
+        if source is None:
+            raise CycleError("historical generic source is missing")
         if source.get("runtime_identity_digest") == _value_digest(
             dict(config["_runtime_identity"])
         ):
@@ -2307,6 +2774,7 @@ def _run_slice(
             expected_snapshot_digests=expected_snapshots,
         )
     attempt: dict[str, Any] | None = None
+    collector_source: dict[str, Any] | None = None
     if source is None:
         review_command = _review_command(config, since, until)
         interval = generic.interval if generic is not None else _generic_interval(
@@ -2346,14 +2814,45 @@ def _run_slice(
                         config, result_path, since, until, replay=False,
                         expected_snapshot_digests=expected_snapshots,
                     )
-                except CycleError as exc:
-                    if "runtime identity" not in str(exc):
+                except _QualityBlocked:
+                    if (result_path.parent / "collector-source.json").exists():
+                        collector_source = _validate_collector_source_stage(
+                            config, result_path, since, until,
+                            expected_snapshot_digests=expected_snapshots,
+                        )
+                    else:
                         raise
-                    source = _validate_stage(
-                        config, result_path, since, until, replay=False,
-                        expected_snapshot_digests=expected_snapshots,
-                        allow_historical_runtime=True,
-                    )
+                except CycleError as exc:
+                    if "runtime identity" in str(exc):
+                        source = _validate_stage(
+                            config, result_path, since, until, replay=False,
+                            expected_snapshot_digests=expected_snapshots,
+                            allow_historical_runtime=True,
+                        )
+                    else:
+                        raise
+        if source is None and collector_source is not None:
+            record.update({
+                "source_parent": collector_source,
+                "source_completeness": collector_source["coverage"],
+            })
+            if _bind_incomplete_recovery_parents(
+                config, record, debt_store, collector_source
+            ):
+                _persist_state(state_path, state, since, record)
+            exact_recorded = _record_exact_debts(
+                config, debt_store, collector_source
+            )
+            if exact_recorded:
+                source_coverage.write(debt_path, debt_store.document())
+                _finish_attempt(record, attempt)
+                record["status"] = "recovery_blocked"
+                _persist_state(state_path, state, since, record)
+                return {
+                    "status": "recovery_blocked",
+                    "slice": {"since": since, "until": until},
+                    "advance_frontier": bool(attempt["advance_frontier"]),
+                }
         if source is None:
             failure_class = (
                 "child_timeout" if child.timed_out
@@ -2608,9 +3107,18 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--enable-sheet-write", action="store_true")
+    parser.add_argument("--audit-coverage-output", type=Path)
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config)
+        if args.audit_coverage_output is not None:
+            output = _coverage_audit_output_path(
+                config, args.audit_coverage_output,
+            )
+            report = source_interval_coverage_audit(config)
+            _atomic(output, report)
+            print(json.dumps(report, sort_keys=True))
+            return 0
         config["_runtime_identity"] = (
             clockify_review_run.clockify_sync_collect.collector_runtime_identity()
         )

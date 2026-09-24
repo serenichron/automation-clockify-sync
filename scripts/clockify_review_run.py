@@ -20,12 +20,12 @@ import stat
 import subprocess
 import sys
 import tempfile
-from typing import Any
+from typing import Any, Mapping
 
 try:
     from scripts import clockify_sync_collect, review_acceptance, semantic_analyzer
     from scripts import clockify_source_debt_recover
-    from scripts import collector_receipts, reconciliation_manifest
+    from scripts import collector_receipts, reconciliation_manifest, work_accounting_pipeline
 except ModuleNotFoundError:  # direct script execution
     import clockify_sync_collect  # type: ignore[no-redef]
     import clockify_source_debt_recover  # type: ignore[no-redef]
@@ -33,6 +33,7 @@ except ModuleNotFoundError:  # direct script execution
     import semantic_analyzer  # type: ignore[no-redef]
     import collector_receipts  # type: ignore[no-redef]
     import reconciliation_manifest  # type: ignore[no-redef]
+    import work_accounting_pipeline  # type: ignore[no-redef]
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,6 +52,13 @@ _RECONCILIATION_INPUTS = {
 }
 _CANONICAL_MEETING_RECONCILIATION = "fathom-reconciliation.json"
 _COMPLETION_BUNDLE_SCHEMA = "collector-completion-bundle/v1"
+_COLLECTOR_EVIDENCE_FILES = (
+    "clockify-existing.json",
+    "fathom-meetings.json",
+    "calendly-recordings.json",
+    "multica-issues.json",
+    "sessions.json",
+)
 
 
 class ReviewRunError(ValueError):
@@ -515,7 +523,13 @@ def _finalize_backlog_completion(
 
 def _ledger_identity(run_dir: Path) -> dict[str, str]:
     path = run_dir / "evidence" / "evidence-ledger.json"
-    document = _read_json(path)
+    document, _content, digest = _read_snapshot_json(path, label="evidence ledger")
+    return _ledger_identity_from_document(document, digest, path=path)
+
+
+def _ledger_identity_from_document(
+    document: Any, digest: str, *, path: Path,
+) -> dict[str, str]:
     if not isinstance(document, dict) or document.get("schema_version") != "evidence-ledger/v1":
         raise ValueError(f"invalid evidence ledger document: {path}")
     manifest = document.get("manifest")
@@ -528,7 +542,7 @@ def _ledger_identity(run_dir: Path) -> dict[str, str]:
     return {
         "manifest_id": manifest_id,
         "events_digest": events_digest,
-        "file_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "file_sha256": digest.removeprefix("sha256:"),
     }
 
 
@@ -540,12 +554,20 @@ def _accounting_identity(run_dir: Path) -> dict[str, str]:
     fail even if the upstream ledger and cached model decisions agree.
     """
     path = run_dir / "work-accounting-result.json"
-    document = _read_json(path)
+    document, _content, digest = _read_snapshot_json(
+        path, label="work accounting result"
+    )
+    return _accounting_identity_from_document(document, digest, path=path)
+
+
+def _accounting_identity_from_document(
+    document: Any, digest: str, *, path: Path,
+) -> dict[str, str]:
     if not isinstance(document, dict) or document.get("schema_version") != 1:
         raise ValueError(f"invalid work accounting result: {path}")
     if document.get("allocation_mode") != "non_overlapping_v1":
         raise ValueError(f"work accounting result has invalid allocation mode: {path}")
-    return {"file_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    return {"file_sha256": digest.removeprefix("sha256:")}
 
 
 def _file_sha256(path: Path, *, label: str) -> str:
@@ -642,8 +664,8 @@ def _reconciliation_binding(
     }
 
 
-def _read_snapshot_source(path: Path, *, label: str) -> bytes:
-    """Read one regular file through an owned descriptor without following links."""
+def _read_snapshot_with_digest(path: Path, *, label: str) -> tuple[bytes, str]:
+    """Read and hash one stable regular file through one no-follow descriptor."""
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
@@ -654,8 +676,10 @@ def _read_snapshot_source(path: Path, *, label: str) -> bytes:
         if not stat.S_ISREG(before.st_mode):
             raise ReviewRunError(f"{label} is missing or unsafe")
         chunks: list[bytes] = []
+        digest = hashlib.sha256()
         while chunk := os.read(descriptor, 65_536):
             chunks.append(chunk)
+            digest.update(chunk)
         after = os.fstat(descriptor)
         identity = lambda value: (
             value.st_dev, value.st_ino, value.st_size,
@@ -663,9 +687,31 @@ def _read_snapshot_source(path: Path, *, label: str) -> bytes:
         )
         if identity(before) != identity(after):
             raise ReviewRunError(f"{label} changed while being snapshotted")
-        return b"".join(chunks)
+        return b"".join(chunks), "sha256:" + digest.hexdigest()
     finally:
         os.close(descriptor)
+
+
+def _read_snapshot_source(path: Path, *, label: str) -> bytes:
+    return _read_snapshot_with_digest(path, label=label)[0]
+
+
+def _read_snapshot_json(path: Path, *, label: str) -> tuple[Any, bytes, str]:
+    content, digest = _read_snapshot_with_digest(path, label=label)
+    try:
+        return json.loads(content), content, digest
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReviewRunError(f"{label} is invalid") from exc
+
+
+def _optional_snapshot_json(path: Path, *, label: str) -> Any | None:
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise ReviewRunError(f"{label} is missing or unsafe")
+    return _read_snapshot_json(path, label=label)[0]
 
 
 def _validated_period_manifest(
@@ -809,6 +855,431 @@ def _snapshot_reconciliation_inputs(
     return targets
 
 
+def _prepare_collector_derivation_run(
+    source: Path,
+    snapshots: Mapping[str, Path],
+    *,
+    executor_runtime_identity: Mapping[str, Any] | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> Path:
+    """Create a write-once executor attempt from one immutable collector source."""
+    source = _run_child(source, label="collector source")
+    identity = collector_receipts.load_collector_source_bundle(
+        source / "completion-bundle.json", run_dir=source
+    )
+    executor = dict(
+        executor_runtime_identity or clockify_sync_collect.collector_runtime_identity()
+    )
+    collector_runtime = dict(identity.collector_runtime_identity)
+    source_artifact_bytes = dict(identity.verified_artifact_bytes)
+    source_artifact_digests = dict(identity.verified_artifact_digests)
+    required_source_artifacts = {
+        "run-report.json", "evidence/evidence-ledger.json",
+        *(f"evidence/{name}" for name in _COLLECTOR_EVIDENCE_FILES),
+    }
+    if set(source_artifact_bytes) != required_source_artifacts or set(
+        source_artifact_digests
+    ) != required_source_artifacts:
+        raise ReviewRunError("collector source verified artifact set is incomplete")
+    snapshot_contents = {
+        filename: _read_snapshot_source(path, label=f"collector derivation {filename}")
+        for filename, path in snapshots.items()
+    }
+    invocation = str((environment or os.environ).get("INVOCATION_ID") or "")
+    invocation_digest = (
+        "sha256:" + hashlib.sha256(invocation.encode("utf-8")).hexdigest()
+        if invocation else None
+    )
+    lineage_payload = {
+        "schema_version": "collector-derivation/v1",
+        "source_run_id": source.name,
+        "source_bundle_digest": identity.source_bundle_digest,
+        "collector_runtime_identity": collector_runtime,
+        "executor_runtime_identity": executor,
+        "source_artifact_digests": dict(sorted(source_artifact_digests.items())),
+        "snapshot_digests": {
+            name: "sha256:" + hashlib.sha256(content).hexdigest()
+            for name, content in sorted(snapshot_contents.items())
+        },
+        "systemd_invocation_digest": invocation_digest,
+    }
+    locator_payload = {
+        key: value
+        for key, value in lineage_payload.items()
+        if key != "systemd_invocation_digest"
+    }
+    locator = hashlib.sha256(
+        json.dumps(
+            locator_payload, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    existing_attempts = sorted(
+        RUNS.resolve().glob(f"collector-derivation-{locator}-attempt-*")
+    )
+    for existing in existing_attempts:
+        existing = _run_child(existing, label="collector derivation candidate")
+        result_path = existing / "autopilot-result.json"
+        result = _optional_snapshot_json(
+            result_path, label="collector derivation terminal result"
+        )
+        if result is None:
+            continue
+        _verified_collector_derivation(existing)
+        quality = _optional_snapshot_json(
+            existing / "quality_report.json", label="collector derivation quality"
+        )
+        if (
+            not isinstance(result, dict)
+            or result.get("run_id") != existing.name
+            or result.get("run_dir") != str(existing)
+            or result.get("quality_status") not in {"pass", "blocked"}
+            or not isinstance(quality, dict)
+            or quality.get("status") != result.get("quality_status")
+        ):
+            raise ReviewRunError("collector derivation terminal result is invalid")
+        if result["quality_status"] == "pass":
+            collector_receipts.load_completion_bundle(
+                existing / "completion-bundle.json", run_dir=existing
+            )
+        return existing
+    attempt = 1
+    while True:
+        target = RUNS.resolve() / f"collector-derivation-{locator}-attempt-{attempt}"
+        try:
+            target.mkdir()
+        except FileExistsError:
+            attempt += 1
+            continue
+        break
+    try:
+        evidence_target = target / "evidence"
+        evidence_target.mkdir()
+        for filename in _COLLECTOR_EVIDENCE_FILES:
+            content = source_artifact_bytes[f"evidence/{filename}"]
+            _write_snapshot(
+                evidence_target / filename,
+                content,
+                label=f"collector derivation evidence {filename}",
+            )
+        ledger_content = source_artifact_bytes["evidence/evidence-ledger.json"]
+        _write_snapshot(
+            evidence_target / "evidence-ledger.json",
+            ledger_content,
+            label="collector derivation evidence ledger",
+        )
+        report_markdown, report_markdown_digest = _read_snapshot_with_digest(
+            source / "run-report.md", label="collector source report"
+        )
+        _write_snapshot(
+            target / "run-report.md", report_markdown,
+            label="collector derivation report",
+        )
+        for filename, content in snapshot_contents.items():
+            _write_snapshot(
+                target / filename, content, label=f"collector derivation {filename}"
+            )
+        try:
+            report = json.loads(source_artifact_bytes["run-report.json"])
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ReviewRunError("collector source run report is invalid") from exc
+        if not isinstance(report, dict):
+            raise ReviewRunError("collector source run report must be an object")
+        report = dict(report)
+        report.update({
+            "run_id": target.name,
+            "collector_source_run_id": source.name,
+            "collector_runtime_identity": collector_runtime,
+            "executor_runtime_identity": executor,
+            # Compatibility consumers treat runtime_identity as the runtime
+            # producing this run's derived artifacts, never the older collector.
+            "runtime_identity": executor,
+        })
+        report_content = (
+            json.dumps(report, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        _write_snapshot(
+            target / "run-report.json", report_content,
+            label="collector derivation run report",
+        )
+        derived_artifact_digests = {
+            **{
+                f"evidence/{filename}": source_artifact_digests[f"evidence/{filename}"]
+                for filename in _COLLECTOR_EVIDENCE_FILES
+            },
+            "evidence/evidence-ledger.json": source_artifact_digests[
+                "evidence/evidence-ledger.json"
+            ],
+            "run-report.md": report_markdown_digest,
+            "run-report.json": "sha256:" + hashlib.sha256(report_content).hexdigest(),
+        }
+        lineage = {
+            **lineage_payload,
+            "attempt": attempt,
+            "source_run_dir": str(source),
+            "source_slice_id": identity.slice_id,
+            "source_since_utc": identity.since_utc,
+            "source_until_utc": identity.until_utc,
+            "derived_artifact_digests": dict(sorted(derived_artifact_digests.items())),
+        }
+        lineage["lineage_digest"] = "sha256:" + hashlib.sha256(
+            json.dumps(lineage, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        _write_snapshot(
+            target / "collector-source.json",
+            json.dumps(lineage, ensure_ascii=False, sort_keys=True).encode("utf-8") + b"\n",
+            label="collector derivation lineage",
+        )
+        return target
+    except Exception:
+        shutil.rmtree(target, ignore_errors=True)
+        raise
+
+
+def _verified_collector_derivation(
+    run_dir: Path,
+) -> tuple[Path, collector_receipts.CollectorSourceBundle, dict[str, Any]]:
+    run_dir = _run_child(run_dir, label="collector derivation")
+    lineage_path = run_dir / "collector-source.json"
+    if lineage_path.is_symlink():
+        raise ReviewRunError("collector derivation lineage file is symlinked")
+    try:
+        lineage = json.loads(
+            _read_snapshot_source(lineage_path, label="collector derivation lineage")
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReviewRunError("collector derivation lineage is invalid") from exc
+    if not isinstance(lineage, dict):
+        raise ReviewRunError("collector derivation lineage must be an object")
+    expected_keys = {
+        "schema_version", "source_run_id", "source_run_dir",
+        "source_bundle_digest", "collector_runtime_identity",
+        "executor_runtime_identity", "source_artifact_digests",
+        "derived_artifact_digests", "snapshot_digests",
+        "systemd_invocation_digest", "attempt", "source_slice_id",
+        "source_since_utc", "source_until_utc", "lineage_digest",
+    }
+    if set(lineage) != expected_keys or lineage.get("schema_version") != "collector-derivation/v1":
+        raise ReviewRunError("collector derivation lineage schema is invalid")
+    unsigned = dict(lineage)
+    digest = unsigned.pop("lineage_digest")
+    expected_digest = "sha256:" + hashlib.sha256(
+        json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    if digest != expected_digest:
+        raise ReviewRunError("collector derivation lineage digest differs")
+    source = _run_child(Path(str(lineage["source_run_dir"])), label="collector source")
+    if source.name != lineage.get("source_run_id"):
+        raise ReviewRunError("collector derivation source identity differs")
+    identity = collector_receipts.load_collector_source_bundle(
+        source / "completion-bundle.json", run_dir=source
+    )
+    if (
+        identity.source_bundle_digest != lineage.get("source_bundle_digest")
+        or identity.slice_id != lineage.get("source_slice_id")
+        or identity.since_utc != lineage.get("source_since_utc")
+        or identity.until_utc != lineage.get("source_until_utc")
+        or identity.collector_runtime_identity != lineage.get("collector_runtime_identity")
+        or dict(identity.verified_artifact_digests)
+        != lineage.get("source_artifact_digests")
+    ):
+        raise ReviewRunError("collector derivation source binding differs")
+    derived_digests = lineage.get("derived_artifact_digests")
+    expected_derived_artifacts = {
+        "run-report.json", "run-report.md", "evidence/evidence-ledger.json",
+        *(f"evidence/{name}" for name in _COLLECTOR_EVIDENCE_FILES),
+    }
+    if (
+        not isinstance(derived_digests, Mapping)
+        or set(derived_digests) != expected_derived_artifacts
+    ):
+        raise ReviewRunError("collector derivation artifact binding is invalid")
+    derived_contents: dict[str, bytes] = {}
+    for relative, expected_digest in derived_digests.items():
+        if not isinstance(relative, str) or not isinstance(expected_digest, str):
+            raise ReviewRunError("collector derivation artifact binding is invalid")
+        content, digest = _read_snapshot_with_digest(
+            run_dir / relative, label=f"collector derivation artifact {relative}"
+        )
+        if digest != expected_digest:
+            raise ReviewRunError("collector derivation derived artifact differs")
+        derived_contents[relative] = content
+    try:
+        ledger_document = json.loads(derived_contents["evidence/evidence-ledger.json"])
+    except (KeyError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReviewRunError("collector derivation evidence ledger is invalid") from exc
+    derived_ledger_identity = _ledger_identity_from_document(
+        ledger_document,
+        str(derived_digests["evidence/evidence-ledger.json"]),
+        path=run_dir / "evidence/evidence-ledger.json",
+    )
+    source_ledger_bytes = identity.verified_artifact_bytes[
+        "evidence/evidence-ledger.json"
+    ]
+    source_ledger_document = json.loads(source_ledger_bytes)
+    source_ledger_identity = _ledger_identity_from_document(
+        source_ledger_document,
+        identity.verified_artifact_digests["evidence/evidence-ledger.json"],
+        path=source / "evidence/evidence-ledger.json",
+    )
+    if derived_ledger_identity != source_ledger_identity:
+        raise ReviewRunError("collector derivation evidence ledger differs")
+    snapshot_digests = lineage.get("snapshot_digests")
+    if not isinstance(snapshot_digests, Mapping):
+        raise ReviewRunError("collector derivation snapshot binding is invalid")
+    for filename in _RECONCILIATION_INPUTS.values():
+        content = _read_snapshot_source(
+            run_dir / filename, label=f"collector derivation {filename}"
+        )
+        if snapshot_digests.get(filename) != "sha256:" + hashlib.sha256(content).hexdigest():
+            raise ReviewRunError("collector derivation snapshot binding differs")
+    try:
+        report = json.loads(derived_contents["run-report.json"])
+    except (KeyError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReviewRunError("collector derivation run report is invalid") from exc
+    if (
+        not isinstance(report, dict)
+        or report.get("run_id") != run_dir.name
+        or report.get("collector_source_run_id") != source.name
+        or report.get("collector_runtime_identity") != lineage["collector_runtime_identity"]
+        or report.get("executor_runtime_identity") != lineage["executor_runtime_identity"]
+        or report.get("runtime_identity") != lineage["executor_runtime_identity"]
+    ):
+        raise ReviewRunError("collector derivation runtime provenance differs")
+    return source, identity, lineage
+
+
+def _finalize_collector_derivation_completion(
+    run_dir: Path,
+) -> collector_receipts.SliceCompletionBundle:
+    """Seal derived artifacts while leaving the collector source untouched."""
+    _source, identity, _lineage = _verified_collector_derivation(run_dir)
+    slice_ = argparse.Namespace(
+        slice_id=identity.slice_id,
+        since=dt.datetime.fromisoformat(identity.since_utc.replace("Z", "+00:00")),
+        until=dt.datetime.fromisoformat(identity.until_utc.replace("Z", "+00:00")),
+    )
+    rebuilt = collector_receipts.build_completion_bundle(run_dir, slice_=slice_)
+    path = run_dir / "completion-bundle.json"
+    if path.exists():
+        existing = collector_receipts.load_completion_bundle(path, run_dir=run_dir)
+        if existing.bundle_digest != rebuilt.bundle_digest:
+            raise ReviewRunError("collector derivation completion bundle differs")
+    else:
+        collector_receipts.write_completion_bundle(path, rebuilt)
+    return collector_receipts.load_completion_bundle(path, run_dir=run_dir)
+
+
+def _adopt_completed_collector_derivation(run_dir: Path) -> Path | None:
+    """Return a verified terminal attempt without executing it again."""
+    run_dir = _run_child(run_dir, label="collector derivation")
+    result_path = run_dir / "autopilot-result.json"
+    result = _optional_snapshot_json(
+        result_path, label="collector derivation terminal result"
+    )
+    if result is None:
+        return None
+    _verified_collector_derivation(run_dir)
+    quality = _optional_snapshot_json(
+        run_dir / "quality_report.json", label="collector derivation quality"
+    )
+    if (
+        not isinstance(result, dict)
+        or result.get("run_id") != run_dir.name
+        or result.get("run_dir") != str(run_dir)
+        or result.get("quality_status") not in {"pass", "blocked"}
+        or not isinstance(quality, dict)
+        or quality.get("status") != result.get("quality_status")
+    ):
+        raise ReviewRunError("collector derivation terminal result is invalid")
+    if result["quality_status"] == "pass":
+        bundle = collector_receipts.load_completion_bundle(
+            run_dir / "completion-bundle.json", run_dir=run_dir
+        )
+        if result.get("completion_bundle_digest") != bundle.bundle_digest:
+            raise ReviewRunError("collector derivation result bundle differs")
+    return result_path
+
+
+def _preflight_replay_analyzer_cache(
+    source: Path, cache_path: Path, source_analysis: dict[str, Any],
+) -> list[dict[str, str]]:
+    """Rebuild semantic requests and prove every decision is a sealed cache hit."""
+    ledger, all_events = work_accounting_pipeline.load_ledger(
+        source / "evidence" / "evidence-ledger.json"
+    )
+    member_identities = work_accounting_pipeline.meeting_reconciliation.manifest_member_identities(
+        ledger.manifest.document()
+    )
+    events, _noise = work_accounting_pipeline._analysis_events(
+        all_events, member_identities
+    )
+    routing = _read_json(source / "routing.json")
+    corrections = work_accounting_pipeline._load_corrections(
+        source / "review-corrections.jsonl"
+    )
+    cache = semantic_analyzer.AnalyzerResponseCache(cache_path)
+    endpoints = cache.sealed_endpoints()
+    primary = next(
+        (endpoint for endpoint in endpoints if endpoint.name == "clockify_analyzer_primary"),
+        None,
+    )
+    fallback = next(
+        (endpoint for endpoint in endpoints if endpoint.name == "clockify_analyzer_fallback"),
+        None,
+    )
+    if primary is None:
+        raise ValueError("sealed analyzer cache lacks its immutable primary route")
+
+    def blocked_transport(_endpoint: object, _body: object) -> dict[str, Any]:
+        raise semantic_analyzer.AnalyzerError(
+            "sealed replay analyzer cache misses the reconstructed request"
+        )
+
+    replayed = semantic_analyzer.analyze_tiered(
+        work_accounting_pipeline._with_semantic_route_hints(events, routing),
+        primary=primary,
+        fallback=fallback,
+        corrections=corrections,
+        transport=blocked_transport,
+        cache=cache,
+        review_taxonomy=work_accounting_pipeline._semantic_review_taxonomy(routing),
+    )
+    source_activities = [
+        {key: value for key, value in activity.items() if key not in {"extractor_model", "rendered_description"}}
+        for activity in source_analysis.get("activities", [])
+    ]
+    replayed_activities = [
+        {key: value for key, value in activity.items() if key not in {"extractor_model", "rendered_description"}}
+        for activity in replayed.get("activities", [])
+    ]
+    if replayed_activities != source_activities:
+        raise ValueError("replay analyzer cache output differs for activities")
+    for key in (
+        "schema_version", "prompt_version", "review_prompt_version",
+        "evidence_bundle_schema_version", "evidence_bundle_manifest",
+        "ledger_event_count", "ledger_evidence_digest",
+        "exceptions", "omissions", "analysis_chunks",
+    ):
+        if replayed.get(key) != source_analysis.get(key):
+            raise ValueError(f"replay analyzer cache output differs for {key}")
+    records = _analysis_cache_records(replayed)
+    if records != _analysis_cache_records(source_analysis):
+        raise ValueError("replay analyzer cache did not reuse every sealed decision")
+    return records
+
+
+def _analysis_is_inference_backed(document: Mapping[str, Any]) -> bool:
+    for section in ("activities", "analysis_chunks"):
+        for value in document.get(section, []):
+            if not isinstance(value, Mapping):
+                continue
+            model = str(value.get("analyzer_model") or value.get("model") or "")
+            tier = str(value.get("analyzer_tier") or value.get("tier") or "")
+            if model and tier and tier != "fixture":
+                return True
+    return False
+
+
 def _prepare_replay_run(source: Path) -> Path:
     """Create a distinct run with immutable ledger and semantic fixture copies."""
     source = _run_child(source, label="replay source")
@@ -818,10 +1289,85 @@ def _prepare_replay_run(source: Path) -> Path:
     ):
         if not (source / required).is_file():
             raise ValueError(f"replay source is incomplete; missing {source / required}")
-    source_identity = _ledger_identity(source)
-    source_accounting_identity = _accounting_identity(source)
+    ledger_path = source / "evidence" / "evidence-ledger.json"
+    ledger_document, ledger_content, ledger_digest = _read_snapshot_json(
+        ledger_path, label="replay evidence ledger"
+    )
+    source_identity = _ledger_identity_from_document(
+        ledger_document, ledger_digest, path=ledger_path,
+    )
+    accounting_path = source / "work-accounting-result.json"
+    accounting_document, _accounting_content, accounting_digest = _read_snapshot_json(
+        accounting_path, label="replay work accounting result"
+    )
+    source_accounting_identity = _accounting_identity_from_document(
+        accounting_document, accounting_digest, path=accounting_path,
+    )
     source_analysis_path = source / "semantic-analysis.json"
-    source_analysis_sha256 = hashlib.sha256(source_analysis_path.read_bytes()).hexdigest()
+    source_analysis, source_analysis_content, source_analysis_digest = _read_snapshot_json(
+        source_analysis_path, label="replay semantic analysis"
+    )
+    if not isinstance(source_analysis, dict):
+        raise ValueError("replay semantic analysis must be an object")
+    source_analysis_sha256 = source_analysis_digest.removeprefix("sha256:")
+    expected_cache_records = _analysis_cache_records(source_analysis)
+    cache_source = source / "analyzer-cache-used.jsonl"
+    cache_content: bytes | None = None
+    cache_sha256: str | None = None
+    reused_cache_records: list[dict[str, str]] = []
+    inference_backed = _analysis_is_inference_backed(source_analysis)
+    if inference_backed and not cache_source.is_file():
+        raise ValueError("inference-backed replay requires its sealed analyzer cache")
+    if cache_source.is_file():
+        cache_content = _read_snapshot_source(cache_source, label="replay analyzer cache")
+        semantic_analyzer.AnalyzerResponseCache(cache_source)
+        records: list[dict[str, Any]] = []
+        for line in cache_content.splitlines():
+            if line.strip():
+                value = json.loads(line)
+                records.append({
+                    "cache_key": value["cache_key"],
+                    "decision_digest": value["decision_digest"],
+                })
+        if sorted(records, key=lambda value: value["cache_key"]) != _analysis_cache_records(source_analysis):
+            raise ValueError("replay analyzer cache decisions differ from semantic analysis")
+        cache_sha256 = hashlib.sha256(cache_content).hexdigest()
+        if inference_backed:
+            cache_summary = source_analysis.get("analyzer_cache")
+            snapshot = (
+                cache_summary.get("snapshot")
+                if isinstance(cache_summary, Mapping)
+                else None
+            )
+            if not isinstance(snapshot, Mapping) or set(snapshot) != {
+                "path", "record_count", "sha256"
+            }:
+                raise ValueError("inference-backed replay lacks analyzer cache binding evidence")
+            if snapshot.get("path") != "analyzer-cache-used.jsonl":
+                raise ValueError("analyzer cache snapshot path differs")
+            if snapshot.get("record_count") != len(records):
+                raise ValueError("analyzer cache snapshot record count differs")
+            if snapshot.get("sha256") != cache_sha256:
+                raise ValueError("analyzer cache snapshot digest differs")
+        ledger = _read_json(source / "evidence" / "evidence-ledger.json")
+        events = ledger.get("events") if isinstance(ledger, dict) else None
+        if not isinstance(events, list):
+            raise ValueError("replay evidence ledger events are invalid")
+        evidence_ids = sorted(
+            str(event.get("evidence_id")) for event in events if isinstance(event, dict)
+        )
+        expected_evidence = semantic_analyzer.stable_digest("led-", evidence_ids)
+        if source_analysis.get("ledger_evidence_digest") != expected_evidence:
+            raise ValueError("replay analyzer cache evidence binding differs")
+        versions = [json.loads(value) for value in _analysis_versions(source_analysis)]
+        models = {str(value.get("model") or "") for value in versions}
+        for line in cache_content.splitlines():
+            if line.strip():
+                value = json.loads(line)
+                if value.get("prompt_version") != source_analysis.get("prompt_version"):
+                    raise ValueError("replay analyzer cache prompt binding differs")
+                if value.get("model") not in models:
+                    raise ValueError("replay analyzer cache model binding differs")
     reconciliation_snapshots: dict[str, bytes] = {}
     for filename in _RECONCILIATION_INPUTS.values():
         source_path = source / filename
@@ -831,6 +1377,12 @@ def _prepare_replay_run(source: Path) -> Path:
             )
         except ReviewRunError as exc:
             raise ValueError(f"replay source missing reconciliation snapshot: {filename}") from exc
+    meeting_source = source / _CANONICAL_MEETING_RECONCILIATION
+    meeting_content = (
+        _read_snapshot_source(meeting_source, label="replay meeting reconciliation")
+        if meeting_source.is_file() and not meeting_source.is_symlink()
+        else None
+    )
     stem = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ") + f"-replay-{source.name}"
     target = RUNS.resolve() / stem
     suffix = 1
@@ -839,18 +1391,30 @@ def _prepare_replay_run(source: Path) -> Path:
         suffix += 1
     try:
         (target / "evidence").mkdir(parents=True)
-        shutil.copyfile(
-            source / "evidence" / "evidence-ledger.json",
-            target / "evidence" / "evidence-ledger.json",
+        _write_snapshot(
+            target / "evidence" / "evidence-ledger.json", ledger_content,
+            label="replay evidence ledger",
         )
         fixture_path = target / "replay-fixture" / "semantic-analysis.json"
         fixture_path.parent.mkdir(parents=True)
-        shutil.copyfile(source_analysis_path, fixture_path)
+        _write_snapshot(
+            fixture_path, source_analysis_content, label="replay semantic analysis",
+        )
+        cache_fixture: Path | None = None
+        if cache_content is not None:
+            cache_fixture = target / "replay-fixture" / "analyzer-cache-used.jsonl"
+            _write_snapshot(cache_fixture, cache_content, label="replay analyzer cache")
         for filename, content in reconciliation_snapshots.items():
             _write_snapshot(target / filename, content, label=f"replay {filename}")
-        meeting_source = source / _CANONICAL_MEETING_RECONCILIATION
-        if meeting_source.is_file() and not meeting_source.is_symlink():
-            shutil.copyfile(meeting_source, target / _CANONICAL_MEETING_RECONCILIATION)
+        if meeting_content is not None:
+            _write_snapshot(
+                target / _CANONICAL_MEETING_RECONCILIATION, meeting_content,
+                label="replay meeting reconciliation",
+            )
+        if inference_backed and cache_fixture is not None:
+            reused_cache_records = _preflight_replay_analyzer_cache(
+                target, cache_fixture, source_analysis
+            )
         report = _read_json(source / "run-report.json")
         if not isinstance(report, dict):
             raise ValueError("replay source run report must be an object")
@@ -859,9 +1423,7 @@ def _prepare_replay_run(source: Path) -> Path:
         report["replay_of_run_id"] = source.name
         _write_json(target / "run-report.json", report)
         shutil.copyfile(source / "run-report.md", target / "run-report.md")
-        _write_json(
-            target / "replay-source.json",
-            {
+        provenance = {
                 "schema_version": 1,
                 "source_run_id": source.name,
                 "source_run_dir": str(source),
@@ -871,8 +1433,14 @@ def _prepare_replay_run(source: Path) -> Path:
                 "semantic_analysis_sha256": source_analysis_sha256,
                 "semantic_analysis_fixture": str(fixture_path.relative_to(target)),
                 "work_accounting_result_sha256": source_accounting_identity["file_sha256"],
-            },
-        )
+            }
+        if cache_fixture is not None and cache_sha256 is not None:
+            provenance.update({
+                "analyzer_cache_fixture": str(cache_fixture.relative_to(target)),
+                "analyzer_cache_sha256": cache_sha256,
+                "analyzer_cache_reused_records": reused_cache_records,
+            })
+        _write_json(target / "replay-source.json", provenance)
         if _ledger_identity(target) != source_identity:
             raise ValueError("replay ledger copy does not match its immutable source")
         if hashlib.sha256(fixture_path.read_bytes()).hexdigest() != source_analysis_sha256:
@@ -906,6 +1474,24 @@ def _replay_analysis_fixture(source: Path, replay: Path) -> Path:
     if source_digest != expected or fixture_digest != expected:
         raise ValueError("replay semantic analysis fixture differs from its immutable source")
     return fixture
+
+
+def _replay_analyzer_cache(replay: Path) -> Path | None:
+    provenance = _read_json(replay / "replay-source.json")
+    if not isinstance(provenance, dict) or "analyzer_cache_fixture" not in provenance:
+        return None
+    relative = str(provenance["analyzer_cache_fixture"])
+    expected = str(provenance.get("analyzer_cache_sha256") or "")
+    cache = (replay / relative).resolve()
+    try:
+        cache.relative_to(replay)
+    except ValueError as exc:
+        raise ValueError("replay analyzer cache escapes the replay run") from exc
+    content = _read_snapshot_source(cache, label="replay analyzer cache")
+    if hashlib.sha256(content).hexdigest() != expected:
+        raise ValueError("replay analyzer cache differs from its immutable source")
+    semantic_analyzer.AnalyzerResponseCache(cache)
+    return cache
 
 
 def _prepare_repair_run(source: Path) -> Path:
@@ -1233,6 +1819,72 @@ def _analysis_cache_records(document: dict[str, Any]) -> list[dict[str, str]]:
     return sorted(normalized, key=lambda value: value["cache_key"])
 
 
+def _replay_source_provenance_matches(
+    source: Path,
+    replay: Path,
+    *,
+    source_identity: Mapping[str, str],
+    source_accounting_identity: Mapping[str, str],
+    source_analysis_sha256: str,
+) -> bool:
+    """Verify every digest sealed when the replay child was prepared."""
+    try:
+        provenance, _content, _digest = _read_snapshot_json(
+            replay / "replay-source.json", label="replay source provenance"
+        )
+        if not isinstance(provenance, dict):
+            return False
+        expected = {
+            "source_run_id": source.name,
+            "source_run_dir": str(source),
+            "source_manifest_id": source_identity["manifest_id"],
+            "source_events_digest": source_identity["events_digest"],
+            "ledger_file_sha256": source_identity["file_sha256"],
+            "semantic_analysis_sha256": source_analysis_sha256,
+            "work_accounting_result_sha256": source_accounting_identity["file_sha256"],
+        }
+        if any(provenance.get(key) != value for key, value in expected.items()):
+            return False
+        semantic_relative = str(provenance.get("semantic_analysis_fixture") or "")
+        semantic_fixture = (replay / semantic_relative).resolve()
+        semantic_fixture.relative_to(replay)
+        if _file_sha256(
+            semantic_fixture, label="replay semantic analysis fixture"
+        ).removeprefix("sha256:") != source_analysis_sha256:
+            return False
+
+        cache_digest = provenance.get("analyzer_cache_sha256")
+        cache_relative = provenance.get("analyzer_cache_fixture")
+        if (cache_digest is None) != (cache_relative is None):
+            return False
+        if cache_digest is not None:
+            if not isinstance(cache_digest, str) or len(cache_digest) != 64:
+                return False
+            source_cache_digest = _file_sha256(
+                source / "analyzer-cache-used.jsonl",
+                label="replay source analyzer cache",
+            ).removeprefix("sha256:")
+            cache_fixture = (replay / str(cache_relative)).resolve()
+            cache_fixture.relative_to(replay)
+            fixture_digest = _file_sha256(
+                cache_fixture, label="replay analyzer cache fixture"
+            ).removeprefix("sha256:")
+            if source_cache_digest != cache_digest or fixture_digest != cache_digest:
+                return False
+        known_digests = {
+            "ledger_file_sha256", "semantic_analysis_sha256",
+            "work_accounting_result_sha256", "analyzer_cache_sha256",
+        }
+        if any(
+            key.endswith("sha256") and key not in known_digests
+            for key in provenance
+        ):
+            return False
+        return True
+    except (KeyError, OSError, ValueError, ReviewRunError):
+        return False
+
+
 def derive_replay_integrity(source: Path, replay: Path) -> dict[str, Any]:
     """Derive replay integrity without writing into either sealed run."""
     source = _run_child(source, label="replay source")
@@ -1241,8 +1893,12 @@ def derive_replay_integrity(source: Path, replay: Path) -> dict[str, Any]:
     replay_identity = _ledger_identity(replay)
     source_accounting_identity = _accounting_identity(source)
     replay_accounting_identity = _accounting_identity(replay)
-    source_analysis = _read_json(source / "semantic-analysis.json")
-    replay_analysis = _read_json(replay / "semantic-analysis.json")
+    source_analysis, _source_analysis_content, source_analysis_digest = _read_snapshot_json(
+        source / "semantic-analysis.json", label="source semantic analysis"
+    )
+    replay_analysis, _replay_analysis_content, _replay_analysis_digest = _read_snapshot_json(
+        replay / "semantic-analysis.json", label="replay semantic analysis"
+    )
     if not isinstance(source_analysis, dict) or not isinstance(replay_analysis, dict):
         raise ValueError("semantic analysis artifacts must be objects")
     source_versions = _analysis_versions(source_analysis)
@@ -1254,6 +1910,14 @@ def derive_replay_integrity(source: Path, replay: Path) -> dict[str, Any]:
     source_evidence_digest = str(source_analysis.get("ledger_evidence_digest") or "")
     replay_evidence_digest = str(replay_analysis.get("ledger_evidence_digest") or "")
     failures: list[str] = []
+    if not _replay_source_provenance_matches(
+        source,
+        replay,
+        source_identity=source_identity,
+        source_accounting_identity=source_accounting_identity,
+        source_analysis_sha256=source_analysis_digest.removeprefix("sha256:"),
+    ):
+        failures.append("replay source provenance differs")
     if source_identity != replay_identity:
         failures.append("immutable ledger identity differs")
     if not source_evidence_digest or source_evidence_digest != replay_evidence_digest:
@@ -1388,9 +2052,15 @@ def _process_run(
         str(args.routing),
         "--corrections",
         str(args.corrections),
-        "--analyzer-cache",
-        str(args.analyzer_cache or (args.state.parent / "analyzer-cache-v2.jsonl")),
     ]
+    replay_cache = getattr(args, "_replay_analyzer_cache", None)
+    analyzer_cache = (
+        replay_cache
+        if replay_source is not None
+        else (args.analyzer_cache or (args.state.parent / "analyzer-cache-v2.jsonl"))
+    )
+    if analyzer_cache is not None:
+        accounting_command.extend(["--analyzer-cache", str(analyzer_cache)])
     analysis_fixture = replay_analysis_fixture or args.analysis_fixture
     if analysis_fixture:
         accounting_command.extend(["--analysis-fixture", str(analysis_fixture)])
@@ -1489,16 +2159,23 @@ def _process_run(
     )
     completion_error = None
     has_repair_source = (run_dir / "repair-source.json").is_file()
+    has_collector_source = (run_dir / "collector-source.json").is_file()
     report_document = _read_json(run_dir / "run-report.json")
     has_recovery_source = (
         isinstance(report_document, dict)
         and isinstance(report_document.get("source_debt_recovery"), dict)
     )
-    if ((run_dir / "slice-finalization.json").is_file() or has_repair_source) and snapshot is not None:
+    if (
+        (run_dir / "slice-finalization.json").is_file()
+        or has_repair_source
+        or has_collector_source
+    ) and snapshot is not None:
         if quality.get("status") == "pass":
             try:
                 if has_repair_source:
                     bundle = _finalize_repair_completion(run_dir)
+                elif has_collector_source:
+                    bundle = _finalize_collector_derivation_completion(run_dir)
                 elif has_recovery_source:
                     bundle = _finalize_recovery_completion(run_dir)
                 else:
@@ -1790,7 +2467,8 @@ def main(argv: list[str] | None = None) -> int:
             args._replay_analysis_fixture = _replay_analysis_fixture(
                 replay_source, run_dirs[0]
             )
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            args._replay_analyzer_cache = _replay_analyzer_cache(run_dirs[0])
+        except (OSError, ValueError, json.JSONDecodeError, semantic_analyzer.AnalyzerError) as exc:
             print(f"clockify review run: cannot prepare immutable replay: {exc}", file=sys.stderr)
             return 2
     else:
@@ -1834,6 +2512,15 @@ def main(argv: list[str] | None = None) -> int:
                 snapshots = _snapshot_reconciliation_inputs(
                     run_dir, args, contents=reconciliation_contents
                 )
+                run_dir = _prepare_collector_derivation_run(run_dir, snapshots)
+                existing = _adopt_completed_collector_derivation(run_dir)
+                if existing is not None:
+                    print(existing)
+                    continue
+                snapshots = {
+                    filename: run_dir / filename
+                    for filename in _RECONCILIATION_INPUTS.values()
+                }
             except ReviewRunError as exc:
                 print(f"clockify review run: cannot snapshot reconciliation inputs: {exc}", file=sys.stderr)
                 return 2

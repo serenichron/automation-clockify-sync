@@ -8,9 +8,15 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import tempfile
 from typing import Mapping
 from zoneinfo import ZoneInfo
+
+try:
+    from scripts import evidence_ledger
+except ModuleNotFoundError:  # direct script execution
+    import evidence_ledger  # type: ignore[no-redef]
 
 
 class CollectorReceiptError(ValueError):
@@ -28,6 +34,13 @@ _ARTIFACT_PATHS = {
 }
 REQUIRED_KINDS = frozenset(_ARTIFACT_PATHS)
 _REPLAY_ARTIFACT = ("replay_integrity", "replay-integrity.json")
+_COLLECTOR_RAW_ARTIFACTS = {
+    "clockify": "evidence/clockify-existing.json",
+    "fathom": "evidence/fathom-meetings.json",
+    "calendly": "evidence/calendly-recordings.json",
+    "multica_issues": "evidence/multica-issues.json",
+    "sessions": "evidence/sessions.json",
+}
 _BUNDLE_SCHEMA_VERSION = "collector-completion-bundle/v1"
 _PERIOD_TIMEZONE = ZoneInfo("Europe/Bucharest")
 
@@ -85,6 +98,30 @@ def _safe_read_text(path: Path) -> str:
         # fdopen owns the descriptor after success; retain the original OSError
         # shape for callers while never following a final symlink.
         raise
+
+
+def _safe_read_bytes_and_digest(path: Path) -> tuple[bytes, str]:
+    """Read and hash one stable regular file through one no-follow descriptor."""
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise CollectorReceiptError("collector artifact is not a regular file")
+        chunks: list[bytes] = []
+        digest = hashlib.sha256()
+        while block := os.read(descriptor, 65_536):
+            chunks.append(block)
+            digest.update(block)
+        after = os.fstat(descriptor)
+        identity = lambda value: (
+            value.st_dev, value.st_ino, value.st_size,
+            value.st_mtime_ns,
+        )
+        if identity(before) != identity(after):
+            raise CollectorReceiptError("collector artifact changed while being read")
+        return b"".join(chunks), "sha256:" + digest.hexdigest()
+    finally:
+        os.close(descriptor)
 
 
 def _digest_string(value: object, label: str) -> str:
@@ -268,6 +305,30 @@ class SliceCompletionBundle:
         }
 
 
+@dataclass(frozen=True)
+class CollectorSourceBundle:
+    """Raw collector identity that remains valid if derived artifacts later drift."""
+
+    run_dir: Path
+    slice_id: str
+    since_utc: str
+    until_utc: str
+    source_coverage_digest: str
+    collector_runtime_identity: dict[str, object]
+    legacy_completion_bundle_digest: str
+    source_bundle_digest: str
+    verified_artifact_bytes: Mapping[str, bytes]
+    verified_artifact_digests: Mapping[str, str]
+
+    @property
+    def bundle_digest(self) -> str:
+        return self.source_bundle_digest
+
+    @property
+    def replay(self) -> bool:
+        return False
+
+
 def _slice_utc(value: object, label: str) -> str:
     if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
         raise CollectorReceiptError(f"slice {label} must be timezone-aware")
@@ -317,6 +378,15 @@ def _completion_identities(
         raise CollectorReceiptError("completion identity artifact is not valid JSON") from exc
     if not isinstance(report, Mapping) or not isinstance(ledger_document, Mapping):
         raise CollectorReceiptError("completion identity artifact must be an object")
+    return _completion_identities_from_documents(
+        report, ledger_document, since_utc=since_utc, until_utc=until_utc
+    )
+
+
+def _completion_identities_from_documents(
+    report: Mapping[str, object], ledger_document: Mapping[str, object], *,
+    since_utc: str, until_utc: str,
+) -> tuple[str, str]:
     date_range = report.get("date_range")
     if not isinstance(date_range, Mapping) or (
         _report_utc(date_range.get("since")) != since_utc
@@ -481,3 +551,152 @@ def load_completion_bundle(path: Path, *, run_dir: Path) -> SliceCompletionBundl
         document["replay"], document["bundle_digest"],
     )
     return verify_completion_bundle(bundle)
+
+
+def load_collector_source_bundle(path: Path, *, run_dir: Path) -> CollectorSourceBundle:
+    """Verify only collector-owned raw artifacts from a historical completion bundle."""
+    run_dir = _safe_path(Path(run_dir))
+    bundle_path = _safe_path(Path(path), run_dir=run_dir)
+    try:
+        document = json.loads(_safe_read_text(bundle_path))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CollectorReceiptError("collector source completion document is invalid") from exc
+    expected_keys = {
+        "schema_version", "slice_id", "since_utc", "until_utc",
+        "source_coverage_digest", "runtime_identity_digest", "artifacts", "replay",
+        "bundle_digest",
+    }
+    if (
+        not isinstance(document, dict)
+        or set(document) != expected_keys
+        or document.get("schema_version") != _BUNDLE_SCHEMA_VERSION
+        or document.get("replay") is not False
+    ):
+        raise CollectorReceiptError("collector source completion schema is invalid")
+    raw_artifacts = document.get("artifacts")
+    if not isinstance(raw_artifacts, list):
+        raise CollectorReceiptError("collector source completion artifacts are invalid")
+    artifact_digests: dict[str, str] = {}
+    artifacts: list[SliceArtifact] = []
+    for item in raw_artifacts:
+        if not isinstance(item, dict) or set(item) != {"kind", "digest"}:
+            raise CollectorReceiptError("collector source completion artifact schema is invalid")
+        kind = item.get("kind")
+        if not isinstance(kind, str) or kind in artifact_digests:
+            raise CollectorReceiptError("collector source completion artifact identity is invalid")
+        digest = _digest_string(item.get("digest"), "artifact")
+        artifact_digests[kind] = digest
+        artifacts.append(SliceArtifact(kind, _artifact_path(run_dir, kind), digest))
+    if set(artifact_digests) != REQUIRED_KINDS:
+        raise CollectorReceiptError("collector source completion artifact set is invalid")
+    unsigned = _bundle_unsigned(
+        slice_id=document.get("slice_id"),
+        since_utc=document.get("since_utc"),
+        until_utc=document.get("until_utc"),
+        source_coverage_digest=document.get("source_coverage_digest"),
+        runtime_identity_digest=document.get("runtime_identity_digest"),
+        artifacts=tuple(artifacts),
+        replay=False,
+    )
+    legacy_digest = _digest_string(document.get("bundle_digest"), "completion bundle")
+    if _digest(unsigned) != legacy_digest:
+        raise CollectorReceiptError("collector source completion digest does not match")
+    verified_bytes: dict[str, bytes] = {}
+    verified_digests: dict[str, str] = {}
+    for kind in ("run_report", "evidence_ledger"):
+        artifact_path = _safe_path(_artifact_path(run_dir, kind), run_dir=run_dir)
+        try:
+            content, digest = _safe_read_bytes_and_digest(artifact_path)
+        except OSError as exc:
+            raise CollectorReceiptError(
+                f"collector source {kind} artifact is missing or unsafe"
+            ) from exc
+        if digest != artifact_digests[kind]:
+            raise CollectorReceiptError(f"collector source {kind} artifact drifted")
+        relative = str(artifact_path.relative_to(run_dir))
+        verified_bytes[relative] = content
+        verified_digests[relative] = digest
+    try:
+        report = json.loads(verified_bytes["run-report.json"])
+        ledger_document = json.loads(verified_bytes["evidence/evidence-ledger.json"])
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CollectorReceiptError("collector source identity artifact is invalid") from exc
+    if not isinstance(report, Mapping) or not isinstance(ledger_document, Mapping):
+        raise CollectorReceiptError("collector source identity artifact must be an object")
+    coverage_digest, runtime_digest = _completion_identities_from_documents(
+        report, ledger_document,
+        since_utc=str(document["since_utc"]),
+        until_utc=str(document["until_utc"]),
+    )
+    if (
+        coverage_digest != document["source_coverage_digest"]
+        or runtime_digest != document["runtime_identity_digest"]
+    ):
+        raise CollectorReceiptError("collector source identities drifted")
+    runtime = report.get("runtime_identity") if isinstance(report, Mapping) else None
+    if not isinstance(runtime, Mapping):
+        raise CollectorReceiptError("collector source runtime identity is invalid")
+    try:
+        manifest_document = ledger_document.get("manifest")
+        events_document = ledger_document.get("events")
+        if not isinstance(manifest_document, Mapping) or not isinstance(events_document, list):
+            raise ValueError("ledger shape")
+        bound_manifest = evidence_ledger.LedgerManifest.from_document(manifest_document)
+        bound = evidence_ledger.EvidenceLedger(
+            tuple(evidence_ledger.EvidenceEvent.from_document(item) for item in events_document),
+            bound_manifest.source_inventory,
+            bound_manifest.timezone,
+            bound_manifest.member_identities,
+        )
+        bound.validate(bound_manifest)
+        raw: dict[str, object] = {}
+        raw_digests: dict[str, str] = {}
+        for key, relative in _COLLECTOR_RAW_ARTIFACTS.items():
+            raw_path = _safe_path(run_dir / relative, run_dir=run_dir)
+            content, digest = _safe_read_bytes_and_digest(raw_path)
+            raw[key] = json.loads(content)
+            raw_digests[relative] = digest
+            verified_bytes[relative] = content
+            verified_digests[relative] = digest
+        reconstructed = evidence_ledger.EvidenceLedger(
+            tuple(evidence_ledger.normalize_collector_snapshot(raw)),
+            evidence_ledger.source_inventory_from_collector(raw),
+            bound.timezone,
+            bound.member_identities,
+        )
+        if reconstructed.manifest.document() != bound.manifest.document():
+            raise ValueError("manifest mismatch")
+    except (
+        OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError,
+    ) as exc:
+        raise CollectorReceiptError(
+            "collector source raw evidence does not match its bound ledger"
+        ) from exc
+    source_unsigned = {
+        "schema_version": "collector-source-bundle/v1",
+        "legacy_completion_bundle_digest": legacy_digest,
+        "slice_id": document["slice_id"],
+        "since_utc": document["since_utc"],
+        "until_utc": document["until_utc"],
+        "source_coverage_digest": coverage_digest,
+        "collector_runtime_identity": dict(runtime),
+        "raw_artifact_digests": {
+            **{
+                kind: artifact_digests[kind]
+                for kind in ("run_report", "evidence_ledger")
+            },
+            **dict(sorted(raw_digests.items())),
+        },
+    }
+    return CollectorSourceBundle(
+        run_dir=run_dir.resolve(),
+        slice_id=_safe_identity(document["slice_id"], "slice ID"),
+        since_utc=_utc_string(document["since_utc"], "slice since"),
+        until_utc=_utc_string(document["until_utc"], "slice until"),
+        source_coverage_digest=coverage_digest,
+        collector_runtime_identity=dict(runtime),
+        legacy_completion_bundle_digest=legacy_digest,
+        source_bundle_digest=_digest(source_unsigned),
+        verified_artifact_bytes=dict(verified_bytes),
+        verified_artifact_digests=dict(verified_digests),
+    )

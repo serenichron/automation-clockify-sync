@@ -52,6 +52,7 @@ try:
     from scripts.collector_receipts import (
         FailureReceiptStore,
         failure_receipt,
+        load_collector_source_bundle,
         load_completion_bundle,
     )
 except ModuleNotFoundError:  # Support direct execution from this directory.
@@ -76,6 +77,7 @@ except ModuleNotFoundError:  # Support direct execution from this directory.
     from collector_receipts import (  # type: ignore[no-redef]
         FailureReceiptStore,
         failure_receipt,
+        load_collector_source_bundle,
         load_completion_bundle,
     )
 
@@ -4296,7 +4298,9 @@ def run(args: argparse.Namespace) -> int:
                 print("collector slice receipt is not safe to reuse", file=sys.stderr)
                 return 2
             try:
-                bundle = load_completion_bundle(expected_bundle_path, run_dir=expected_run_dir)
+                bundle = load_collector_source_bundle(
+                    expected_bundle_path, run_dir=expected_run_dir
+                )
                 report_path, report = _verified_existing_slice_bundle(
                     expected_run_dir,
                     slice_.since,

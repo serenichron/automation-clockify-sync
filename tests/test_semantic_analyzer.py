@@ -3849,6 +3849,34 @@ class SemanticAnalyzerTests(unittest.TestCase):
         self.assertEqual(2, len(records))
         self.assertNotEqual(records[0]["route_digest"], records[1]["route_digest"])
 
+    def test_snapshot_rejects_legacy_decision_under_conflicting_configured_route(self):
+        body = {"model": semantic.DEFAULT_PRIMARY_MODEL, "messages": []}
+        original = semantic.AnalyzerEndpoint(
+            "primary", "http://primary", semantic.DEFAULT_PRIMARY_MODEL,
+            revision="a" * 64,
+        )
+        conflicting = dataclasses.replace(original, revision="b" * 64)
+        response = {"activities": [], "exceptions": [], "omissions": []}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "analyzer-cache.jsonl"
+            cache = semantic.AnalyzerResponseCache(path)
+            cache.store_accepted(original, body, response)
+            record = json.loads(path.read_text(encoding="utf-8"))
+            record.pop("route")
+            path.write_text(semantic.canonical_json(record) + "\n", encoding="utf-8")
+            legacy = semantic.AnalyzerResponseCache(path)
+
+            with self.assertRaisesRegex(
+                semantic.AnalyzerError, "does not match a configured analyzer route"
+            ):
+                legacy.records_for_snapshot(
+                    [{
+                        "cache_key": record["cache_key"],
+                        "decision_digest": record["decision_digest"],
+                    }],
+                    configured_endpoints=(conflicting,),
+                )
+
     def test_response_cache_does_not_inherit_legacy_rejection_into_new_reasoning_route(self):
         body = {"model": semantic.DEFAULT_PRIMARY_MODEL, "messages": []}
         legacy = semantic.AnalyzerEndpoint(

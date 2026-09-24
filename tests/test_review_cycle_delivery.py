@@ -17,6 +17,7 @@ from scripts import collector_receipts, collector_slices
 from scripts import clockify_review_run as review_run
 from scripts import semantic_analyzer
 from scripts.autopilot_process import ChildResult
+from task3_scenario_contract import assert_scenario_contract
 
 
 SINCE_UTC = "2026-09-06T21:00:00Z"
@@ -62,6 +63,7 @@ def make_run(
     accounting_remove: tuple[str, ...] = (),
     compatibility_version: str = "fixture-collector-lineage/v1",
     runtime_identity: dict[str, object] | None = None,
+    collector_source_marker: bool = False,
 ) -> Path:
     run_dir = (runs_dir or root / "runs") / name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -160,8 +162,32 @@ def make_run(
             write_json(run_dir / "replay-integrity.json", replay_integrity_override)
         else:
             active_runs = runs_dir or root / "runs"
+            source_dir = active_runs / source_name
+            fixture = run_dir / "replay-fixture" / "semantic-analysis.json"
+            fixture.parent.mkdir()
+            fixture.write_bytes((source_dir / "semantic-analysis.json").read_bytes())
+            ledger = json.loads(
+                (source_dir / "evidence" / "evidence-ledger.json").read_text()
+            )
+            write_json(run_dir / "replay-source.json", {
+                "schema_version": 1,
+                "source_run_id": source_dir.name,
+                "source_run_dir": str(source_dir.resolve()),
+                "source_manifest_id": ledger["manifest"]["manifest_id"],
+                "source_events_digest": ledger["manifest"]["events_digest"],
+                "ledger_file_sha256": hashlib.sha256(
+                    (source_dir / "evidence" / "evidence-ledger.json").read_bytes()
+                ).hexdigest(),
+                "semantic_analysis_sha256": hashlib.sha256(
+                    (source_dir / "semantic-analysis.json").read_bytes()
+                ).hexdigest(),
+                "semantic_analysis_fixture": "replay-fixture/semantic-analysis.json",
+                "work_accounting_result_sha256": hashlib.sha256(
+                    (source_dir / "work-accounting-result.json").read_bytes()
+                ).hexdigest(),
+            })
             with mock.patch.object(review_run, "RUNS", active_runs):
-                review_run._verify_replay_integrity(active_runs / source_name, run_dir)
+                review_run._verify_replay_integrity(source_dir, run_dir)
     slice_ = collector_slices.plan_slices(
         since_dt, until_dt, zone=local, max_days=2,
     )
@@ -233,6 +259,8 @@ def make_run(
         },
     }
     write_json(run_dir / "autopilot-result.json", result)
+    if collector_source_marker:
+        write_json(run_dir / "collector-source.json", {})
     return run_dir / "autopilot-result.json"
 
 
@@ -534,6 +562,11 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
                 cycle.run_cycle(
                     self.config, enable_sheet_write=True, today=dt.date(2026, 9, 10)
                 )
+        source = self.root / "runs" / "source-run"
+        parent_before = {
+            str(path.relative_to(source)): path.read_bytes()
+            for path in sorted(source.rglob("*")) if path.is_file()
+        }
         with mock.patch.object(cycle, "run_child_bounded", side_effect=child), mock.patch.object(
             cycle, "_write_delivery_receipt", side_effect=real_write
         ):
@@ -544,6 +577,23 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
         publisher_commands = [item for item in commands if "clockify_sheet_publish.py" in item[1]]
         self.assertEqual(2, len(publisher_commands))
         self.assertEqual(publisher_commands[0], publisher_commands[1])
+        receipt = json.loads(
+            (self.state_dir / "delivery-receipts" / "2026-09-07.json").read_text()
+        )
+        assert_scenario_contract(
+            self,
+            stable_ids=receipt["review_ids"],
+            parent_before=parent_before,
+            parent_after={
+                str(path.relative_to(source)): path.read_bytes()
+                for path in sorted(source.rglob("*")) if path.is_file()
+            },
+            emitted_ids=receipt["review_ids"],
+            clockify_adapter_calls=sum(
+                "clockify_post_approved_portfolio.py" in command[1]
+                for command in commands
+            ),
+        )
 
     def test_replay_failure_blocks_before_publisher(self):
         """Catches publication continuing without a passing distinct replay."""
@@ -898,7 +948,12 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
         """Catches a partial accounting object being accepted as a completion marker."""
         commands: list[list[str]] = []
         child = self.child_for_runs(
-            commands, replay_code=7, source_options={"accounting_remove": ("schema_version",)}
+            commands,
+            replay_code=7,
+            source_options={
+                "accounting_remove": ("schema_version",),
+                "collector_source_marker": True,
+            },
         )
         with mock.patch.object(cycle, "run_child_bounded", side_effect=child), self.assertRaisesRegex(
             cycle.CycleError, "schema"

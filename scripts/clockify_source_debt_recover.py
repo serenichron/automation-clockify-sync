@@ -381,7 +381,7 @@ class RecoveryReceipt:
 class _Parent:
     run_dir: Path
     report: dict[str, Any]
-    bundle: collector_receipts.SliceCompletionBundle
+    bundle: collector_receipts.SliceCompletionBundle | collector_receipts.CollectorSourceBundle
     identity: collector.BacklogIdentity
     slice_: object
     source: str
@@ -438,8 +438,25 @@ def _validate_parent(
             parent / "completion-bundle.json", run_dir=parent
         )
         coverage = collector_receipts.completion_coverage(bundle)
-    except (OSError, ValueError, collector_receipts.CollectorReceiptError) as exc:
-        raise SourceDebtRecoveryError("parent completion bundle is invalid") from exc
+    except (OSError, ValueError, collector_receipts.CollectorReceiptError):
+        try:
+            bundle = collector_receipts.load_collector_source_bundle(
+                parent / "completion-bundle.json", run_dir=parent
+            )
+            ledger_document = _read_object(
+                parent / "evidence" / "evidence-ledger.json",
+                label="parent evidence ledger",
+            )
+            manifest = ledger_document.get("manifest")
+            coverage = (
+                manifest.get("source_completeness")
+                if isinstance(manifest, Mapping) else None
+            )
+            if not isinstance(coverage, Mapping):
+                raise SourceDebtRecoveryError("parent collector coverage is invalid")
+            coverage = dict(coverage)
+        except (OSError, ValueError, collector_receipts.CollectorReceiptError) as exc:
+            raise SourceDebtRecoveryError("parent completion bundle is invalid") from exc
     if bundle.replay:
         raise SourceDebtRecoveryError("replay runs cannot be recovery parents")
     bound_ledger = _verified_parent_ledger(parent)

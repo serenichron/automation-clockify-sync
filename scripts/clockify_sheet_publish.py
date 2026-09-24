@@ -457,7 +457,7 @@ def proposal_row(
         for warning in warnings
     ]
     project = str(proposal.get("client_project") or "").strip()
-    route_is_blank = not project or not tag_text.strip()
+    route_is_blank = not project
     unresolved = proposal.get("routing_disposition") == "unresolved-routing"
     unresolved_warnings = [
         warning for warning in sanitized_warnings

@@ -279,6 +279,29 @@ class ReviewCycleSourceDebtEndToEndTests(unittest.TestCase):
             replay_dir / "evidence" / "evidence-ledger.json",
         )
         shutil.copyfile(source_dir / "run-report.json", replay_dir / "run-report.json")
+        fixture = replay_dir / "replay-fixture" / "semantic-analysis.json"
+        fixture.parent.mkdir()
+        fixture.write_bytes((source_dir / "semantic-analysis.json").read_bytes())
+        ledger = json.loads(
+            (source_dir / "evidence" / "evidence-ledger.json").read_text()
+        )
+        write_json(replay_dir / "replay-source.json", {
+            "schema_version": 1,
+            "source_run_id": source_dir.name,
+            "source_run_dir": str(source_dir.resolve()),
+            "source_manifest_id": ledger["manifest"]["manifest_id"],
+            "source_events_digest": ledger["manifest"]["events_digest"],
+            "ledger_file_sha256": hashlib.sha256(
+                (source_dir / "evidence" / "evidence-ledger.json").read_bytes()
+            ).hexdigest(),
+            "semantic_analysis_sha256": hashlib.sha256(
+                (source_dir / "semantic-analysis.json").read_bytes()
+            ).hexdigest(),
+            "semantic_analysis_fixture": "replay-fixture/semantic-analysis.json",
+            "work_accounting_result_sha256": hashlib.sha256(
+                (source_dir / "work-accounting-result.json").read_bytes()
+            ).hexdigest(),
+        })
         review._verify_replay_integrity(source_dir, replay_dir)
         (replay_dir / "completion-bundle.json").unlink()
         slice_ = argparse.Namespace(
@@ -295,12 +318,19 @@ class ReviewCycleSourceDebtEndToEndTests(unittest.TestCase):
         old_runtime = {
             "collector_path": "/repo/collector.py", "git_sha": "fixture", "dirty": False,
         }
-        self._seed_real_parent()
+        parent = self._seed_real_parent()
         legacy_state = json.loads(
             (self.state_dir / "review-cycle-state.json").read_text(encoding="utf-8")
         )
         self.assertNotIn(
             "runtime_identity_digest", legacy_state["slices"]["2026-09-07"]["source"]
+        )
+        # Reproduce the deployed failure: a newer executor rewrote a derived
+        # artifact in the deterministic collector directory. Raw collection,
+        # backlog receipt, and the legacy bundle document remain unchanged.
+        (parent / "quality_report.json").write_text(
+            '{"status":"blocked","summary":{"fixture":"derived drift"}}\n',
+            encoding="utf-8",
         )
 
         generic = cycle._generic_interval(self.config, "2026-09-07", "2026-09-09")

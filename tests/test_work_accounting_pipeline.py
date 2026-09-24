@@ -14,6 +14,7 @@ from scripts import evidence_ledger
 from scripts import review_corrections
 from scripts import work_accounting_pipeline as pipeline
 from scripts.meeting_reconciliation import MeetingReconciliationError, reconcile_meetings
+from task3_scenario_contract import assert_scenario_contract
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -858,6 +859,7 @@ class WorkAccountingPipelineTests(unittest.TestCase):
 
         self.assertEqual([], result["ambiguous"])
         self.assertEqual(1, len(result["proposals"]))
+        self.assertIs(result["external_writes"], False)
         proposal = result["proposals"][0]
         self.assertEqual("", proposal["client_project"])
         self.assertEqual([], proposal["tag_names"])
@@ -940,6 +942,7 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         )
 
         self.assertEqual(1, len(result["proposals"]))
+        self.assertIs(result["external_writes"], False)
         proposal = result["proposals"][0]
         self.assertEqual(
             ("2026-07-10T13:00:00+03:00", "2026-07-10T14:00:00+03:00"),
@@ -972,7 +975,7 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             "session_routes": [], "meeting_routes": [], "evidence_routes": [],
         })
 
-        _run_dir, result = self.make_run(
+        run_dir, result = self.make_run(
             [meeting, existing], analysis, routing_path=routing_path,
         )
 
@@ -985,6 +988,16 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         self.assertEqual("pending", row[9])
         self.assertEqual(proposal["review_warnings"], json.loads(row[12]))
         self.assertEqual("unposted", row[13])
+        ledger_path = run_dir / "evidence" / "evidence-ledger.json"
+        ledger_bytes = ledger_path.read_bytes()
+        assert_scenario_contract(
+            self,
+            stable_ids=[proposal["review_activity_key"]],
+            parent_before={"evidence/evidence-ledger.json": ledger_bytes},
+            parent_after={"evidence/evidence-ledger.json": ledger_path.read_bytes()},
+            emitted_ids=[row[0]],
+            clockify_adapter_calls=int(bool(result["external_writes"])),
+        )
 
     def test_collector_snapshot_local_minute_fathom_reaches_accounting_in_ledger_timezone(self):
         """The collector's local Fathom minute evidence is normalized before deduplication."""
@@ -2576,7 +2589,7 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             canonical_meeting_id=canonical.canonical_id,
         )
 
-        _, result = self.make_run([meeting, existing], meeting_analysis(meeting))
+        run_dir, result = self.make_run([meeting, existing], meeting_analysis(meeting))
 
         self.assertEqual([], result["proposals"])
         reconciliation = result["fathom_reconciliation"][0]
@@ -2652,7 +2665,7 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         existing = clockify_event(
             "2026-07-10T13:30:00+03:00", "2026-07-10T14:30:00+03:00"
         )
-        _, result = self.make_run([meeting, existing], meeting_analysis(meeting))
+        run_dir, result = self.make_run([meeting, existing], meeting_analysis(meeting))
 
         self.assertEqual(1, len(result["proposals"]))
         proposal = result["proposals"][0]
@@ -2680,6 +2693,17 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             row.get("exception_kind") == "insufficient_meeting_evidence"
             for row in result["ambiguous"]
         ))
+        row = sheet_publisher.proposal_row(proposal, "run-partial-overlap")
+        ledger_path = run_dir / "evidence" / "evidence-ledger.json"
+        ledger_bytes = ledger_path.read_bytes()
+        assert_scenario_contract(
+            self,
+            stable_ids=[proposal["review_activity_key"]],
+            parent_before={"evidence/evidence-ledger.json": ledger_bytes},
+            parent_after={"evidence/evidence-ledger.json": ledger_path.read_bytes()},
+            emitted_ids=[row[0]],
+            clockify_adapter_calls=int(bool(result["external_writes"])),
+        )
 
     def test_overlap_warning_retains_only_clockify_project_suffix(self):
         meeting = fathom_event(

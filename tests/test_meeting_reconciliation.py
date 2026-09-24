@@ -13,8 +13,10 @@ from scripts.meeting_reconciliation import (
     MeetingReconciliationError,
     MeetingSplit,
     reconcile_meetings,
+    reconcile_recording_sources,
     validate_meeting_splits,
 )
+from task3_scenario_contract import assert_scenario_contract
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -69,6 +71,307 @@ VLAD_IDS = {"vlad@example.test", "Vlad"}
 
 
 class CanonicalMeetingTests(unittest.TestCase):
+    def test_provider_neutral_sources_collapse_one_cross_provider_meeting(self):
+        """Removing the provider-neutral adapter must split one meeting in two."""
+        result = reconcile_recording_sources(
+            {
+                "source-a": [{
+                    "source_id": "recording-a",
+                    "meeting_id": "shared-event",
+                    "start": "2026-08-04T10:00:00Z",
+                    "end": "2026-08-04T10:37:00Z",
+                    "title": "Client review",
+                    "organizer": {"email": "vlad@example.test"},
+                    "participants": [{"email": "client@example.test"}],
+                }],
+                "source-b": [{
+                    "source_id": "recording-b",
+                    "meeting_id": "shared-event",
+                    "start": "2026-08-04T10:02:00Z",
+                    "end": "2026-08-04T10:39:00Z",
+                    "title": "Client review",
+                    "organizer": {"email": "vlad@example.test"},
+                    "participants": [{"email": "client@example.test"}],
+                }],
+            },
+            vlad_identities=VLAD_IDS,
+        )
+
+        self.assertEqual(1, len(result.meetings))
+        self.assertEqual(
+            ("source-a:recording-a", "source-b:recording-b"),
+            result.meetings[0].source_ids,
+        )
+
+    def test_provider_neutral_sources_keep_simultaneous_unrelated_evidence_distinct(self):
+        """Weak timing alone must not merge unrelated provider evidence."""
+        result = reconcile_recording_sources(
+            {
+                "source-a": [{
+                    "source_id": "recording-a",
+                    "start": "2026-08-04T10:00:00Z",
+                    "end": "2026-08-04T10:37:00Z",
+                    "title": "Client review",
+                    "organizer": {"email": "vlad@example.test"},
+                    "participants": [{"email": "first@example.test"}],
+                }],
+                "source-b": [{
+                    "source_id": "recording-b",
+                    "start": "2026-08-04T10:00:00Z",
+                    "end": "2026-08-04T10:37:00Z",
+                    "title": "Internal review",
+                    "organizer": {"email": "vlad@example.test"},
+                    "participants": [{"email": "second@example.test"}],
+                }],
+            },
+            vlad_identities=VLAD_IDS,
+        )
+
+        self.assertEqual(2, len(result.meetings))
+        self.assertEqual("participant_conflict", result.exceptions[0]["reason"])
+
+    def test_provider_neutral_sources_accept_more_than_two_provider_ids(self):
+        """A third normalized provider must join the same explicit meeting."""
+        common = {
+            "meeting_id": "shared-event",
+            "start": "2026-08-04T10:00:00Z",
+            "end": "2026-08-04T10:37:00Z",
+            "title": "Client review",
+            "organizer": {"email": "vlad@example.test"},
+            "participants": [{"email": "client@example.test"}],
+        }
+        result = reconcile_recording_sources(
+            {
+                "source-a": [{**common, "source_id": "recording-a"}],
+                "source-b": [{**common, "source_id": "recording-b"}],
+                "source-c": [{**common, "source_id": "recording-c"}],
+            },
+            vlad_identities=VLAD_IDS,
+        )
+
+        self.assertEqual(1, len(result.meetings))
+        self.assertEqual(
+            (
+                "source-a:recording-a",
+                "source-b:recording-b",
+                "source-c:recording-c",
+            ),
+            result.meetings[0].source_ids,
+        )
+
+    def test_multi_provider_explicit_identity_wins_over_earlier_window_fallback(self):
+        """A weak provider encountered first must not consume an explicit peer."""
+        anchor = {
+            "source_id": "anchor",
+            "meeting_id": "explicit-event",
+            "start": "2026-08-04T10:00:00Z",
+            "end": "2026-08-04T10:37:00Z",
+            "participants": [{"email": "client@example.test"}],
+        }
+        second = {
+            "source_id": "second",
+            "meeting_id": "other-event",
+            "start": "2026-08-04T10:01:00Z",
+            "end": "2026-08-04T10:38:00Z",
+            "participants": [{"email": "client@example.test"}],
+        }
+        explicit = {
+            "source_id": "explicit",
+            "meeting_id": "explicit-event",
+            "start": "2026-08-04T10:02:00Z",
+            "end": "2026-08-04T10:39:00Z",
+            "participants": [{"email": "client@example.test"}],
+        }
+        second_explicit = {
+            "source_id": "second-explicit",
+            "meeting_id": "other-event",
+            "start": "2026-08-04T10:02:00Z",
+            "end": "2026-08-04T10:39:00Z",
+            "participants": [{"email": "client@example.test"}],
+        }
+
+        for sources in (
+            {
+                "source-a": [anchor], "source-b": [second],
+                "source-c": [explicit], "source-d": [second_explicit],
+            },
+            {
+                "source-d": [second_explicit], "source-c": [explicit],
+                "source-b": [second], "source-a": [anchor],
+            },
+        ):
+            with self.subTest(order=tuple(sources)):
+                result = reconcile_recording_sources(
+                    sources, vlad_identities=VLAD_IDS,
+                )
+                merged = [meeting.source_ids for meeting in result.meetings]
+                self.assertEqual(
+                    [
+                        ("source-a:anchor", "source-c:explicit"),
+                        ("source-b:second", "source-d:second-explicit"),
+                    ],
+                    merged,
+                )
+
+    def test_multi_provider_group_merge_rejects_transitive_timing_conflict(self):
+        """A-B and B-C identities must not hide the incompatible A-C pair."""
+        rows = {
+            "source-a": [{
+                "source_id": "a", "meeting_id": "identity-x",
+                "start": "2026-08-04T10:00:00Z", "end": "2026-08-04T10:30:00Z",
+                "participants": [{"email": "client@example.test"}],
+            }],
+            "source-b": [{
+                "source_id": "b", "meeting_id": "identity-x",
+                "join_url": "https://meet.example.test/identity-y",
+                "start": "2026-08-04T10:04:00Z", "end": "2026-08-04T10:34:00Z",
+                "participants": [{"email": "client@example.test"}],
+            }],
+            "source-c": [{
+                "source_id": "c", "join_url": "https://meet.example.test/identity-y",
+                "start": "2026-08-04T10:08:00Z", "end": "2026-08-04T10:38:00Z",
+                "participants": [{"email": "client@example.test"}],
+            }],
+        }
+
+        for sources in (
+            rows,
+            dict(reversed(tuple(rows.items()))),
+            {"source-b": rows["source-b"], "source-c": rows["source-c"], "source-a": rows["source-a"]},
+        ):
+            with self.subTest(order=tuple(sources)):
+                result = reconcile_recording_sources(sources, vlad_identities=VLAD_IDS)
+
+                self.assertEqual(3, len(result.meetings))
+                self.assertEqual(
+                    [1, 1, 1],
+                    sorted(len(meeting.source_ids) for meeting in result.meetings),
+                )
+                self.assertIn(
+                    {
+                        "kind": "duplicate_ambiguous",
+                        "reason": "timing_conflict",
+                        "source_ids": ["source-a:a", "source-c:c"],
+                        "candidate_source_ids": [],
+                    },
+                    result.exceptions,
+                )
+
+    def test_ambiguous_explicit_bridge_is_quarantined_independent_of_provider_ids(self):
+        """Renaming providers must not decide which side of an explicit bridge wins."""
+        roles = {
+            "a": {"source_id": "a", "meeting_id": "identity-x", "start": "2026-08-04T10:00:00Z", "end": "2026-08-04T10:30:00Z", "participants": [{"email": "client@example.test"}]},
+            "b": {"source_id": "b", "meeting_id": "identity-x", "join_url": "https://meet.example.test/identity-y", "start": "2026-08-04T10:04:00Z", "end": "2026-08-04T10:34:00Z", "participants": [{"email": "client@example.test"}]},
+            "c": {"source_id": "c", "join_url": "https://meet.example.test/identity-y", "start": "2026-08-04T10:08:00Z", "end": "2026-08-04T10:38:00Z", "participants": [{"email": "client@example.test"}]},
+        }
+        for provider_roles in (
+            {"provider-a": "a", "provider-b": "b", "provider-c": "c"},
+            {"provider-z": "a", "provider-a": "b", "provider-m": "c"},
+            {"provider-m": "a", "provider-z": "b", "provider-a": "c"},
+        ):
+            sources = {provider: [roles[role]] for provider, role in provider_roles.items()}
+            with self.subTest(provider_roles=provider_roles):
+                source_bytes = json.dumps(
+                    sources, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+                result = reconcile_recording_sources(sources, vlad_identities=VLAD_IDS)
+                self.assertEqual([1, 1, 1], sorted(len(meeting.source_ids) for meeting in result.meetings))
+                self.assertTrue(any(item["reason"] == "timing_conflict" for item in result.exceptions))
+                source_ids = [
+                    source_id
+                    for meeting in result.meetings
+                    for source_id in meeting.source_ids
+                ]
+                assert_scenario_contract(
+                    self,
+                    stable_ids=source_ids,
+                    parent_before={"recording-sources.json": source_bytes},
+                    parent_after={
+                        "recording-sources.json": json.dumps(
+                            sources, sort_keys=True, separators=(",", ":")
+                        ).encode("utf-8")
+                    },
+                    emitted_ids=source_ids,
+                    # Reconciliation is pure and has no Clockify write adapter boundary.
+                    clockify_adapter_calls=0,
+                )
+
+    def test_one_to_many_explicit_identity_is_quarantined_with_empty_provider(self):
+        """An empty third provider must not let lexical edge order pick a winner."""
+        anchor = {
+            "source_id": "anchor", "meeting_id": "shared-event",
+            "start": "2026-08-04T10:00:00Z", "end": "2026-08-04T10:30:00Z",
+            "participants": [{"email": "client@example.test"}],
+        }
+        duplicate_rows = [{
+            **anchor, "source_id": source_id,
+        } for source_id in ("duplicate-a", "duplicate-b")]
+
+        for provider_roles in (
+            ("provider-a", "provider-z", "provider-empty"),
+            ("provider-z", "provider-a", "provider-missing"),
+        ):
+            anchor_provider, duplicate_provider, empty_provider = provider_roles
+            with self.subTest(provider_roles=provider_roles):
+                sources = {
+                    anchor_provider: [anchor],
+                    duplicate_provider: duplicate_rows,
+                    empty_provider: [],
+                }
+                result = reconcile_recording_sources(
+                    sources, vlad_identities=VLAD_IDS,
+                )
+
+                self.assertEqual(
+                    [1, 1, 1],
+                    sorted(len(meeting.source_ids) for meeting in result.meetings),
+                )
+                self.assertTrue(any(
+                    exception["reason"] == "multiple_candidates"
+                    and len(exception["source_ids"]) == 3
+                    for exception in result.exceptions
+                ))
+
+    def test_one_to_many_participant_window_is_quarantined_with_empty_provider(self):
+        """Fallback matching must quarantine before lexical edge order picks a pair."""
+        window = {
+            "start": "2026-08-04T10:00:00Z",
+            "end": "2026-08-04T10:30:00Z",
+            "participants": [{"email": "client@example.test"}],
+        }
+        duplicate_rows = [
+            {**window, "source_id": source_id}
+            for source_id in ("a1", "a2")
+        ]
+        peer = {**window, "source_id": "b1"}
+
+        for duplicate_provider, peer_provider, empty_provider in (
+            ("provider-a", "provider-z", "provider-empty"),
+            ("provider-z", "provider-a", "provider-missing"),
+        ):
+            with self.subTest(
+                duplicate_provider=duplicate_provider,
+                peer_provider=peer_provider,
+            ):
+                result = reconcile_recording_sources(
+                    {
+                        duplicate_provider: duplicate_rows,
+                        peer_provider: [peer],
+                        empty_provider: [],
+                    },
+                    vlad_identities=VLAD_IDS,
+                )
+
+                self.assertEqual(
+                    [1, 1, 1],
+                    sorted(len(meeting.source_ids) for meeting in result.meetings),
+                )
+                self.assertTrue(any(
+                    exception["reason"] == "multiple_candidates"
+                    and len(exception["source_ids"]) == 3
+                    for exception in result.exceptions
+                ))
+
     def test_numeric_fathom_recording_identity_is_canonicalized_as_text(self):
         try:
             result = reconcile_meetings(

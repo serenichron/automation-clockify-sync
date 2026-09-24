@@ -436,17 +436,31 @@ def _candidate(provider: str, record: Mapping[str, Any], vlad: frozenset[str]) -
     )
 
 
-def _normalized_candidates(fathom: Iterable[Mapping[str, Any]], calendly: Iterable[Mapping[str, Any]], vlad_identities: object) -> tuple[tuple[_Candidate, ...], tuple[_Candidate, ...]]:
-    vlad = _identity_set(vlad_identities)
+def _normalized_source_candidates(
+    sources: Mapping[str, Iterable[Mapping[str, Any]]],
+    member_identities: frozenset[str],
+) -> tuple[tuple[str, tuple[_Candidate, ...]], ...]:
+    if not isinstance(sources, Mapping) or not sources:
+        raise MeetingReconciliationError("recording sources must be a non-empty mapping")
+
     def load(provider: str, values: Iterable[Mapping[str, Any]]) -> tuple[_Candidate, ...]:
+        if not isinstance(provider, str) or not provider.strip():
+            raise MeetingReconciliationError("recording source identity is required")
         if isinstance(values, (str, bytes)):
             raise MeetingReconciliationError(f"{provider} recordings must be a sequence")
-        result = tuple(_candidate(provider, _mapping(value, "recording"), vlad) for value in values)
+        result = tuple(
+            _candidate(provider, _mapping(value, "recording"), member_identities)
+            for value in values
+        )
         ids = [item.source_id for item in result]
         if len(set(ids)) != len(ids):
             raise MeetingReconciliationError(f"duplicate {provider} recording identity")
         return tuple(sorted(result, key=lambda item: item.source_id))
-    return load("fathom", fathom), load("calendly", calendly)
+
+    return tuple(
+        (provider, load(provider, values))
+        for provider, values in sorted(sources.items())
+    )
 
 
 def _window_agrees(left: _Candidate, right: _Candidate, tolerance: dt.timedelta) -> bool:
@@ -564,6 +578,123 @@ def _match_in_priority_order(fathom: tuple[_Candidate, ...], calendly: tuple[_Ca
     return tuple(groups), tuple(unique[key] for key in sorted(unique))
 
 
+def _match_multiple_sources(
+    sources: tuple[tuple[str, tuple[_Candidate, ...]], ...],
+    tolerance: dt.timedelta,
+) -> tuple[tuple[tuple[_Candidate, ...], ...], tuple[Mapping[str, Any], ...]]:
+    """Match all providers globally in deterministic identity-priority order."""
+    candidates = tuple(candidate for _provider, values in sources for candidate in values)
+    parent = {candidate.source_id: candidate.source_id for candidate in candidates}
+    exceptions: list[Mapping[str, Any]] = []
+
+    def root(source_id: str) -> str:
+        while parent[source_id] != source_id:
+            parent[source_id] = parent[parent[source_id]]
+            source_id = parent[source_id]
+        return source_id
+
+    def members(source_id: str) -> tuple[_Candidate, ...]:
+        target = root(source_id)
+        return tuple(candidate for candidate in candidates if root(candidate.source_id) == target)
+
+    def merge(left: _Candidate, right: _Candidate) -> None:
+        left_root, right_root = root(left.source_id), root(right.source_id)
+        if left_root == right_root:
+            return
+        left_members = members(left_root)
+        right_members = members(right_root)
+        left_providers = {item.provider for item in left_members}
+        right_providers = {item.provider for item in right_members}
+        if left_providers & right_providers:
+            peer_ids = tuple(item.source_id for item in (*left_members, *right_members))
+            exceptions.append(_exception(peer_ids, "multiple_candidates", peer_ids))
+            return
+        if any(
+            _relation(left_member, right_member, tolerance)[1]
+            for left_member in left_members
+            for right_member in right_members
+        ):
+            return
+        first, second = sorted((left_root, right_root))
+        parent[second] = first
+
+    edges: list[tuple[str, str, _Candidate, _Candidate]] = []
+    for index, left in enumerate(candidates):
+        for right in candidates[index + 1:]:
+            if left.provider == right.provider:
+                continue
+            strength, reason = _relation(left, right, tolerance)
+            if reason:
+                exceptions.append(_exception((left.source_id, right.source_id), reason))
+            elif strength:
+                edges.append((strength, min(left.source_id, right.source_id), left, right))
+
+    by_id = {candidate.source_id: candidate for candidate in candidates}
+    quarantined: set[str] = set()
+
+    def quarantine_ambiguous_components(strengths: set[str]) -> None:
+        adjacency: dict[str, set[str]] = {}
+        for strength, _identity, left, right in edges:
+            if strength in strengths:
+                adjacency.setdefault(left.source_id, set()).add(right.source_id)
+                adjacency.setdefault(right.source_id, set()).add(left.source_id)
+        pending = set(adjacency)
+        while pending:
+            start = min(pending)
+            component: set[str] = set()
+            frontier = [start]
+            while frontier:
+                current = frontier.pop()
+                if current in component:
+                    continue
+                component.add(current)
+                frontier.extend(adjacency.get(current, ()))
+            pending.difference_update(component)
+            ordered = [by_id[source_id] for source_id in sorted(component)]
+            provider_count = len({candidate.provider for candidate in ordered})
+            if provider_count != len(ordered) or any(
+                _relation(left, right, tolerance)[1]
+                for index, left in enumerate(ordered)
+                for right in ordered[index + 1:]
+            ):
+                quarantined.update(component)
+                exceptions.append(
+                    _exception(tuple(component), "multiple_candidates", tuple(component))
+                )
+
+    quarantine_ambiguous_components({"shared_identity", "cross_provider_identity"})
+    quarantine_ambiguous_components({"participant_window"})
+
+    for strength in ("shared_identity", "cross_provider_identity"):
+        for _kind, _identity, left, right in sorted(
+            edges, key=lambda item: (item[1], item[2].source_id, item[3].source_id)
+        ):
+            if _kind == strength and not ({left.source_id, right.source_id} & quarantined):
+                merge(left, right)
+
+    for _kind, _identity, left, right in sorted(
+        edges, key=lambda item: (item[1], item[2].source_id, item[3].source_id)
+    ):
+        if (
+            _kind != "participant_window"
+            or root(left.source_id) == root(right.source_id)
+            or {left.source_id, right.source_id} & quarantined
+        ):
+            continue
+        combined = (*members(left.source_id), *members(right.source_id))
+        if any(item.provider_ids or item.meeting_ids or item.join_urls for item in combined):
+            continue
+        merge(left, right)
+
+    grouped: dict[str, list[_Candidate]] = {}
+    for candidate in candidates:
+        grouped.setdefault(root(candidate.source_id), []).append(candidate)
+    groups = [tuple(sorted(values, key=lambda item: item.source_id)) for values in grouped.values()]
+    groups.sort(key=lambda group: tuple(sorted(item.source_id for item in group)))
+    unique = {_canonical(item): item for item in exceptions}
+    return tuple(groups), tuple(unique[key] for key in sorted(unique))
+
+
 def _canonical_meeting(group: tuple[_Candidate, ...], algorithm_version: str) -> CanonicalMeeting:
     ordered = tuple(sorted(group, key=lambda item: item.source_id))
     # Fathom is authoritative when it supplies at least as much semantic evidence;
@@ -593,18 +724,40 @@ def _canonical_meeting(group: tuple[_Candidate, ...], algorithm_version: str) ->
     )
 
 
-def reconcile_meetings(fathom: Iterable[Mapping[str, Any]], calendly: Iterable[Mapping[str, Any]], *, vlad_identities: object, tolerance: dt.timedelta = DEDUP_TOLERANCE, algorithm_version: str = DEDUP_VERSION) -> MeetingReconciliation:
+def reconcile_recording_sources(
+    sources: Mapping[str, Iterable[Mapping[str, Any]]],
+    *,
+    vlad_identities: object,
+    tolerance: dt.timedelta = DEDUP_TOLERANCE,
+    algorithm_version: str = DEDUP_VERSION,
+) -> MeetingReconciliation:
+    """Reconcile normalized recording rows without coupling to provider names."""
     if not isinstance(tolerance, dt.timedelta) or tolerance.total_seconds() < 0 or tolerance != dt.timedelta(seconds=int(tolerance.total_seconds())):
         raise MeetingReconciliationError("tolerance must be a non-negative whole-second duration")
     if not isinstance(algorithm_version, str) or not algorithm_version:
         raise MeetingReconciliationError("algorithm version is required")
     member_identities = _identity_set(vlad_identities)
-    f_candidates, c_candidates = _normalized_candidates(fathom, calendly, member_identities)
-    groups, exceptions = _match_in_priority_order(f_candidates, c_candidates, tolerance)
+    normalized = _normalized_source_candidates(sources, member_identities)
+    if len(normalized) <= 2:
+        left = normalized[0][1]
+        right = normalized[1][1] if len(normalized) == 2 else ()
+        groups, exceptions = _match_in_priority_order(left, right, tolerance)
+    else:
+        groups, exceptions = _match_multiple_sources(normalized, tolerance)
     meetings = tuple(_canonical_meeting(group, algorithm_version) for group in groups)
     return MeetingReconciliation(
         algorithm_version, int(tolerance.total_seconds()), meetings, (), exceptions,
         member_identities=tuple(sorted(member_identities)),
+    )
+
+
+def reconcile_meetings(fathom: Iterable[Mapping[str, Any]], calendly: Iterable[Mapping[str, Any]], *, vlad_identities: object, tolerance: dt.timedelta = DEDUP_TOLERANCE, algorithm_version: str = DEDUP_VERSION) -> MeetingReconciliation:
+    """Compatibility adapter for the original Fathom/Calendly interface."""
+    return reconcile_recording_sources(
+        {"fathom": fathom, "calendly": calendly},
+        vlad_identities=vlad_identities,
+        tolerance=tolerance,
+        algorithm_version=algorithm_version,
     )
 
 

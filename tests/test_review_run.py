@@ -8,17 +8,25 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
+import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 import csv
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from scripts import collector_receipts, reconciliation_manifest
+from scripts import (
+    collector_receipts, evidence_ledger, reconciliation_manifest,
+    semantic_analyzer, work_accounting_pipeline,
+)
+from task3_scenario_contract import assert_scenario_contract
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "clockify_review_run.py"
+ROOT = SCRIPT.parents[1]
 SPEC = importlib.util.spec_from_file_location("clockify_review_run", SCRIPT)
 review_run = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
@@ -74,7 +82,388 @@ def run_tree_snapshot(*roots: Path) -> dict[str, dict[str, str]]:
     }
 
 
+def analyzer_provider_response(payload: dict) -> dict:
+    members = [
+        {"bundle_ref": bundle["bundle_ref"], **member}
+        for bundle in payload["bundles"]
+        for member in bundle["members"]
+    ]
+    partitions = [
+        {"bundle_ref": member["bundle_ref"], "member_ranges": [[member["member"], member["member"]]]}
+        for member in members
+    ]
+    return {
+        "activities": [{
+            "lifecycle": "completed", "action": "Reviewed", "object": "offline replay",
+            "outcome": "validated sealed analyzer cache", "evidence_partitions": partitions,
+            "evidence_spans": [member["time_span"] for member in members],
+            "project_recommendation": {
+                "name": "Serenichron Level 2", "prefix": "SC", "tag_names": ["Processes"],
+            },
+            "effort": {"minimum_minutes": 10, "recommended_minutes": 10, "maximum_minutes": 10},
+            "semantic_confidence": "high", "timing_confidence": "high",
+            "split_rationale": "one result", "merge_rationale": "",
+        }],
+        "exceptions": [], "omissions": [],
+    }
+
+
 class ReviewRunResultTests(unittest.TestCase):
+    def test_normal_inference_run_seals_used_cache_then_replays_without_mutable_state(self):
+        """Removing run-cache sealing must strand a real normal run after cleanup."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs = root / "runs"
+            source = runs / "normal-source"
+            source.mkdir(parents=True)
+            inventory = {
+                "clockify": {"status": "complete"},
+                "fathom": {"status": "complete"},
+                "multica_issues": {"status": "complete"},
+            }
+            event = evidence_ledger.evidence_event(
+                "codex_sessions_event",
+                {
+                    "source_type": "codex_sessions", "source_id": "normal-1",
+                    "machine": "fixture", "session_id": "session-normal",
+                },
+                observed_at="2026-08-01T10:00:00Z",
+                raw_source_span={
+                    "start": "2026-08-01T10:00:00Z",
+                    "end": "2026-08-01T10:10:00Z",
+                    "path": "/offline/normal.jsonl",
+                },
+                attributes={
+                    "role": "user", "kind": "message",
+                    "content": "Seal the normal analyzer decisions",
+                },
+            )
+            ledger = evidence_ledger.EvidenceLedger((event,), inventory)
+            write_json(source / "evidence" / "evidence-ledger.json", {
+                "schema_version": ledger.manifest.schema_version,
+                "manifest": ledger.manifest.document(),
+                "events": [event.document()],
+            })
+            write_json(source / "run-report.json", {
+                "run_id": source.name,
+                "runtime_identity": {"git_sha": "fixture"},
+                "date_range": {
+                    "since": "2026-08-01T00:00:00Z",
+                    "until": "2026-08-02T00:00:00Z",
+                },
+                "evidence_ledger": {
+                    "source_completeness": ledger.manifest.document()["source_completeness"],
+                },
+            })
+            (source / "run-report.md").write_text("# normal source\n", encoding="utf-8")
+            routing = {
+                "session_routes": [{
+                    "pattern": "normal", "project_name": "Serenichron Level 2",
+                    "prefix": "SC", "tag_names": ["Processes"], "billable": True,
+                }],
+                "meeting_routes": [],
+            }
+            write_json(source / "routing.json", routing)
+            (source / "review-corrections.jsonl").write_text("", encoding="utf-8")
+            (source / "review-acceptance.jsonl").write_text("", encoding="utf-8")
+
+            mutable_cache = root / "state" / "analyzer-cache-v2.jsonl"
+            cache = semantic_analyzer.AnalyzerResponseCache(mutable_cache)
+            endpoint = semantic_analyzer.AnalyzerEndpoint(
+                name="clockify_analyzer_primary",
+                url="https://offline.invalid/v1/chat/completions",
+                model="deepseek-v4-flash:cloud",
+                revision="a" * 64,
+            )
+
+            def transport(_endpoint, body):
+                payload = json.loads(body["messages"][-1]["content"])
+                return (
+                    {"probe": "ok"}
+                    if payload.get("probe")
+                    else analyzer_provider_response(payload)
+                )
+
+            semantic_analyzer.analyze_tiered(
+                work_accounting_pipeline._with_semantic_route_hints(
+                    [event.document()], routing
+                ),
+                primary=endpoint,
+                transport=transport,
+                private_text_approved=True,
+                cache=cache,
+                max_workers=1,
+                review_taxonomy=[{
+                    "project_name": "Serenichron Level 2", "prefix": "SC",
+                    "tag_names": ["Processes"], "billable": True,
+                    "selection_guidance": ["normal"],
+                }],
+            )
+            cache.store_rejected(
+                endpoint, {"unused": True}, failure_code="contract_rejected"
+            )
+            legacy_records = [
+                json.loads(line) for line in mutable_cache.read_text().splitlines()
+            ]
+            for record in legacy_records:
+                record.pop("route")
+            mutable_cache.write_text(
+                "".join(
+                    semantic_analyzer.canonical_json(record) + "\n"
+                    for record in legacy_records
+                ),
+                encoding="utf-8",
+            )
+            mutable_record_count = len(legacy_records)
+            args = argparse.Namespace(
+                routing=source / "routing.json",
+                corrections=source / "review-corrections.jsonl",
+                state=root / "state" / "review-items.json",
+                analyzer_cache=mutable_cache,
+                analysis_fixture=None,
+                analyzer_target_body_bytes=None,
+                analyzer_max_events_per_chunk=None,
+                analyzer_workers=1,
+                review_mode="shadow_all",
+            )
+            environment = {
+                "CLOCKIFY_ANALYZER_PRIMARY_URL": endpoint.url,
+                "CLOCKIFY_ANALYZER_PRIMARY_MODEL": endpoint.model,
+                "CLOCKIFY_ANALYZER_PRIMARY_REVISION": endpoint.revision,
+                "CLOCKIFY_ANALYZER_FALLBACK_URL": "",
+                "CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED": "approved",
+            }
+            with mock.patch.object(review_run, "RUNS", runs), mock.patch.dict(
+                os.environ, environment, clear=False
+            ):
+                code, _result = review_run._process_run(args, source, {})
+            self.assertEqual(0, code)
+
+            sealed_cache = source / "analyzer-cache-used.jsonl"
+            self.assertTrue(sealed_cache.is_file())
+            sealed_records = [
+                json.loads(line) for line in sealed_cache.read_text().splitlines()
+            ]
+            self.assertTrue(all(record["route"] == {
+                "name": endpoint.name,
+                "url": endpoint.url,
+                "model": endpoint.model,
+                "revision": endpoint.revision,
+            } for record in sealed_records))
+            analysis = json.loads((source / "semantic-analysis.json").read_text())
+            used = analysis["analyzer_cache"]["records"]
+            self.assertEqual(
+                [record["cache_key"] for record in used],
+                [record["cache_key"] for record in sealed_records],
+            )
+            self.assertLess(len(sealed_records), mutable_record_count)
+            self.assertEqual({
+                "path": "analyzer-cache-used.jsonl",
+                "record_count": len(sealed_records),
+                "sha256": hashlib.sha256(sealed_cache.read_bytes()).hexdigest(),
+            }, analysis["analyzer_cache"]["snapshot"])
+
+            self._write_reconciliation_snapshots(source)
+            write_json(source / "routing.json", routing)
+            mutable_cache.unlink()
+            with mock.patch.dict(os.environ, {
+                "CLOCKIFY_ANALYZER_PRIMARY_URL": "",
+                "CLOCKIFY_ANALYZER_PRIMARY_MODEL": "",
+                "CLOCKIFY_ANALYZER_PRIMARY_REVISION": "",
+                "CLOCKIFY_ANALYZER_FALLBACK_URL": "",
+                "CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED": "approved",
+            }, clear=False):
+                replay_code = review_run.main([
+                    "--replay-from", str(source),
+                    "--runs-root", str(runs),
+                    "--state", str(root / "state" / "replay-items.json"),
+                ])
+            self.assertEqual(0, replay_code)
+
+    def test_real_offline_replay_main_reuses_accepted_cache_and_passes_integrity(self):
+        """Replay must prove accepted cache reuse before crossing the accounting child."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs = root / "runs"
+            source = self._write_real_offline_replay_source(runs, root)
+            immutable_before = run_tree_snapshot(source)
+            parent_before = {
+                str(path.relative_to(source)): path.read_bytes()
+                for path in sorted(source.rglob("*")) if path.is_file()
+            }
+
+            with mock.patch.dict(os.environ, {
+                "CLOCKIFY_ANALYZER_PRIMARY_URL": "",
+                "CLOCKIFY_ANALYZER_PRIMARY_MODEL": "",
+                "CLOCKIFY_ANALYZER_PRIMARY_REVISION": "",
+                "CLOCKIFY_ANALYZER_FALLBACK_URL": "",
+                "CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED": "approved",
+            }, clear=False):
+                code = review_run.main([
+                    "--replay-from", str(source),
+                    "--runs-root", str(runs.resolve()),
+                    "--state", str(root / "replay-items.json"),
+                ])
+
+            replay = next(runs.glob("*-replay-source-run"))
+            self.assertEqual(
+                0, code,
+                (replay / "autopilot-result.json").read_text(encoding="utf-8"),
+            )
+            self.assertEqual(
+                "pass",
+                json.loads((replay / "replay-integrity.json").read_text())["status"],
+            )
+            self.assertEqual(immutable_before, run_tree_snapshot(source))
+            self.assertEqual(
+                (source / "work-accounting-result.json").read_bytes(),
+                (replay / "work-accounting-result.json").read_bytes(),
+            )
+            provenance = json.loads((replay / "replay-source.json").read_text())
+            self.assertEqual(
+                json.loads((source / "semantic-analysis.json").read_text())["analyzer_cache"]["records"],
+                provenance["analyzer_cache_reused_records"],
+            )
+            self.assertEqual(
+                (source / "analyzer-cache-used.jsonl").read_bytes(),
+                (replay / provenance["analyzer_cache_fixture"]).read_bytes(),
+            )
+            self.assertEqual(
+                hashlib.sha256((source / "analyzer-cache-used.jsonl").read_bytes()).hexdigest(),
+                provenance["analyzer_cache_sha256"],
+            )
+            replay_result = json.loads(
+                (replay / "work-accounting-result.json").read_text(encoding="utf-8")
+            )
+            assert_scenario_contract(
+                self,
+                stable_ids=[
+                    proposal["review_activity_key"]
+                    for proposal in replay_result["proposals"]
+                ],
+                parent_before=parent_before,
+                parent_after={
+                    str(path.relative_to(source)): path.read_bytes()
+                    for path in sorted(source.rglob("*")) if path.is_file()
+                },
+                emitted_ids=[
+                    record["cache_key"]
+                    for record in provenance["analyzer_cache_reused_records"]
+                ],
+                clockify_adapter_calls=int(bool(replay_result["external_writes"])),
+            )
+
+    def test_inference_backed_replay_requires_source_cache_before_child(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = self._write_real_offline_replay_source(root / "runs", root)
+            (source / "analyzer-cache-used.jsonl").unlink()
+
+            blocked_child = SimpleNamespace(returncode=2, stderr="unexpected child", stdout="")
+            with mock.patch.object(review_run, "_run", return_value=blocked_child) as child:
+                code = review_run.main([
+                    "--replay-from", str(source), "--runs-root", str(root / "runs"),
+                    "--state", str(root / "review-items.json"),
+                ])
+
+            self.assertEqual(2, code)
+            child.assert_not_called()
+
+    def test_inference_metadata_requires_cache_even_without_cache_summary_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = self._write_real_offline_replay_source(root / "runs", root)
+            analysis_path = source / "semantic-analysis.json"
+            analysis = json.loads(analysis_path.read_text())
+            analysis["analyzer_cache"]["records"] = []
+            write_json(analysis_path, analysis)
+            (source / "analyzer-cache-used.jsonl").unlink()
+
+            with mock.patch.object(review_run, "RUNS", root / "runs"):
+                with self.assertRaisesRegex(ValueError, "sealed analyzer cache"):
+                    review_run._prepare_replay_run(source)
+
+    def test_replay_cache_binding_mismatches_block_before_accounting_child(self):
+        """Evidence, prompt, model, or output drift must never reach child transport."""
+        for field in ("evidence", "prompt", "model", "request", "output"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                runs = root / "runs"
+                source = self._write_real_offline_replay_source(runs, root)
+                if field == "evidence":
+                    analysis = json.loads((source / "semantic-analysis.json").read_text())
+                    analysis["ledger_evidence_digest"] = "led-" + "f" * 64
+                    write_json(source / "semantic-analysis.json", analysis)
+                else:
+                    cache_path = source / "analyzer-cache-used.jsonl"
+                    records = [json.loads(line) for line in cache_path.read_text().splitlines()]
+                    record = records[-1]
+                    if field == "prompt":
+                        record["prompt_version"] = "clockify-semantic-v99"
+                    elif field == "model":
+                        record["model"] = "different-flash-route"
+                    elif field == "request":
+                        record["body_digest"] = "a" * 64
+                        record["cache_key"] = semantic_analyzer.stable_digest(
+                            "arc-", {
+                                "schema_version": record["schema_version"],
+                                "prompt_version": record["prompt_version"],
+                                "semantic_schema_version": record["semantic_schema_version"],
+                                "route_digest": record["route_digest"],
+                                "body_digest": record["body_digest"],
+                            }, length=64,
+                        )
+                    else:
+                        record["response"]["activities"][0]["outcome"] = "mutated output"
+                        record["decision_digest"] = semantic_analyzer.AnalyzerResponseCache._decision_digest({
+                            "status": "accepted", "response": record["response"],
+                        })
+                    records[-1] = record
+                    cache_path.write_text("".join(json.dumps(item, sort_keys=True) + "\n" for item in records))
+                    if field in {"request", "output"}:
+                        analysis_path = source / "semantic-analysis.json"
+                        analysis = json.loads(analysis_path.read_text())
+                        analysis["analyzer_cache"]["records"][-1] = {
+                            "cache_key": record["cache_key"],
+                            "decision_digest": record["decision_digest"],
+                        }
+                        write_json(analysis_path, analysis)
+
+                with mock.patch.dict(os.environ, {
+                    "CLOCKIFY_ANALYZER_PRIMARY_URL": "https://offline.invalid/v1/chat/completions",
+                    "CLOCKIFY_ANALYZER_PRIMARY_MODEL": "deepseek-v4-flash:cloud",
+                    "CLOCKIFY_ANALYZER_PRIMARY_REVISION": "a" * 64,
+                    "CLOCKIFY_ANALYZER_FALLBACK_URL": "",
+                    "CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED": "approved",
+                }, clear=False):
+                    with self.assertRaises((ValueError, semantic_analyzer.AnalyzerError)):
+                        review_run._prepare_replay_run(source)
+
+    def test_collector_derivation_successfully_finalizes_verified_completion(self):
+        """A passing derivation must seal and reload its complete artifact bundle."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = self._write_real_offline_replay_source(root / "runs", root)
+            (run_dir / "completion-bundle.json").unlink()
+            identity = SimpleNamespace(
+                slice_id="slice-fixture",
+                since_utc="2026-08-01T00:00:00Z",
+                until_utc="2026-08-02T00:00:00Z",
+            )
+            with mock.patch.object(
+                review_run, "_verified_collector_derivation",
+                return_value=(root / "collector-source", identity, {}),
+            ):
+                bundle = review_run._finalize_collector_derivation_completion(run_dir)
+
+            self.assertEqual("slice-fixture", bundle.slice_id)
+            self.assertEqual(
+                bundle.bundle_digest,
+                collector_receipts.load_completion_bundle(
+                    run_dir / "completion-bundle.json", run_dir=run_dir,
+                ).bundle_digest,
+            )
+
     def test_finalization_records_only_a_verified_downstream_bundle(self):
         """Collector output stays pending until all downstream artifacts bind one slice."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -308,6 +697,10 @@ class ReviewRunResultTests(unittest.TestCase):
                 review_run, "_run", return_value=collected
             ), mock.patch.object(
                 review_run,
+                "_prepare_collector_derivation_run",
+                side_effect=lambda run_dir, snapshots: run_dir,
+            ), mock.patch.object(
+                review_run,
                 "_process_run",
                 side_effect=[(0, first_result), (0, second_result)],
             ) as process_run, redirect_stdout(output):
@@ -412,7 +805,7 @@ class ReviewRunResultTests(unittest.TestCase):
                     "ledger_evidence_digest": "sha256:" + "c" * 64,
                     "activities": [{
                         "analyzer_model": "model-a",
-                        "analyzer_tier": "primary",
+                        "analyzer_tier": "fixture",
                     }],
                     "analysis_chunks": [],
                 }) + "\n",
@@ -928,6 +1321,48 @@ class ReviewRunResultTests(unittest.TestCase):
             ):
                 review_run._prepare_replay_run(source)
 
+    def test_replay_preparation_copies_the_exact_preflight_semantic_bytes(self):
+        """A source-path replacement before the old copy must not change child input."""
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            source, _ = self._complete_replay_fixture(runs)
+            (source / "run-report.md").write_text("# source\n", encoding="utf-8")
+            semantic_path = source / "semantic-analysis.json"
+            original = semantic_path.read_bytes()
+            real_copyfile = shutil.copyfile
+
+            def mutate_before_copy(src, dst, *args, **kwargs):
+                if Path(src) == semantic_path:
+                    semantic_path.write_text('{"schema_version":1,"mutated":true}\n')
+                return real_copyfile(src, dst, *args, **kwargs)
+
+            with mock.patch.object(review_run, "RUNS", runs), mock.patch.object(
+                review_run.shutil, "copyfile", side_effect=mutate_before_copy,
+            ):
+                replay = review_run._prepare_replay_run(source)
+
+            provenance = json.loads((replay / "replay-source.json").read_text())
+            self.assertEqual(
+                original,
+                (replay / provenance["semantic_analysis_fixture"]).read_bytes(),
+            )
+
+    def test_replay_integrity_enforces_sealed_source_provenance_digests(self):
+        """Final integrity must not recompute mutable equality around a broken seal."""
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            source, replay = self._complete_replay_fixture(runs)
+            provenance_path = replay / "replay-source.json"
+            provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+            provenance["semantic_analysis_sha256"] = "0" * 64
+            write_json(provenance_path, provenance)
+
+            with mock.patch.object(review_run, "RUNS", runs):
+                report = review_run.derive_replay_integrity(source, replay)
+
+            self.assertEqual("blocked", report["status"])
+            self.assertIn("replay source provenance differs", report["failures"])
+
     @staticmethod
     def _write_reconciliation_snapshots(directory: Path) -> None:
         directory.mkdir(parents=True, exist_ok=True)
@@ -1012,7 +1447,7 @@ class ReviewRunResultTests(unittest.TestCase):
             "evidence_bundle_schema_version": "clockify-semantic-evidence-bundle/v1",
             "evidence_bundle_manifest": bundle_manifest(),
             "ledger_evidence_digest": "sha256:" + "c" * 64,
-            "activities": [{"analyzer_model": "model-a", "analyzer_tier": "primary"}],
+            "activities": [{"analyzer_model": "model-a", "analyzer_tier": "fixture"}],
             "analysis_chunks": [],
         }
         manifests: dict[Path, dict] = {}
@@ -1060,7 +1495,153 @@ class ReviewRunResultTests(unittest.TestCase):
         (replay / "period-manifest.json").write_bytes(
             (source / "period-manifest.json").read_bytes()
         )
+        semantic_fixture = replay / "replay-fixture" / "semantic-analysis.json"
+        semantic_fixture.parent.mkdir()
+        semantic_fixture.write_bytes((source / "semantic-analysis.json").read_bytes())
+        write_json(replay / "replay-source.json", {
+            "schema_version": 1,
+            "source_run_id": source.name,
+            "source_run_dir": str(source.resolve()),
+            "source_manifest_id": ledger["manifest"]["manifest_id"],
+            "source_events_digest": ledger["manifest"]["events_digest"],
+            "ledger_file_sha256": hashlib.sha256(
+                (source / "evidence" / "evidence-ledger.json").read_bytes()
+            ).hexdigest(),
+            "semantic_analysis_sha256": hashlib.sha256(
+                (source / "semantic-analysis.json").read_bytes()
+            ).hexdigest(),
+            "semantic_analysis_fixture": "replay-fixture/semantic-analysis.json",
+            "work_accounting_result_sha256": hashlib.sha256(
+                (source / "work-accounting-result.json").read_bytes()
+            ).hexdigest(),
+        })
         return source, replay
+
+    @staticmethod
+    def _write_real_offline_replay_source(runs: Path, root: Path) -> Path:
+        source = runs / "source-run"
+        source.mkdir(parents=True)
+        inventory = {
+            "clockify": {"status": "complete"},
+            "fathom": {"status": "complete"},
+            "multica_issues": {"status": "complete"},
+        }
+        event = evidence_ledger.evidence_event(
+            "codex_sessions_event",
+            {"source_type": "codex_sessions", "source_id": "offline-1", "machine": "fixture", "session_id": "session-1"},
+            observed_at="2026-08-01T10:00:00Z",
+            raw_source_span={"start": "2026-08-01T10:00:00Z", "end": "2026-08-01T10:10:00Z", "path": "/offline/replay.jsonl"},
+            attributes={"role": "user", "kind": "message", "content": "Validate offline replay"},
+        )
+        ledger = evidence_ledger.EvidenceLedger((event,), inventory)
+        write_json(source / "evidence" / "evidence-ledger.json", {
+            "schema_version": ledger.manifest.schema_version,
+            "manifest": ledger.manifest.document(),
+            "events": [event.document()],
+        })
+        write_json(source / "run-report.json", {
+            "run_id": source.name,
+            "runtime_identity": {"git_sha": "fixture"},
+            "date_range": {
+                "since": "2026-08-01T00:00:00Z",
+                "until": "2026-08-02T00:00:00Z",
+            },
+            "evidence_ledger": {
+                "source_completeness": ledger.manifest.document()["source_completeness"],
+            },
+        })
+        (source / "run-report.md").write_text("# offline replay source\n")
+        routing = {
+            "session_routes": [{
+                "pattern": "offline", "project_name": "Serenichron Level 2",
+                "prefix": "SC", "tag_names": ["Processes"], "billable": True,
+            }],
+            "meeting_routes": [],
+        }
+        write_json(source / "routing.json", routing)
+        (source / "review-corrections.jsonl").write_text("")
+        (source / "review-acceptance.jsonl").write_text("")
+        cache_path = source / "analyzer-cache-used.jsonl"
+        cache = semantic_analyzer.AnalyzerResponseCache(cache_path)
+        endpoint = semantic_analyzer.AnalyzerEndpoint(
+            name="clockify_analyzer_primary", url="https://offline.invalid/v1/chat/completions",
+            model="deepseek-v4-flash:cloud", revision="a" * 64,
+        )
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][-1]["content"])
+            return {"probe": "ok"} if payload.get("probe") else analyzer_provider_response(payload)
+
+        analysis = semantic_analyzer.analyze_tiered(
+            work_accounting_pipeline._with_semantic_route_hints([event.document()], routing),
+            primary=endpoint, transport=transport,
+            private_text_approved=True, cache=cache, max_workers=1,
+            review_taxonomy=[{
+                "project_name": "Serenichron Level 2", "prefix": "SC",
+                "tag_names": ["Processes"], "billable": True,
+                "selection_guidance": ["offline"],
+            }],
+        )
+        cache_content = cache_path.read_bytes()
+        analysis["analyzer_cache"]["snapshot"] = {
+            "path": "analyzer-cache-used.jsonl",
+            "record_count": len(cache_content.splitlines()),
+            "sha256": hashlib.sha256(cache_content).hexdigest(),
+        }
+        fixture = root / "sealed-analysis.json"
+        write_json(fixture, analysis)
+        completed = subprocess.run([
+            sys.executable, str(ROOT / "scripts" / "work_accounting_pipeline.py"),
+            str(source), "--root", str(ROOT), "--routing", str(source / "routing.json"),
+            "--corrections", str(source / "review-corrections.jsonl"),
+            "--analysis-fixture", str(fixture),
+        ], cwd=ROOT, text=True, capture_output=True, check=False)
+        if completed.returncode:
+            raise AssertionError(completed.stderr or completed.stdout)
+        quality = subprocess.run([
+            sys.executable, str(ROOT / "scripts" / "clockify_sync_quality.py"),
+            source.name, "--runs-root", str(runs), "--root", str(ROOT),
+            "--routing", str(source / "routing.json"), "--strict",
+        ], cwd=ROOT, text=True, capture_output=True, check=False)
+        if quality.returncode:
+            raise AssertionError(quality.stderr or quality.stdout)
+        state = subprocess.run([
+            sys.executable, str(ROOT / "scripts" / "clockify_review_state.py"),
+            str(source), "--state", str(root / "source-items.json"),
+        ], cwd=ROOT, text=True, capture_output=True, check=False)
+        if state.returncode:
+            raise AssertionError(state.stderr or state.stdout)
+        slice_ = review_run.clockify_sync_collect.plan_slices(
+            dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc),
+            dt.datetime(2026, 8, 2, tzinfo=dt.timezone.utc),
+            zone=review_run.clockify_sync_collect.BUCHAREST,
+        )[0]
+        bundle = collector_receipts.build_completion_bundle(source, slice_=slice_)
+        bundle_path = source / "completion-bundle.json"
+        collector_receipts.write_completion_bundle(bundle_path, bundle)
+        manifest = {
+            "schema_version": reconciliation_manifest.MANIFEST_COMPATIBILITY_VERSION,
+            "compatibility_version": reconciliation_manifest.MANIFEST_COMPATIBILITY_VERSION,
+            "period": {
+                "compatibility_version": reconciliation_manifest.PERIOD_COMPATIBILITY_VERSION,
+                "member_id": "member-fixture", "workspace_id": "workspace-fixture",
+                "timezone": "Europe/Bucharest", "since_utc": "2026-08-01T00:00:00Z",
+                "until_utc": "2026-08-02T00:00:00Z", "revision": 1,
+            },
+            "state": "reconciling", "event_count": 2,
+            "events_digest": "sha256:" + "d" * 64,
+            "artifacts": [{
+                "path": str(bundle_path.resolve()),
+                "schema_version": "collector-completion-bundle/v1",
+                "compatibility_version": "collector-completion-bundle/v1",
+                "digest": "sha256:" + hashlib.sha256(bundle_path.read_bytes()).hexdigest(),
+            }],
+            "blockers": [],
+        }
+        manifest["manifest_digest"] = "sha256:" + hashlib.sha256(
+            json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        write_json(source / "period-manifest.json", manifest)
+        return source
 
     def test_replay_range_options_are_rejected_before_any_process_runs(self):
         with mock.patch.object(review_run, "_run") as run:
@@ -1281,7 +1862,13 @@ class ReviewRunResultTests(unittest.TestCase):
             )
             with mock.patch.object(review_run, "RUNS", runs), mock.patch.object(
                 review_run, "_run", side_effect=[collected, blocked]
-            ) as run:
+            ) as run, mock.patch.object(
+                review_run,
+                "_prepare_collector_derivation_run",
+                side_effect=lambda source, snapshots: source,
+            ), mock.patch.object(
+                review_run, "_adopt_completed_collector_derivation", return_value=None
+            ):
                 result_code = review_run.main(
                     [
                         "--period-manifest", str(inputs / "period-manifest.json"),
@@ -1348,6 +1935,10 @@ class ReviewRunResultTests(unittest.TestCase):
             with mock.patch.object(review_run, "RUNS", runs), mock.patch.object(
                 review_run, "_run", return_value=collected
             ) as run, mock.patch.object(
+                review_run,
+                "_prepare_collector_derivation_run",
+                side_effect=lambda source, snapshots: source,
+            ), mock.patch.object(
                 review_run, "_process_run",
                 return_value=(0, run_dir / "autopilot-result.json"),
             ) as process_run:
@@ -1405,6 +1996,10 @@ class ReviewRunResultTests(unittest.TestCase):
 
             with mock.patch.object(review_run, "RUNS", runs), mock.patch.object(
                 review_run, "_run", return_value=collected
+            ), mock.patch.object(
+                review_run,
+                "_prepare_collector_derivation_run",
+                side_effect=lambda source, snapshots: source,
             ), mock.patch.object(
                 review_run, "_process_run", return_value=(0, result_path)
             ) as process_run:

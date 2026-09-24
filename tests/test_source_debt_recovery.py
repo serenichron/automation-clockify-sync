@@ -356,6 +356,32 @@ class SourceDebtRecoveryTests(unittest.TestCase):
         self.assertEqual(SOURCE, transition["source"])
         self.assertEqual(ATTEMPT_1, transition["attempt_id"])
 
+    def test_recovery_accepts_raw_parent_after_only_derived_artifact_drift(self) -> None:
+        """The backlog-bound raw collector source survives an old executor overwrite."""
+        parent = self.make_parent()
+        (parent / "quality_report.json").write_text(
+            '{"status":"blocked","summary":{"fixture":"old executor"}}\n'
+        )
+        before = tree_hashes(parent)
+        with mock.patch.object(
+            collector, "collect_remote_sessions", return_value=self.healthy_peer()
+        ) as transport:
+            result = recovery.recover(parent, SOURCE, ATTEMPT_1)
+
+        self.assertEqual(1, transport.call_count)
+        self.assertNotEqual(parent, result.run_dir)
+        self.assertEqual(before, tree_hashes(parent))
+        transition = json.loads(
+            (result.run_dir / "run-report.json").read_text()
+        )["source_debt_recovery"]
+        source_bundle = collector_receipts.load_collector_source_bundle(
+            parent / "completion-bundle.json", run_dir=parent
+        )
+        self.assertEqual(
+            source_bundle.source_bundle_digest,
+            transition["parent_bundle_digest"],
+        )
+
     def test_recovery_collects_peer_once_and_binds_rebuilt_ledger(self) -> None:
         """Only bundle-bound ledger events may cross the parent boundary."""
         parent = self.make_parent()

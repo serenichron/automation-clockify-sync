@@ -10,10 +10,11 @@ from pathlib import Path
 from unittest import mock
 
 from scripts import clockify_review_cycle as cycle
-from scripts import collector_slices
+from scripts import collector_receipts, collector_slices, evidence_ledger
 from scripts import clockify_review_run as review_run
 from scripts import source_coverage
 from scripts.autopilot_process import ChildResult
+from task3_scenario_contract import assert_scenario_contract
 _DELIVERY_SPEC = importlib.util.spec_from_file_location(
     "review_cycle_delivery_fixtures", Path(__file__).with_name("test_review_cycle_delivery.py")
 )
@@ -80,6 +81,112 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
     def debts(self):
         document = source_coverage.read(self.state_dir / "source-coverage.json")
         return source_coverage.SourceDebtStore.from_document(document).active()
+
+    def verified_audit_stage(
+        self, name: str, *, since: dt.date, until: dt.date,
+        calendly_status: str = "complete", calendly_optional: bool,
+        fathom_status: str = "complete",
+        machines: tuple[str, ...] = (),
+        compatibility_version: str = "source-debt/v1",
+    ) -> dict[str, object]:
+        """Create a real, raw-evidence-bound collector bundle for audit tests."""
+        local = cycle.ZoneInfo("Europe/Bucharest")
+        since_dt = dt.datetime.combine(since, dt.time(), local)
+        until_dt = dt.datetime.combine(until, dt.time(), local)
+        planned = collector_slices.plan_slices(
+            since_dt, until_dt, zone=local, max_days=2,
+        )
+        self.assertEqual(1, len(planned))
+        slice_ = planned[0]
+        run_dir = self.root / "runs" / name
+        (run_dir / "evidence").mkdir(parents=True)
+        raw = {
+            "clockify": {"status": "complete", "entries": []},
+            "fathom": (
+                {"status": "complete", "meetings": []}
+                if fathom_status == "complete"
+                else {"status": "unavailable", "meetings": []}
+            ),
+            "calendly": (
+                {"status": "complete", "recordings": []}
+                if calendly_status == "complete"
+                else {"status": "excluded", "complete": True, "recordings": []}
+            ),
+            "multica_issues": {"status": "complete", "issues": []},
+            "sessions": [
+                {
+                    "machine": machine, "status": "complete",
+                    "repository_evidence_status": "complete",
+                    "repository_events": [],
+                }
+                for machine in machines
+            ],
+        }
+        filenames = {
+            "clockify": "clockify-existing.json",
+            "fathom": "fathom-meetings.json",
+            "calendly": "calendly-recordings.json",
+            "multica_issues": "multica-issues.json",
+            "sessions": "sessions.json",
+        }
+        for key, filename in filenames.items():
+            write_json(run_dir / "evidence" / filename, raw[key])
+        ledger = evidence_ledger.EvidenceLedger(
+            tuple(evidence_ledger.normalize_collector_snapshot(raw)),
+            evidence_ledger.source_inventory_from_collector(raw),
+        )
+        manifest = ledger.manifest.document()
+        write_json(run_dir / "evidence" / "evidence-ledger.json", {
+            "schema_version": evidence_ledger.SCHEMA_VERSION,
+            "manifest": manifest,
+            "events": [event.document() for event in ledger.events],
+        })
+        since_utc = since_dt.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        until_utc = until_dt.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        write_json(run_dir / "run-report.json", {
+            "runtime_identity": {"git_sha": "fixture"},
+            "date_range": {"since": since_utc, "until": until_utc},
+            "collection_mode": {"calendly_optional": calendly_optional},
+            "evidence_ledger": {
+                "source_completeness": manifest["source_completeness"],
+            },
+        })
+        for relative in (
+            "semantic-analysis.json", "work-accounting-result.json",
+            "quality_report.json", "review-snapshot.json",
+        ):
+            write_json(run_dir / relative, {"artifact": relative})
+        completion = collector_receipts.build_completion_bundle(
+            run_dir, slice_=slice_,
+        )
+        collector_receipts.write_completion_bundle(
+            run_dir / "completion-bundle.json", completion,
+        )
+        verified = collector_receipts.load_collector_source_bundle(
+            run_dir / "completion-bundle.json", run_dir=run_dir,
+        )
+        return {
+            "stage_kind": "collector_source",
+            "run_dir": str(run_dir.resolve()),
+            "bundle_digest": verified.source_bundle_digest,
+            "slice_id": verified.slice_id,
+            "since_utc": verified.since_utc,
+            "until_utc": verified.until_utc,
+            "compatibility_version": compatibility_version,
+        }
+
+    def write_audit_state(self, stages: list[dict[str, object]]) -> None:
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        write_json(self.state_dir / "review-cycle-state.json", {
+            "schema_version": cycle.SCHEMA_VERSION,
+            "completed_through": None,
+            "scheduled_through": "2026-09-11",
+            "next_work_class": "routine",
+            "slices": {
+                f"slice-{index}": {"source": stage}
+                for index, stage in enumerate(stages)
+            },
+        })
 
     def test_verified_recovery_attempt_requires_external_receipt_identity(self):
         parent = {
@@ -250,6 +357,156 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
         self.assertEqual("2026-09-09", self.state()["scheduled_through"])
         self.assertIsNone(self.state()["completed_through"])
 
+    def test_verified_unclassified_gap_restarts_through_existing_generic_debt_path(self):
+        """Catches a persisted verified gap escaping debt after a pre-debt crash."""
+        commands: list[list[str]] = []
+
+        def unclassified_child(command, **_kwargs):
+            command = list(command)
+            commands.append(command)
+            since = dt.date.fromisoformat(command[command.index("--since") + 1])
+            path = make_run(
+                self.root, f"unclassified-{since.isoformat()}", replay=False,
+                coverage={
+                    "status": "incomplete",
+                    "sources": {"fathom": {"status": "unavailable"}},
+                    "incomplete_sources": ["fathom"],
+                },
+                since=since, until=since + dt.timedelta(days=2),
+            )
+            return ChildResult(0, str(path) + "\n", "", False, 0.1)
+
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=unclassified_child), \
+             mock.patch.object(
+                 cycle.source_coverage, "write",
+                 side_effect=RuntimeError("before generic debt persistence"),
+             ):
+            with self.assertRaisesRegex(RuntimeError, "before generic debt persistence"):
+                cycle.run_cycle(
+                    {**self.config, "max_slices": 1}, enable_sheet_write=True,
+                    today=dt.date(2026, 9, 12),
+                )
+
+        with mock.patch.object(cycle, "run_child_bounded") as child:
+            outcome = cycle.run_cycle(
+                {**self.config, "max_slices": 1}, enable_sheet_write=True,
+                today=dt.date(2026, 9, 12),
+            )
+
+        child.assert_not_called()
+        self.assertEqual("recovery_blocked", outcome["status"])
+        self.assertEqual(1, len(commands))
+        self.assertEqual(
+            ["runner/unclassified"],
+            [item.interval.source for item in self.debts()],
+        )
+
+    def test_quality_failure_persists_exact_peer_debt_from_verified_collector_source(self):
+        """Catches semantic/quality failure suppressing an already proven source gap."""
+        result_path = self.root / "runs" / "derived" / "autopilot-result.json"
+        result_path.parent.mkdir(parents=True)
+        result_path.write_text('{"quality_status":"blocked"}\n')
+        collector_source_path = result_path.parent / "collector-source.json"
+        collector_source_path.write_text("{}\n")
+        parent_before = {"collector-source.json": collector_source_path.read_bytes()}
+        collector_stage = {
+            "stage_kind": "collector_source",
+            "result_path": str(result_path),
+            "result_digest": "sha256:" + "1" * 64,
+            "run_dir": str((self.root / "runs" / "collector-parent").resolve()),
+            "run_id": "collector-parent",
+            "bundle_digest": "sha256:" + "2" * 64,
+            "legacy_completion_bundle_digest": "sha256:" + "3" * 64,
+            "runtime_identity_digest": "sha256:" + "4" * 64,
+            "collector_runtime_identity_digest": "sha256:" + "4" * 64,
+            "executor_runtime_identity_digest": "sha256:" + "5" * 64,
+            "snapshot_digests": {},
+            "coverage": {
+                "status": "incomplete",
+                "sources": {
+                    "sessions/macbook": {"status": "unavailable"},
+                    "repositories/macbook": {"status": "unavailable"},
+                },
+                "incomplete_sources": [
+                    "repositories/macbook", "sessions/macbook",
+                ],
+            },
+            "slice_id": "slice-fixture",
+            "since_utc": "2026-09-06T21:00:00Z",
+            "until_utc": "2026-09-08T21:00:00Z",
+            "compatibility_version": "collector-slice-bundles/v1:" + "a" * 64,
+        }
+        child = ChildResult(2, str(result_path) + "\n", "quality blocked", False, 0.1)
+        real_write = source_coverage.write
+        writes = 0
+
+        def crash_after_debt(path, value):
+            nonlocal writes
+            real_write(path, value)
+            writes += 1
+            if writes == 1:
+                raise RuntimeError("after exact debt persistence")
+
+        with mock.patch.object(cycle, "run_child_bounded", return_value=child), \
+             mock.patch.object(
+                 cycle, "_validate_collector_source_stage", return_value=collector_stage
+             ) as validated, mock.patch.object(
+                 cycle.source_coverage, "write", side_effect=crash_after_debt
+             ):
+            with self.assertRaisesRegex(RuntimeError, "after exact debt persistence"):
+                cycle.run_cycle(
+                    {**self.config, "max_slices": 1},
+                    enable_sheet_write=True,
+                    today=dt.date(2026, 9, 12),
+                )
+
+        with mock.patch.object(cycle, "run_child_bounded", return_value=child), \
+             mock.patch.object(
+                 cycle, "_validate_collector_source_stage", return_value=collector_stage
+             ):
+            outcome = cycle.run_cycle(
+                {**self.config, "max_slices": 1}, enable_sheet_write=True,
+                today=dt.date(2026, 9, 12),
+            )
+
+        self.assertEqual("recovery_blocked", outcome["status"])
+        self.assertEqual(["peer/macbook"], [item.interval.source for item in self.debts()])
+        validated.assert_called_once()
+        record = self.state()["slices"]["2026-09-07"]
+        self.assertEqual("collector_source", record["source_parent"]["stage_kind"])
+
+        later_commands: list[list[str]] = []
+        with mock.patch.object(
+            cycle, "run_child_bounded", side_effect=self.child_complete(later_commands),
+        ):
+            cycle.run_cycle(
+                {**self.config, "max_slices": 2}, enable_sheet_write=True,
+                today=dt.date(2026, 9, 12),
+            )
+        self.assertTrue(any(
+            "--since" in command and "2026-09-09" in command
+            for command in later_commands
+        ))
+        self.assertEqual(
+            ["peer/macbook"],
+            [item.interval.source for item in self.debts()],
+        )
+        debt_document = source_coverage.read(self.state_dir / "source-coverage.json")
+        assert_scenario_contract(
+            self,
+            stable_ids=[item.debt_id for item in self.debts()],
+            parent_before=parent_before,
+            parent_after={"collector-source.json": collector_source_path.read_bytes()},
+            emitted_ids=[
+                event["debt_id"] for event in debt_document["events"]
+                if event["event"] == "failure"
+            ],
+            clockify_adapter_calls=sum(
+                "clockify_post_approved_portfolio.py" in command[1]
+                for command in later_commands
+            ),
+        )
+
     def test_v1_state_migrates_routine_frontier_from_completed_through(self):
         """Catches migration inferring progress from run-directory contents."""
         path = self.state_dir / "review-cycle-state.json"
@@ -269,10 +526,26 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
     def test_two_incomplete_sources_create_independent_exact_debts(self):
         """Catches collapsing multiple canonical source failures into one obligation."""
         commands: list[list[str]] = []
+        parent_paths = (self.root / "routing.json", self.root / "corrections.jsonl")
+        parent_before = {path.name: path.read_bytes() for path in parent_paths}
 
         def two_gap_child(command, **kwargs):
             command = list(command)
             commands.append(command)
+            if "--recover-source-debt-from" in command:
+                return ChildResult(None, "", "suppressed", True, 0.1)
+            if "clockify_sheet_publish.py" in command[1]:
+                return ChildResult(0, "", "", False, 0.1)
+            if "--replay-from" in command:
+                source_dir = Path(command[command.index("--replay-from") + 1])
+                since = dt.date.fromisoformat(source_dir.name.removeprefix("source-"))
+                path = make_run(
+                    self.root, f"replay-{since.isoformat()}", replay=True,
+                    source_name=source_dir.name, since=since,
+                    until=since + dt.timedelta(days=2), snapshots_from=source_dir,
+                )
+                return ChildResult(0, str(path) + "\n", "", False, 0.1)
+            since = dt.date.fromisoformat(command[command.index("--since") + 1])
             coverage = {
                 "status": "incomplete",
                 "sources": {
@@ -281,16 +554,40 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
                 },
                 "incomplete_sources": ["sessions/macbook", "repositories/desktop"],
             }
+            if since == dt.date(2026, 9, 9):
+                coverage = {"status": "complete", "incomplete_sources": []}
             path = make_run(
-                self.root, "source-2026-09-07", replay=False,
-                coverage=coverage, since=dt.date(2026, 9, 7),
-                until=dt.date(2026, 9, 9),
+                self.root, f"source-{since.isoformat()}", replay=False,
+                coverage=coverage, since=since,
+                until=since + dt.timedelta(days=2),
             )
             return ChildResult(0, str(path) + "\n", "", False, 0.1)
+
+        real_write = source_coverage.write
+        writes = 0
+
+        def crash_after_debt(path, value):
+            nonlocal writes
+            real_write(path, value)
+            writes += 1
+            if writes == 1:
+                raise RuntimeError("after independent debt persistence")
+
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=two_gap_child), \
+             mock.patch.object(cycle.source_coverage, "write", side_effect=crash_after_debt):
+            with self.assertRaisesRegex(RuntimeError, "after independent debt persistence"):
+                cycle.run_cycle(
+                    {**self.config, "max_slices": 1}, enable_sheet_write=True,
+                    today=dt.date(2026, 9, 12),
+                )
 
         with mock.patch.object(cycle, "run_child_bounded", side_effect=two_gap_child):
             cycle.run_cycle(
                 {**self.config, "max_slices": 1}, enable_sheet_write=True,
+                today=dt.date(2026, 9, 12),
+            )
+            cycle.run_cycle(
+                {**self.config, "max_slices": 2}, enable_sheet_write=True,
                 today=dt.date(2026, 9, 12),
             )
 
@@ -299,6 +596,241 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
             sorted(item.interval.source for item in self.debts()),
         )
         self.assertEqual([1, 1], sorted(item.retry_count for item in self.debts()))
+        self.assertEqual(1, sum(
+            "--since" in command and "2026-09-07" in command
+            for command in commands
+        ))
+        self.assertTrue(any(
+            "--since" in command and "2026-09-09" in command
+            for command in commands
+        ))
+        debt_document = source_coverage.read(self.state_dir / "source-coverage.json")
+        active = self.debts()
+        assert_scenario_contract(
+            self,
+            stable_ids=[item.debt_id for item in active],
+            parent_before=parent_before,
+            parent_after={path.name: path.read_bytes() for path in parent_paths},
+            emitted_ids=[
+                event["debt_id"] for event in debt_document["events"]
+                if event["event"] == "failure"
+            ],
+            clockify_adapter_calls=sum(
+                "clockify_post_approved_portfolio.py" in command[1]
+                for command in commands
+            ),
+        )
+
+    def test_coverage_audit_uses_actual_adjacent_verified_bundles(self):
+        first = self.verified_audit_stage(
+            "audit-one", since=dt.date(2026, 9, 7), until=dt.date(2026, 9, 9),
+            calendly_optional=False,
+        )
+        second = self.verified_audit_stage(
+            "audit-two", since=dt.date(2026, 9, 9), until=dt.date(2026, 9, 11),
+            calendly_optional=False,
+        )
+        self.write_audit_state([first, second])
+
+        report = cycle.source_interval_coverage_audit({
+            **self.config, "calendly_optional": False,
+        })
+
+        self.assertEqual(
+            ["calendly", "clockify", "fathom", "multica_issues"],
+            report["configured_sources"],
+        )
+        self.assertEqual(
+            "2026-09-10T21:00:00Z", report["frontiers"]["fathom"]
+        )
+        fathom = [row for row in report["intervals"] if row["source"] == "fathom"]
+        self.assertEqual(["complete", "complete"], [row["status"] for row in fathom])
+        self.assertTrue(all("resume_state_digest" not in row for row in fathom))
+        self.assertNotIn(str(self.root), json.dumps(report))
+
+    def test_coverage_audit_current_config_filters_disabled_optional_and_fleet_sources(self):
+        write_json(self.root / "fleet.json", {
+            "machines": [
+                {"name": "active", "enabled": True},
+                {"name": "retired", "enabled": False},
+            ],
+        })
+        stage = self.verified_audit_stage(
+            "audit-filtered", since=dt.date(2026, 9, 7),
+            until=dt.date(2026, 9, 9), calendly_optional=False,
+            machines=("active", "retired"),
+        )
+        self.write_audit_state([stage])
+
+        report = cycle.source_interval_coverage_audit({
+            **self.config, "calendly_optional": True,
+        })
+
+        self.assertNotIn("calendly", report["configured_sources"])
+        self.assertNotIn("sessions/retired", report["configured_sources"])
+        self.assertNotIn("repositories/retired", report["configured_sources"])
+        self.assertIn("sessions/active", report["configured_sources"])
+        self.assertIn("repositories/active", report["configured_sources"])
+        historical_sources = {row["source"] for row in report["intervals"]}
+        self.assertIn("calendly", historical_sources)
+        self.assertIn("sessions/retired", historical_sources)
+
+    def test_coverage_audit_uses_snapshotted_optional_policy_for_exclusion(self):
+        optional = self.verified_audit_stage(
+            "audit-optional", since=dt.date(2026, 9, 7),
+            until=dt.date(2026, 9, 9), calendly_status="excluded",
+            calendly_optional=True,
+        )
+        self.write_audit_state([optional])
+        accepted = cycle.source_interval_coverage_audit({
+            **self.config, "calendly_optional": False,
+        })
+        calendar = [
+            row for row in accepted["intervals"] if row["source"] == "calendly"
+        ]
+        self.assertEqual(["complete"], [row["status"] for row in calendar])
+
+        required = self.verified_audit_stage(
+            "audit-required", since=dt.date(2026, 9, 7),
+            until=dt.date(2026, 9, 9), calendly_status="excluded",
+            calendly_optional=False,
+        )
+        self.write_audit_state([required])
+        with self.assertRaisesRegex(cycle.CycleError, "unbound|excluded"):
+            cycle.source_interval_coverage_audit({
+                **self.config, "calendly_optional": False,
+            })
+
+    def test_coverage_audit_requires_full_exact_debt_compatibility(self):
+        stage = self.verified_audit_stage(
+            "audit-exact-gap", since=dt.date(2026, 9, 7),
+            until=dt.date(2026, 9, 9), calendly_optional=False,
+            fathom_status="unavailable", compatibility_version="source-debt/v1",
+        )
+        self.write_audit_state([stage])
+        for compatibility, accepted in (
+            ("source-debt/v2", False), ("source-debt/v1", True),
+        ):
+            store = source_coverage.SourceDebtStore()
+            interval = source_coverage.SourceInterval(
+                source="fathom", since_utc=str(stage["since_utc"]),
+                until_utc=str(stage["until_utc"]), slice_id=str(stage["slice_id"]),
+                compatibility_version=compatibility,
+            )
+            store.record_failure(
+                interval, failure_class="offline", retryable=True,
+                resume_state_digest="sha256:" + "1" * 64,
+                attempted_at="2026-09-10T00:00:00Z",
+            )
+            source_coverage.write(
+                self.state_dir / "source-coverage.json", store.document()
+            )
+            if accepted:
+                report = cycle.source_interval_coverage_audit(self.config)
+                self.assertIn(interval.debt_id, report["active_debt_ids"])
+            else:
+                with self.assertRaisesRegex(cycle.CycleError, "unbound"):
+                    cycle.source_interval_coverage_audit(self.config)
+
+    def test_coverage_audit_accepts_only_generic_compatibility_version(self):
+        stage = self.verified_audit_stage(
+            "audit-generic-gap", since=dt.date(2026, 9, 7),
+            until=dt.date(2026, 9, 9), calendly_optional=False,
+            fathom_status="unavailable", compatibility_version="source-debt/v1",
+        )
+        self.write_audit_state([stage])
+        for compatibility, accepted in (
+            ("runner-unclassified/v2", False),
+            (cycle.GENERIC_COMPATIBILITY_VERSION, True),
+        ):
+            store = source_coverage.SourceDebtStore()
+            interval = source_coverage.SourceInterval(
+                source="runner/unclassified", since_utc=str(stage["since_utc"]),
+                until_utc=str(stage["until_utc"]), slice_id=str(stage["slice_id"]),
+                compatibility_version=compatibility,
+            )
+            store.record_failure(
+                interval, failure_class="coverage_unclassified", retryable=True,
+                resume_state_digest="sha256:" + "2" * 64,
+                attempted_at="2026-09-10T00:00:00Z",
+            )
+            source_coverage.write(
+                self.state_dir / "source-coverage.json", store.document()
+            )
+            if accepted:
+                report = cycle.source_interval_coverage_audit(self.config)
+                self.assertIn(interval.debt_id, report["active_debt_ids"])
+            else:
+                with self.assertRaisesRegex(cycle.CycleError, "unbound"):
+                    cycle.source_interval_coverage_audit(self.config)
+
+    def test_coverage_audit_projects_exact_outcomes_and_cli_is_observer_only(self):
+        first = source_coverage.SourceInterval(
+            source="fathom", since_utc="2026-09-06T21:00:00Z",
+            until_utc="2026-09-08T21:00:00Z", slice_id="slice-one",
+            compatibility_version="source-debt/v1",
+        )
+        second = source_coverage.SourceInterval(
+            source="fathom", since_utc="2026-09-08T21:00:00Z",
+            until_utc="2026-09-10T21:00:00Z", slice_id="slice-two",
+            compatibility_version="source-debt/v1",
+        )
+        store = source_coverage.SourceDebtStore()
+        store.record_failure(
+            first, failure_class="offline", retryable=True,
+            resume_state_digest="sha256:" + "1" * 64,
+            attempted_at="2026-09-09T00:00:00Z",
+        )
+        store.record_complete(
+            first, completion_bundle_digest="sha256:" + "2" * 64,
+            completed_at="2026-09-10T00:00:00Z",
+        )
+        store.record_failure(
+            second, failure_class="offline", retryable=True,
+            resume_state_digest="sha256:" + "3" * 64,
+            attempted_at="2026-09-11T00:00:00Z",
+        )
+        self.write_audit_state([])
+        source_coverage.write(
+            self.state_dir / "source-coverage.json", store.document()
+        )
+        before = {
+            path.name: path.read_bytes() for path in self.state_dir.iterdir()
+        }
+
+        report = cycle.source_interval_coverage_audit(self.config)
+
+        rows = [row for row in report["intervals"] if row["source"] == "fathom"]
+        self.assertEqual(["resolved", "active"], [row["status"] for row in rows])
+        self.assertIn("completion_bundle_digest", rows[0])
+        self.assertNotIn("resume_state_digest", rows[0])
+        self.assertIn("resume_state_digest", rows[1])
+        self.assertNotIn("completion_bundle_digest", rows[1])
+        self.assertEqual([second.debt_id], report["active_debt_ids"])
+
+        config_path = self.root / "cycle-config.json"
+        output = self.root / "reports" / "source-interval-coverage-audit.json"
+        write_json(config_path, self.config)
+        with mock.patch.object(
+            cycle, "run_cycle", side_effect=AssertionError("audit scheduled work")
+        ), mock.patch.object(
+            cycle.clockify_review_run.clockify_sync_collect,
+            "collector_runtime_identity",
+            side_effect=AssertionError("audit inspected runtime"),
+        ):
+            self.assertEqual(0, cycle.main([
+                "--config", str(config_path),
+                "--audit-coverage-output", str(output),
+            ]))
+        self.assertEqual(report, json.loads(output.read_text()))
+        self.assertEqual(
+            before,
+            {path.name: path.read_bytes() for path in self.state_dir.iterdir()},
+        )
+        with self.assertRaisesRegex(cycle.CycleError, "transient reports path"):
+            cycle._coverage_audit_output_path(
+                self.config, self.state_dir / "source-coverage.json"
+            )
 
     def test_two_facets_for_one_machine_coalesce_into_one_peer_debt(self):
         """One combined peer exporter must never create two transport attempts."""
@@ -764,6 +1296,8 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
     def test_debt_write_crash_converges_without_duplicate_exact_failure(self):
         """Catches replaying the same verified incomplete bundle as a new failure event."""
         commands: list[list[str]] = []
+        parent_paths = (self.root / "routing.json", self.root / "corrections.jsonl")
+        parent_before = {path.name: path.read_bytes() for path in parent_paths}
         real_write = source_coverage.write
         writes = 0
 
@@ -795,6 +1329,17 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
         failures = [event for event in document["events"] if event["event"] == "failure"]
         self.assertEqual(1, len(failures))
         self.assertEqual(1, sum("--since" in command for command in commands))
+        assert_scenario_contract(
+            self,
+            stable_ids=[item.debt_id for item in self.debts()],
+            parent_before=parent_before,
+            parent_after={path.name: path.read_bytes() for path in parent_paths},
+            emitted_ids=[event["debt_id"] for event in failures],
+            clockify_adapter_calls=sum(
+                "clockify_post_approved_portfolio.py" in command[1]
+                for command in commands
+            ),
+        )
 
     def test_selector_never_schedules_current_day_and_splits_at_month_boundary(self):
         """Catches partial-day work or a routine slice crossing into another month."""
