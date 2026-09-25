@@ -20,13 +20,16 @@ from typing import Mapping
 
 SCHEMA_VERSION = "clockify-accounting-runner/v1"
 RESULT_SCHEMA_VERSION = 1
-APPROVED_FLASH_MODELS = {
-    "deepseek-v4-flash:cloud",
-    "deepseek-v4-flash:0731-cloud",
-}
 APPROVED_FLASH_REVISION = (
-    "6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc"
+    "e04da138d31e0c9468e982e1ae9503d06cb7e170caa16a90c17d931c4aa140f8"
 )
+# Exact (model, revision) releases; keep in sync with semantic_analyzer.
+APPROVED_FLASH_ROUTES = frozenset({
+    ("deepseek-v4.1-flash:cloud", APPROVED_FLASH_REVISION),
+    ("deepseek-v4-flash:cloud", "6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc"),
+    ("deepseek-v4-flash:0731-cloud", "6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc"),
+})
+APPROVED_FLASH_MODELS = {model for model, _revision in APPROVED_FLASH_ROUTES}
 REQUIRED_RESULT_ARTIFACTS = (
     "semantic-analysis.json",
     "allocation-report.json",
@@ -54,7 +57,7 @@ def _validated_analyzer_route(
         raise RunnerConfigurationError(
             "CLOCKIFY_ANALYZER_PRIMARY_MODEL must be an approved Flash route"
         )
-    if revision != APPROVED_FLASH_REVISION:
+    if (model, revision) not in APPROVED_FLASH_ROUTES:
         raise RunnerConfigurationError(
             "CLOCKIFY_ANALYZER_PRIMARY_REVISION must match the approved Flash release"
         )

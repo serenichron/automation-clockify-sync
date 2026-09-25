@@ -22,7 +22,7 @@ class AccountingRunnerTests(unittest.TestCase):
             "CLOCKIFY_ACCOUNTING_TARGET_BODY_BYTES": "250000",
             "CLOCKIFY_ACCOUNTING_MAX_EVENTS": "250",
             "CLOCKIFY_ACCOUNTING_WORKERS": "4",
-            "CLOCKIFY_ANALYZER_PRIMARY_MODEL": "deepseek-v4-flash:0731-cloud",
+            "CLOCKIFY_ANALYZER_PRIMARY_MODEL": "deepseek-v4.1-flash:cloud",
             "CLOCKIFY_ANALYZER_PRIMARY_REVISION": runner.APPROVED_FLASH_REVISION,
         }
 
@@ -79,7 +79,7 @@ class AccountingRunnerTests(unittest.TestCase):
         self.assertNotIn("environment", status)
         self.assertNotIn("api_key", json.dumps(status).casefold())
         self.assertEqual(
-            "deepseek-v4-flash:0731-cloud",
+            "deepseek-v4.1-flash:cloud",
             status["analyzer_route"]["model"],
         )
         self.assertEqual(
@@ -124,7 +124,7 @@ class AccountingRunnerTests(unittest.TestCase):
             root, run_dir, cache = self._layout(directory)
             cache.parent.mkdir(parents=True)
             cache.write_text(
-                json.dumps({"model": "deepseek-v4-flash:0731-cloud"}) + "\n",
+                json.dumps({"model": "deepseek-v4.1-flash:cloud"}) + "\n",
                 encoding="utf-8",
             )
             completed = subprocess.CompletedProcess(["fixture"], 2)
@@ -243,7 +243,7 @@ class AccountingRunnerTests(unittest.TestCase):
         self.assertIn('[[ "${runner_exit}" -eq 2 ]] && exit 0', wrapper)
         self.assertIn("unset CLOCKIFY_ANALYZER_FALLBACK_URL", wrapper)
         self.assertIn(
-            "CLOCKIFY_ANALYZER_PRIMARY_MODEL=deepseek-v4-flash:cloud",
+            "CLOCKIFY_ANALYZER_PRIMARY_MODEL=deepseek-v4.1-flash:cloud",
             environment,
         )
         self.assertIn("CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED=", environment)

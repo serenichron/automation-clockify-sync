@@ -40,11 +40,17 @@ PORTFOLIO_REVIEW_PROMPT_VERSION = "clockify-portfolio-review-v2"
 PORTFOLIO_VALIDATION_PROMPT_VERSION = "clockify-portfolio-validation-v1"
 ANALYZER_CACHE_SCHEMA_VERSION = "clockify-analyzer-cache/v2"
 EVIDENCE_BUNDLE_SCHEMA_VERSION = "clockify-semantic-evidence-bundle/v1"
-DEFAULT_PRIMARY_MODEL = "deepseek-v4-flash:cloud"
-APPROVED_PRIMARY_MODELS = frozenset({
-    DEFAULT_PRIMARY_MODEL,
-    "deepseek-v4-flash:0731-cloud",
+DEFAULT_PRIMARY_MODEL = "deepseek-v4.1-flash:cloud"
+DEFAULT_PRIMARY_REVISION = "e04da138d31e0c9468e982e1ae9503d06cb7e170caa16a90c17d931c4aa140f8"
+# Exact (model, revision) releases.  The retired V4 Flash pairs stay approved only
+# so artifacts they already produced remain valid; Ollama Cloud retired them on
+# 2026-09-25, so new inference uses the current default.
+APPROVED_FLASH_ROUTES = frozenset({
+    (DEFAULT_PRIMARY_MODEL, DEFAULT_PRIMARY_REVISION),
+    ("deepseek-v4-flash:cloud", "6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc"),
+    ("deepseek-v4-flash:0731-cloud", "6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc"),
 })
+APPROVED_PRIMARY_MODELS = frozenset(model for model, _revision in APPROVED_FLASH_ROUTES)
 FORBIDDEN_ANALYZER_MODEL_MARKERS = ("deepseek-v4-pro",)
 DEFAULT_MAX_BODY_BYTES = 1_450_000
 # Operational limits are deliberately well below the hard request ceiling.  The

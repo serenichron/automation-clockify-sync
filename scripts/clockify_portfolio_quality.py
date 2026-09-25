@@ -29,12 +29,20 @@ except ImportError:  # pragma: no cover - direct execution fallback
     import work_accounting_pipeline  # type: ignore[no-redef]
 
 
-REQUIRED_MODELS = frozenset({
-    "deepseek-v4-flash:cloud",
-    "deepseek-v4-flash:0731-cloud",
+# Exact (model, revision) releases; keep in sync with semantic_analyzer.
+APPROVED_FLASH_ROUTES = frozenset({
+    ("deepseek-v4.1-flash:cloud", "e04da138d31e0c9468e982e1ae9503d06cb7e170caa16a90c17d931c4aa140f8"),
+    ("deepseek-v4-flash:cloud", "6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc"),
+    ("deepseek-v4-flash:0731-cloud", "6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc"),
 })
-REQUIRED_MODEL = "deepseek-v4-flash:cloud"
-REQUIRED_REVISION = "6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc"
+
+# Current release for newly produced documents.
+REQUIRED_MODEL = "deepseek-v4.1-flash:cloud"
+REQUIRED_REVISION = "e04da138d31e0c9468e982e1ae9503d06cb7e170caa16a90c17d931c4aa140f8"
+
+
+def is_approved_flash_route(model: Any, revision: Any) -> bool:
+    return (model, revision) in APPROVED_FLASH_ROUTES
 _PREFIX_RE = re.compile(r"^([A-Za-z][A-Za-z0-9 &-]{0,24}) — ")
 
 
@@ -867,10 +875,8 @@ def audit(
     except (TypeError, ValueError) as exc:
         structural.append({"reason": f"immutable evidence ledger invalid: {exc}"})
 
-    if document.get("model") not in REQUIRED_MODELS:
-        structural.append({"reason": "document model is not the required Flash model"})
-    if document.get("revision") != REQUIRED_REVISION:
-        structural.append({"reason": "document revision is not the required Flash revision"})
+    if not is_approved_flash_route(document.get("model"), document.get("revision")):
+        structural.append({"reason": "document model and revision are not an approved Flash release"})
 
     ids: set[str] = set()
     row_evidence_ids: set[str] = set()
@@ -947,10 +953,10 @@ def audit(
                     structural.append({"review_id": review_id, "reason": "cited source proposals have mixed, missing, or unknown routes"})
                 elif route is not None and (route[0], route[1]) != next(iter(source_routes)):
                     structural.append({"review_id": review_id, "reason": "row route differs from cited source proposal route"})
-        if row.get("semantic_reviewer_model") not in REQUIRED_MODELS:
-            structural.append({"review_id": review_id, "reason": "row model is not the required Flash model"})
-        if row.get("semantic_reviewer_revision") != REQUIRED_REVISION:
-            structural.append({"review_id": review_id, "reason": "row revision is not the required Flash revision"})
+        if not is_approved_flash_route(
+            row.get("semantic_reviewer_model"), row.get("semantic_reviewer_revision")
+        ):
+            structural.append({"review_id": review_id, "reason": "row model and revision are not an approved Flash release"})
         if row.get("validation_status") != "flash_validated":
             structural.append({
                 "review_id": review_id,

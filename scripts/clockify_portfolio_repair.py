@@ -30,7 +30,11 @@ except ImportError:  # pragma: no cover - direct script execution fallback
 
 
 REPAIR_SCHEMA_VERSION = 1
-APPROVED_FLASH_REVISION = "6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc"
+APPROVED_FLASH_REVISION = semantic_analyzer.DEFAULT_PRIMARY_REVISION
+
+
+def is_approved_flash_route(model: Any, revision: Any) -> bool:
+    return (model, revision) in semantic_analyzer.APPROVED_FLASH_ROUTES
 DEFAULT_WORKERS = 4
 MAX_WORKERS = 4
 SINGLE_ACTIVITY_REPAIR_PROMPT_VERSION = (
@@ -1137,9 +1141,9 @@ def repair_document(
         raise PortfolioRepairError("CLOCKIFY_ANALYZER_PRIMARY_URL is required when repairs are needed")
     if endpoint.model not in semantic_analyzer.APPROVED_PRIMARY_MODELS:
         raise PortfolioRepairError(
-            "portfolio repair requires the approved DeepSeek V4 Flash cloud alias"
+            "portfolio repair requires the approved DeepSeek Flash cloud alias"
         )
-    if endpoint.revision != APPROVED_FLASH_REVISION:
+    if not is_approved_flash_route(endpoint.model, endpoint.revision):
         raise PortfolioRepairError("portfolio repair requires the approved exact Flash revision")
     route_repairs = [item for item in repairs if item["repair_route"]]
     full_taxonomy: list[dict[str, Any]] | None = None

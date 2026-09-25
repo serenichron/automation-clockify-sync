@@ -187,7 +187,7 @@ class UserSystemdArtifactTests(unittest.TestCase):
         self.assertNotIn("/var/lib/", json.dumps(document))
 
         env_text = ENV_EXAMPLE.read_text(encoding="utf-8")
-        self.assertIn("CLOCKIFY_ANALYZER_PRIMARY_MODEL=deepseek-v4-flash:cloud", env_text)
+        self.assertIn("CLOCKIFY_ANALYZER_PRIMARY_MODEL=deepseek-v4.1-flash:cloud", env_text)
         self.assertNotIn("CLOCKIFY_ANALYZER_FALLBACK_", env_text)
         self.assertNotIn("OPENAI_API_KEY=", env_text)
         self.assertNotIn("CF_ACCESS_CLIENT_SECRET=", env_text)
