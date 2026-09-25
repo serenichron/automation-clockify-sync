@@ -556,6 +556,45 @@ def _declares_exact_proposal_overlap(
     return False
 
 
+def _declares_exact_existing_overlap(
+    proposal: dict[str, Any],
+    entry: dict[str, Any],
+    overlap_start: dt.datetime,
+    overlap_end: dt.datetime,
+) -> bool:
+    """Accept only the pipeline's exact warning for fixed Clockify time."""
+    warnings = proposal.get("review_warnings")
+    if not isinstance(warnings, list):
+        return False
+    required = {
+        "type", "counterpart_id", "overlap_start", "overlap_end",
+        "overlap_duration_seconds",
+    }
+    allowed = required | {"counterpart_project_suffix"}
+    elapsed = (overlap_end - overlap_start).total_seconds()
+    if not elapsed.is_integer() or elapsed <= 0:
+        return False
+    entry_suffix = entry.get("project_id_suffix")
+    for warning in warnings:
+        if not isinstance(warning, dict) or set(warning) - allowed or required - set(warning):
+            continue
+        if warning.get("type") != "existing_clockify_overlap":
+            continue
+        if not re.fullmatch(r"ev-[a-f0-9]{64}", str(warning.get("counterpart_id") or "")):
+            continue
+        warning_suffix = warning.get("counterpart_project_suffix")
+        if warning_suffix is not None and entry_suffix and warning_suffix != entry_suffix:
+            continue
+        start = parse_timestamp(warning.get("overlap_start"))
+        end = parse_timestamp(warning.get("overlap_end"))
+        if start != overlap_start or end != overlap_end:
+            continue
+        duration = warning.get("overlap_duration_seconds")
+        if type(duration) is int and duration == int(elapsed):
+            return True
+    return False
+
+
 def find_time_overlaps(
     proposals: list[dict[str, Any]], existing: list[dict[str, Any]] | None = None
 ) -> list[dict[str, str]]:
@@ -592,6 +631,16 @@ def find_time_overlaps(
                     )
                 ):
                     continue
+                # Evidence overlapping fixed Clockify time stays reviewable when
+                # the proposal carries the exact warning the reviewer will see.
+                if {left[3], right[3]} == {"proposal", "existing_clockify"}:
+                    proposal_row, entry = (
+                        (left[4], right[4]) if left[3] == "proposal" else (right[4], left[4])
+                    )
+                    if _declares_exact_existing_overlap(
+                        proposal_row, entry, overlap_start, overlap_end
+                    ):
+                        continue
                 overlaps.append({"left": left[2], "right": right[2]})
     return overlaps
 

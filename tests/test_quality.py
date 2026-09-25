@@ -268,6 +268,58 @@ class QualityMatchingTests(unittest.TestCase):
         )
         self.assertEqual([{"left": "P001", "right": "existing-1"}], overlaps)
 
+    def _existing_overlap_case(self, **warning_overrides):
+        warning = {
+            "type": "existing_clockify_overlap",
+            "counterpart_id": "ev-" + "a" * 64,
+            "counterpart_project_suffix": "775f9f",
+            "overlap_start": "2026-07-10T10:30:00+03:00",
+            "overlap_end": "2026-07-10T11:00:00+03:00",
+            "overlap_duration_seconds": 1800,
+        }
+        warning.update(warning_overrides)
+        proposals = [
+            {
+                "id": "P001",
+                "start": "2026-07-10T10:00:00+03:00",
+                "end": "2026-07-10T11:00:00+03:00",
+                "review_warnings": [warning],
+            }
+        ]
+        existing = [
+            {
+                "start": "2026-07-10T10:30:00+03:00",
+                "end": "2026-07-10T11:30:00+03:00",
+                "project_id_suffix": "775f9f",
+            }
+        ]
+        return quality.find_time_overlaps(proposals, existing)
+
+    def test_quality_allows_existing_clockify_overlap_declared_for_human_review(self):
+        """Catches the review cycle blocking overlaps the pipeline already warns about."""
+        self.assertEqual([], self._existing_overlap_case())
+
+    def test_quality_blocks_existing_overlap_when_warning_interval_differs(self):
+        self.assertEqual(
+            [{"left": "P001", "right": "existing-1"}],
+            self._existing_overlap_case(
+                overlap_start="2026-07-10T10:31:00+03:00",
+                overlap_duration_seconds=1740,
+            ),
+        )
+
+    def test_quality_blocks_existing_overlap_when_project_suffix_differs(self):
+        self.assertEqual(
+            [{"left": "P001", "right": "existing-1"}],
+            self._existing_overlap_case(counterpart_project_suffix="1207d5"),
+        )
+
+    def test_quality_blocks_existing_overlap_declared_with_proposal_counterpart(self):
+        self.assertEqual(
+            [{"left": "P001", "right": "existing-1"}],
+            self._existing_overlap_case(counterpart_id="wks-" + "2" * 24),
+        )
+
     def test_quality_allows_exact_proposal_overlap_declared_for_human_review(self):
         left = {
             "id": "P001",
