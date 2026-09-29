@@ -99,32 +99,78 @@ class AccountingRunnerTests(unittest.TestCase):
                 with self.subTest(name=name):
                     self.assertEqual(2, runner.run(environment))
 
-    def test_sealed_cache_rejects_model_tag_drift_and_mixing(self):
+    def test_sealed_cache_accepts_mixed_current_and_retired_exact_routes(self):
         with tempfile.TemporaryDirectory() as directory:
             root, run_dir, cache = self._layout(directory)
             cache.parent.mkdir(parents=True)
             environment = self._environment(root, run_dir, cache)
             cache.write_text(
-                json.dumps({"model": "deepseek-v4-flash:cloud"}) + "\n",
-                encoding="utf-8",
-            )
-            self.assertEqual(2, runner.run(environment))
-
-            cache.write_text(
                 "\n".join([
-                    json.dumps({"model": "deepseek-v4-flash:0731-cloud"}),
-                    json.dumps({"model": "deepseek-v4-flash:cloud"}),
+                    json.dumps({
+                        "model": "deepseek-v4.1-flash:cloud",
+                        "route": {
+                            "model": "deepseek-v4.1-flash:cloud",
+                            "revision": runner.APPROVED_FLASH_REVISION,
+                        },
+                    }),
+                    json.dumps({
+                        "model": "deepseek-v4-flash:cloud",
+                        "route": {
+                            "model": "deepseek-v4-flash:cloud",
+                            "revision": runner.RETIRED_FLASH_REVISION,
+                        },
+                    }),
                 ]) + "\n",
                 encoding="utf-8",
             )
-            self.assertEqual(2, runner.run(environment))
+            completed = subprocess.CompletedProcess(["fixture"], 2)
+            with mock.patch.object(runner.subprocess, "run", return_value=completed):
+                self.assertEqual(2, runner.run(environment))
+            status = json.loads((cache.parent / "status.json").read_text())
+            self.assertEqual("blocked", status["state"])
+
+    def test_sealed_cache_rejects_each_unapproved_or_mismatched_record_route(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_dir, cache = self._layout(directory)
+            cache.parent.mkdir(parents=True)
+            environment = self._environment(root, run_dir, cache)
+            for model, revision in (
+                ("deepseek-v4-flash:cloud", runner.APPROVED_FLASH_REVISION),
+                ("deepseek-v4.1-flash:cloud", runner.RETIRED_FLASH_REVISION),
+                ("deepseek-v4-pro:cloud", runner.APPROVED_FLASH_REVISION),
+            ):
+                with self.subTest(model=model, revision=revision):
+                    cache.write_text(
+                        json.dumps({
+                            "model": model,
+                            "route": {"model": model, "revision": revision},
+                        }) + "\n",
+                        encoding="utf-8",
+                    )
+                    self.assertEqual(2, runner.run(environment))
+
+    def test_sealed_cache_rejects_record_without_exact_route_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, run_dir, cache = self._layout(directory)
+            cache.parent.mkdir(parents=True)
+            cache.write_text(
+                json.dumps({"model": "deepseek-v4-flash:cloud"}) + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(2, runner.run(self._environment(root, run_dir, cache)))
 
     def test_sealed_cache_accepts_its_exact_model_tag(self):
         with tempfile.TemporaryDirectory() as directory:
             root, run_dir, cache = self._layout(directory)
             cache.parent.mkdir(parents=True)
             cache.write_text(
-                json.dumps({"model": "deepseek-v4.1-flash:cloud"}) + "\n",
+                json.dumps({
+                    "model": "deepseek-v4.1-flash:cloud",
+                    "route": {
+                        "model": "deepseek-v4.1-flash:cloud",
+                        "revision": runner.APPROVED_FLASH_REVISION,
+                    },
+                }) + "\n",
                 encoding="utf-8",
             )
             completed = subprocess.CompletedProcess(["fixture"], 2)

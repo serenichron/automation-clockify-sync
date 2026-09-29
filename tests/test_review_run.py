@@ -172,8 +172,8 @@ class ReviewRunResultTests(unittest.TestCase):
             endpoint = semantic_analyzer.AnalyzerEndpoint(
                 name="clockify_analyzer_primary",
                 url="https://offline.invalid/v1/chat/completions",
-                model="deepseek-v4-flash:cloud",
-                revision="a" * 64,
+                model=semantic_analyzer.DEFAULT_PRIMARY_MODEL,
+                revision=semantic_analyzer.DEFAULT_PRIMARY_REVISION,
             )
 
             def transport(_endpoint, body):
@@ -431,8 +431,8 @@ class ReviewRunResultTests(unittest.TestCase):
 
                 with mock.patch.dict(os.environ, {
                     "CLOCKIFY_ANALYZER_PRIMARY_URL": "https://offline.invalid/v1/chat/completions",
-                    "CLOCKIFY_ANALYZER_PRIMARY_MODEL": "deepseek-v4-flash:cloud",
-                    "CLOCKIFY_ANALYZER_PRIMARY_REVISION": "a" * 64,
+                    "CLOCKIFY_ANALYZER_PRIMARY_MODEL": semantic_analyzer.DEFAULT_PRIMARY_MODEL,
+                    "CLOCKIFY_ANALYZER_PRIMARY_REVISION": semantic_analyzer.DEFAULT_PRIMARY_REVISION,
                     "CLOCKIFY_ANALYZER_FALLBACK_URL": "",
                     "CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED": "approved",
                 }, clear=False):
@@ -1565,7 +1565,8 @@ class ReviewRunResultTests(unittest.TestCase):
         cache = semantic_analyzer.AnalyzerResponseCache(cache_path)
         endpoint = semantic_analyzer.AnalyzerEndpoint(
             name="clockify_analyzer_primary", url="https://offline.invalid/v1/chat/completions",
-            model="deepseek-v4-flash:cloud", revision="a" * 64,
+            model=semantic_analyzer.DEFAULT_PRIMARY_MODEL,
+            revision=semantic_analyzer.DEFAULT_PRIMARY_REVISION,
         )
         def transport(_endpoint, body):
             payload = json.loads(body["messages"][-1]["content"])

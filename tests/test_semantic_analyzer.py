@@ -110,7 +110,8 @@ class SemanticAnalyzerTests(unittest.TestCase):
         environment = {
             "OPENAI_BASE_URL": "https://precision-llm.example/v1",
             "OPENAI_API_KEY": "gateway-bearer",
-            "OPENAI_MODEL": "deepseek-v4-flash:cloud",
+            "OPENAI_MODEL": semantic.DEFAULT_PRIMARY_MODEL,
+            "CLOCKIFY_ANALYZER_PRIMARY_REVISION": semantic.DEFAULT_PRIMARY_REVISION,
             "CF_ACCESS_CLIENT_ID": "access-id",
             "CF_ACCESS_CLIENT_SECRET": "access-secret",
             "CLOCKIFY_ANALYZER_PRIMARY_REASONING_EFFORT": "none",
@@ -145,6 +146,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
             "https://precision-llm.example/v1/chat/completions",
             semantic.DEFAULT_PRIMARY_MODEL,
             api_key="gateway-bearer",
+            revision=semantic.DEFAULT_PRIMARY_REVISION,
             cf_access_client_id="access-id",
             cf_access_client_secret="access-secret",
             reasoning_effort="none",
@@ -168,8 +170,11 @@ class SemanticAnalyzerTests(unittest.TestCase):
         )
 
     def test_http_transport_separates_retryable_and_hard_http_failures(self):
-        endpoint = semantic.AnalyzerEndpoint("primary", "http://primary", "qualified")
-        body = {"model": "qualified", "messages": []}
+        endpoint = semantic.AnalyzerEndpoint(
+            "primary", "http://primary", semantic.DEFAULT_PRIMARY_MODEL,
+            revision=semantic.DEFAULT_PRIMARY_REVISION,
+        )
+        body = {"model": semantic.DEFAULT_PRIMARY_MODEL, "messages": []}
         retryable = urllib.error.HTTPError(
             endpoint.url, 503, "unavailable", None, None
         )
@@ -627,7 +632,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
         }
         with mock.patch.dict(os.environ, base, clear=False):
             with self.assertRaisesRegex(
-                semantic.AnalyzerError, "approved DeepSeek V4 Flash cloud alias"
+                semantic.AnalyzerError, "current exact Flash release"
             ):
                 semantic.AnalyzerEndpoint.from_env(
                     "CLOCKIFY_ANALYZER_PRIMARY",
@@ -636,19 +641,24 @@ class SemanticAnalyzerTests(unittest.TestCase):
         preview_alias = {
             "CLOCKIFY_ANALYZER_PRIMARY_URL": "http://analyzer.test/v1/chat",
             "CLOCKIFY_ANALYZER_PRIMARY_MODEL": "deepseek-v4-flash:cloud",
+            "CLOCKIFY_ANALYZER_PRIMARY_REVISION": (
+                "6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc"
+            ),
         }
         with mock.patch.dict(os.environ, preview_alias, clear=False):
-            endpoint = semantic.AnalyzerEndpoint.from_env(
-                "CLOCKIFY_ANALYZER_PRIMARY",
-                default_model=semantic.DEFAULT_PRIMARY_MODEL,
-            )
-        self.assertEqual("deepseek-v4-flash:cloud", endpoint.model)
+            with self.assertRaisesRegex(
+                semantic.AnalyzerError, "current exact Flash release"
+            ):
+                semantic.AnalyzerEndpoint.from_env(
+                    "CLOCKIFY_ANALYZER_PRIMARY",
+                    default_model=semantic.DEFAULT_PRIMARY_MODEL,
+                )
         with self.assertRaisesRegex(semantic.AnalyzerError, "V4 Pro is not approved"):
             semantic.AnalyzerEndpoint(
                 "fallback", "http://analyzer.test", "deepseek-v4-pro:cloud"
             )
 
-    def test_explicit_0731_cloud_tag_requires_release_revision(self):
+    def test_current_cloud_tag_requires_exact_release_revision(self):
         endpoint = semantic.AnalyzerEndpoint(
             "primary",
             "http://analyzer.test/v1/chat",
@@ -656,7 +666,7 @@ class SemanticAnalyzerTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(
             semantic.AnalyzerError,
-            "cloud model tags require an explicit 64-character release revision",
+            "current exact Flash release",
         ):
             semantic.probe_endpoint(endpoint, transport=lambda *_args: {"probe": "ok"})
 

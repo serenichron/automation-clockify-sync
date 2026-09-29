@@ -42,15 +42,16 @@ ANALYZER_CACHE_SCHEMA_VERSION = "clockify-analyzer-cache/v2"
 EVIDENCE_BUNDLE_SCHEMA_VERSION = "clockify-semantic-evidence-bundle/v1"
 DEFAULT_PRIMARY_MODEL = "deepseek-v4.1-flash:cloud"
 DEFAULT_PRIMARY_REVISION = "e04da138d31e0c9468e982e1ae9503d06cb7e170caa16a90c17d931c4aa140f8"
+CURRENT_LIVE_FLASH_ROUTE = (DEFAULT_PRIMARY_MODEL, DEFAULT_PRIMARY_REVISION)
 # Exact (model, revision) releases.  The retired V4 Flash pairs stay approved only
 # so artifacts they already produced remain valid; Ollama Cloud retired them on
 # 2026-09-25, so new inference uses the current default.
 APPROVED_FLASH_ROUTES = frozenset({
-    (DEFAULT_PRIMARY_MODEL, DEFAULT_PRIMARY_REVISION),
+    CURRENT_LIVE_FLASH_ROUTE,
     ("deepseek-v4-flash:cloud", "6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc"),
     ("deepseek-v4-flash:0731-cloud", "6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc"),
 })
-APPROVED_PRIMARY_MODELS = frozenset(model for model, _revision in APPROVED_FLASH_ROUTES)
+APPROVED_PRIMARY_MODELS = frozenset({DEFAULT_PRIMARY_MODEL})
 FORBIDDEN_ANALYZER_MODEL_MARKERS = ("deepseek-v4-pro",)
 DEFAULT_MAX_BODY_BYTES = 1_450_000
 # Operational limits are deliberately well below the hard request ceiling.  The
@@ -2595,6 +2596,10 @@ class AnalyzerEndpoint:
             url = os.environ.get("OPENAI_BASE_URL", "").strip()
         if not url:
             return None
+        if prefix == "CLOCKIFY_ANALYZER_FALLBACK":
+            raise AnalyzerError(
+                "Clockify analyzer fallback routes are not approved"
+            )
         if url.rstrip("/").endswith("/v1"):
             url = url.rstrip("/") + "/chat/completions"
         endpoint = cls(
@@ -2628,14 +2633,20 @@ class AnalyzerEndpoint:
         )
         if bool(endpoint.cf_access_client_id) != bool(endpoint.cf_access_client_secret):
             raise AnalyzerError("Cloudflare Access service credentials must be a complete pair")
-        if prefix == "CLOCKIFY_ANALYZER_PRIMARY" and endpoint.model not in APPROVED_PRIMARY_MODELS:
-            raise AnalyzerError(
-                "Clockify primary analyzer must use the approved DeepSeek V4 Flash cloud alias"
-            )
+        if prefix == "CLOCKIFY_ANALYZER_PRIMARY":
+            require_current_live_flash_route(endpoint)
         return endpoint
 
 
 Transport = Callable[[AnalyzerEndpoint, dict[str, Any]], dict[str, Any]]
+
+
+def require_current_live_flash_route(endpoint: AnalyzerEndpoint) -> None:
+    """Reject every route except the one approved for new provider requests."""
+    if (endpoint.model, endpoint.revision) != CURRENT_LIVE_FLASH_ROUTE:
+        raise AnalyzerError(
+            "Clockify live inference requires the current exact Flash release"
+        )
 
 
 class AnalyzerResponseCache:
@@ -3026,6 +3037,7 @@ class AnalyzerResponseCache:
 
 
 def http_transport(endpoint: AnalyzerEndpoint, body: dict[str, Any]) -> dict[str, Any]:
+    require_current_live_flash_route(endpoint)
     transport_body = dict(body)
     if endpoint.reasoning_effort:
         transport_body["reasoning_effort"] = endpoint.reasoning_effort
@@ -3088,6 +3100,8 @@ def http_transport(endpoint: AnalyzerEndpoint, body: dict[str, Any]) -> dict[str
 
 
 def probe_endpoint(endpoint: AnalyzerEndpoint, transport: Transport = http_transport) -> dict[str, Any]:
+    if transport is http_transport or endpoint.model.startswith("deepseek-v4"):
+        require_current_live_flash_route(endpoint)
     if endpoint.model.endswith((":cloud", "-cloud")) and not re.fullmatch(
         r"[a-f0-9]{64}", endpoint.revision
     ):

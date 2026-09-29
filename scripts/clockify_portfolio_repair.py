@@ -35,6 +35,12 @@ APPROVED_FLASH_REVISION = semantic_analyzer.DEFAULT_PRIMARY_REVISION
 
 def is_approved_flash_route(model: Any, revision: Any) -> bool:
     return (model, revision) in semantic_analyzer.APPROVED_FLASH_ROUTES
+
+
+def is_current_live_flash_route(model: Any, revision: Any) -> bool:
+    return (model, revision) == semantic_analyzer.CURRENT_LIVE_FLASH_ROUTE
+
+
 DEFAULT_WORKERS = 4
 MAX_WORKERS = 4
 SINGLE_ACTIVITY_REPAIR_PROMPT_VERSION = (
@@ -1139,12 +1145,10 @@ def repair_document(
 
     if endpoint is None:
         raise PortfolioRepairError("CLOCKIFY_ANALYZER_PRIMARY_URL is required when repairs are needed")
-    if endpoint.model not in semantic_analyzer.APPROVED_PRIMARY_MODELS:
+    if not is_current_live_flash_route(endpoint.model, endpoint.revision):
         raise PortfolioRepairError(
-            "portfolio repair requires the approved DeepSeek Flash cloud alias"
+            "portfolio repair requires the current exact Flash release"
         )
-    if not is_approved_flash_route(endpoint.model, endpoint.revision):
-        raise PortfolioRepairError("portfolio repair requires the approved exact Flash revision")
     route_repairs = [item for item in repairs if item["repair_route"]]
     full_taxonomy: list[dict[str, Any]] | None = None
     proposals_by_activity: dict[str, list[Mapping[str, Any]]] = {}

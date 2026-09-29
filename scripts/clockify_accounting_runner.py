@@ -23,13 +23,16 @@ RESULT_SCHEMA_VERSION = 1
 APPROVED_FLASH_REVISION = (
     "e04da138d31e0c9468e982e1ae9503d06cb7e170caa16a90c17d931c4aa140f8"
 )
+RETIRED_FLASH_REVISION = (
+    "6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc"
+)
+CURRENT_LIVE_FLASH_ROUTE = ("deepseek-v4.1-flash:cloud", APPROVED_FLASH_REVISION)
 # Exact (model, revision) releases; keep in sync with semantic_analyzer.
 APPROVED_FLASH_ROUTES = frozenset({
-    ("deepseek-v4.1-flash:cloud", APPROVED_FLASH_REVISION),
-    ("deepseek-v4-flash:cloud", "6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc"),
-    ("deepseek-v4-flash:0731-cloud", "6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc"),
+    CURRENT_LIVE_FLASH_ROUTE,
+    ("deepseek-v4-flash:cloud", RETIRED_FLASH_REVISION),
+    ("deepseek-v4-flash:0731-cloud", RETIRED_FLASH_REVISION),
 })
-APPROVED_FLASH_MODELS = {model for model, _revision in APPROVED_FLASH_ROUTES}
 REQUIRED_RESULT_ARTIFACTS = (
     "semantic-analysis.json",
     "allocation-report.json",
@@ -53,33 +56,34 @@ def _validated_analyzer_route(
     revision = str(
         environment.get("CLOCKIFY_ANALYZER_PRIMARY_REVISION") or ""
     ).strip()
-    if model not in APPROVED_FLASH_MODELS:
+    if (model, revision) != CURRENT_LIVE_FLASH_ROUTE:
         raise RunnerConfigurationError(
-            "CLOCKIFY_ANALYZER_PRIMARY_MODEL must be an approved Flash route"
-        )
-    if (model, revision) not in APPROVED_FLASH_ROUTES:
-        raise RunnerConfigurationError(
-            "CLOCKIFY_ANALYZER_PRIMARY_REVISION must match the approved Flash release"
+            "new analysis requires the current exact Flash release"
         )
     if cache.is_file():
-        cached_models: set[str] = set()
         try:
             with cache.open(encoding="utf-8") as handle:
                 for line in handle:
                     if not line.strip():
                         continue
                     record = json.loads(line)
+                    if not isinstance(record, dict):
+                        raise ValueError
+                    route = record.get("route")
+                    if not isinstance(route, dict):
+                        raise ValueError
                     cached_model = str(record.get("model") or "").strip()
-                    if cached_model:
-                        cached_models.add(cached_model)
-        except (OSError, json.JSONDecodeError, AttributeError) as exc:
+                    route_model = str(route.get("model") or "").strip()
+                    route_revision = str(route.get("revision") or "").strip()
+                    if (
+                        route_model != cached_model
+                        or (route_model, route_revision) not in APPROVED_FLASH_ROUTES
+                    ):
+                        raise ValueError
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
             raise RunnerConfigurationError(
                 "CLOCKIFY_ACCOUNTING_CACHE metadata is invalid"
             ) from exc
-        if cached_models and cached_models != {model}:
-            raise RunnerConfigurationError(
-                "CLOCKIFY_ACCOUNTING_CACHE is sealed to a different or mixed model tag"
-            )
     return {"model": model, "revision": revision}
 
 

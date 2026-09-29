@@ -1263,7 +1263,7 @@ class PortfolioRepairTests(unittest.TestCase):
             "primary", "http://flash", semantic.DEFAULT_PRIMARY_MODEL, revision="a" * 64
         )
         with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(repair.PortfolioRepairError, "approved exact Flash revision"):
+            with self.assertRaisesRegex(repair.PortfolioRepairError, "current exact Flash release"):
                 repair.repair_document(
                     source, ledger(), endpoint=wrong_endpoint,
                     cache=semantic.AnalyzerResponseCache(Path(directory) / "cache.jsonl"),
