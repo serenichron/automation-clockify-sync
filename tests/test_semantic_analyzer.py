@@ -3676,6 +3676,86 @@ class SemanticAnalyzerTests(unittest.TestCase):
             first["analyzer_cache"]["records"], second["analyzer_cache"]["records"]
         )
 
+    def test_current_route_replays_retired_route_less_hit_and_sends_only_current_miss(self):
+        current = semantic.AnalyzerEndpoint(
+            "clockify_analyzer_primary",
+            "https://analyzer.example/v1/chat/completions",
+            "deepseek-v4.1-flash:cloud",
+            revision="e04da138d31e0c9468e982e1ae9503d06cb7e170caa16a90c17d931c4aa140f8",
+        )
+        retired = semantic.AnalyzerEndpoint(
+            "clockify_analyzer_primary",
+            "https://analyzer.example/v1/chat/completions",
+            "deepseek-v4-flash:cloud",
+            revision="6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc",
+        )
+        cached_event = event("ev-cached", content="cached retired work")
+        missed_event = event(
+            "ev-missed", day="2026-07-11", content="current route work"
+        )
+        live_calls: list[str] = []
+
+        def response_for(body):
+            payload = json.loads(body["messages"][-1]["content"])
+            response = provider_response(payload)
+            response["activities"][0]["workstream"] = str(
+                provider_members(payload)[0]["content"]
+            )
+            return response
+
+        def transport(endpoint, body):
+            self.assertEqual(
+                (
+                    "deepseek-v4.1-flash:cloud",
+                    "e04da138d31e0c9468e982e1ae9503d06cb7e170caa16a90c17d931c4aa140f8",
+                ),
+                (endpoint.model, endpoint.revision),
+            )
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                live_calls.append("probe")
+                return {"probe": "ok"}
+            live_calls.append(str(provider_members(payload)[0]["content"]))
+            return response_for(body)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "analyzer-cache.jsonl"
+            retired_body = semantic._body_for(
+                [cached_event],
+                model=retired.model,
+                mode="extract",
+                private_text_approved=True,
+            )
+            cache = semantic.AnalyzerResponseCache(path)
+            cache.store_accepted(retired, retired_body, response_for(retired_body))
+            retired_record = json.loads(path.read_text(encoding="utf-8"))
+            retired_record.pop("route")
+            path.write_text(
+                semantic.canonical_json(retired_record) + "\n", encoding="utf-8"
+            )
+
+            result = semantic.analyze_tiered(
+                [cached_event, missed_event],
+                primary=current,
+                transport=transport,
+                private_text_approved=True,
+                cache=semantic.AnalyzerResponseCache(path),
+                max_events_per_chunk=1,
+                max_workers=1,
+            )
+            records = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(["probe", "current route work"], live_calls)
+        self.assertEqual(2, len(result["activities"]))
+        self.assertEqual(2, len(records))
+        self.assertEqual(
+            {"deepseek-v4-flash:cloud", "deepseek-v4.1-flash:cloud"},
+            {str(record["model"]) for record in records},
+        )
+
     def test_repair_cache_identity_is_distinct_and_replays_without_transport(self):
         calls: list[dict] = []
 

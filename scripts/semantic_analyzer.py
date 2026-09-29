@@ -2685,10 +2685,16 @@ class AnalyzerResponseCache:
         *,
         include_reasoning_effort: bool = True,
     ) -> dict[str, str]:
-        body_digest = hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
         route = AnalyzerResponseCache._route_identity(endpoint)
         if not include_reasoning_effort:
             route.pop("reasoning_effort", None)
+        return AnalyzerResponseCache._request_identity_for_route(route, body)
+
+    @staticmethod
+    def _request_identity_for_route(
+        route: Mapping[str, str], body: Mapping[str, Any]
+    ) -> dict[str, str]:
+        body_digest = hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
         route_digest = hashlib.sha256(
             canonical_json(route).encode("utf-8")
         ).hexdigest()
@@ -2708,6 +2714,36 @@ class AnalyzerResponseCache:
             "body_digest": body_digest,
             "route_digest": route_digest,
         }
+
+    @staticmethod
+    def _historical_request_identities(
+        endpoint: AnalyzerEndpoint, body: Mapping[str, Any]
+    ) -> tuple[dict[str, str], ...]:
+        if (endpoint.model, endpoint.revision) != CURRENT_LIVE_FLASH_ROUTE:
+            return ()
+        identities: list[dict[str, str]] = []
+        for model, revision in sorted(APPROVED_FLASH_ROUTES - {CURRENT_LIVE_FLASH_ROUTE}):
+            historical_body = copy.deepcopy(dict(body))
+            historical_body["model"] = model
+            route = {
+                "name": endpoint.name,
+                "url": endpoint.url,
+                "model": model,
+                "revision": revision,
+            }
+            variants = [route]
+            if endpoint.reasoning_effort:
+                variants.insert(0, {
+                    **route,
+                    "reasoning_effort": endpoint.reasoning_effort,
+                })
+            identities.extend(
+                AnalyzerResponseCache._request_identity_for_route(
+                    variant, historical_body
+                )
+                for variant in variants
+            )
+        return tuple(identities)
 
     @staticmethod
     def _decision_digest(value: Mapping[str, Any]) -> str:
@@ -2850,6 +2886,20 @@ class AnalyzerResponseCache:
                     identity = legacy_identity
                 else:
                     record = None
+            if record is None:
+                for historical_identity in self._historical_request_identities(
+                    endpoint, body
+                ):
+                    historical_record = self._records.get(
+                        historical_identity["cache_key"]
+                    )
+                    if (
+                        historical_record is not None
+                        and historical_record["status"] == "accepted"
+                    ):
+                        identity = historical_identity
+                        record = historical_record
+                        break
             if record is None:
                 self.misses += 1
                 return None
