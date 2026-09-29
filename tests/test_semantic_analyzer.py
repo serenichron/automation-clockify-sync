@@ -14,6 +14,7 @@ from unittest import mock
 import urllib.error
 
 from scripts import semantic_analyzer as semantic
+from scripts import work_accounting_pipeline
 
 
 def event(evidence_id: str, day: str = "2026-07-10", content: str = "work") -> dict:
@@ -3750,10 +3751,164 @@ class SemanticAnalyzerTests(unittest.TestCase):
 
         self.assertEqual(["probe", "current route work"], live_calls)
         self.assertEqual(2, len(result["activities"]))
+        activities_by_evidence = {
+            tuple(activity["evidence_ids"]): activity
+            for activity in result["activities"]
+        }
+        self.assertEqual(
+            (
+                "deepseek-v4-flash:cloud",
+                "6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc",
+            ),
+            (
+                activities_by_evidence[("ev-cached",)]["analyzer_model"],
+                activities_by_evidence[("ev-cached",)]["analyzer_revision"],
+            ),
+        )
+        self.assertEqual(
+            (
+                "deepseek-v4.1-flash:cloud",
+                "e04da138d31e0c9468e982e1ae9503d06cb7e170caa16a90c17d931c4aa140f8",
+            ),
+            (
+                activities_by_evidence[("ev-missed",)]["analyzer_model"],
+                activities_by_evidence[("ev-missed",)]["analyzer_revision"],
+            ),
+        )
         self.assertEqual(2, len(records))
         self.assertEqual(
             {"deepseek-v4-flash:cloud", "deepseek-v4.1-flash:cloud"},
             {str(record["model"]) for record in records},
+        )
+
+    def test_route_less_retired_hit_seals_snapshot_with_reconstructed_exact_route(self):
+        current = semantic.AnalyzerEndpoint(
+            "clockify_analyzer_primary",
+            "https://analyzer.example/v1/chat/completions",
+            "deepseek-v4.1-flash:cloud",
+            revision="e04da138d31e0c9468e982e1ae9503d06cb7e170caa16a90c17d931c4aa140f8",
+        )
+        retired = semantic.AnalyzerEndpoint(
+            "clockify_analyzer_primary",
+            "https://analyzer.example/v1/chat/completions",
+            "deepseek-v4-flash:cloud",
+            revision="6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc",
+        )
+        retired_body = {"model": retired.model, "messages": []}
+        current_body = {"model": current.model, "messages": []}
+        response = {"activities": [], "exceptions": [], "omissions": []}
+        environment = {
+            "CLOCKIFY_ANALYZER_PRIMARY_URL": current.url,
+            "CLOCKIFY_ANALYZER_PRIMARY_MODEL": current.model,
+            "CLOCKIFY_ANALYZER_PRIMARY_REVISION": current.revision,
+            "CLOCKIFY_ANALYZER_FALLBACK_URL": "",
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "analyzer-cache.jsonl"
+            cache = semantic.AnalyzerResponseCache(path)
+            cache.store_accepted(retired, retired_body, response)
+            retired_record = json.loads(path.read_text(encoding="utf-8"))
+            retired_record.pop("route")
+            path.write_text(
+                semantic.canonical_json(retired_record) + "\n", encoding="utf-8"
+            )
+            replay = semantic.AnalyzerResponseCache(path)
+            self.assertEqual(response, replay.lookup(current, current_body))
+
+            with mock.patch.dict(os.environ, environment, clear=False):
+                snapshot = work_accounting_pipeline._seal_analyzer_cache_snapshot(
+                    root / "run",
+                    path,
+                    {"analyzer_cache": replay.summary()},
+                )
+            sealed = json.loads(
+                (root / "run" / "analyzer-cache-used.jsonl").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(1, snapshot["record_count"])
+        self.assertEqual(
+            {
+                "name": "clockify_analyzer_primary",
+                "url": "https://analyzer.example/v1/chat/completions",
+                "model": "deepseek-v4-flash:cloud",
+                "revision": "6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc",
+            },
+            sealed["route"],
+        )
+
+    def test_retired_semantic_review_hit_preserves_extractor_analyzer_and_reviewer_route(self):
+        current = semantic.AnalyzerEndpoint(
+            "clockify_analyzer_primary",
+            "https://analyzer.example/v1/chat/completions",
+            "deepseek-v4.1-flash:cloud",
+            revision="e04da138d31e0c9468e982e1ae9503d06cb7e170caa16a90c17d931c4aa140f8",
+        )
+        retired = semantic.AnalyzerEndpoint(
+            "clockify_analyzer_primary",
+            "https://analyzer.example/v1/chat/completions",
+            "deepseek-v4-flash:cloud",
+            revision="6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc",
+        )
+        events = [event("ev-review")]
+        candidate = valid_response("ev-review")
+        taxonomy = [{
+            "project_name": "Serenichron Level 2",
+            "prefix": "SC",
+            "tag_names": ["Processes"],
+            "billable": True,
+            "selection_guidance": ["clockify"],
+        }]
+        retired_body = semantic._review_body(
+            events,
+            candidate=candidate,
+            taxonomy=taxonomy,
+            model=retired.model,
+        )
+        review_response = provider_response(
+            json.loads(retired_body["messages"][-1]["content"])
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = semantic.AnalyzerResponseCache(Path(directory) / "cache.jsonl")
+            cache.store_accepted(retired, retired_body, review_response)
+            result = semantic._call_semantic_review(
+                current,
+                events,
+                candidate=candidate,
+                taxonomy=taxonomy,
+                tier="primary_flash_review",
+                transport=lambda *_args: self.fail(
+                    "retired review hit must not call current transport"
+                ),
+                known_evidence_ids={"ev-review"},
+                evidence_time_spans={
+                    "ev-review": {
+                        "start": "2026-07-10 10:00",
+                        "end": "2026-07-10 10:10",
+                    }
+                },
+                cache=cache,
+                before_transport=None,
+                cancelled=None,
+            )
+
+        activity = result["activities"][0]
+        self.assertEqual("deepseek-v4-flash:cloud", activity["extractor_model"])
+        self.assertEqual("deepseek-v4-flash:cloud", activity["analyzer_model"])
+        self.assertEqual(
+            "6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc",
+            activity["analyzer_revision"],
+        )
+        self.assertEqual(
+            "deepseek-v4-flash:cloud", activity["semantic_reviewer_model"]
+        )
+        self.assertEqual(
+            "6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc",
+            activity["semantic_reviewer_revision"],
         )
 
     def test_repair_cache_identity_is_distinct_and_replays_without_transport(self):

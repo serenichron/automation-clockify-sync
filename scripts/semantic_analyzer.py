@@ -217,6 +217,14 @@ class _ValidatedAnalysis(dict[str, Any]):
         self.low_timing_evidence_ids = frozenset(low_timing_evidence_ids)
 
 
+class _CachedProviderResponse(dict[str, Any]):
+    """Cached response carrying its validated, credential-free provider route."""
+
+    def __init__(self, value: Mapping[str, Any], *, route: Mapping[str, str]):
+        super().__init__(copy.deepcopy(dict(value)))
+        self.provider_route = copy.deepcopy(dict(route))
+
+
 class AnalyzerContractError(AnalyzerError):
     """A sealed provider response rejected by the semantic output contract."""
 
@@ -2718,13 +2726,26 @@ class AnalyzerResponseCache:
     @staticmethod
     def _historical_request_identities(
         endpoint: AnalyzerEndpoint, body: Mapping[str, Any]
+    ) -> tuple[tuple[dict[str, str], dict[str, str]], ...]:
+        return tuple(
+            (
+                AnalyzerResponseCache._request_identity_for_route(
+                    route,
+                    {**copy.deepcopy(dict(body)), "model": route["model"]},
+                ),
+                route,
+            )
+            for route in AnalyzerResponseCache._historical_route_variants(endpoint)
+        )
+
+    @staticmethod
+    def _historical_route_variants(
+        endpoint: AnalyzerEndpoint,
     ) -> tuple[dict[str, str], ...]:
         if (endpoint.model, endpoint.revision) != CURRENT_LIVE_FLASH_ROUTE:
             return ()
-        identities: list[dict[str, str]] = []
+        routes: list[dict[str, str]] = []
         for model, revision in sorted(APPROVED_FLASH_ROUTES - {CURRENT_LIVE_FLASH_ROUTE}):
-            historical_body = copy.deepcopy(dict(body))
-            historical_body["model"] = model
             route = {
                 "name": endpoint.name,
                 "url": endpoint.url,
@@ -2737,13 +2758,8 @@ class AnalyzerResponseCache:
                     **route,
                     "reasoning_effort": endpoint.reasoning_effort,
                 })
-            identities.extend(
-                AnalyzerResponseCache._request_identity_for_route(
-                    variant, historical_body
-                )
-                for variant in variants
-            )
-        return tuple(identities)
+            routes.extend(variants)
+        return tuple(routes)
 
     @staticmethod
     def _decision_digest(value: Mapping[str, Any]) -> str:
@@ -2861,6 +2877,7 @@ class AnalyzerResponseCache:
     def lookup(self, endpoint: AnalyzerEndpoint, body: Mapping[str, Any]) -> dict[str, Any] | None:
         with self._lock:
             identity = self._request_identity(endpoint, body)
+            matched_route = self._route_identity(endpoint)
             record = self._records.get(identity["cache_key"])
             if record is None and self.path.exists():
                 # Another guarded run may have appended after this instance loaded.
@@ -2884,10 +2901,11 @@ class AnalyzerResponseCache:
                 # inference behavior.
                 if record is not None and record["status"] == "accepted":
                     identity = legacy_identity
+                    matched_route.pop("reasoning_effort", None)
                 else:
                     record = None
             if record is None:
-                for historical_identity in self._historical_request_identities(
+                for historical_identity, historical_route in self._historical_request_identities(
                     endpoint, body
                 ):
                     historical_record = self._records.get(
@@ -2898,6 +2916,7 @@ class AnalyzerResponseCache:
                         and historical_record["status"] == "accepted"
                     ):
                         identity = historical_identity
+                        matched_route = historical_route
                         record = historical_record
                         break
             if record is None:
@@ -2905,6 +2924,16 @@ class AnalyzerResponseCache:
                 return None
             if record["body_digest"] != identity["body_digest"] or record["route_digest"] != identity["route_digest"]:
                 raise AnalyzerError("analyzer cache identity collision")
+            sealed_route = record.get("route")
+            if isinstance(sealed_route, dict):
+                matched_route = copy.deepcopy(sealed_route)
+            if (
+                matched_route.get("model") != record.get("model")
+                or hashlib.sha256(
+                    canonical_json(matched_route).encode("utf-8")
+                ).hexdigest() != record.get("route_digest")
+            ):
+                raise AnalyzerError("analyzer cache route identity collision")
             self.hits += 1
             self.used[identity["cache_key"]] = str(record["decision_digest"])
             if record["status"] == "rejected":
@@ -2919,7 +2948,9 @@ class AnalyzerResponseCache:
                 raise AnalyzerContractError(
                     f"analyzer cache records {record['failure_code']}"
                 )
-            return copy.deepcopy(record["response"])
+            return _CachedProviderResponse(
+                record["response"], route=matched_route
+            )
 
     def _store_record(self, record: dict[str, Any]) -> None:
         with self._lock:
@@ -3031,7 +3062,7 @@ class AnalyzerResponseCache:
         with self._lock:
             if self.path.exists():
                 self._load()
-            configured_routes: dict[str, dict[str, str]] = {}
+            configured_routes: dict[str, list[dict[str, str]]] = {}
             for endpoint in configured_endpoints:
                 route = self._route_identity(endpoint)
                 variants = [route]
@@ -3041,11 +3072,14 @@ class AnalyzerResponseCache:
                         for key, value in route.items()
                         if key != "reasoning_effort"
                     })
+                variants.extend(self._historical_route_variants(endpoint))
                 for variant in variants:
                     digest = hashlib.sha256(
                         canonical_json(variant).encode("utf-8")
                     ).hexdigest()
-                    configured_routes[digest] = variant
+                    candidates = configured_routes.setdefault(digest, [])
+                    if variant not in candidates:
+                        candidates.append(variant)
             selected: list[dict[str, Any]] = []
             seen: set[str] = set()
             for reference in references:
@@ -3063,12 +3097,17 @@ class AnalyzerResponseCache:
                     raise AnalyzerError("analyzer cache snapshot decision is unavailable")
                 sealed = copy.deepcopy(record)
                 if not isinstance(sealed.get("route"), dict):
-                    route = configured_routes.get(str(sealed.get("route_digest") or ""))
-                    if route is None or route.get("model") != sealed.get("model"):
+                    routes = configured_routes.get(
+                        str(sealed.get("route_digest") or ""), []
+                    )
+                    if (
+                        len(routes) != 1
+                        or routes[0].get("model") != sealed.get("model")
+                    ):
                         raise AnalyzerError(
                             "legacy analyzer cache decision does not match a configured analyzer route"
                         )
-                    sealed["route"] = copy.deepcopy(route)
+                    sealed["route"] = copy.deepcopy(routes[0])
                     sealed = self._validate_record(sealed, line_number=0)
                 selected.append(sealed)
             return tuple(sorted(selected, key=lambda value: str(value["cache_key"])))
@@ -3189,6 +3228,18 @@ def probe_endpoint(endpoint: AnalyzerEndpoint, transport: Transport = http_trans
     }
 
 
+def _response_provider_identity(
+    response: Mapping[str, Any], endpoint: AnalyzerEndpoint
+) -> tuple[str, str]:
+    route = getattr(response, "provider_route", None)
+    if isinstance(route, Mapping):
+        model = str(route.get("model") or "")
+        revision = str(route.get("revision") or "")
+        if model:
+            return model, revision
+    return endpoint.model, endpoint.revision
+
+
 def _validate_review_taxonomy(
     result: Mapping[str, Any],
     taxonomy: list[dict[str, Any]],
@@ -3234,6 +3285,7 @@ def _call_semantic_review_once(
     transport_failure_code: str | None = None,
     review_scope: str = "extraction",
     review_prompt_version: str = REVIEW_PROMPT_VERSION,
+    extractor_model: str | None = None,
 ) -> dict[str, Any]:
     request_options = dict(
         candidate=candidate,
@@ -3298,6 +3350,9 @@ def _call_semantic_review_once(
                     failure_code=_contract_failure_code(exc),
                 )
             raise AnalyzerContractError(str(exc)) from exc
+    reviewer_model, reviewer_revision = _response_provider_identity(
+        response, endpoint
+    )
     try:
         response = _normalize_provider_response(response, mode="extract")
         _provider_response_cache_safe(
@@ -3312,9 +3367,9 @@ def _call_semantic_review_once(
         result = validate_result(
             restored,
             known_evidence_ids=known_evidence_ids,
-            provider_model=endpoint.model,
+            provider_model=reviewer_model,
             analyzer_tier=tier,
-            provider_revision=endpoint.revision,
+            provider_revision=reviewer_revision,
             evidence_time_spans=evidence_time_spans,
             semantic_validation=False,
         )
@@ -3334,9 +3389,9 @@ def _call_semantic_review_once(
     if cache is not None and cache_miss:
         cache.store_accepted(endpoint, body, response)
     for activity in result["activities"]:
-        activity["extractor_model"] = endpoint.model
-        activity["semantic_reviewer_model"] = endpoint.model
-        activity["semantic_reviewer_revision"] = endpoint.revision
+        activity["extractor_model"] = extractor_model or reviewer_model
+        activity["semantic_reviewer_model"] = reviewer_model
+        activity["semantic_reviewer_revision"] = reviewer_revision
         activity["review_prompt_version"] = review_prompt_version
     return result
 
@@ -3356,6 +3411,7 @@ def _call_semantic_review(
     cancelled: Callable[[], bool] | None,
     review_scope: str = "extraction",
     review_prompt_version: str = REVIEW_PROMPT_VERSION,
+    extractor_model: str | None = None,
 ) -> dict[str, Any]:
     def failure(reason: str) -> dict[str, Any]:
         return {
@@ -3392,6 +3448,7 @@ def _call_semantic_review(
                 transport_failure_code=transport_failure_code,
                 review_scope=review_scope,
                 review_prompt_version=review_prompt_version,
+                extractor_model=extractor_model,
             )
         except AnalyzerContractError as exc:
             repair_error = exc
@@ -3415,6 +3472,7 @@ def _call_semantic_review(
                         transport_failure_code=transport_failure_code,
                         review_scope=review_scope,
                         review_prompt_version=review_prompt_version,
+                        extractor_model=extractor_model,
                     )
                 except AnalyzerContractError as error:
                     repair_error = error
@@ -3523,6 +3581,9 @@ def _call_validated(
                     failure_code=_contract_failure_code(exc),
                 )
             raise AnalyzerContractError(str(exc)) from exc
+    provider_model, provider_revision = _response_provider_identity(
+        response, endpoint
+    )
     try:
         response = _normalize_provider_response(response, mode="extract")
         extraction_ids = known_evidence_ids or {
@@ -3550,6 +3611,7 @@ def _call_validated(
                 cache=cache,
                 before_transport=before_transport,
                 cancelled=cancelled,
+                extractor_model=provider_model,
             )
             return _ValidatedAnalysis(
                 reviewed,
@@ -3565,9 +3627,9 @@ def _call_validated(
         result = validate_result(
             restored_response,
             known_evidence_ids=extraction_ids,
-            provider_model=endpoint.model,
+            provider_model=provider_model,
             analyzer_tier=tier,
-            provider_revision=endpoint.revision,
+            provider_revision=provider_revision,
             evidence_time_spans=evidence_time_spans,
             evidence_support=_evidence_support(events),
         )
@@ -3652,6 +3714,9 @@ def _call_synthesis_validated(
                     failure_code=_contract_failure_code(exc),
                 )
             raise AnalyzerContractError(str(exc)) from exc
+    provider_model, provider_revision = _response_provider_identity(
+        response, endpoint
+    )
     try:
         response = _normalize_provider_response(response, mode="synthesize")
         restored_response = _restore_evidence_references(
@@ -3664,9 +3729,9 @@ def _call_synthesis_validated(
         result = validate_result(
             restored_response,
             known_evidence_ids=known_evidence_ids,
-            provider_model=endpoint.model,
+            provider_model=provider_model,
             analyzer_tier=tier,
-            provider_revision=endpoint.revision,
+            provider_revision=provider_revision,
             evidence_time_spans=evidence_time_spans,
             semantic_validation=semantic_validation,
         )
