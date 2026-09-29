@@ -69,12 +69,21 @@ def _validated_analyzer_route(
                     record = json.loads(line)
                     if not isinstance(record, dict):
                         raise ValueError
-                    route = record.get("route")
-                    if not isinstance(route, dict):
-                        raise ValueError
                     cached_model = str(record.get("model") or "").strip()
-                    route_model = str(route.get("model") or "").strip()
-                    route_revision = str(route.get("revision") or "").strip()
+                    route = record.get("route")
+                    if route is None:
+                        legacy_pairs = {
+                            pair for pair in APPROVED_FLASH_ROUTES
+                            if pair[0] == cached_model
+                        }
+                        if len(legacy_pairs) != 1:
+                            raise ValueError
+                        route_model, route_revision = next(iter(legacy_pairs))
+                    elif isinstance(route, dict):
+                        route_model = str(route.get("model") or "").strip()
+                        route_revision = str(route.get("revision") or "").strip()
+                    else:
+                        raise ValueError
                     if (
                         route_model != cached_model
                         or (route_model, route_revision) not in APPROVED_FLASH_ROUTES

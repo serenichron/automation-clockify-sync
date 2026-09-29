@@ -149,15 +149,27 @@ class AccountingRunnerTests(unittest.TestCase):
                     )
                     self.assertEqual(2, runner.run(environment))
 
-    def test_sealed_cache_rejects_record_without_exact_route_metadata(self):
+            cache.write_text(
+                json.dumps({"model": "deepseek-v4-pro:cloud"}) + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(2, runner.run(environment))
+
+    def test_sealed_cache_accepts_legacy_route_less_records_for_unique_historical_pairs(self):
         with tempfile.TemporaryDirectory() as directory:
             root, run_dir, cache = self._layout(directory)
             cache.parent.mkdir(parents=True)
             cache.write_text(
-                json.dumps({"model": "deepseek-v4-flash:cloud"}) + "\n",
+                "\n".join([
+                    json.dumps({"model": "deepseek-v4-flash:cloud"}),
+                    json.dumps({"model": "deepseek-v4.1-flash:cloud"}),
+                ]) + "\n",
                 encoding="utf-8",
             )
-            self.assertEqual(2, runner.run(self._environment(root, run_dir, cache)))
+            route = runner._validated_analyzer_route(
+                self._environment(root, run_dir, cache), cache
+            )
+            self.assertEqual("deepseek-v4.1-flash:cloud", route["model"])
 
     def test_sealed_cache_accepts_its_exact_model_tag(self):
         with tempfile.TemporaryDirectory() as directory:
