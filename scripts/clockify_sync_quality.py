@@ -16,9 +16,10 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from scripts import caveman_renderer
+    from scripts import caveman_renderer, evidence_ledger
 except ModuleNotFoundError:
     import caveman_renderer  # type: ignore[no-redef]
+    import evidence_ledger  # type: ignore[no-redef]
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNS = ROOT / "runs"
@@ -559,6 +560,7 @@ def _declares_exact_proposal_overlap(
 def _declares_exact_existing_overlap(
     proposal: dict[str, Any],
     entry: dict[str, Any],
+    entry_index: int,
     overlap_start: dt.datetime,
     overlap_end: dt.datetime,
 ) -> bool:
@@ -574,16 +576,19 @@ def _declares_exact_existing_overlap(
     elapsed = (overlap_end - overlap_start).total_seconds()
     if not elapsed.is_integer() or elapsed <= 0:
         return False
+    entry_id = evidence_ledger._snapshot_event(
+        "clockify", entry, entry_index
+    ).evidence_id
     entry_suffix = entry.get("project_id_suffix")
     for warning in warnings:
         if not isinstance(warning, dict) or set(warning) - allowed or required - set(warning):
             continue
         if warning.get("type") != "existing_clockify_overlap":
             continue
-        if not re.fullmatch(r"ev-[a-f0-9]{64}", str(warning.get("counterpart_id") or "")):
+        if warning.get("counterpart_id") != entry_id:
             continue
         warning_suffix = warning.get("counterpart_project_suffix")
-        if warning_suffix is not None and entry_suffix and warning_suffix != entry_suffix:
+        if entry_suffix and warning_suffix != entry_suffix:
             continue
         start = parse_timestamp(warning.get("overlap_start"))
         end = parse_timestamp(warning.get("overlap_end"))
@@ -603,12 +608,16 @@ def find_time_overlaps(
         start = parse_timestamp(proposal.get("start"))
         end = parse_timestamp(proposal.get("end"))
         if start and end and end > start:
-            intervals.append((start, end, str(proposal.get("id")), "proposal", proposal))
+            intervals.append(
+                (start, end, str(proposal.get("id")), "proposal", proposal, None)
+            )
     for index, entry in enumerate(existing or [], 1):
         start = parse_timestamp(entry.get("start"))
         end = parse_timestamp(entry.get("end"))
         if start and end and end > start:
-            intervals.append((start, end, f"existing-{index}", "existing_clockify", entry))
+            intervals.append(
+                (start, end, f"existing-{index}", "existing_clockify", entry, index)
+            )
     intervals.sort(key=lambda row: (row[0], row[1], row[2]))
     overlaps = []
     for index, left in enumerate(intervals):
@@ -634,11 +643,13 @@ def find_time_overlaps(
                 # Evidence overlapping fixed Clockify time stays reviewable when
                 # the proposal carries the exact warning the reviewer will see.
                 if {left[3], right[3]} == {"proposal", "existing_clockify"}:
-                    proposal_row, entry = (
-                        (left[4], right[4]) if left[3] == "proposal" else (right[4], left[4])
+                    proposal_row, entry, entry_index = (
+                        (left[4], right[4], right[5])
+                        if left[3] == "proposal"
+                        else (right[4], left[4], left[5])
                     )
                     if _declares_exact_existing_overlap(
-                        proposal_row, entry, overlap_start, overlap_end
+                        proposal_row, entry, entry_index, overlap_start, overlap_end
                     ):
                         continue
                 overlaps.append({"left": left[2], "right": right[2]})

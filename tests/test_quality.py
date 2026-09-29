@@ -268,16 +268,20 @@ class QualityMatchingTests(unittest.TestCase):
         )
         self.assertEqual([{"left": "P001", "right": "existing-1"}], overlaps)
 
-    def _existing_overlap_case(self, **warning_overrides):
+    def _existing_overlap_case(
+        self, *, omit_counterpart_project_suffix=False, **warning_overrides
+    ):
         warning = {
             "type": "existing_clockify_overlap",
-            "counterpart_id": "ev-" + "a" * 64,
+            "counterpart_id": "ev-945c7bee4544799bc5ed6723e52ab54f34f1ae46e49e86dc4f620dcc3047bd44",
             "counterpart_project_suffix": "775f9f",
             "overlap_start": "2026-07-10T10:30:00+03:00",
             "overlap_end": "2026-07-10T11:00:00+03:00",
             "overlap_duration_seconds": 1800,
         }
         warning.update(warning_overrides)
+        if omit_counterpart_project_suffix:
+            warning.pop("counterpart_project_suffix")
         proposals = [
             {
                 "id": "P001",
@@ -288,15 +292,22 @@ class QualityMatchingTests(unittest.TestCase):
         ]
         existing = [
             {
+                "id_suffix": "entry001",
+                "description": "Existing work",
                 "start": "2026-07-10T10:30:00+03:00",
                 "end": "2026-07-10T11:30:00+03:00",
                 "project_id_suffix": "775f9f",
+                "tag_id_suffixes": [],
+                "running": False,
+                "running_snapshot": None,
+                "duration": "PT1H",
+                "billable": True,
             }
         ]
         return quality.find_time_overlaps(proposals, existing)
 
     def test_quality_allows_existing_clockify_overlap_declared_for_human_review(self):
-        """Catches the review cycle blocking overlaps the pipeline already warns about."""
+        """Catches quality deriving a different identity than the evidence ledger."""
         self.assertEqual([], self._existing_overlap_case())
 
     def test_quality_blocks_existing_overlap_when_warning_interval_differs(self):
@@ -312,6 +323,18 @@ class QualityMatchingTests(unittest.TestCase):
         self.assertEqual(
             [{"left": "P001", "right": "existing-1"}],
             self._existing_overlap_case(counterpart_project_suffix="1207d5"),
+        )
+
+    def test_quality_blocks_existing_overlap_when_counterpart_id_names_another_entry(self):
+        self.assertEqual(
+            [{"left": "P001", "right": "existing-1"}],
+            self._existing_overlap_case(counterpart_id="ev-" + "b" * 64),
+        )
+
+    def test_quality_blocks_existing_overlap_when_project_suffix_is_missing(self):
+        self.assertEqual(
+            [{"left": "P001", "right": "existing-1"}],
+            self._existing_overlap_case(omit_counterpart_project_suffix=True),
         )
 
     def test_quality_blocks_existing_overlap_declared_with_proposal_counterpart(self):
