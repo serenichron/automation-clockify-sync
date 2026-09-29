@@ -1349,12 +1349,19 @@ def _prepare_replay_run(source: Path) -> Path:
                 raise ValueError("analyzer cache snapshot record count differs")
             if snapshot.get("sha256") != cache_sha256:
                 raise ValueError("analyzer cache snapshot digest differs")
-        ledger = _read_json(source / "evidence" / "evidence-ledger.json")
-        events = ledger.get("events") if isinstance(ledger, dict) else None
-        if not isinstance(events, list):
-            raise ValueError("replay evidence ledger events are invalid")
+        ledger, all_events = work_accounting_pipeline.load_ledger(ledger_path)
+        member_identities = (
+            work_accounting_pipeline.meeting_reconciliation.manifest_member_identities(
+                ledger.manifest.document()
+            )
+        )
+        analysis_events, _noise = work_accounting_pipeline._analysis_events(
+            all_events, member_identities
+        )
         evidence_ids = sorted(
-            str(event.get("evidence_id")) for event in events if isinstance(event, dict)
+            str(event.get("evidence_id"))
+            for event in analysis_events
+            if isinstance(event, dict)
         )
         expected_evidence = semantic_analyzer.stable_digest("led-", evidence_ids)
         if source_analysis.get("ledger_evidence_digest") != expected_evidence:

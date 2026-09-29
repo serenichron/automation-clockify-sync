@@ -353,6 +353,57 @@ class ReviewRunResultTests(unittest.TestCase):
                 clockify_adapter_calls=int(bool(replay_result["external_writes"])),
             )
 
+    def test_replay_cache_binding_uses_the_source_semantic_event_selection(self):
+        """Clockify and noise evidence must not change the analyzer input digest."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs = root / "runs"
+            source = self._write_real_offline_replay_source(
+                runs, root, mixed_evidence=True,
+            )
+            source_before = run_tree_snapshot(source)
+            ledger, all_events = work_accounting_pipeline.load_ledger(
+                source / "evidence" / "evidence-ledger.json"
+            )
+            member_identities = (
+                work_accounting_pipeline.meeting_reconciliation.manifest_member_identities(
+                    ledger.manifest.document()
+                )
+            )
+            semantic_events, noise = work_accounting_pipeline._analysis_events(
+                all_events, member_identities
+            )
+            source_analysis = json.loads(
+                (source / "semantic-analysis.json").read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(
+                {"clockify", "codex_sessions_event", "fathom"},
+                {event["source_type"] for event in all_events},
+            )
+            self.assertEqual(
+                ["fathom"],
+                [event["source_type"] for event in semantic_events],
+            )
+            self.assertEqual(1, len(noise))
+            self.assertEqual(
+                semantic_analyzer.stable_digest(
+                    "led-",
+                    sorted(event["evidence_id"] for event in semantic_events),
+                ),
+                source_analysis["ledger_evidence_digest"],
+            )
+
+            with mock.patch.object(review_run, "RUNS", runs), mock.patch.dict(
+                os.environ,
+                {"CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED": "approved"},
+                clear=False,
+            ):
+                replay = review_run._prepare_replay_run(source)
+
+            self.assertTrue(replay.is_dir())
+            self.assertEqual(source_before, run_tree_snapshot(source))
+
     def test_inference_backed_replay_requires_source_cache_before_child(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1518,7 +1569,9 @@ class ReviewRunResultTests(unittest.TestCase):
         return source, replay
 
     @staticmethod
-    def _write_real_offline_replay_source(runs: Path, root: Path) -> Path:
+    def _write_real_offline_replay_source(
+        runs: Path, root: Path, *, mixed_evidence: bool = False,
+    ) -> Path:
         source = runs / "source-run"
         source.mkdir(parents=True)
         inventory = {
@@ -1526,18 +1579,70 @@ class ReviewRunResultTests(unittest.TestCase):
             "fathom": {"status": "complete"},
             "multica_issues": {"status": "complete"},
         }
-        event = evidence_ledger.evidence_event(
-            "codex_sessions_event",
-            {"source_type": "codex_sessions", "source_id": "offline-1", "machine": "fixture", "session_id": "session-1"},
-            observed_at="2026-08-01T10:00:00Z",
-            raw_source_span={"start": "2026-08-01T10:00:00Z", "end": "2026-08-01T10:10:00Z", "path": "/offline/replay.jsonl"},
-            attributes={"role": "user", "kind": "message", "content": "Validate offline replay"},
+        if mixed_evidence:
+            events = (
+                evidence_ledger.evidence_event(
+                    "clockify",
+                    {"source_type": "clockify", "source_id": "existing-1"},
+                    observed_at="2026-08-01T09:00:00Z",
+                    raw_source_span={
+                        "start": "2026-08-01T09:00:00Z",
+                        "end": "2026-08-01T09:10:00Z",
+                    },
+                    attributes={"description": "Existing Clockify entry"},
+                ),
+                evidence_ledger.evidence_event(
+                    "fathom",
+                    {"source_type": "fathom", "source_id": "meeting-1"},
+                    observed_at="2026-08-01T10:00:00Z",
+                    raw_source_span={
+                        "start": "2026-08-01T10:00:00Z",
+                        "end": "2026-08-01T10:10:00Z",
+                    },
+                    attributes={
+                        "title": "Validate offline replay",
+                        "semantic_evidence_status": "transcript",
+                        "recorded_by_email": "member@example.test",
+                        "calendar_invitees": [{"email": "client@example.test"}],
+                        "transcript": [{"speaker": "Member", "text": "Validate replay"}],
+                    },
+                ),
+                evidence_ledger.evidence_event(
+                    "codex_sessions_event",
+                    {
+                        "source_type": "codex_sessions",
+                        "source_id": "noise-1",
+                        "machine": "fixture",
+                        "session_id": "session-noise",
+                    },
+                    observed_at="2026-08-01T11:00:00Z",
+                    raw_source_span={
+                        "start": "2026-08-01T11:00:00Z",
+                        "end": "2026-08-01T11:01:00Z",
+                        "path": "/offline/noise.jsonl",
+                    },
+                    attributes={
+                        "role": "system", "kind": "message", "content": "Heartbeat: ok",
+                    },
+                ),
+            )
+            member_identities = ("member@example.test",)
+        else:
+            events = (evidence_ledger.evidence_event(
+                "codex_sessions_event",
+                {"source_type": "codex_sessions", "source_id": "offline-1", "machine": "fixture", "session_id": "session-1"},
+                observed_at="2026-08-01T10:00:00Z",
+                raw_source_span={"start": "2026-08-01T10:00:00Z", "end": "2026-08-01T10:10:00Z", "path": "/offline/replay.jsonl"},
+                attributes={"role": "user", "kind": "message", "content": "Validate offline replay"},
+            ),)
+            member_identities = ()
+        ledger = evidence_ledger.EvidenceLedger(
+            events, inventory, member_identities=member_identities,
         )
-        ledger = evidence_ledger.EvidenceLedger((event,), inventory)
         write_json(source / "evidence" / "evidence-ledger.json", {
             "schema_version": ledger.manifest.schema_version,
             "manifest": ledger.manifest.document(),
-            "events": [event.document()],
+            "events": [event.document() for event in ledger.events],
         })
         write_json(source / "run-report.json", {
             "run_id": source.name,
@@ -1572,8 +1677,16 @@ class ReviewRunResultTests(unittest.TestCase):
             payload = json.loads(body["messages"][-1]["content"])
             return {"probe": "ok"} if payload.get("probe") else analyzer_provider_response(payload)
 
+        member_identity_set = (
+            work_accounting_pipeline.meeting_reconciliation.manifest_member_identities(
+                ledger.manifest.document()
+            )
+        )
+        analysis_events, _noise = work_accounting_pipeline._analysis_events(
+            [event.document() for event in ledger.events], member_identity_set
+        )
         analysis = semantic_analyzer.analyze_tiered(
-            work_accounting_pipeline._with_semantic_route_hints([event.document()], routing),
+            work_accounting_pipeline._with_semantic_route_hints(analysis_events, routing),
             primary=endpoint, transport=transport,
             private_text_approved=True, cache=cache, max_workers=1,
             review_taxonomy=[{
