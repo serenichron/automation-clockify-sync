@@ -6,7 +6,7 @@
   "additionalProperties": false,
   "required": [
     "schema_version", "allocation_mode", "ledger_manifest", "semantic_analysis",
-    "proposals", "ambiguous", "skipped", "allocation", "fathom_reconciliation",
+    "proposals", "ambiguous", "skipped", "review_tombstones", "allocation", "fathom_reconciliation",
     "correction_regression", "external_writes", "member_identities", "coverage_warnings"
   ],
   "properties": {
@@ -30,6 +30,7 @@
     "proposals": {"type": "array", "items": {"$ref": "#/$defs/proposal"}},
     "ambiguous": {"type": "array", "items": {"type": "object"}},
     "skipped": {"type": "array", "items": {"type": "object"}},
+    "review_tombstones": {"type": "array", "items": {"type": "object"}},
     "allocation": {"type": "object"},
     "fathom_reconciliation": {"type": "array", "items": {"type": "object"}},
     "meeting_reconciliation_digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},

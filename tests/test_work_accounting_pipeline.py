@@ -1260,7 +1260,7 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         self.assertGreaterEqual(result["proposals"][1]["start"], "2026-07-10T10:30+03:00")
         self.assertTrue(all(row["allocation_mode"] == "non_overlapping_v1" for row in result["proposals"]))
 
-    def test_full_fixed_block_exhaustion_emits_review_proposal_with_warnings(self):
+    def test_full_fixed_block_exhaustion_emits_credited_tombstone(self):
         work = session_event(
             "capacity-recovery:event:1",
             "2026-07-10T09:00:00+03:00",
@@ -1277,54 +1277,23 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             analysis_for([work.evidence_id], recommended=30),
         )
 
-        self.assertEqual(1, len(result["proposals"]))
-        proposal = result["proposals"][0]
-        self.assertEqual(30, proposal["duration_minutes"])
+        self.assertEqual([], result["proposals"])
+        self.assertEqual(1, len(result["review_tombstones"]))
         self.assertEqual(
-            {
-                "type": "allocation_capacity_recovery",
-                "requested_minutes": 30,
-                "allocator_allocated_minutes": 0,
-                "recovered_minutes": 30,
-                "residual_minutes": 0,
-            },
-            proposal["review_warnings"][0],
+            1800,
+            result["review_tombstones"][0]["credited_overlap_receipt"]["credited_seconds"],
         )
-        self.assertEqual(
-            {
-                "type": "existing_clockify_overlap",
-                "counterpart_id": existing.evidence_id,
-                "counterpart_project_suffix": "775f9f",
-                "overlap_start": "2026-07-10T09:00:00+03:00",
-                "overlap_end": "2026-07-10T09:30:00+03:00",
-                "overlap_duration_seconds": 1800,
-            },
-            proposal["review_warnings"][1],
-        )
-        self.assertFalse(any(
-            row.get("activity_id") == proposal["activity_id"]
-            and row.get("exception_kind") == "contested_time"
-            for row in result["ambiguous"]
-        ))
         self.assertEqual([], result["allocation"]["contested_time"])
         self.assertEqual(
             [{
-                "activity_id": proposal["activity_id"],
+                "activity_id": result["review_tombstones"][0]["activity_id"],
                 "requested_minutes": 30,
                 "allocator_allocated_minutes": 0,
-                "recovered_minutes": 30,
+                "recovered_minutes": 0,
+                "credited_minutes": 30,
                 "residual_minutes": 0,
             }],
             result["allocation"]["capacity_recoveries"],
-        )
-        row = sheet_publisher.proposal_row(
-            proposal,
-            "run-capacity-recovery",
-            project_allowlist={"775f9f": "Serenichron Level 2"},
-        )
-        self.assertEqual(
-            "allocation_capacity_recovery",
-            json.loads(row[12])[0]["type"],
         )
 
     def test_partial_allocator_capacity_recovers_only_unallocated_duration(self):
@@ -1344,32 +1313,66 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             analysis_for([work.evidence_id], recommended=40),
         )
 
-        self.assertEqual(40, sum(row["duration_minutes"] for row in result["proposals"]))
-        recovered = next(
-            row for row in result["proposals"]
-            if any(
-                warning.get("type") == "allocation_capacity_recovery"
-                for warning in row["review_warnings"]
-            )
-        )
-        self.assertEqual("2026-07-10T09:20:00+03:00", recovered["start"])
-        self.assertEqual("2026-07-10T09:30:00+03:00", recovered["end"])
-        self.assertEqual(
-            {
-                "type": "allocation_capacity_recovery",
-                "requested_minutes": 40,
-                "allocator_allocated_minutes": 30,
-                "recovered_minutes": 10,
-                "residual_minutes": 0,
-            },
-            recovered["review_warnings"][0],
-        )
-        self.assertFalse(any(
-            row.get("activity_id") == recovered["activity_id"]
-            and row.get("exception_kind") == "contested_time"
-            for row in result["ambiguous"]
-        ))
+        self.assertEqual(30, sum(row["duration_minutes"] for row in result["proposals"]))
+        self.assertEqual(10, result["allocation"]["capacity_recoveries"][0]["credited_minutes"])
+        self.assertEqual(1, len(result["review_tombstones"]))
         self.assertEqual([], result["allocation"]["contested_time"])
+
+    def test_overlap_normalization_rebinds_recovery_warning_to_surviving_slice(self):
+        stale_warning = {
+            "type": "allocation_capacity_recovery",
+            "requested_minutes": 50,
+            "allocator_allocated_minutes": 20,
+            "recovered_minutes": 30,
+            "residual_minutes": 0,
+        }
+        unrelated_warning = {"type": "routing_review", "detail": "preserve me"}
+        survivor = {
+            "candidate_key": "wks-survivor",
+            "activity_id": "act-recovery",
+            "start": "2026-07-10T10:00:00+03:00",
+            "duration_minutes": 10,
+            "duration_seconds": 600,
+            "review_warnings": [unrelated_warning, stale_warning],
+            "provenance": {"allocation_capacity_recovery": True},
+        }
+        credited = {
+            "activity_id": "act-recovery",
+            "credited_overlap_receipt": {"credited_seconds": 1200},
+            "provenance": {"allocation_capacity_recovery": True},
+        }
+        records = [{
+            "activity_id": "act-recovery",
+            "requested_minutes": 50,
+            "allocator_allocated_minutes": 20,
+            "recovered_minutes": 30,
+            "residual_minutes": 0,
+        }]
+
+        pipeline._refresh_capacity_recovery_warnings(
+            [survivor], [credited], records,
+        )
+
+        self.assertEqual({
+            "activity_id": "act-recovery",
+            "requested_minutes": 50,
+            "allocator_allocated_minutes": 20,
+            "recovered_minutes": 10,
+            "credited_minutes": 20,
+            "residual_minutes": 0,
+        }, records[0])
+        self.assertEqual(unrelated_warning, survivor["review_warnings"][0])
+        self.assertEqual([{
+            "type": "allocation_capacity_recovery",
+            "requested_minutes": 50,
+            "allocator_allocated_minutes": 20,
+            "recovered_minutes": 10,
+            "credited_minutes": 20,
+            "residual_minutes": 0,
+        }], [
+            warning for warning in survivor["review_warnings"]
+            if warning.get("type") == "allocation_capacity_recovery"
+        ])
 
     def test_capacity_recovery_dedupes_same_activity_interval_but_keeps_distinct_work(self):
         first = session_event(
@@ -1410,18 +1413,19 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             [first, duplicate_span, distinct_span, existing], analysis
         )
 
-        recovered = [
-            row for row in result["proposals"]
-            if any(
-                warning.get("type") == "allocation_capacity_recovery"
-                for warning in row["review_warnings"]
-            )
-        ]
+        recovered = result["review_tombstones"]
         self.assertEqual(2, len(recovered))
         self.assertEqual(2, len({row["activity_id"] for row in recovered}))
         self.assertEqual(
             2,
-            len({(row["activity_id"], row["start"], row["end"]) for row in recovered}),
+            len({
+                (
+                    row["activity_id"],
+                    row["credited_overlap_receipt"]["original_start"],
+                    row["credited_overlap_receipt"]["original_end"],
+                )
+                for row in recovered
+            }),
         )
 
     def test_multi_interval_recovery_emits_one_aggregate_capacity_warning(self):
@@ -1459,34 +1463,10 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             analysis_for([first.evidence_id, second.evidence_id], recommended=30),
         )
 
-        recovered = sorted(result["proposals"], key=lambda row: row["start"])
-        self.assertEqual([20, 10], [row["duration_minutes"] for row in recovered])
-        capacity_warnings = [
-            warning
-            for row in recovered
-            for warning in row["review_warnings"]
-            if warning.get("type") == "allocation_capacity_recovery"
-        ]
-        self.assertEqual(1, len(capacity_warnings))
-        self.assertEqual(
-            sum(row["duration_minutes"] for row in recovered),
-            capacity_warnings[0]["recovered_minutes"],
-        )
-        self.assertEqual(
-            ["allocation_capacity_recovery", "existing_clockify_overlap"],
-            [warning["type"] for warning in recovered[0]["review_warnings"]],
-        )
-        self.assertEqual(
-            ["existing_clockify_overlap"],
-            [warning["type"] for warning in recovered[1]["review_warnings"]],
-        )
+        self.assertEqual([], result["proposals"])
+        self.assertEqual(2, len(result["review_tombstones"]))
         self.assertEqual(1, len(result["allocation"]["capacity_recoveries"]))
-        for proposal in recovered:
-            sheet_publisher.proposal_row(
-                proposal,
-                "run-multi-capacity-recovery",
-                project_allowlist={"775f9f": "Serenichron Level 2"},
-            )
+        self.assertEqual(30, result["allocation"]["capacity_recoveries"][0]["credited_minutes"])
 
     def test_recovery_replay_preserves_all_intervals_capacity_and_overlap_warnings(self):
         """Exact replay must keep every recovered interval reviewable exactly once."""
@@ -1540,11 +1520,11 @@ class WorkAccountingPipelineTests(unittest.TestCase):
 
         self.assertEqual(first_result, replay_result)
         proposals = sorted(replay_result["proposals"], key=lambda row: row["start"])
-        self.assertEqual(30, sum(row["duration_minutes"] for row in proposals))
+        sheet_publisher.validate_recovery_proposal_groups(proposals)
+        self.assertEqual(20, sum(row["duration_minutes"] for row in proposals))
         self.assertEqual(
             [
                 ("2026-07-10T09:00:00+03:00", "2026-07-10T09:05:00+03:00"),
-                ("2026-07-10T09:05:00+03:00", "2026-07-10T09:15:00+03:00"),
                 ("2026-07-10T09:15:00+03:00", "2026-07-10T09:20:00+03:00"),
                 ("2026-07-10T10:00:00+03:00", "2026-07-10T10:10:00+03:00"),
             ],
@@ -1558,55 +1538,10 @@ class WorkAccountingPipelineTests(unittest.TestCase):
                 for evidence_id in row["provenance"]["evidence_ids"]
             },
         )
-        warning_types = {
-            warning["type"]
-            for proposal in proposals
-            for warning in proposal["review_warnings"]
-        }
+        self.assertEqual(1, len(replay_result["review_tombstones"]))
         self.assertEqual(
-            {"allocation_capacity_recovery", "existing_clockify_overlap"},
-            warning_types,
-        )
-        overlapping = next(
-            proposal
-            for proposal in proposals
-            if any(
-                warning["type"] == "existing_clockify_overlap"
-                for warning in proposal["review_warnings"]
-            )
-        )
-        self.assertEqual(
-            ("2026-07-10T09:05:00+03:00", "2026-07-10T09:15:00+03:00"),
-            (overlapping["start"], overlapping["end"]),
-        )
-        self.assertEqual(
-            {
-                "type": "existing_clockify_overlap",
-                "counterpart_id": existing.evidence_id,
-                "counterpart_project_suffix": "775f9f",
-                "overlap_start": "2026-07-10T09:05:00+03:00",
-                "overlap_end": "2026-07-10T09:15:00+03:00",
-                "overlap_duration_seconds": 600,
-            },
-            next(
-                warning
-                for warning in overlapping["review_warnings"]
-                if warning["type"] == "existing_clockify_overlap"
-            ),
-        )
-        self.assertEqual(
-            {
-                "type": "allocation_capacity_recovery",
-                "requested_minutes": 20,
-                "allocator_allocated_minutes": 10,
-                "recovered_minutes": 10,
-                "residual_minutes": 0,
-            },
-            next(
-                warning
-                for warning in overlapping["review_warnings"]
-                if warning["type"] == "allocation_capacity_recovery"
-            ),
+            600,
+            replay_result["review_tombstones"][0]["credited_overlap_receipt"]["credited_seconds"],
         )
         self.assertEqual(
             len(proposals),
@@ -2553,7 +2488,7 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             result["fathom_reconciliation"][0]["reason"],
         )
 
-    def test_temporal_overlap_without_meeting_identity_does_not_dedupe(self):
+    def test_temporal_overlap_without_meeting_identity_is_credited_not_reposted(self):
         meeting = fathom_event(
             "2026-07-10T13:00:00+03:00",
             "2026-07-10T14:00:00+03:00",
@@ -2564,15 +2499,12 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         )
         _, result = self.make_run([meeting, existing], meeting_analysis(meeting))
 
-        self.assertEqual(1, len(result["proposals"]))
+        self.assertEqual([], result["proposals"])
         reconciliation = result["fathom_reconciliation"][0]
-        self.assertEqual("proposed", reconciliation["status"])
+        self.assertEqual("reconciled", reconciliation["status"])
         self.assertEqual(meeting.evidence_id, reconciliation["evidence_id"])
         self.assertEqual([meeting.evidence_id], reconciliation["source_evidence_ids"])
-        self.assertEqual(
-            "existing_clockify_overlap",
-            result["proposals"][0]["review_warnings"][0]["type"],
-        )
+        self.assertEqual(1, len(result["review_tombstones"]))
 
     def test_exact_canonical_meeting_identity_dedupes_without_overlap_ratio(self):
         meeting = fathom_event(
@@ -2656,7 +2588,43 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             "counterpart_project", reconciliation["overlap_diagnostics"][0]
         )
 
-    def test_partial_clockify_overlap_keeps_full_meeting_proposal_with_review_warning(self):
+    def test_fully_covered_meeting_is_suppressed_with_credited_overlap_receipt(self):
+        """Catches live Clockify time being proposed again for an entire meeting."""
+        meeting = fathom_event(
+            "2026-07-10T13:00:00+03:00",
+            "2026-07-10T14:00:00+03:00",
+            status="available",
+        )
+        existing = clockify_event(
+            "2026-07-10T12:30:00+03:00", "2026-07-10T14:30:00+03:00"
+        )
+
+        _, result = self.make_run([meeting, existing], meeting_analysis(meeting))
+
+        self.assertEqual([], result["proposals"])
+        credited = next(
+            row for row in result["skipped"]
+            if row.get("reason") == "proposal fully credited to existing Clockify time"
+        )
+        self.assertEqual(meeting.evidence_id, credited["evidence_ids"][0])
+        self.assertEqual(
+            {
+                "schema_version": "clockify-overlap-credit/v1",
+                "original_start": "2026-07-10T13:00:00+03:00",
+                "original_end": "2026-07-10T14:00:00+03:00",
+                "credited_seconds": 3600,
+                "counterparts": [{
+                    "type": "existing_clockify_overlap",
+                    "counterpart_id": existing.evidence_id,
+                    "overlap_start": "2026-07-10T13:00:00+03:00",
+                    "overlap_end": "2026-07-10T14:00:00+03:00",
+                    "overlap_duration_seconds": 3600,
+                }],
+            },
+            credited["credited_overlap_receipt"],
+        )
+
+    def test_partial_clockify_overlap_emits_only_uncovered_meeting_tail_with_credit(self):
         meeting = fathom_event(
             "2026-07-10T13:00:00+03:00",
             "2026-07-10T14:00:00+03:00",
@@ -2670,7 +2638,8 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         self.assertEqual(1, len(result["proposals"]))
         proposal = result["proposals"][0]
         self.assertEqual("2026-07-10T13:00:00+03:00", proposal["start"])
-        self.assertEqual("2026-07-10T14:00:00+03:00", proposal["end"])
+        self.assertEqual("2026-07-10T13:30:00+03:00", proposal["end"])
+        self.assertEqual(1800, proposal["duration_seconds"])
         reconciliation = result["fathom_reconciliation"][0]
         self.assertEqual("proposed", reconciliation["status"])
         self.assertEqual(meeting.evidence_id, reconciliation["evidence_id"])
@@ -2684,6 +2653,16 @@ class WorkAccountingPipelineTests(unittest.TestCase):
                 "overlap_duration_seconds": 1800,
             }],
             proposal["review_warnings"],
+        )
+        self.assertEqual(
+            {
+                "schema_version": "clockify-overlap-credit/v1",
+                "original_start": "2026-07-10T13:00:00+03:00",
+                "original_end": "2026-07-10T14:00:00+03:00",
+                "credited_seconds": 1800,
+                "counterparts": proposal["review_warnings"],
+            },
+            proposal["provenance"]["credited_overlap_receipt"],
         )
         self.assertFalse(any(
             row.get("exception_kind") == "fixed_block_conflict"
@@ -2704,6 +2683,70 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             emitted_ids=[row[0]],
             clockify_adapter_calls=int(bool(result["external_writes"])),
         )
+
+    def test_overlapping_meetings_are_split_into_deterministic_non_overlapping_rows(self):
+        """Catches simultaneous meeting proposals that the poster would reject."""
+        first = evidence_ledger.evidence_event(
+            "fathom",
+            {"source_type": "fathom", "source_id": "meeting-1"},
+            observed_at="2026-07-10T13:00:00+03:00",
+            raw_source_span={
+                "start": "2026-07-10T13:00:00+03:00",
+                "end": "2026-07-10T14:00:00+03:00",
+            },
+            attributes={
+                "title": "Daily Meet",
+                "semantic_evidence_status": "available",
+                "recorded_by_email": "vlad@serenichron.com",
+                "calendar_invitees": [{
+                    "email": "vlad@serenichron.com", "is_external": False,
+                }],
+            },
+        )
+        second = evidence_ledger.evidence_event(
+            "fathom",
+            {"source_type": "fathom", "source_id": "meeting-2"},
+            observed_at="2026-07-10T13:30:00+03:00",
+            raw_source_span={
+                "start": "2026-07-10T13:30:00+03:00",
+                "end": "2026-07-10T14:30:00+03:00",
+            },
+            attributes={
+                "title": "BNI one-to-one",
+                "semantic_evidence_status": "available",
+                "recorded_by_email": "vlad@serenichron.com",
+                "calendar_invitees": [{
+                    "email": "partner@example.test", "is_external": True,
+                }],
+            },
+        )
+        analysis = meeting_analysis(first)
+        second_analysis = meeting_analysis(second)["activities"][0]
+        second_analysis["object"] = "BNI one-to-one"
+        analysis["activities"].append(second_analysis)
+
+        _, result = self.make_run([first, second], analysis)
+
+        proposals = sorted(result["proposals"], key=lambda row: row["start"])
+        self.assertEqual(2, len(proposals))
+        self.assertEqual(
+            [
+                ("2026-07-10T13:00:00+03:00", "2026-07-10T13:30:00+03:00"),
+                ("2026-07-10T13:30:00+03:00", "2026-07-10T14:30:00+03:00"),
+            ],
+            [(row["start"], row["end"]) for row in proposals],
+        )
+        receipt = proposals[0]["provenance"]["credited_overlap_receipt"]
+        self.assertEqual("clockify-overlap-credit/v1", receipt["schema_version"])
+        self.assertEqual(1800, receipt["credited_seconds"])
+        self.assertEqual(
+            "meeting_proposal_overlap", receipt["counterparts"][0]["type"]
+        )
+        self.assertEqual(
+            "specific_external_meeting_over_generic_internal_meeting",
+            receipt["precedence"]["rule"],
+        )
+        self.assertLessEqual(proposals[0]["end"], proposals[1]["start"])
 
     def test_overlap_warning_retains_only_clockify_project_suffix(self):
         meeting = fathom_event(
@@ -2799,6 +2842,31 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         self.assertEqual("SC", route["prefix"])
         self.assertEqual(["Business development"], route["tag_names"])
 
+    def test_post_activation_mazilu_meeting_uses_configured_client_route(self):
+        """Catches dedicated Mazilu meetings falling back to Serenichron."""
+        routing = json.loads((ROOT / "routing.json").read_text())
+        cited = [fathom_event(
+            "2026-09-24T10:02:00+03:00",
+            "2026-09-24T11:27:00+03:00",
+            status="available",
+        ).document()]
+        cited[0]["attributes"]["title"] = "Mazilu & Partners working session"
+
+        route = pipeline._route_from_client_lifecycle(cited, routing)
+
+        self.assertEqual(
+            {
+                "project_name": "Mazilu & Partners — Retainer",
+                "project_suffix": "54ecf6",
+                "tag_suffixes": ["f2634e9f"],
+                "tag_names": ["Mazilu — Sesiuni de lucru"],
+                "billable": True,
+                "confidence": "high",
+                "prefix": "M&P",
+            },
+            route,
+        )
+
     def test_mazilu_text_does_not_activate_future_client_route_without_marker_and_date(self):
         """Catches a client name alone inventing a contract activation cutover."""
         routing = json.loads((ROOT / "routing.json").read_text())
@@ -2810,7 +2878,7 @@ class WorkAccountingPipelineTests(unittest.TestCase):
 
         self.assertIsNone(pipeline._route_from_client_lifecycle(cited, routing))
 
-    def test_client_lifecycle_requires_marker_in_substantive_evidence(self):
+    def test_client_lifecycle_uses_configured_effective_date_without_marker(self):
         routing = json.loads((ROOT / "routing.json").read_text())
         routing["client_lifecycle_routes"][0]["activation"] = {
             "marker": "contract activated",
@@ -2832,7 +2900,10 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             "/Users/blackthorne/Work/contract-activated/session.jsonl"
         )
 
-        self.assertIsNone(pipeline._route_from_client_lifecycle(cited, routing))
+        self.assertEqual(
+            "Mazilu & Partners Level 1",
+            pipeline._route_from_client_lifecycle(cited, routing)["project_name"],
+        )
 
     def test_client_lifecycle_activates_after_effective_marker_is_observed(self):
         routing = json.loads((ROOT / "routing.json").read_text())

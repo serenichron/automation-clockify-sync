@@ -37,6 +37,7 @@ CAPACITY_RECOVERY_WARNING_FIELDS = frozenset({
     "type", "requested_minutes", "allocator_allocated_minutes",
     "recovered_minutes", "residual_minutes",
 })
+CAPACITY_RECOVERY_WARNING_OPTIONAL_FIELDS = frozenset({"credited_minutes"})
 OVERLAP_WARNING_FIELDS = frozenset({
     "type", "counterpart_id", "overlap_start",
     "overlap_end", "overlap_duration_seconds",
@@ -348,7 +349,11 @@ def _validate_review_warning(
             )
         return dict(warning)
     elif warning_type == "allocation_capacity_recovery":
-        extra = set(warning) - CAPACITY_RECOVERY_WARNING_FIELDS
+        extra = (
+            set(warning)
+            - CAPACITY_RECOVERY_WARNING_FIELDS
+            - CAPACITY_RECOVERY_WARNING_OPTIONAL_FIELDS
+        )
         missing = CAPACITY_RECOVERY_WARNING_FIELDS - set(warning)
         if extra or missing:
             detail = "unsupported fields" if extra else "missing fields"
@@ -363,12 +368,15 @@ def _validate_review_warning(
         recovered = _warning_count(
             warning.get("recovered_minutes"), "recovered_minutes", positive=True
         )
+        credited = _warning_count(
+            warning.get("credited_minutes", 0), "credited_minutes"
+        )
         residual = _warning_count(
             warning.get("residual_minutes"), "residual_minutes"
         )
         if (
-            allocated + recovered > requested
-            or residual != requested - allocated - recovered
+            allocated + recovered + credited > requested
+            or residual != requested - allocated - recovered - credited
         ):
             raise PublicationError(
                 "proposal review capacity recovery warning is inconsistent"
@@ -578,6 +586,7 @@ def validate_recovery_proposal_groups(
         if (
             warning["allocator_allocated_minutes"]
             + recovered
+            + warning.get("credited_minutes", 0)
             + warning["residual_minutes"]
             != warning["requested_minutes"]
         ):
@@ -981,6 +990,84 @@ def _publication_receipt(
     }
 
 
+def _tombstone_note(tombstone: Mapping[str, Any]) -> str:
+    receipt = tombstone.get("credited_overlap_receipt")
+    if (
+        not isinstance(receipt, Mapping)
+        or receipt.get("schema_version") != "clockify-overlap-credit/v1"
+    ):
+        raise PublicationError("review tombstone lacks a valid credited-overlap receipt")
+    digest = hashlib.sha256(
+        json.dumps(receipt, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    return f"credited-overlap sha256:{digest}"
+
+
+def _apply_tombstones(
+    gateway: SheetsGateway,
+    *,
+    spreadsheet_id: str,
+    sheet_title: str,
+    tombstones: Sequence[Mapping[str, Any]],
+) -> int:
+    if not tombstones:
+        return 0
+    metadata = gateway.spreadsheet(spreadsheet_id)
+    sheets = _sheet_map(metadata)
+    if sheet_title not in sheets:
+        raise PublicationError("tombstones cannot create a review Sheet")
+    quoted = _a1_title(sheet_title)
+    row_count = _sheet_row_count(metadata, sheet_title)
+    positions, existing = _scan_rows(
+        gateway, spreadsheet_id, quoted, row_count
+    )
+    updates: list[Mapping[str, Any]] = []
+    expected: dict[str, tuple[str, str, str]] = {}
+    for tombstone in tombstones:
+        review_id = stable_review_id(tombstone)
+        row_number = positions.get(review_id)
+        if row_number is None:
+            raise PublicationError(
+                f"review tombstone cannot append missing review ID: {review_id}"
+            )
+        prior = list(existing[row_number])
+        prior.extend([""] * (len(HEADER) - len(prior)))
+        note = _tombstone_note(tombstone)
+        disposition = str(prior[9]).strip().casefold()
+        status = str(prior[13]).strip().casefold()
+        if disposition in {"approved", "posted"} or status in {"approved", "posted"}:
+            raise PublicationError(
+                f"approved or posted review ID cannot be superseded: {review_id}"
+            )
+        if disposition == status == "superseded" and str(prior[12]) == note:
+            expected[review_id] = ("superseded", note, str(prior[14]))
+            continue
+        updates.append({
+            "range": f"{quoted}!J{row_number}:N{row_number}",
+            "values": [[
+                "superseded", prior[10], prior[11], note, "superseded",
+            ]],
+        })
+        expected[review_id] = ("superseded", note, str(prior[14]))
+    gateway.update_values(spreadsheet_id, updates)
+    _positions, readback = _scan_rows(
+        gateway, spreadsheet_id, quoted, row_count
+    )
+    for review_id, (terminal, note, human_note) in expected.items():
+        actual = list(readback[_positions[review_id]])
+        actual.extend([""] * (len(HEADER) - len(actual)))
+        if not (
+            str(actual[9]) == terminal
+            and str(actual[12]) == note
+            and str(actual[13]) == terminal
+            and str(actual[14]) == human_note
+        ):
+            raise PublicationError(
+                f"Sheet readback does not match review tombstone: {review_id}"
+            )
+    return len(expected)
+
+
 def _write_result(path: Path, document: Mapping[str, Any]) -> None:
     encoded = (json.dumps(document, sort_keys=True) + "\n").encode("utf-8")
     if path.exists():
@@ -1009,6 +1096,7 @@ def publish_proposal_partitions(
     sheet_title: str,
     template_title: str,
     proposals: Sequence[Mapping[str, Any]],
+    tombstones: Sequence[Mapping[str, Any]] = (),
     run_id: str,
     project_allowlist: Mapping[str, str],
 ) -> dict[str, Any]:
@@ -1036,6 +1124,9 @@ def publish_proposal_partitions(
     ids = [str(row[0]) for _destination, rows in partitions for row in rows]
     if len(ids) != len(set(ids)):
         raise PublicationError("proposal input contains duplicate stable review IDs")
+    tombstone_ids = [stable_review_id(row) for row in tombstones]
+    if len(tombstone_ids) != len(set(tombstone_ids)) or set(ids) & set(tombstone_ids):
+        raise PublicationError("proposal and tombstone review identities must be disjoint")
     plans = [
         _plan_publish(
             gateway,
@@ -1059,9 +1150,33 @@ def publish_proposal_partitions(
             ),
             **result,
         })
+    terminal_updates = 0
+    for destination, members in (
+        (
+            sheet_title,
+            [
+                row for row in tombstones
+                if row.get("routing_disposition") != "unresolved-routing"
+            ],
+        ),
+        (
+            "unresolved-evidence",
+            [
+                row for row in tombstones
+                if row.get("routing_disposition") == "unresolved-routing"
+            ],
+        ),
+    ):
+        terminal_updates += _apply_tombstones(
+            gateway,
+            spreadsheet_id=spreadsheet_id,
+            sheet_title=destination,
+            tombstones=members,
+        )
     return {
         "schema_version": "sheet-publication-result/v1",
         "publications": publications,
+        "terminal_updates": terminal_updates,
         "clockify_writes": 0,
     }
 
@@ -1095,6 +1210,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--quality-report", type=Path, required=True)
     parser.add_argument("--replay-integrity", type=Path, required=True)
     parser.add_argument("--routing-snapshot", type=Path)
+    parser.add_argument("--review-tombstones", type=Path)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--result-output", type=Path)
     parser.add_argument("--enable-write", action="store_true")
@@ -1119,6 +1235,19 @@ def main(argv: list[str] | None = None) -> int:
             raise PublicationError("proposals input must be a JSON array of objects")
         verify_gates(proposals, quality, replay, args.run_id)
         validate_recovery_proposal_groups(proposals)
+        tombstones: list[dict[str, Any]] = []
+        if args.review_tombstones is not None:
+            raw_tombstones = _json(args.review_tombstones)
+            accounting = _json(args.review_tombstones.parent / "work-accounting-result.json")
+            if (
+                not isinstance(raw_tombstones, list)
+                or not all(isinstance(row, dict) for row in raw_tombstones)
+                or raw_tombstones != accounting.get("review_tombstones")
+            ):
+                raise PublicationError(
+                    "review tombstones do not match the replay-bound accounting result"
+                )
+            tombstones = raw_tombstones
         rows = [
             proposal_row(proposal, args.run_id, project_allowlist=projects)
             for proposal in proposals
@@ -1139,6 +1268,7 @@ def main(argv: list[str] | None = None) -> int:
             sheet_title=args.sheet_title,
             template_title=args.template_title,
             proposals=proposals,
+            tombstones=tombstones,
             run_id=args.run_id,
             project_allowlist=projects,
         )
@@ -1163,6 +1293,7 @@ def main(argv: list[str] | None = None) -> int:
                 "status": document["status"],
                 "external_writes": document["external_writes"],
                 "clockify_writes": document["clockify_writes"],
+                "terminal_updates": document["terminal_updates"],
                 "publications": [
                     {field: item[field] for field in receipt_fields}
                     for item in document["publications"]

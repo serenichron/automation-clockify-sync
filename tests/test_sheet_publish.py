@@ -105,6 +105,10 @@ class StatefulGateway(FakeGateway):
                     while len(self.rows[row_index]) < 13:
                         self.rows[row_index].append("")
                     self.rows[row_index][10:13] = list(row)
+                elif column == "J":
+                    while len(self.rows[row_index]) < 15:
+                        self.rows[row_index].append("")
+                    self.rows[row_index][9:14] = list(row)
                 else:
                     self.rows[row_index] = list(row)
 
@@ -182,6 +186,10 @@ class MultiSheetGateway(StatefulGateway):
                     while len(rows[row_index]) < 13:
                         rows[row_index].append("")
                     rows[row_index][10:13] = list(row)
+                elif column == "J":
+                    while len(rows[row_index]) < 15:
+                        rows[row_index].append("")
+                    rows[row_index][9:14] = list(row)
                 else:
                     rows[row_index] = list(row)
 
@@ -513,6 +521,22 @@ class SheetPublicationTests(unittest.TestCase):
             "allocator_allocated_minutes": 0,
             "recovered_minutes": 1,
             "residual_minutes": 0,
+        }
+        candidate = proposal()
+        candidate["review_warnings"] = [warning]
+
+        row = publisher.proposal_row(candidate, "run-1")
+
+        self.assertEqual([warning], json.loads(row[12]))
+
+    def test_allocation_capacity_recovery_accounts_for_credited_minutes(self):
+        warning = {
+            "type": "allocation_capacity_recovery",
+            "requested_minutes": 10,
+            "allocator_allocated_minutes": 2,
+            "recovered_minutes": 3,
+            "credited_minutes": 4,
+            "residual_minutes": 1,
         }
         candidate = proposal()
         candidate["review_warnings"] = [warning]
@@ -1257,6 +1281,45 @@ class SheetPublicationTests(unittest.TestCase):
             [item["receipt_id"] for item in result["publications"]],
             [item["receipt_id"] for item in retried["publications"]],
         )
+
+    def test_credited_tombstone_supersedes_existing_row_without_appending(self):
+        prior = publisher.proposal_row(proposal(), "run-before")
+        prior[14] = "human review note — preserve exactly"
+        gateway = MultiSheetGateway()
+        gateway.sheets["September 2026 review"] = {
+            "sheet_id": 2,
+            "rows": [publisher.HEADER, prior],
+        }
+        tombstone = {
+            "review_activity_key": proposal()["review_activity_key"],
+            "allocation_segment": 1,
+            "reason": "proposal fully credited to existing Clockify time",
+            "credited_overlap_receipt": {
+                "schema_version": "clockify-overlap-credit/v1",
+                "credited_seconds": 600,
+                "counterparts": [],
+            },
+        }
+
+        result = publisher.publish_proposal_partitions(
+            gateway,
+            spreadsheet_id="sheet",
+            sheet_title="September 2026 review",
+            template_title="Proposals",
+            proposals=[],
+            tombstones=[tombstone],
+            run_id="run-2",
+            project_allowlist={},
+        )
+
+        updated = gateway.sheets["September 2026 review"]["rows"][1]
+        self.assertEqual("superseded", updated[9])
+        self.assertEqual("superseded", updated[13])
+        self.assertRegex(updated[12], r"^credited-overlap sha256:[a-f0-9]{64}$")
+        self.assertEqual("human review note — preserve exactly", updated[14])
+        self.assertEqual([], gateway.appended)
+        self.assertEqual(1, result["terminal_updates"])
+        self.assertEqual(0, result["clockify_writes"])
 
     def test_only_nonempty_proposal_partition_is_published(self):
         unresolved = proposal()

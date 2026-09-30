@@ -192,6 +192,32 @@ def _find_item(state: dict[str, Any], keys: dict[str, str], *, excluded_ids: set
     return None
 
 
+def _tombstone_matches_active_allocation(
+    item: dict[str, Any], tombstone: dict[str, Any],
+) -> bool:
+    """Fail closed unless a tombstone is provably for a different sibling segment."""
+    candidate_key = _normal_text(tombstone.get("candidate_key"))
+    segment = tombstone.get("allocation_segment")
+    current = item.get("current")
+    if not candidate_key or segment is None or not isinstance(current, dict):
+        return True
+    allocations = current.get("allocation_segments")
+    if not isinstance(allocations, list) or not allocations:
+        return True
+    try:
+        identity = (candidate_key, int(segment))
+        active_identities = {
+            (_normal_text(value.get("candidate_key")), int(value.get("segment")))
+            for value in allocations
+            if isinstance(value, dict)
+            and value.get("candidate_key")
+            and value.get("segment") is not None
+        }
+    except (TypeError, ValueError):
+        return True
+    return not active_identities or identity in active_identities
+
+
 def _item_view(item: dict[str, Any]) -> dict[str, Any]:
     current = item.get("current", {})
     view = {
@@ -243,6 +269,16 @@ def _load_records(run_dir: Path, warnings: list[dict[str, str]]) -> list[tuple[s
                 raise ValueError(f"Expected object records in {path}")
             records.append((disposition, record))
     return records
+
+
+def _load_tombstones(run_dir: Path) -> list[dict[str, Any]]:
+    path = run_dir / "review-tombstones.json"
+    if not path.exists():
+        return []
+    data = _read_json(path)
+    if not isinstance(data, list) or not all(isinstance(row, dict) for row in data):
+        raise ValueError(f"Expected object records in {path}")
+    return data
 
 
 def _semantic_allocation(record: dict[str, Any]) -> bool:
@@ -509,6 +545,7 @@ def ingest_run(run_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
         key=lambda row: (_canonical(row[2]), _canonical(row[1])),
     )
     split_plans = _split_plans(state, prepared, warnings)
+    tombstones = sorted(_load_tombstones(run_dir), key=_canonical)
     categories: dict[str, list[dict[str, Any]]] = {
         "new": [], "changed": [], "carried_pending": [], "resolved_disappeared": []
     }
@@ -602,6 +639,36 @@ def ingest_run(run_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
                 "evidence_fingerprint": plan["parent_fingerprint"],
             })
         superseded_parents.add(parent["id"])
+
+    for tombstone in tombstones:
+        receipt = tombstone.get("credited_overlap_receipt")
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("schema_version") != "clockify-overlap-credit/v1"
+        ):
+            raise ValueError("review tombstone lacks a valid credited-overlap receipt")
+        item = _find_item(state, _keys(tombstone))
+        if item is None:
+            continue
+        if item["id"] in seen_ids:
+            if _tombstone_matches_active_allocation(item, tombstone):
+                raise ValueError("review tombstone conflicts with an active record")
+            # The durable review item is activity-level, while overlap credit is
+            # segment-level.  A credited sibling must not terminalize the
+            # uncovered allocation that remains active in this run.
+            continue
+        old = item["disposition"]
+        if old not in ACTIVE_DISPOSITIONS:
+            continue
+        item["disposition"] = "superseded"
+        item["terminal_receipt"] = copy.deepcopy(receipt)
+        item.setdefault("history", []).append({
+            "run_id": run_id,
+            "action": "credited_overlap_superseded",
+            "from": old,
+            "reason": str(tombstone.get("reason") or ""),
+            "credited_overlap_receipt": copy.deepcopy(receipt),
+        })
 
     for item in sorted(state["items"].values(), key=lambda value: value["id"]):
         if item["id"] in seen_ids:

@@ -720,7 +720,7 @@ def _route_from_review_correction(
 def _route_from_client_lifecycle(
     cited_events: list[Mapping[str, Any]], routing: Mapping[str, Any]
 ) -> dict[str, Any] | None:
-    """Activate client routing only with an explicit marker and effective date."""
+    """Apply a configured client route only on/after its explicit cutover."""
     for rule in routing.get("client_lifecycle_routes", []):
         if not isinstance(rule, Mapping):
             continue
@@ -730,10 +730,9 @@ def _route_from_client_lifecycle(
         activation = rule.get("activation")
         if not isinstance(activation, Mapping):
             return None
-        marker = str(activation.get("marker") or "").strip()
         effective = _parse_dt(activation.get("effective_at"))
         route = activation.get("route")
-        if not marker or effective is None or not isinstance(route, Mapping):
+        if effective is None or not isinstance(route, Mapping):
             return None
         activated = False
         for event in cited_events:
@@ -743,8 +742,6 @@ def _route_from_client_lifecycle(
                 observed is not None
                 and observed >= effective
                 and re.search(pattern, searchable, flags=re.IGNORECASE) is not None
-                and re.search(re.escape(marker), searchable, flags=re.IGNORECASE)
-                is not None
             ):
                 activated = True
                 break
@@ -1120,6 +1117,32 @@ def _meeting_is_eligible(
     return False, "unknown_meeting_ownership"
 
 
+def _meeting_precedence(event: Mapping[str, Any]) -> dict[str, Any]:
+    """Classify only the evidence needed for deterministic overlap precedence."""
+    attrs = _attributes(event)
+    title = str(attrs.get("title") or "").strip()
+    participants = attrs.get("calendar_invitees", attrs.get("participants"))
+    external = any(
+        isinstance(person, Mapping) and person.get("is_external") is True
+        for person in participants
+    ) if isinstance(participants, list) else False
+    generic_internal = re.search(
+        r"\b(?:daily(?:\s+meet(?:ing)?)?|internal(?:\s+meet(?:ing)?)?)\b",
+        title,
+        flags=re.IGNORECASE,
+    ) is not None
+    specific_named = re.search(
+        r"\b(?:BNI|Mazilu(?:\s*&\s*Partners)?|client)\b",
+        title,
+        flags=re.IGNORECASE,
+    ) is not None
+    if external or specific_named:
+        return {"rank": 0, "class": "specific_external_meeting"}
+    if generic_internal:
+        return {"rank": 2, "class": "generic_internal_meeting"}
+    return {"rank": 1, "class": "meeting"}
+
+
 def _overlap_ratio(
     start: dt.datetime,
     end: dt.datetime,
@@ -1400,6 +1423,76 @@ def _capacity_recovery_slices(
     return result
 
 
+def _refresh_capacity_recovery_warnings(
+    proposals: list[dict[str, Any]],
+    skipped: list[dict[str, Any]],
+    recovery_records: list[dict[str, Any]],
+) -> None:
+    """Rebind one aggregate recovery warning after overlap normalization."""
+    surviving_by_activity: dict[str, list[dict[str, Any]]] = {}
+    for proposal in proposals:
+        provenance = proposal.get("provenance")
+        if not (
+            isinstance(provenance, Mapping)
+            and provenance.get("allocation_capacity_recovery") is True
+        ):
+            continue
+        warnings = proposal.get("review_warnings", [])
+        if isinstance(warnings, list):
+            proposal["review_warnings"] = [
+                warning for warning in warnings
+                if not (
+                    isinstance(warning, Mapping)
+                    and warning.get("type") == "allocation_capacity_recovery"
+                )
+            ]
+        activity_id = str(proposal.get("activity_id") or "")
+        surviving_by_activity.setdefault(activity_id, []).append(proposal)
+
+    for record in recovery_records:
+        activity_id = str(record["activity_id"])
+        survivors = sorted(
+            surviving_by_activity.get(activity_id, []),
+            key=lambda row: (
+                str(row.get("start") or ""),
+                str(row.get("end") or ""),
+                str(row.get("candidate_key") or ""),
+            ),
+        )
+        recovered_minutes = sum(
+            int(proposal.get("duration_seconds") or 0) // 60
+            for proposal in survivors
+        )
+        credited_minutes = sum(
+            int((row.get("credited_overlap_receipt") or {}).get("credited_seconds") or 0) // 60
+            for row in skipped
+            if row.get("activity_id") == activity_id
+            and (row.get("provenance") or {}).get("allocation_capacity_recovery")
+        )
+        residual_minutes = max(
+            0,
+            int(record["requested_minutes"])
+            - int(record["allocator_allocated_minutes"])
+            - recovered_minutes
+            - credited_minutes,
+        )
+        record.update({
+            "recovered_minutes": recovered_minutes,
+            "credited_minutes": credited_minutes,
+            "residual_minutes": residual_minutes,
+        })
+        if not survivors:
+            continue
+        survivors[0].setdefault("review_warnings", []).append({
+            "type": "allocation_capacity_recovery",
+            "requested_minutes": int(record["requested_minutes"]),
+            "allocator_allocated_minutes": int(record["allocator_allocated_minutes"]),
+            "recovered_minutes": recovered_minutes,
+            "credited_minutes": credited_minutes,
+            "residual_minutes": residual_minutes,
+        })
+
+
 def _proposal(
     activity: Mapping[str, Any],
     route: Mapping[str, Any],
@@ -1475,6 +1568,241 @@ def _proposal(
     if route.get("routing_disposition") == "unresolved-routing":
         proposal["routing_disposition"] = "unresolved-routing"
     return proposal
+
+
+def _overlap_warning(
+    proposal_start: dt.datetime,
+    proposal_end: dt.datetime,
+    counterpart: Mapping[str, Any],
+    warning_type: str,
+) -> dict[str, Any] | None:
+    overlap_start = max(proposal_start, counterpart["start"])
+    overlap_end = min(proposal_end, counterpart["end"])
+    if overlap_end <= overlap_start:
+        return None
+    warning = {
+        "type": warning_type,
+        "counterpart_id": str(counterpart["block_id"]),
+        "overlap_start": _iso(overlap_start),
+        "overlap_end": _iso(overlap_end),
+        "overlap_duration_seconds": int(
+            (overlap_end - overlap_start).total_seconds()
+        ),
+    }
+    if counterpart.get("project_id_suffix"):
+        warning["counterpart_project_suffix"] = str(
+            counterpart["project_id_suffix"]
+        )
+    return warning
+
+
+def _credited_overlap_receipt(
+    original_start: dt.datetime,
+    original_end: dt.datetime,
+    warnings: list[dict[str, Any]],
+) -> dict[str, Any]:
+    overlap_intervals = [
+        (_parse_dt(warning["overlap_start"]), _parse_dt(warning["overlap_end"]))
+        for warning in warnings
+    ]
+    merged: list[tuple[dt.datetime, dt.datetime]] = []
+    for start, end in sorted(
+        (start, end)
+        for start, end in overlap_intervals
+        if start is not None and end is not None
+    ):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return {
+        "schema_version": "clockify-overlap-credit/v1",
+        "original_start": _iso(original_start),
+        "original_end": _iso(original_end),
+        "credited_seconds": sum(
+            int((end - start).total_seconds()) for start, end in merged
+        ),
+        "counterparts": copy.deepcopy(warnings),
+    }
+
+
+def _slice_proposal_around_credits(
+    proposal: Mapping[str, Any],
+    counterparts: Iterable[Mapping[str, Any]],
+    warning_type: str,
+    skipped: list[dict[str, Any]],
+    *,
+    fully_credited_reason: str,
+    precedence: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Return only uncredited proposal spans and bind an audit receipt."""
+    start = _parse_dt(proposal.get("start"))
+    end = _parse_dt(proposal.get("end"))
+    if start is None or end is None:
+        return [dict(proposal)]
+    warnings = [
+        warning
+        for counterpart in counterparts
+        if (warning := _overlap_warning(start, end, counterpart, warning_type))
+        is not None
+    ]
+    if not warnings:
+        return [dict(proposal)]
+    free = _subtract_intervals(
+        [(start, end)],
+        [
+            (_parse_dt(warning["overlap_start"]), _parse_dt(warning["overlap_end"]))
+            for warning in warnings
+            if _parse_dt(warning["overlap_start"]) is not None
+            and _parse_dt(warning["overlap_end"]) is not None
+        ],
+    )
+    receipt = _credited_overlap_receipt(start, end, warnings)
+    if precedence is not None:
+        receipt["precedence"] = copy.deepcopy(dict(precedence))
+    if not free:
+        skipped.append({
+            "id": str(proposal.get("candidate_key") or proposal.get("id") or ""),
+            "candidate_key": str(proposal.get("candidate_key") or ""),
+            "review_activity_key": str(proposal.get("review_activity_key") or ""),
+            "allocation_segment": int(proposal.get("allocation_segment") or 0),
+            "activity_id": str(proposal.get("activity_id") or ""),
+            "reason": fully_credited_reason,
+            "evidence_ids": list(
+                (proposal.get("provenance") or {}).get("evidence_ids", [])
+            ),
+            "provenance": copy.deepcopy(proposal.get("provenance") or {}),
+            "credited_overlap_receipt": receipt,
+        })
+        return []
+
+    sliced: list[dict[str, Any]] = []
+    for index, (free_start, free_end) in enumerate(free):
+        row = copy.deepcopy(proposal)
+        seconds = int((free_end - free_start).total_seconds())
+        row.update({
+            "start": _iso(free_start),
+            "end": _iso(free_end),
+            "duration_minutes": seconds // 60,
+            "duration_seconds": seconds,
+        })
+        row["review_warnings"] = [*row.get("review_warnings", []), *warnings]
+        row["provenance"]["burst_start"] = _iso(free_start)
+        row["provenance"]["burst_end"] = _iso(free_end)
+        row["provenance"]["credited_overlap_receipt"] = copy.deepcopy(receipt)
+        if index:
+            row["allocation_segment"] = int(proposal["allocation_segment"]) + index
+            row["candidate_key"] = semantic_analyzer.stable_digest(
+                "wks-",
+                {
+                    "parent_candidate_key": str(proposal["candidate_key"]),
+                    "start": row["start"],
+                    "end": row["end"],
+                    "allocation_mode": ALLOCATION_MODE,
+                },
+            )
+        sliced.append(row)
+    return sliced
+
+
+def _normalize_postable_proposals(
+    proposals: list[dict[str, Any]],
+    existing: list[dict[str, Any]],
+    skipped: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Credit live time first, then deterministically remove proposal overlap."""
+    live_normalized = [
+        sliced
+        for proposal in proposals
+        for sliced in _slice_proposal_around_credits(
+            proposal,
+            (block for block in existing if block.get("kind") == "existing_clockify"),
+            "existing_clockify_overlap",
+            skipped,
+            fully_credited_reason="proposal fully credited to existing Clockify time",
+        )
+    ]
+
+    def priority(row: Mapping[str, Any]) -> tuple[int, str, str]:
+        provenance = row.get("provenance") or {}
+        meeting_precedence = provenance.get("meeting_precedence")
+        return (
+            (
+                int(meeting_precedence.get("rank", 1))
+                if isinstance(meeting_precedence, Mapping)
+                else 3
+            ),
+            str(row.get("start") or ""),
+            str(row.get("candidate_key") or ""),
+        )
+
+    accepted: list[dict[str, Any]] = []
+    for proposal in sorted(live_normalized, key=priority):
+        proposal_is_meeting = bool(
+            (proposal.get("provenance") or {}).get("canonical_meeting_id")
+        )
+        blocks = [
+            {
+                "block_id": str(row.get("candidate_key") or ""),
+                "start": _parse_dt(row.get("start")),
+                "end": _parse_dt(row.get("end")),
+                "project_id_suffix": row.get("clockify_project_suffix"),
+                "is_meeting": bool(
+                    (row.get("provenance") or {}).get("canonical_meeting_id")
+                ),
+            }
+            for row in accepted
+        ]
+        overlapping = [
+            block
+            for block in blocks
+            if block["start"] is not None and block["end"] is not None
+            and _parse_dt(proposal.get("start")) < block["end"]
+            and block["start"] < _parse_dt(proposal.get("end"))
+        ]
+        warning_type = (
+            "meeting_proposal_overlap"
+            if proposal_is_meeting and any(block["is_meeting"] for block in overlapping)
+            else "review_proposal_overlap"
+        )
+        winner = overlapping[0] if overlapping else None
+        winner_precedence = None
+        if winner is not None:
+            winner_row = next(
+                row for row in accepted
+                if row.get("candidate_key") == winner["block_id"]
+            )
+            winner_class = str(
+                ((winner_row.get("provenance") or {}).get("meeting_precedence") or {}).get("class")
+                or "incidental_activity"
+            )
+            loser_class = str(
+                ((proposal.get("provenance") or {}).get("meeting_precedence") or {}).get("class")
+                or "incidental_activity"
+            )
+            rule = (
+                "specific_external_meeting_over_generic_internal_meeting"
+                if winner_class == "specific_external_meeting"
+                and loser_class == "generic_internal_meeting"
+                else "deterministic_precedence_then_stable_key"
+            )
+            winner_precedence = {
+                "rule": rule,
+                "winner_candidate_key": str(winner["block_id"]),
+                "loser_candidate_key": str(proposal.get("candidate_key") or ""),
+            }
+        accepted.extend(_slice_proposal_around_credits(
+            proposal,
+            overlapping,
+            warning_type,
+            skipped,
+            fully_credited_reason="proposal fully credited to higher-priority review time",
+            precedence=winner_precedence,
+        ))
+    return sorted(
+        accepted,
+        key=lambda row: (str(row.get("start") or ""), str(row.get("candidate_key") or "")),
+    )
 
 
 def run_accounting(
@@ -1920,6 +2248,9 @@ def run_accounting(
                 review_warnings=candidate["review_warnings"],
             )
             proposal["provenance"]["canonical_meeting_id"] = meeting_id
+            proposal["provenance"]["meeting_precedence"] = _meeting_precedence(
+                representative
+            )
             meeting_proposals.append(proposal)
             fathom_manifest[meeting_id].update({
                 "status": "proposed", "activity_id": str(candidate["activity"].get("activity_id") or ""),
@@ -1955,6 +2286,9 @@ def run_accounting(
                 review_warnings=candidate["review_warnings"],
             )
             proposal["provenance"]["canonical_meeting_id"] = meeting_id
+            proposal["provenance"]["meeting_precedence"] = _meeting_precedence(
+                representative
+            )
             proposal["provenance"]["timestamped_split_evidence_ids"] = list(segment.evidence_ids)
             meeting_proposals.append(proposal)
         fathom_manifest[meeting_id].update({
@@ -2067,70 +2401,17 @@ def run_accounting(
         contested_time=tuple(residual_conflicts),
     )
 
-    meeting_proposal_ids = {
-        str(proposal.get("candidate_key") or "")
-        for proposal in meeting_proposals
+    proposals = _normalize_postable_proposals(proposals, existing, skipped)
+    _refresh_capacity_recovery_warnings(proposals, skipped, recovery_records)
+    proposed_meeting_ids = {
+        str((proposal.get("provenance") or {}).get("canonical_meeting_id") or "")
+        for proposal in proposals
     }
-    for proposal in proposals:
-        is_meeting = proposal.get("candidate_key") in meeting_proposal_ids
-        is_recovery = proposal.get("candidate_key") in recovery_proposal_ids
-        if not is_meeting and not is_recovery:
-            continue
-        proposal_start = _parse_dt(proposal.get("start"))
-        proposal_end = _parse_dt(proposal.get("end"))
-        if proposal_start is None or proposal_end is None:
-            continue
-        warnings = proposal["review_warnings"]
-        canonical_id = str(
-            (proposal.get("provenance") or {}).get("canonical_meeting_id") or ""
-        )
-        overlap_blocks = (
-            meeting_overlap_blocks.get(canonical_id, [])
-            if is_meeting
-            else fixed
-        )
-        for block in overlap_blocks:
-            if block.get("kind") != "existing_clockify":
-                continue
-            overlap_start = max(proposal_start, block["start"])
-            overlap_end = min(proposal_end, block["end"])
-            if overlap_end <= overlap_start:
-                continue
-            warnings.append({
-                "type": "existing_clockify_overlap",
-                "counterpart_id": str(block["block_id"]),
-                **({
-                    "counterpart_project_suffix": str(block.get("project_id_suffix")),
-                } if block.get("project_id_suffix") else {}),
-                "overlap_start": _iso(overlap_start),
-                "overlap_end": _iso(overlap_end),
-                "overlap_duration_seconds": int((overlap_end - overlap_start).total_seconds()),
-            })
-        for counterpart in proposals:
-            if counterpart is proposal:
-                continue
-            counterpart_start = _parse_dt(counterpart.get("start"))
-            counterpart_end = _parse_dt(counterpart.get("end"))
-            if (
-                counterpart_start is None
-                or counterpart_end is None
-                or proposal_start >= counterpart_end
-                or counterpart_start >= proposal_end
-            ):
-                continue
-            overlap_start = max(proposal_start, counterpart_start)
-            overlap_end = min(proposal_end, counterpart_end)
-            warnings.append({
-                "type": "meeting_proposal_overlap" if counterpart.get("candidate_key") in meeting_proposal_ids else "review_proposal_overlap",
-                "counterpart_id": str(counterpart.get("candidate_key") or counterpart.get("id") or ""),
-                **({
-                    "counterpart_project_suffix": str(
-                        counterpart.get("clockify_project_suffix")
-                    ),
-                } if counterpart.get("clockify_project_suffix") else {}),
-                "overlap_start": _iso(overlap_start),
-                "overlap_end": _iso(overlap_end),
-                "overlap_duration_seconds": int((overlap_end - overlap_start).total_seconds()),
+    for meeting_id, status in fathom_manifest.items():
+        if status.get("status") == "proposed" and meeting_id not in proposed_meeting_ids:
+            status.update({
+                "status": "reconciled",
+                "reason": "fully_credited_existing_clockify_overlap",
             })
     for conflict in allocation.contested_time:
         ambiguous.append({
@@ -2256,6 +2537,11 @@ def run_accounting(
             POINT_OBSERVATION_CLUSTERING_INPUT
         )
     }
+    review_tombstones = [
+        copy.deepcopy(row)
+        for row in skipped
+        if isinstance(row.get("credited_overlap_receipt"), Mapping)
+    ]
     result = {
         "schema_version": SCHEMA_VERSION,
         "allocation_mode": ALLOCATION_MODE,
@@ -2272,6 +2558,7 @@ def run_accounting(
         "proposals": proposals,
         "ambiguous": ambiguous,
         "skipped": skipped,
+        "review_tombstones": review_tombstones,
         "allocation": serialized_allocation,
         "fathom_reconciliation": [
             {"evidence_id": value["source_evidence_ids"][0], **value}
@@ -2298,6 +2585,7 @@ def run_accounting(
     _write_json(run_dir / "proposals.json", proposals)
     _write_json(run_dir / "ambiguous.json", ambiguous)
     _write_json(run_dir / "skipped.json", skipped)
+    _write_json(run_dir / "review-tombstones.json", review_tombstones)
     # This is the durable completion marker consumed by the service runner.
     # Publish it only after every required artifact has been atomically replaced.
     _write_json(run_dir / "work-accounting-result.json", result)

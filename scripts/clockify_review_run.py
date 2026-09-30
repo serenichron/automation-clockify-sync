@@ -1200,6 +1200,50 @@ def _adopt_completed_collector_derivation(run_dir: Path) -> Path | None:
     return result_path
 
 
+def _sealed_replay_transport(
+    _endpoint: object, body: object,
+) -> dict[str, str]:
+    """Permit the analyzer's synthetic route probe, never an evidence request."""
+    try:
+        messages = body["messages"]  # type: ignore[index]
+        payload = json.loads(messages[-1]["content"])
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+        payload = None
+    if payload == {"probe": semantic_analyzer.PROMPT_VERSION}:
+        return {"probe": "ok"}
+    raise semantic_analyzer.AnalyzerError(
+        "sealed replay analyzer cache misses the reconstructed request"
+    )
+
+
+def _sealed_source_endpoint(
+    endpoints: list[semantic_analyzer.AnalyzerEndpoint],
+    source_analysis: Mapping[str, Any],
+    *,
+    name: str,
+) -> semantic_analyzer.AnalyzerEndpoint | None:
+    candidates = [endpoint for endpoint in endpoints if endpoint.name == name]
+    recorded = {
+        (str(chunk.get("model") or ""), str(chunk.get("revision") or ""))
+        for chunk in source_analysis.get("analysis_chunks", [])
+        if isinstance(chunk, Mapping)
+        and chunk.get("endpoint") == name
+        and chunk.get("model")
+        and chunk.get("revision")
+    }
+    matches = [
+        endpoint for endpoint in candidates
+        if (endpoint.model, endpoint.revision) in recorded
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if len(candidates) == 1 and not recorded:
+        return candidates[0]
+    if not candidates:
+        return None
+    raise ValueError(f"sealed analyzer cache has ambiguous {name} routes")
+
+
 def _preflight_replay_analyzer_cache(
     source: Path, cache_path: Path, source_analysis: dict[str, Any],
 ) -> list[dict[str, str]]:
@@ -1219,29 +1263,24 @@ def _preflight_replay_analyzer_cache(
     )
     cache = semantic_analyzer.AnalyzerResponseCache(cache_path)
     endpoints = cache.sealed_endpoints()
-    primary = next(
-        (endpoint for endpoint in endpoints if endpoint.name == "clockify_analyzer_primary"),
-        None,
+    primary = _sealed_source_endpoint(
+        endpoints, source_analysis, name="clockify_analyzer_primary",
     )
-    fallback = next(
-        (endpoint for endpoint in endpoints if endpoint.name == "clockify_analyzer_fallback"),
-        None,
+    fallback = _sealed_source_endpoint(
+        endpoints, source_analysis, name="clockify_analyzer_fallback",
     )
     if primary is None:
         raise ValueError("sealed analyzer cache lacks its immutable primary route")
-
-    def blocked_transport(_endpoint: object, _body: object) -> dict[str, Any]:
-        raise semantic_analyzer.AnalyzerError(
-            "sealed replay analyzer cache misses the reconstructed request"
-        )
 
     replayed = semantic_analyzer.analyze_tiered(
         work_accounting_pipeline._with_semantic_route_hints(events, routing),
         primary=primary,
         fallback=fallback,
         corrections=corrections,
-        transport=blocked_transport,
+        transport=_sealed_replay_transport,
         cache=cache,
+        max_workers=1,
+        probe_routes=False,
         review_taxonomy=work_accounting_pipeline._semantic_review_taxonomy(routing),
     )
     source_activities = [
@@ -1278,6 +1317,23 @@ def _analysis_is_inference_backed(document: Mapping[str, Any]) -> bool:
             if model and tier and tier != "fixture":
                 return True
     return False
+
+
+def _analysis_bound_models(document: Mapping[str, Any]) -> set[str]:
+    """Return every provider model recorded as contributing to the analysis."""
+    models: set[str] = set()
+    for section in ("activities", "analysis_chunks"):
+        values = document.get(section, [])
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            if not isinstance(value, Mapping):
+                continue
+            for key in ("analyzer_model", "model", "extractor_model"):
+                model = str(value.get(key) or "")
+                if model:
+                    models.add(model)
+    return models
 
 
 def _prepare_replay_run(source: Path) -> Path:
@@ -1366,15 +1422,11 @@ def _prepare_replay_run(source: Path) -> Path:
         expected_evidence = semantic_analyzer.stable_digest("led-", evidence_ids)
         if source_analysis.get("ledger_evidence_digest") != expected_evidence:
             raise ValueError("replay analyzer cache evidence binding differs")
-        versions = [json.loads(value) for value in _analysis_versions(source_analysis)]
-        models = {str(value.get("model") or "") for value in versions}
         for line in cache_content.splitlines():
             if line.strip():
                 value = json.loads(line)
                 if value.get("prompt_version") != source_analysis.get("prompt_version"):
                     raise ValueError("replay analyzer cache prompt binding differs")
-                if value.get("model") not in models:
-                    raise ValueError("replay analyzer cache model binding differs")
     reconciliation_snapshots: dict[str, bytes] = {}
     for filename in _RECONCILIATION_INPUTS.values():
         source_path = source / filename
@@ -1501,10 +1553,19 @@ def _replay_analyzer_cache(replay: Path) -> Path | None:
     return cache
 
 
-def _prepare_repair_run(source: Path) -> Path:
+def _prepare_repair_run(
+    source: Path, *, routing_override: Path | None = None,
+) -> Path:
     """Derive a new accounting run without recollection or changing its source."""
     source, snapshots = _resume_source(source)
-    if _adopt_completed_resume(source) is None:
+    try:
+        source_bundle = collector_receipts.load_completion_bundle(
+            source / "completion-bundle.json", run_dir=source
+        )
+        source_coverage = collector_receipts.completion_coverage(source_bundle)
+    except collector_receipts.CollectorReceiptError as exc:
+        raise ReviewRunError("repair requires a verified completed source") from exc
+    if source_bundle.replay:
         raise ReviewRunError("repair requires a verified completed source")
     _validated_period_manifest(snapshots["period-manifest.json"], allow_collecting_bootstrap=True)
     target = Path(tempfile.mkdtemp(
@@ -1513,9 +1574,65 @@ def _prepare_repair_run(source: Path) -> Path:
     ))
     # All source reads are verified before a destination is eligible for resume.
     for filename in ("run-report.md", "evidence/evidence-ledger.json", *_RECONCILIATION_INPUTS.values()):
-        content = _read_snapshot_source(source / filename, label=f"repair source {filename}")
+        input_path = (
+            routing_override
+            if filename == "routing.json" and routing_override is not None
+            else source / filename
+        )
+        content = _read_snapshot_source(input_path, label=f"repair source {filename}")
+        if filename == "routing.json":
+            try:
+                routing_document = json.loads(content)
+            except json.JSONDecodeError as exc:
+                raise ReviewRunError("repair routing snapshot is invalid") from exc
+            if not isinstance(routing_document, Mapping):
+                raise ReviewRunError("repair routing snapshot must be an object")
         (target / filename).parent.mkdir(parents=True, exist_ok=True)
         _write_snapshot(target / filename, content, label=f"repair {filename}")
+    semantic_document, semantic_content, semantic_digest = _read_snapshot_json(
+        source / "semantic-analysis.json", label="repair semantic analysis"
+    )
+    if not isinstance(semantic_document, Mapping):
+        raise ReviewRunError("repair semantic analysis must be an object")
+    semantic_fixture = target / "repair-fixture" / "semantic-analysis.json"
+    semantic_fixture.parent.mkdir(parents=True)
+    _write_snapshot(
+        semantic_fixture, semantic_content, label="repair semantic analysis fixture"
+    )
+    cache_provenance: dict[str, str] = {}
+    cache_summary = semantic_document.get("analyzer_cache")
+    cache_snapshot = (
+        cache_summary.get("snapshot")
+        if isinstance(cache_summary, Mapping)
+        else None
+    )
+    if cache_snapshot is not None:
+        if (
+            not isinstance(cache_snapshot, Mapping)
+            or set(cache_snapshot) != {"path", "record_count", "sha256"}
+            or cache_snapshot.get("path") != "analyzer-cache-used.jsonl"
+        ):
+            raise ReviewRunError("repair semantic analysis has invalid cache binding")
+        cache_content = _read_snapshot_source(
+            source / "analyzer-cache-used.jsonl",
+            label="repair source analyzer cache",
+        )
+        cache_digest = hashlib.sha256(cache_content).hexdigest()
+        cache_records = sum(bool(line.strip()) for line in cache_content.splitlines())
+        if (
+            cache_snapshot.get("sha256") != cache_digest
+            or cache_snapshot.get("record_count") != cache_records
+        ):
+            raise ReviewRunError("repair analyzer cache differs from semantic binding")
+        _write_snapshot(
+            target / "analyzer-cache-used.jsonl",
+            cache_content,
+            label="repair analyzer cache",
+        )
+        cache_provenance = {
+            "analyzer_cache_path": "analyzer-cache-used.jsonl",
+            "analyzer_cache_sha256": cache_digest,
+        }
     report = dict(_read_json(source / "run-report.json"))
     report.update(run_id=target.name, repair_of_run_id=source.name)
     _write_json(target / "run-report.json", report)
@@ -1524,8 +1641,59 @@ def _prepare_repair_run(source: Path) -> Path:
         "source_run_id": source.name,
         "source_completion_sha256": _file_sha256(source / "completion-bundle.json", label="repair source completion"),
         "ledger_identity": _ledger_identity(source),
+        "source_coverage": source_coverage,
+        "semantic_analysis_fixture": str(semantic_fixture.relative_to(target)),
+        "semantic_analysis_sha256": semantic_digest.removeprefix("sha256:"),
+        "source_routing_sha256": _file_sha256(
+            source / "routing.json", label="repair source routing"
+        ),
+        "repair_routing_sha256": _file_sha256(
+            target / "routing.json", label="repair routing"
+        ),
+        **cache_provenance,
     }, sort_keys=True).encode("utf-8") + b"\n", label="repair provenance")
     return target
+
+
+def _repair_analysis_fixture(repair: Path) -> Path:
+    """Return the copied semantic snapshot only while source and target remain bound."""
+    repair = _run_child(repair, label="repair run")
+    lineage = _read_json(repair / "repair-source.json")
+    if not isinstance(lineage, Mapping):
+        raise ReviewRunError("repair provenance is invalid")
+    source = _run_child(
+        RUNS / str(lineage.get("source_run_id") or ""), label="repair source"
+    )
+    relative = str(lineage.get("semantic_analysis_fixture") or "")
+    expected = str(lineage.get("semantic_analysis_sha256") or "")
+    fixture = (repair / relative).resolve()
+    try:
+        fixture.relative_to(repair)
+    except ValueError as exc:
+        raise ReviewRunError("repair semantic fixture escapes its run") from exc
+    if (
+        len(expected) != 64
+        or not fixture.is_file()
+        or hashlib.sha256(fixture.read_bytes()).hexdigest() != expected
+        or hashlib.sha256((source / "semantic-analysis.json").read_bytes()).hexdigest()
+        != expected
+    ):
+        raise ReviewRunError("repair semantic fixture differs from its source")
+    cache_relative = lineage.get("analyzer_cache_path")
+    if cache_relative is not None:
+        if cache_relative != "analyzer-cache-used.jsonl":
+            raise ReviewRunError("repair analyzer cache path differs")
+        cache_expected = str(lineage.get("analyzer_cache_sha256") or "")
+        source_cache = source / cache_relative
+        repair_cache = repair / cache_relative
+        if (
+            len(cache_expected) != 64
+            or not repair_cache.is_file()
+            or hashlib.sha256(repair_cache.read_bytes()).hexdigest() != cache_expected
+            or hashlib.sha256(source_cache.read_bytes()).hexdigest() != cache_expected
+        ):
+            raise ReviewRunError("repair analyzer cache differs from its source")
+    return fixture
 
 
 def _finalize_repair_completion(run_dir: Path) -> collector_receipts.SliceCompletionBundle:
@@ -1536,9 +1704,19 @@ def _finalize_repair_completion(run_dir: Path) -> collector_receipts.SliceComple
     if _file_sha256(source_bundle_path, label="repair source completion") != lineage.get("source_completion_sha256"):
         raise ReviewRunError("repair source completion changed")
     original = collector_receipts.load_completion_bundle(source_bundle_path, run_dir=source)
+    if collector_receipts.completion_coverage(original) != lineage.get("source_coverage"):
+        raise ReviewRunError("repair source coverage changed")
     if _ledger_identity(run_dir) != lineage.get("ledger_identity"):
         raise ReviewRunError("repair immutable evidence changed")
     for filename in _RECONCILIATION_INPUTS.values():
+        if filename == "routing.json":
+            if _file_sha256(
+                source / filename, label="repair original routing"
+            ) != lineage.get("source_routing_sha256") or _file_sha256(
+                run_dir / filename, label="repair snapshot routing"
+            ) != lineage.get("repair_routing_sha256"):
+                raise ReviewRunError("repair routing provenance changed")
+            continue
         if _read_snapshot_source(source / filename, label="repair original input") != _read_snapshot_source(run_dir / filename, label="repair snapshot input"):
             raise ReviewRunError("repair reconciliation snapshot changed")
     slice_ = argparse.Namespace(
@@ -2049,6 +2227,7 @@ def _process_run(
 ) -> tuple[int, Path]:
     replay_source = getattr(args, "_replay_source", None)
     replay_analysis_fixture = getattr(args, "_replay_analysis_fixture", None)
+    repair_analysis_fixture = getattr(args, "_repair_analysis_fixture", None)
     accounting_command = [
         sys.executable,
         str(SCRIPTS / "work_accounting_pipeline.py"),
@@ -2062,13 +2241,19 @@ def _process_run(
     ]
     replay_cache = getattr(args, "_replay_analyzer_cache", None)
     analyzer_cache = (
-        replay_cache
-        if replay_source is not None
-        else (args.analyzer_cache or (args.state.parent / "analyzer-cache-v2.jsonl"))
+        getattr(args, "_repair_analyzer_cache", None)
+        if repair_analysis_fixture is not None
+        else (
+            replay_cache
+            if replay_source is not None
+            else (args.analyzer_cache or (args.state.parent / "analyzer-cache-v2.jsonl"))
+        )
     )
     if analyzer_cache is not None:
         accounting_command.extend(["--analyzer-cache", str(analyzer_cache)])
-    analysis_fixture = replay_analysis_fixture or args.analysis_fixture
+    analysis_fixture = (
+        replay_analysis_fixture or repair_analysis_fixture or args.analysis_fixture
+    )
     if analysis_fixture:
         accounting_command.extend(["--analysis-fixture", str(analysis_fixture)])
     for option, value in (
@@ -2311,6 +2496,17 @@ def _adopt_completed_resume(source: Path) -> Path | None:
         return None
     try:
         result = _read_json(result_path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("completed resume source cannot be verified") from exc
+    if not isinstance(result, dict):
+        raise ValueError("completed resume source cannot be verified")
+    if result.get("quality_status") != "pass":
+        if result.get("external_writes") is not False:
+            raise ValueError("blocked resume source has unsafe external writes")
+        if (source / "completion-bundle.json").exists():
+            raise ValueError("blocked completed resume source requires repair")
+        return None
+    try:
         bundle = collector_receipts.load_completion_bundle(
             source / "completion-bundle.json", run_dir=source
         )
@@ -2319,8 +2515,6 @@ def _adopt_completed_resume(source: Path) -> Path | None:
         raise ValueError("completed resume source cannot be verified") from exc
     if (
         bundle.replay
-        or not isinstance(result, dict)
-        or result.get("quality_status") != "pass"
         or coverage.get("status") != "complete"
         or coverage.get("incomplete_sources") != []
     ):
@@ -2382,10 +2576,17 @@ def main(argv: list[str] | None = None) -> int:
     if sum((args.replay_from is not None, args.resume_from is not None, args.repair_from is not None, recovery_mode)) > 1:
         print("clockify review run: replay, resume, repair and recovery modes are mutually exclusive", file=sys.stderr)
         return 2
+    supplied_reconciliation_overrides = {
+        option for option in reconciliation_options
+        if _option_was_supplied(raw_argv, option)
+    }
+    disallowed_reconciliation_overrides = set(supplied_reconciliation_overrides)
+    if args.repair_from:
+        disallowed_reconciliation_overrides.discard("--routing")
     if (args.replay_from or args.resume_from or args.repair_from or recovery_mode) and (
         args.since or args.until or args.no_enrich or args.calendly_optional
         or args.analysis_fixture
-        or any(_option_was_supplied(raw_argv, option) for option in reconciliation_options)
+        or disallowed_reconciliation_overrides
     ):
         print(
             "clockify review run: --replay-from/--resume-from cannot be combined with collection "
@@ -2450,7 +2651,17 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     elif args.repair_from:
         try:
-            run_dirs = (_prepare_repair_run(args.repair_from),)
+            repair = _prepare_repair_run(
+                args.repair_from,
+                routing_override=(
+                    args.routing
+                    if "--routing" in supplied_reconciliation_overrides
+                    else None
+                ),
+            )
+            run_dirs = (repair,)
+            args._repair_analysis_fixture = _repair_analysis_fixture(repair)
+            args._repair_analyzer_cache = None
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             print(f"clockify review run: cannot prepare repair: {exc}", file=sys.stderr)
             return 2

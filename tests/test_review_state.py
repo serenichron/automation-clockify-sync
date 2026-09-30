@@ -113,6 +113,110 @@ class ReviewStateTests(unittest.TestCase):
         self.assertEqual(snapshot["summary"]["resolved_disappeared"], 0)
         self.assertTrue(any(w["type"] == "coverage_warning" for w in snapshot["coverage_warnings"]))
 
+    def test_credited_overlap_tombstone_supersedes_prior_pending_item(self):
+        """Catches a fully credited proposal remaining pending after it disappears."""
+        initial = semantic_proposal("wks-parent", "clockify", ["ev-1"])
+        state, _, _ = ingest(self.tmp_path, "run-one", [initial])
+        item_id = next(iter(state["items"]))
+        run_dir = self.tmp_path / "run-two"
+        write_json(run_dir / "proposals.json", [])
+        write_json(run_dir / "ambiguous.json", [])
+        write_json(run_dir / "review-tombstones.json", [{
+            "candidate_key": initial["candidate_key"],
+            "review_activity_key": initial["review_activity_key"],
+            "allocation_segment": initial["allocation_segment"],
+            "activity_id": initial["activity_id"],
+            "provenance": initial["provenance"],
+            "reason": "proposal fully credited to existing Clockify time",
+            "credited_overlap_receipt": {
+                "schema_version": "clockify-overlap-credit/v1",
+                "credited_seconds": 3600,
+            },
+        }])
+
+        snapshot = review_state.ingest_run(run_dir, state)
+
+        self.assertEqual("superseded", state["items"][item_id]["disposition"])
+        self.assertEqual(
+            "credited_overlap_superseded",
+            state["items"][item_id]["history"][-1]["action"],
+        )
+        self.assertEqual(
+            "clockify-overlap-credit/v1",
+            state["items"][item_id]["terminal_receipt"]["schema_version"],
+        )
+        self.assertEqual(0, snapshot["summary"]["carried_pending"])
+        self.assertEqual(1, snapshot["summary"]["resolved_disappeared"])
+
+    def test_credited_sibling_tombstone_keeps_active_allocation_pending(self):
+        first = semantic_proposal(
+            "wks-active", "act-shared", ["ev-1"],
+            end="2026-07-28T09:30:00+03:00",
+        )
+        second = semantic_proposal(
+            "wks-credited", "act-shared", ["ev-1"],
+            start="2026-07-28T09:30:00+03:00",
+        )
+        second["allocation_segment"] = 2
+        state, _, _ = ingest(self.tmp_path, "run-one", [first, second])
+        item_id = next(iter(state["items"]))
+        run_dir = self.tmp_path / "run-repaired"
+        write_json(run_dir / "proposals.json", [first])
+        write_json(run_dir / "ambiguous.json", [])
+        write_json(run_dir / "review-tombstones.json", [{
+            "candidate_key": second["candidate_key"],
+            "review_activity_key": second["review_activity_key"],
+            "allocation_segment": second["allocation_segment"],
+            "activity_id": second["activity_id"],
+            "provenance": second["provenance"],
+            "reason": "sibling allocation fully credited",
+            "credited_overlap_receipt": {
+                "schema_version": "clockify-overlap-credit/v1",
+                "credited_seconds": 1800,
+            },
+        }])
+
+        review_state.ingest_run(run_dir, state)
+
+        item = state["items"][item_id]
+        self.assertEqual("pending", item["disposition"])
+        self.assertEqual("run-repaired", item["last_seen_run"])
+        self.assertNotIn("terminal_receipt", item)
+        self.assertEqual(
+            [{"candidate_key": "wks-active", "segment": 1}],
+            [
+                {
+                    "candidate_key": segment["candidate_key"],
+                    "segment": segment["segment"],
+                }
+                for segment in item["current"]["allocation_segments"]
+            ],
+        )
+
+    def test_exact_active_allocation_tombstone_collision_is_rejected(self):
+        active = semantic_proposal("wks-active", "act-shared", ["ev-1"])
+        state, _, _ = ingest(self.tmp_path, "run-one", [active])
+        run_dir = self.tmp_path / "run-conflict"
+        write_json(run_dir / "proposals.json", [active])
+        write_json(run_dir / "ambiguous.json", [])
+        write_json(run_dir / "review-tombstones.json", [{
+            "candidate_key": active["candidate_key"],
+            "review_activity_key": active["review_activity_key"],
+            "allocation_segment": active["allocation_segment"],
+            "activity_id": active["activity_id"],
+            "provenance": active["provenance"],
+            "reason": "same allocation cannot be active and credited",
+            "credited_overlap_receipt": {
+                "schema_version": "clockify-overlap-credit/v1",
+                "credited_seconds": 3600,
+            },
+        }])
+
+        with self.assertRaisesRegex(
+            ValueError, "review tombstone conflicts with an active record"
+        ):
+            review_state.ingest_run(run_dir, state)
+
     def test_lifecycle_preserves_explicit_terminal_disposition(self):
         state, _, _ = ingest(self.tmp_path, "run-one", [proposal()])
         item_id = next(iter(state["items"]))
