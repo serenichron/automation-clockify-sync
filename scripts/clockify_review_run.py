@@ -2612,6 +2612,13 @@ def _process_run(
         isinstance(report_document, dict)
         and isinstance(report_document.get("source_debt_recovery"), dict)
     )
+    is_recovery_run = (
+        has_recovery_source
+        and not has_repair_source
+        and not has_collector_source
+        and replay_source is None
+        and (run_dir / "ledger-recovery.json").is_file()
+    )
     if (
         has_replay_completion_source
         or
@@ -2627,7 +2634,7 @@ def _process_run(
                     bundle = _finalize_repair_completion(run_dir)
                 elif has_collector_source:
                     bundle = _finalize_collector_derivation_completion(run_dir)
-                elif has_recovery_source:
+                elif is_recovery_run:
                     bundle = _finalize_recovery_completion(run_dir)
                 else:
                     bundle = _finalize_backlog_completion(
@@ -2645,7 +2652,7 @@ def _process_run(
                 }
                 result["completion_bundle_digest"] = bundle.bundle_digest
                 result["completion_bundle"] = bundle.document()
-                if has_recovery_source and replay_source is None:
+                if is_recovery_run:
                     transition = report_document["source_debt_recovery"]
                     result["source_debt_recovery"] = {
                         "source": transition["source"],
@@ -2682,7 +2689,7 @@ def _process_run(
     else:
         result["paths"]["review_current_csv"] = None
     _write_json(result_path, result)
-    if has_recovery_source and replay_source is None and completion_error is None and quality.get("status") == "pass":
+    if is_recovery_run and completion_error is None and quality.get("status") == "pass":
         try:
             clockify_source_debt_recover.seal_recovery_receipt(run_dir)
         except (OSError, ValueError, clockify_source_debt_recover.SourceDebtRecoveryError) as exc:
