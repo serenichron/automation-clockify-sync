@@ -877,9 +877,13 @@ def _prepare_collector_derivation_run(
     collector_runtime = dict(identity.collector_runtime_identity)
     source_artifact_bytes = dict(identity.verified_artifact_bytes)
     source_artifact_digests = dict(identity.verified_artifact_digests)
+    evidence_files = _COLLECTOR_EVIDENCE_FILES + (
+        ("enriched-context.json",)
+        if "evidence/enriched-context.json" in source_artifact_bytes else ()
+    )
     required_source_artifacts = {
         "run-report.json", "evidence/evidence-ledger.json",
-        *(f"evidence/{name}" for name in _COLLECTOR_EVIDENCE_FILES),
+        *(f"evidence/{name}" for name in evidence_files),
     }
     if set(source_artifact_bytes) != required_source_artifacts or set(
         source_artifact_digests
@@ -964,7 +968,7 @@ def _prepare_collector_derivation_run(
     try:
         evidence_target = target / "evidence"
         evidence_target.mkdir()
-        for filename in _COLLECTOR_EVIDENCE_FILES:
+        for filename in evidence_files:
             content = source_artifact_bytes[f"evidence/{filename}"]
             _write_snapshot(
                 evidence_target / filename,
@@ -1014,7 +1018,7 @@ def _prepare_collector_derivation_run(
         derived_artifact_digests = {
             **{
                 f"evidence/{filename}": source_artifact_digests[f"evidence/{filename}"]
-                for filename in _COLLECTOR_EVIDENCE_FILES
+                for filename in evidence_files
             },
             "evidence/evidence-ledger.json": source_artifact_digests[
                 "evidence/evidence-ledger.json"
@@ -1094,9 +1098,13 @@ def _verified_collector_derivation(
     ):
         raise ReviewRunError("collector derivation source binding differs")
     derived_digests = lineage.get("derived_artifact_digests")
+    evidence_files = _COLLECTOR_EVIDENCE_FILES + (
+        ("enriched-context.json",)
+        if "evidence/enriched-context.json" in identity.verified_artifact_digests else ()
+    )
     expected_derived_artifacts = {
         "run-report.json", "run-report.md", "evidence/evidence-ledger.json",
-        *(f"evidence/{name}" for name in _COLLECTOR_EVIDENCE_FILES),
+        *(f"evidence/{name}" for name in evidence_files),
     }
     if (
         not isinstance(derived_digests, Mapping)

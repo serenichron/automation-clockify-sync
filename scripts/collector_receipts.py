@@ -651,7 +651,11 @@ def load_collector_source_bundle(path: Path, *, run_dir: Path) -> CollectorSourc
         bound.validate(bound_manifest)
         raw: dict[str, object] = {}
         raw_digests: dict[str, str] = {}
-        for key, relative in _COLLECTOR_RAW_ARTIFACTS.items():
+        raw_artifacts = dict(_COLLECTOR_RAW_ARTIFACTS)
+        enriched_path = run_dir / "evidence/enriched-context.json"
+        if enriched_path.exists() or enriched_path.is_symlink():
+            raw_artifacts["enriched_context"] = "evidence/enriched-context.json"
+        for key, relative in raw_artifacts.items():
             raw_path = _safe_path(run_dir / relative, run_dir=run_dir)
             content, digest = _safe_read_bytes_and_digest(raw_path)
             raw[key] = json.loads(content)
@@ -666,6 +670,21 @@ def load_collector_source_bundle(path: Path, *, run_dir: Path) -> CollectorSourc
         )
         if reconstructed.manifest.document() != bound.manifest.document():
             raise ValueError("manifest mismatch")
+        if "enriched_context" in raw:
+            legacy_raw = {key: value for key, value in raw.items() if key != "enriched_context"}
+            legacy_reconstructed = evidence_ledger.EvidenceLedger(
+                tuple(evidence_ledger.normalize_collector_snapshot(legacy_raw)),
+                evidence_ledger.source_inventory_from_collector(legacy_raw),
+                bound.timezone,
+                bound.member_identities,
+            )
+            if legacy_reconstructed.manifest.document() == bound.manifest.document():
+                # The optional file contributed no ledger events. Preserve the
+                # identity of historical derivations sealed before it was read.
+                relative = "evidence/enriched-context.json"
+                raw_digests.pop(relative)
+                verified_bytes.pop(relative)
+                verified_digests.pop(relative)
     except (
         OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError,
     ) as exc:

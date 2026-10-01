@@ -11,7 +11,7 @@ import unittest
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from scripts import collector_receipts, evidence_ledger
+from scripts import clockify_review_run as review_run, collector_receipts, evidence_ledger
 from scripts.collector_slices import CollectionSlice
 from task3_scenario_contract import assert_scenario_contract
 
@@ -81,7 +81,9 @@ class CompletionBundleTests(unittest.TestCase):
             "evidence_ledger": {"source_completeness": coverage},
         }) + "\n", encoding="utf-8")
 
-    def _write_bound_collector_raw(self, run_dir: Path) -> None:
+    def _write_bound_collector_raw(
+        self, run_dir: Path, *, enriched_context: dict | None = None,
+    ) -> None:
         raw = {
             "clockify": {"status": "complete", "entries": []},
             "fathom": {"status": "complete", "meetings": []},
@@ -89,6 +91,8 @@ class CompletionBundleTests(unittest.TestCase):
             "multica_issues": {"status": "complete", "issues": []},
             "sessions": [],
         }
+        if enriched_context is not None:
+            raw["enriched_context"] = enriched_context
         filenames = {
             "clockify": "clockify-existing.json",
             "fathom": "fathom-meetings.json",
@@ -96,6 +100,8 @@ class CompletionBundleTests(unittest.TestCase):
             "multica_issues": "multica-issues.json",
             "sessions": "sessions.json",
         }
+        if enriched_context is not None:
+            filenames["enriched_context"] = "enriched-context.json"
         for key, filename in filenames.items():
             (run_dir / "evidence" / filename).write_text(
                 json.dumps(raw[key]) + "\n", encoding="utf-8"
@@ -115,6 +121,123 @@ class CompletionBundleTests(unittest.TestCase):
             "source_completeness": manifest["source_completeness"]
         }
         (run_dir / "run-report.json").write_text(json.dumps(report) + "\n")
+
+    def test_enriched_collector_source_verifies_and_derivation_preserves_raw_snapshot(self) -> None:
+        """Catches loss of collected enrichment during source verification/copy."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs = root / "runs"
+            source = runs / "source"
+            self._write_required_artifacts(source)
+            self._write_bound_collector_raw(source, enriched_context={
+                "claude_contexts": [],
+                "hermes_contexts": [
+                    {"id": f"hermes-{index}", "timestamp": f"2026-08-01T10:0{index}:00Z"}
+                    for index in range(4)
+                ],
+            })
+            (source / "run-report.md").write_text("collector report\n")
+            for filename in review_run._RECONCILIATION_INPUTS.values():
+                (source / filename).write_text("{}\n")
+            bundle_path = source / "completion-bundle.json"
+            collector_receipts.write_completion_bundle(
+                bundle_path,
+                collector_receipts.build_completion_bundle(source, slice_=self.slice),
+            )
+            original = {
+                path.relative_to(source): path.read_bytes()
+                for path in source.rglob("*") if path.is_file()
+            }
+
+            verified = collector_receipts.load_collector_source_bundle(
+                bundle_path, run_dir=source,
+            )
+            enriched_bytes = original[Path("evidence/enriched-context.json")]
+            self.assertEqual(
+                enriched_bytes,
+                verified.verified_artifact_bytes["evidence/enriched-context.json"],
+            )
+            with mock.patch.object(review_run, "RUNS", runs):
+                child = review_run._prepare_collector_derivation_run(
+                    source,
+                    {name: source / name for name in review_run._RECONCILIATION_INPUTS.values()},
+                    executor_runtime_identity={"git_sha": "executor"},
+                    environment={},
+                )
+                review_run._verified_collector_derivation(child)
+            self.assertEqual(enriched_bytes, (child / "evidence/enriched-context.json").read_bytes())
+            self.assertEqual(original, {
+                path.relative_to(source): path.read_bytes()
+                for path in source.rglob("*") if path.is_file()
+            })
+
+            derived_enriched = child / "evidence/enriched-context.json"
+            derived_enriched.write_text('{"tampered":true}\n')
+            with mock.patch.object(review_run, "RUNS", runs):
+                with self.assertRaisesRegex(review_run.ReviewRunError, "derived artifact"):
+                    review_run._verified_collector_derivation(child)
+
+            raw_enriched = source / "evidence/enriched-context.json"
+            raw_enriched.write_text('{"tampered":true}\n')
+            with self.assertRaisesRegex(
+                collector_receipts.CollectorReceiptError, "raw evidence",
+            ):
+                collector_receipts.load_collector_source_bundle(bundle_path, run_dir=source)
+
+    def test_unenriched_collector_source_still_derives_without_enrichment(self) -> None:
+        """Catches making enrichment mandatory for historical collector sources."""
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            source = runs / "source"
+            self._write_required_artifacts(source)
+            self._write_bound_collector_raw(source)
+            (source / "run-report.md").write_text("collector report\n")
+            for filename in review_run._RECONCILIATION_INPUTS.values():
+                (source / filename).write_text("{}\n")
+            bundle_path = source / "completion-bundle.json"
+            collector_receipts.write_completion_bundle(
+                bundle_path,
+                collector_receipts.build_completion_bundle(source, slice_=self.slice),
+            )
+
+            verified = collector_receipts.load_collector_source_bundle(
+                bundle_path, run_dir=source,
+            )
+            self.assertNotIn(
+                "evidence/enriched-context.json", verified.verified_artifact_digests,
+            )
+            with mock.patch.object(review_run, "RUNS", runs):
+                child = review_run._prepare_collector_derivation_run(
+                    source,
+                    {name: source / name for name in review_run._RECONCILIATION_INPUTS.values()},
+                    executor_runtime_identity={"git_sha": "executor"},
+                    environment={},
+                )
+                review_run._verified_collector_derivation(child)
+            self.assertFalse((child / "evidence/enriched-context.json").exists())
+
+            # Historical collectors could emit an empty optional snapshot.
+            # It must not change an already-sealed derivation's source identity.
+            enriched_path = source / "evidence/enriched-context.json"
+            enriched_path.write_text('{"claude_contexts":[],"hermes_contexts":[]}\n')
+            empty_verified = collector_receipts.load_collector_source_bundle(
+                bundle_path, run_dir=source,
+            )
+            self.assertEqual(verified.source_bundle_digest, empty_verified.source_bundle_digest)
+            self.assertNotIn(
+                "evidence/enriched-context.json", empty_verified.verified_artifact_digests,
+            )
+            with mock.patch.object(review_run, "RUNS", runs):
+                review_run._verified_collector_derivation(child)
+
+            enriched_path.write_text(
+                '{"claude_contexts":[],"hermes_contexts":'
+                '[{"id":"added","timestamp":"2026-08-01T10:00:00Z"}]}\n'
+            )
+            with self.assertRaisesRegex(
+                collector_receipts.CollectorReceiptError, "raw evidence",
+            ):
+                collector_receipts.load_collector_source_bundle(bundle_path, run_dir=source)
 
     def test_bundle_binds_every_downstream_artifact_and_rejects_drift(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
