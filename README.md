@@ -1,9 +1,10 @@
 # Clockify reconciliation workflow
 
-Purpose: reconstruct Vlad's direct interactive accomplishments and meetings
-from complete evidence, allocate honest non-overlapping effort, and progress
-from full-denominator shadow review to an exceptions-only, approval-gated
-Clockify review queue after measured acceptance gates pass.
+Purpose: recover Vlad's evidence-backed work and meetings into a review queue,
+without duplicating work already recorded in Clockify. Keep unrelated
+overlapping activity visible with an explicit warning. The recurring cycle
+publishes pending/unposted proposals; Clockify writes require approval of the
+specific review entries.
 
 This repository is the canonical implementation. The collector lives only in
 `scripts/clockify_sync_collect.py`; the top-level `clockify_sync_collect.py` is
@@ -34,8 +35,9 @@ complete process:
 4. use an independent Flash review to select a configured project/task and
    render Caveman descriptions targeting 8–14 words, while local code verifies
    taxonomy membership and structural safety;
-5. allocate active effort around fixed Clockify and Fathom blocks without
-   overlap, gap filling, overnight bridging, or silent trimming;
+5. allocate evidence-backed active effort without gap filling, overnight
+   bridging, or silent trimming; preserve complete meetings and unrelated
+   simultaneous work with explicit overlap warnings;
 6. validate quality and ingest stable review identities; shadow evaluation
    exposes the full denominator, while repeated runs emit only actionable
    deltas. Exceptions-only operation is not activated until its measured gates
@@ -60,10 +62,11 @@ only as `scheduled_without_recording` exclusions and never supply billable time.
 
 ## Guarded Google Sheet publication
 
-Google Sheet publication is a separate post-review stage. It is never invoked
-by collection, analysis, quality checks, replay, or the scheduled service. Run
-it only after the source quality report and immutable replay both pass and a
-human board instruction explicitly authorizes the named workbook and interval:
+Google Sheet publication is a separate post-review stage. Collection, analysis,
+quality checks and replay do not publish. The recurring review cycle can invoke
+publication after source quality and immutable replay pass, using the explicit
+Sheet-write setting and the standing authorization for its named destination.
+An operator can use the same stage directly for an authorized review package:
 
 ```bash
 python3 scripts/clockify_sheet_publish.py \
@@ -86,6 +89,22 @@ For existing IDs it updates machine-owned evidence fields while preserving the
 human-owned `Disposition`, `Review Status`, and `Review Notes` cells. It never
 calls Clockify. Later intervals in the same month use the same command and tab;
 already published stable IDs are not duplicated.
+
+### Reusing completed historical review
+
+`clockify_review_cycle.py --config <config> --adopt-historical-request <request>`
+can import a completed historical slice without collecting, inferring or
+publishing again. It requires the genuine collector checkpoint, sealed exact
+replay, and completed publisher/readback receipt for the same source and rows.
+It does not turn a preview or a subset publication into full delivery. A stale
+checkpoint remains a gap; never edit its digest to make it match newer files.
+
+Saved receipts and posted-row captures are trusted local connector/operator
+evidence, not remote signatures. Use actual verified captures, never fabricate
+a publication result from expected row hashes. A posted-work credit also needs
+an exact existing Clockify match and the same evidence-backed accomplishment;
+mere temporal overlap is not credit. Later genuine captures can preserve
+historical proof without reconstructing an unavailable original run.
 
 ## Guarded Clockify portfolio posting
 
@@ -262,18 +281,27 @@ partition recovery below even when the primary is the only qualified route. Conf
 low-confidence claims that remain unresolved become explicit exceptions, never
 proposals.
 
-The required primary is the generic `deepseek-v4-flash:cloud` alias. Every live
+The required primary is the `deepseek-v4.1-flash:cloud` alias. Every live
 run must additionally pin the full revision reported by the host's current
 manifest so the scorecard, analyzer cache, semantic run, and replay cannot
 silently mix model releases if the alias moves later. The current Precision
 rollout binds revision
-`6ca9e29c41ded618e527ee40e305ed5e4d8319b571d5b6695a30e1df65f103cc`.
-The equivalent explicit tag `deepseek-v4-flash:0731-cloud` and its historical
-revision remain accepted only for already sealed decisions. The exact model tag
+`e04da138d31e0c9468e982e1ae9503d06cb7e170caa16a90c17d931c4aa140f8`.
+The retired `deepseek-v4-flash:cloud` and `deepseek-v4-flash:0731-cloud` tags
+remain accepted only with their historical revision for already sealed decisions. The exact model tag
 is part of each cache route identity, so an in-progress sealed run must retain
 the tag it started with rather than migrating accepted decisions to an alias.
 The active release must pass the v17 synthetic route gate.
 `deepseek-v4-pro:cloud` is not an approved route for this process.
+
+An explicit retry of a review rejected for missing or conflicting citations
+uses a separate request identity. It may preserve only whole, uncontested rows;
+all evidence in conflicting rows and all uncited evidence become an explicit
+locally derived manual-review exception, without assigned effort. It never
+chooses a conflicting owner or trims a semantic claim. Other validation errors
+still reject the result. The validated derived response is sealed in the cache
+so replay produces the same activities and unresolved evidence without another
+inference call; existing sealed runs are never rewritten.
 
 Analyzer requests retain the fail-closed 1,450,000-byte hard ceiling. Normal
 extraction uses a 250,000-byte and 250-event operational target with four

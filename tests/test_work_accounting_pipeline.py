@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 
 from scripts import clockify_sheet_publish as sheet_publisher
+from scripts import clockify_sync_quality as quality
 from scripts import evidence_ledger
 from scripts import review_corrections
 from scripts import work_accounting_pipeline as pipeline
@@ -284,6 +285,104 @@ def meeting_analysis(meeting):
 
 
 class WorkAccountingPipelineTests(unittest.TestCase):
+    def test_failed_review_retry_selects_one_exact_source_group(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "analyzer-cache-used.jsonl"
+            endpoint = pipeline.semantic_analyzer.AnalyzerEndpoint(
+                "primary", "http://fixture", "flash-fixture"
+            )
+            decisions = pipeline.semantic_analyzer.AnalyzerResponseCache(cache)
+            decisions.store_rejected(endpoint, {"request": "source"}, failure_code="contract_rejected")
+            original_cache = cache.read_bytes()
+            source = {
+                "ledger_event_count": 2,
+                "ledger_evidence_digest": pipeline.semantic_analyzer.stable_digest("led-", ["ev-1", "ev-2"]),
+                "analyzer_cache": {"snapshot": {"path": "analyzer-cache-used.jsonl", "sha256": hashlib.sha256(original_cache).hexdigest(), "record_count": 1}},
+                "exceptions": [
+                    {"kind": "analyzer_review_failure", "evidence_ids": ["ev-1"], "reason": "Flash reviewer exhausted bounded structural repair: contract_rejected_duplicate_evidence"},
+                    {"kind": "analyzer_review_failure", "evidence_ids": ["ev-2"], "reason": "Flash reviewer exhausted bounded structural repair: contract_rejected_omitted_evidence"},
+                ],
+            }
+            selected = pipeline.semantic_analyzer.stable_digest("frt-", ["ev-1"], length=64)
+            decisions.store_rejected(endpoint, {"request": "paid-retry"}, failure_code="contract_rejected_invalid_evidence_ids")
+            self.assertEqual(
+                {("ev-1",): "contract_rejected_duplicate_evidence"},
+                pipeline._failed_review_retry_targets(source, [{"evidence_id": "ev-1"}, {"evidence_id": "ev-2"}], cache, selected),
+            )
+            with self.assertRaisesRegex(pipeline.WorkAccountingError, "source cache binding"):
+                cache.write_bytes(b" " + cache.read_bytes()[1:])
+                pipeline._failed_review_retry_targets(source, [{"evidence_id": "ev-1"}, {"evidence_id": "ev-2"}], cache, selected)
+
+    def test_failed_review_retry_passes_bound_target_to_analyzer(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = root / "analyzer-cache-used.jsonl"
+            cache.write_bytes(b"")
+            source = root / "semantic-analysis.json"
+            selected = pipeline.semantic_analyzer.stable_digest("frt-", ["ev-1"], length=64)
+            write_json(source, {
+                "ledger_event_count": 1,
+                "ledger_evidence_digest": pipeline.semantic_analyzer.stable_digest("led-", ["ev-1"]),
+                "analyzer_cache": {"snapshot": {"path": "analyzer-cache-used.jsonl", "sha256": hashlib.sha256(b"").hexdigest(), "record_count": 0}},
+                "exceptions": [{"kind": "analyzer_review_failure", "evidence_ids": ["ev-1"], "reason": "Flash reviewer exhausted bounded structural repair: contract_rejected_duplicate_evidence"}],
+            })
+            primary = pipeline.semantic_analyzer.AnalyzerEndpoint("primary", "http://fixture", pipeline.semantic_analyzer.CURRENT_LIVE_FLASH_ROUTE[0], revision=pipeline.semantic_analyzer.CURRENT_LIVE_FLASH_ROUTE[1])
+            cache_type = pipeline.semantic_analyzer.AnalyzerResponseCache
+            with (
+                mock.patch.object(pipeline.semantic_analyzer.AnalyzerEndpoint, "from_env", side_effect=[primary, None]),
+                mock.patch.object(pipeline.semantic_analyzer, "analyze_tiered", autospec=True, return_value={"activities": [], "exceptions": [], "omissions": []}) as analyze,
+                mock.patch.object(pipeline.semantic_analyzer, "AnalyzerResponseCache", wraps=cache_type) as caches,
+            ):
+                result = pipeline.analyze_ledger(
+                    [{"evidence_id": "ev-1"}], analyzer_cache_path=cache,
+                    failed_review_retry_source=source, failed_review_retry_digest=selected,
+                )
+            self.assertEqual(1, sum(call.kwargs.get("record_review_diagnostics") is True for call in caches.call_args_list))
+            self.assertEqual(selected, result["failed_review_retry"]["target_digest"])
+            self.assertEqual({("ev-1",): "contract_rejected_duplicate_evidence"}, analyze.call_args.kwargs["failed_review_retry_targets"])
+
+    def test_failed_review_retry_selects_canonical_multiple_groups(self):
+        import hashlib
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = root / "analyzer-cache-used.jsonl"
+            cache.write_bytes(b"")
+            source = root / "semantic-analysis.json"
+            first = pipeline.semantic_analyzer.stable_digest("frt-", ["ev-1"], length=64)
+            second = pipeline.semantic_analyzer.stable_digest("frt-", ["ev-2"], length=64)
+            write_json(source, {
+                "ledger_event_count": 2,
+                "ledger_evidence_digest": pipeline.semantic_analyzer.stable_digest("led-", ["ev-1", "ev-2"]),
+                "analyzer_cache": {"snapshot": {"path": "analyzer-cache-used.jsonl", "sha256": hashlib.sha256(b"").hexdigest(), "record_count": 0}},
+                "exceptions": [
+                    {"kind": "analyzer_review_failure", "evidence_ids": ["ev-1"], "reason": "Flash reviewer exhausted bounded structural repair: contract_rejected_duplicate_evidence"},
+                    {"kind": "analyzer_review_failure", "evidence_ids": ["ev-2"], "reason": "Flash reviewer exhausted bounded structural repair: contract_rejected_omitted_evidence"},
+                ],
+            })
+            primary = pipeline.semantic_analyzer.AnalyzerEndpoint("primary", "http://fixture", pipeline.semantic_analyzer.CURRENT_LIVE_FLASH_ROUTE[0], revision=pipeline.semantic_analyzer.CURRENT_LIVE_FLASH_ROUTE[1])
+            with (
+                mock.patch.object(pipeline.semantic_analyzer.AnalyzerEndpoint, "from_env", side_effect=[primary, None]),
+                mock.patch.object(pipeline.semantic_analyzer, "analyze_tiered", autospec=True, return_value={"activities": [], "exceptions": [], "omissions": []}) as analyze,
+            ):
+                result = pipeline.analyze_ledger(
+                    [{"evidence_id": "ev-1"}, {"evidence_id": "ev-2"}],
+                    analyzer_cache_path=cache, failed_review_retry_source=source,
+                    failed_review_retry_digest=[second, first],
+                )
+            self.assertEqual(sorted([first, second]), result["failed_review_retry"]["target_digests"])
+            self.assertEqual({
+                ("ev-1",): "contract_rejected_duplicate_evidence",
+                ("ev-2",): "contract_rejected_omitted_evidence",
+            }, analyze.call_args.kwargs["failed_review_retry_targets"])
+            for selection in ([first, first], [first, "frt-" + "0" * 64]):
+                with self.assertRaises(pipeline.WorkAccountingError):
+                    pipeline._failed_review_retry_targets(
+                        json.loads(source.read_text()),
+                        [{"evidence_id": "ev-1"}, {"evidence_id": "ev-2"}], cache, selection,
+                    )
+
     def test_analyzer_tuning_cli_options_are_explicit(self):
         args = pipeline.parse_args([
             "/tmp/run",
@@ -1242,6 +1341,57 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             },
         )
 
+    def test_completed_analysis_fixture_preserves_live_row_order_and_extractor(self):
+        first = session_event(
+            "replay-order:event:1", "2026-07-10T09:00:00+03:00",
+            span_end="2026-07-10T09:30:00+03:00",
+        )
+        second = session_event(
+            "replay-order:event:2", "2026-07-10T10:00:00+03:00",
+            span_end="2026-07-10T10:30:00+03:00",
+        )
+        activities = []
+        for event, obj, start, end in (
+            (first, "First replay task", "2026-07-10T09:00:00+03:00", "2026-07-10T09:30:00+03:00"),
+            (second, "Second replay task", "2026-07-10T10:00:00+03:00", "2026-07-10T10:30:00+03:00"),
+        ):
+            activity = analysis_for([event.evidence_id], recommended=15)["activities"][0]
+            activity["object"] = obj
+            activity["evidence_spans"] = [{
+                "evidence_id": event.evidence_id, "start": start, "end": end,
+            }]
+            activity.update({
+                "analyzer_model": "deepseek-v4-flash:cloud",
+                "semantic_reviewer_model": "deepseek-v4-flash:cloud",
+                "extractor_model": "deepseek-v4-flash:cloud",
+            })
+            activities.append(activity)
+        # A scoped live recovery retains prior rows, then appends new ones.
+        # Make that order intentionally differ from validator ID order.
+        activities.sort(key=lambda row: pipeline.semantic_analyzer.stable_digest(
+            "act-", {
+                "evidence_ids": row["evidence_ids"],
+                "lifecycle": row["lifecycle"],
+                "project": "serenichron level 2",
+                "object": row["object"].lower(),
+            }
+        ), reverse=True)
+        expected_ids = [row["evidence_ids"] for row in activities]
+        run_dir, result = self.make_run(
+            [first, second],
+            {"activities": activities, "exceptions": [], "omissions": []},
+        )
+        restored = json.loads((run_dir / "semantic-analysis.json").read_text())
+        self.assertEqual(expected_ids, [row["evidence_ids"] for row in restored["activities"]])
+        self.assertEqual(expected_ids, [
+            [span["evidence_id"] for span in row["evidence_spans"]]
+            for row in result["allocation"]["evidence"]
+        ])
+        self.assertTrue(all(
+            row["extractor_model"] == "deepseek-v4-flash:cloud"
+            for row in restored["activities"]
+        ))
+
     def test_splits_effort_around_existing_block_without_overlap(self):
         first = session_event(
             "session-1:event:1",
@@ -1260,7 +1410,7 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         self.assertGreaterEqual(result["proposals"][1]["start"], "2026-07-10T10:30+03:00")
         self.assertTrue(all(row["allocation_mode"] == "non_overlapping_v1" for row in result["proposals"]))
 
-    def test_full_fixed_block_exhaustion_emits_credited_tombstone(self):
+    def test_full_fixed_block_without_accomplishment_match_keeps_recovery_for_review(self):
         work = session_event(
             "capacity-recovery:event:1",
             "2026-07-10T09:00:00+03:00",
@@ -1277,20 +1427,19 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             analysis_for([work.evidence_id], recommended=30),
         )
 
-        self.assertEqual([], result["proposals"])
-        self.assertEqual(1, len(result["review_tombstones"]))
-        self.assertEqual(
-            1800,
-            result["review_tombstones"][0]["credited_overlap_receipt"]["credited_seconds"],
-        )
+        self.assertEqual(30, sum(row["duration_minutes"] for row in result["proposals"]))
+        self.assertEqual([], result["review_tombstones"])
+        self.assertIn("existing_clockify_overlap", [
+            warning["type"] for warning in result["proposals"][0]["review_warnings"]
+        ])
         self.assertEqual([], result["allocation"]["contested_time"])
         self.assertEqual(
             [{
-                "activity_id": result["review_tombstones"][0]["activity_id"],
+                "activity_id": result["proposals"][0]["activity_id"],
                 "requested_minutes": 30,
                 "allocator_allocated_minutes": 0,
-                "recovered_minutes": 0,
-                "credited_minutes": 30,
+                "recovered_minutes": 30,
+                "credited_minutes": 0,
                 "residual_minutes": 0,
             }],
             result["allocation"]["capacity_recoveries"],
@@ -1313,9 +1462,10 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             analysis_for([work.evidence_id], recommended=40),
         )
 
-        self.assertEqual(30, sum(row["duration_minutes"] for row in result["proposals"]))
-        self.assertEqual(10, result["allocation"]["capacity_recoveries"][0]["credited_minutes"])
-        self.assertEqual(1, len(result["review_tombstones"]))
+        self.assertEqual(40, sum(row["duration_minutes"] for row in result["proposals"]))
+        self.assertEqual(0, result["allocation"]["capacity_recoveries"][0]["credited_minutes"])
+        self.assertEqual(10, result["allocation"]["capacity_recoveries"][0]["recovered_minutes"])
+        self.assertEqual([], result["review_tombstones"])
         self.assertEqual([], result["allocation"]["contested_time"])
 
     def test_overlap_normalization_rebinds_recovery_warning_to_surviving_slice(self):
@@ -1413,20 +1563,12 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             [first, duplicate_span, distinct_span, existing], analysis
         )
 
-        recovered = result["review_tombstones"]
-        self.assertEqual(2, len(recovered))
-        self.assertEqual(2, len({row["activity_id"] for row in recovered}))
-        self.assertEqual(
-            2,
-            len({
-                (
-                    row["activity_id"],
-                    row["credited_overlap_receipt"]["original_start"],
-                    row["credited_overlap_receipt"]["original_end"],
-                )
-                for row in recovered
-            }),
-        )
+        self.assertEqual([], result["review_tombstones"])
+        self.assertEqual(2, len({row["activity_id"] for row in result["proposals"]}))
+        self.assertTrue(all(
+            any(warning["type"] == "existing_clockify_overlap" for warning in row["review_warnings"])
+            for row in result["proposals"]
+        ))
 
     def test_multi_interval_recovery_emits_one_aggregate_capacity_warning(self):
         first = session_event(
@@ -1463,10 +1605,11 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             analysis_for([first.evidence_id, second.evidence_id], recommended=30),
         )
 
-        self.assertEqual([], result["proposals"])
-        self.assertEqual(2, len(result["review_tombstones"]))
+        self.assertEqual(2, len(result["proposals"]))
+        self.assertEqual([], result["review_tombstones"])
         self.assertEqual(1, len(result["allocation"]["capacity_recoveries"]))
-        self.assertEqual(30, result["allocation"]["capacity_recoveries"][0]["credited_minutes"])
+        self.assertEqual(30, result["allocation"]["capacity_recoveries"][0]["recovered_minutes"])
+        self.assertEqual(0, result["allocation"]["capacity_recoveries"][0]["credited_minutes"])
 
     def test_recovery_replay_preserves_all_intervals_capacity_and_overlap_warnings(self):
         """Exact replay must keep every recovered interval reviewable exactly once."""
@@ -1521,10 +1664,11 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         self.assertEqual(first_result, replay_result)
         proposals = sorted(replay_result["proposals"], key=lambda row: row["start"])
         sheet_publisher.validate_recovery_proposal_groups(proposals)
-        self.assertEqual(20, sum(row["duration_minutes"] for row in proposals))
+        self.assertEqual(30, sum(row["duration_minutes"] for row in proposals))
         self.assertEqual(
             [
                 ("2026-07-10T09:00:00+03:00", "2026-07-10T09:05:00+03:00"),
+                ("2026-07-10T09:05:00+03:00", "2026-07-10T09:15:00+03:00"),
                 ("2026-07-10T09:15:00+03:00", "2026-07-10T09:20:00+03:00"),
                 ("2026-07-10T10:00:00+03:00", "2026-07-10T10:10:00+03:00"),
             ],
@@ -1538,11 +1682,13 @@ class WorkAccountingPipelineTests(unittest.TestCase):
                 for evidence_id in row["provenance"]["evidence_ids"]
             },
         )
-        self.assertEqual(1, len(replay_result["review_tombstones"]))
-        self.assertEqual(
-            600,
-            replay_result["review_tombstones"][0]["credited_overlap_receipt"]["credited_seconds"],
-        )
+        self.assertEqual([], replay_result["review_tombstones"])
+        self.assertEqual(600, sum(
+            warning["overlap_duration_seconds"]
+            for proposal in proposals
+            for warning in proposal["review_warnings"]
+            if warning["type"] == "existing_clockify_overlap"
+        ))
         self.assertEqual(
             len(proposals),
             len({
@@ -2488,7 +2634,7 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             result["fathom_reconciliation"][0]["reason"],
         )
 
-    def test_temporal_overlap_without_meeting_identity_is_credited_not_reposted(self):
+    def test_temporal_overlap_without_meeting_identity_remains_reviewable(self):
         meeting = fathom_event(
             "2026-07-10T13:00:00+03:00",
             "2026-07-10T14:00:00+03:00",
@@ -2499,12 +2645,14 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         )
         _, result = self.make_run([meeting, existing], meeting_analysis(meeting))
 
-        self.assertEqual([], result["proposals"])
+        self.assertEqual(1, len(result["proposals"]))
+        self.assertEqual(3600, result["proposals"][0]["duration_seconds"])
+        self.assertEqual("existing_clockify_overlap", result["proposals"][0]["review_warnings"][0]["type"])
         reconciliation = result["fathom_reconciliation"][0]
-        self.assertEqual("reconciled", reconciliation["status"])
+        self.assertEqual("proposed", reconciliation["status"])
         self.assertEqual(meeting.evidence_id, reconciliation["evidence_id"])
         self.assertEqual([meeting.evidence_id], reconciliation["source_evidence_ids"])
-        self.assertEqual(1, len(result["review_tombstones"]))
+        self.assertEqual([], result["review_tombstones"])
 
     def test_exact_canonical_meeting_identity_dedupes_without_overlap_ratio(self):
         meeting = fathom_event(
@@ -2588,8 +2736,8 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             "counterpart_project", reconciliation["overlap_diagnostics"][0]
         )
 
-    def test_fully_covered_meeting_is_suppressed_with_credited_overlap_receipt(self):
-        """Catches live Clockify time being proposed again for an entire meeting."""
+    def test_fully_covered_meeting_without_identity_stays_reviewable(self):
+        """Nonreciprocal time coverage does not prove the same meeting."""
         meeting = fathom_event(
             "2026-07-10T13:00:00+03:00",
             "2026-07-10T14:00:00+03:00",
@@ -2601,30 +2749,19 @@ class WorkAccountingPipelineTests(unittest.TestCase):
 
         _, result = self.make_run([meeting, existing], meeting_analysis(meeting))
 
-        self.assertEqual([], result["proposals"])
-        credited = next(
-            row for row in result["skipped"]
-            if row.get("reason") == "proposal fully credited to existing Clockify time"
-        )
-        self.assertEqual(meeting.evidence_id, credited["evidence_ids"][0])
-        self.assertEqual(
-            {
-                "schema_version": "clockify-overlap-credit/v1",
-                "original_start": "2026-07-10T13:00:00+03:00",
-                "original_end": "2026-07-10T14:00:00+03:00",
-                "credited_seconds": 3600,
-                "counterparts": [{
-                    "type": "existing_clockify_overlap",
-                    "counterpart_id": existing.evidence_id,
-                    "overlap_start": "2026-07-10T13:00:00+03:00",
-                    "overlap_end": "2026-07-10T14:00:00+03:00",
-                    "overlap_duration_seconds": 3600,
-                }],
-            },
-            credited["credited_overlap_receipt"],
-        )
+        self.assertEqual(1, len(result["proposals"]))
+        proposal = result["proposals"][0]
+        self.assertEqual(3600, proposal["duration_seconds"])
+        self.assertEqual([{
+            "type": "existing_clockify_overlap",
+            "counterpart_id": existing.evidence_id,
+            "overlap_start": "2026-07-10T13:00:00+03:00",
+            "overlap_end": "2026-07-10T14:00:00+03:00",
+            "overlap_duration_seconds": 3600,
+        }], proposal["review_warnings"])
+        self.assertEqual([], result["review_tombstones"])
 
-    def test_partial_clockify_overlap_emits_only_uncovered_meeting_tail_with_credit(self):
+    def test_partial_clockify_overlap_keeps_complete_meeting_with_warning(self):
         meeting = fathom_event(
             "2026-07-10T13:00:00+03:00",
             "2026-07-10T14:00:00+03:00",
@@ -2638,8 +2775,8 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         self.assertEqual(1, len(result["proposals"]))
         proposal = result["proposals"][0]
         self.assertEqual("2026-07-10T13:00:00+03:00", proposal["start"])
-        self.assertEqual("2026-07-10T13:30:00+03:00", proposal["end"])
-        self.assertEqual(1800, proposal["duration_seconds"])
+        self.assertEqual("2026-07-10T14:00:00+03:00", proposal["end"])
+        self.assertEqual(3600, proposal["duration_seconds"])
         reconciliation = result["fathom_reconciliation"][0]
         self.assertEqual("proposed", reconciliation["status"])
         self.assertEqual(meeting.evidence_id, reconciliation["evidence_id"])
@@ -2654,16 +2791,7 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             }],
             proposal["review_warnings"],
         )
-        self.assertEqual(
-            {
-                "schema_version": "clockify-overlap-credit/v1",
-                "original_start": "2026-07-10T13:00:00+03:00",
-                "original_end": "2026-07-10T14:00:00+03:00",
-                "credited_seconds": 1800,
-                "counterparts": proposal["review_warnings"],
-            },
-            proposal["provenance"]["credited_overlap_receipt"],
-        )
+        self.assertNotIn("credited_overlap_receipt", proposal["provenance"])
         self.assertFalse(any(
             row.get("exception_kind") == "fixed_block_conflict"
             for row in result["ambiguous"]
@@ -2684,8 +2812,8 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             clockify_adapter_calls=int(bool(result["external_writes"])),
         )
 
-    def test_overlapping_meetings_are_split_into_deterministic_non_overlapping_rows(self):
-        """Catches simultaneous meeting proposals that the poster would reject."""
+    def test_distinct_overlapping_meetings_keep_full_intervals_with_warning(self):
+        """Distinct meetings remain reviewable without treating either as credited work."""
         first = evidence_ledger.evidence_event(
             "fathom",
             {"source_type": "fathom", "source_id": "meeting-1"},
@@ -2731,22 +2859,60 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         self.assertEqual(2, len(proposals))
         self.assertEqual(
             [
-                ("2026-07-10T13:00:00+03:00", "2026-07-10T13:30:00+03:00"),
+                ("2026-07-10T13:00:00+03:00", "2026-07-10T14:00:00+03:00"),
                 ("2026-07-10T13:30:00+03:00", "2026-07-10T14:30:00+03:00"),
             ],
             [(row["start"], row["end"]) for row in proposals],
         )
-        receipt = proposals[0]["provenance"]["credited_overlap_receipt"]
-        self.assertEqual("clockify-overlap-credit/v1", receipt["schema_version"])
-        self.assertEqual(1800, receipt["credited_seconds"])
-        self.assertEqual(
-            "meeting_proposal_overlap", receipt["counterparts"][0]["type"]
+        self.assertEqual(7200, sum(row["duration_seconds"] for row in proposals))
+        self.assertTrue(all("credited_overlap_receipt" not in row["provenance"] for row in proposals))
+        warnings = [warning for row in proposals for warning in row["review_warnings"]
+                    if warning["type"] == "review_proposal_overlap"]
+        self.assertEqual(1, len(warnings))
+        self.assertEqual(1800, warnings[0]["overlap_duration_seconds"])
+
+    def test_distinct_tst_and_sc_work_preserves_two_minute_overlap_for_review(self):
+        start = dt.datetime.fromisoformat("2026-09-28T09:00:00+03:00")
+        tst = pipeline._proposal(
+            {"activity_id": "act-tst", "workstream_id": "ws-tst", "object": "TST repair"},
+            {"project_name": "TST Prep", "project_suffix": "tst001"},
+            "TST — Repair", start, start + dt.timedelta(minutes=2), ["ev-tst"], 1,
         )
-        self.assertEqual(
-            "specific_external_meeting_over_generic_internal_meeting",
-            receipt["precedence"]["rule"],
+        sc = pipeline._proposal(
+            {"activity_id": "act-sc", "workstream_id": "ws-sc", "object": "SC review"},
+            {"project_name": "Serenichron", "project_suffix": "sc0001"},
+            "SC — Review", start, start + dt.timedelta(minutes=10), ["ev-sc"], 1,
         )
-        self.assertLessEqual(proposals[0]["end"], proposals[1]["start"])
+        skipped: list[dict] = []
+        proposals = pipeline._normalize_postable_proposals([tst, sc], [], skipped)
+
+        self.assertEqual({"act-tst": 120, "act-sc": 600}, {
+            row["activity_id"]: row["duration_seconds"] for row in proposals
+        })
+        self.assertEqual([], skipped)
+        warned = [row for row in proposals if row["review_warnings"]]
+        self.assertEqual(1, len(warned))
+        warning = warned[0]["review_warnings"][0]
+        counterpart = next(row for row in proposals if row is not warned[0])
+        self.assertEqual("review_proposal_overlap", warning["type"])
+        self.assertEqual(counterpart["candidate_key"], warning["counterpart_id"])
+        self.assertEqual(120, warning["overlap_duration_seconds"])
+        self.assertEqual([], quality.find_time_overlaps(proposals))
+
+    def test_same_activity_proposal_overlap_still_credits_duplicate_interval(self):
+        start = dt.datetime.fromisoformat("2026-09-28T09:00:00+03:00")
+        activity = {"activity_id": "act-one", "workstream_id": "ws-one"}
+        route = {"project_name": "Serenichron", "project_suffix": "sc0001"}
+        first = pipeline._proposal(activity, route, "SC — Review", start, start + dt.timedelta(minutes=10), ["ev-one"], 1)
+        duplicate = pipeline._proposal(activity, route, "SC — Review", start + dt.timedelta(minutes=1), start + dt.timedelta(minutes=3), ["ev-one"], 2)
+        skipped: list[dict] = []
+        proposals = pipeline._normalize_postable_proposals([first, duplicate], [], skipped)
+
+        self.assertEqual(1, len(proposals))
+        self.assertEqual(600, proposals[0]["duration_seconds"])
+        self.assertEqual(1, len(skipped))
+        self.assertEqual("proposal fully credited to higher-priority review time", skipped[0]["reason"])
+        self.assertEqual(120, skipped[0]["credited_overlap_receipt"]["credited_seconds"])
 
     def test_overlap_warning_retains_only_clockify_project_suffix(self):
         meeting = fathom_event(

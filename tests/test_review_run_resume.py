@@ -352,14 +352,12 @@ class ResumeTests(unittest.TestCase):
             runs = root / "runs"
             source = self.source(root)
             (source / "run-report.md").write_text("collector report\n")
+            (source / "completion-bundle.json").write_text("sealed fixture\n")
             derived = runs / "derived-attempt"
             derived.mkdir()
             manifest = root / "manifest.json"
-            manifest.write_text("{}\n")
+            manifest.write_bytes((source / "period-manifest.json").read_bytes())
             result = derived / "autopilot-result.json"
-            snapshots = {
-                name: source / name for name in review._RECONCILIATION_INPUTS.values()
-            }
             collected = SimpleNamespace(
                 returncode=0,
                 stdout=str(source / "run-report.md") + "\n",
@@ -369,8 +367,8 @@ class ResumeTests(unittest.TestCase):
                  mock.patch.object(review, "_run", return_value=collected), \
                  mock.patch.object(review, "_collector_run_dirs", return_value=(source,)), \
                  mock.patch.object(
-                     review, "_snapshot_reconciliation_inputs", return_value=snapshots
-                 ), \
+                     review, "_snapshot_reconciliation_inputs"
+                 ) as source_snapshot, \
                  mock.patch.object(
                      review, "_prepare_collector_derivation_run", return_value=derived
                  ) as prepared, \
@@ -386,7 +384,14 @@ class ResumeTests(unittest.TestCase):
                 ])
 
             self.assertEqual(0, code)
-            prepared.assert_called_once_with(source, snapshots)
+            prepared.assert_called_once()
+            self.assertEqual(source, prepared.call_args.args[0])
+            self.assertEqual(manifest, prepared.call_args.args[1]["period-manifest.json"])
+            self.assertEqual(
+                (source / "routing.json").read_bytes(),
+                prepared.call_args.kwargs["snapshot_contents"]["routing.json"],
+            )
+            source_snapshot.assert_not_called()
             self.assertEqual(derived, processed.call_args.args[1])
 
     def test_fresh_collection_adopts_terminal_derivation_without_overwrite(self):
@@ -395,6 +400,7 @@ class ResumeTests(unittest.TestCase):
             root = Path(directory)
             runs = root / "runs"
             source = self.source(root)
+            (source / "completion-bundle.json").write_text("sealed fixture\n")
             derived = runs / "derived-attempt"
             derived.mkdir()
             result = derived / "autopilot-result.json"
@@ -405,7 +411,7 @@ class ResumeTests(unittest.TestCase):
                 for path in parent_paths if path.is_file()
             }
             manifest = root / "manifest.json"
-            manifest.write_text("{}\n")
+            manifest.write_bytes((source / "period-manifest.json").read_bytes())
             snapshots = {
                 name: source / name for name in review._RECONCILIATION_INPUTS.values()
             }

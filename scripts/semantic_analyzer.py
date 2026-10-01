@@ -21,6 +21,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 import threading
 from typing import Any, Callable, Iterable, Mapping
@@ -976,6 +977,68 @@ def _restore_extraction_partitions(
     return restored
 
 
+def _quarantine_review_citation_conflicts(
+    response: Mapping[str, Any],
+    restored: Mapping[str, Any],
+    *,
+    events: list[dict[str, Any]],
+    known_evidence_ids: set[str],
+) -> dict[str, Any] | None:
+    """Keep whole uncontested rows and explicitly quarantine disputed members."""
+    sections = ("activities", "exceptions", "omissions")
+    counts: dict[str, int] = {}
+    for section in sections:
+        for row in restored[section]:
+            for evidence_id in row["evidence_ids"]:
+                counts[evidence_id] = counts.get(evidence_id, 0) + 1
+    if not set(counts) <= known_evidence_ids:
+        return None
+    duplicate_ids = {evidence_id for evidence_id, count in counts.items() if count > 1}
+    missing_ids = known_evidence_ids - set(counts)
+    if not duplicate_ids and not missing_ids:
+        return None
+
+    replacement = copy.deepcopy(dict(response))
+    quarantined_ids = set(missing_ids)
+    for section in sections:
+        retained = []
+        for original, expanded in zip(response[section], restored[section], strict=True):
+            row_ids = set(expanded["evidence_ids"])
+            if row_ids & duplicate_ids:
+                quarantined_ids.update(row_ids)
+            else:
+                retained.append(copy.deepcopy(original))
+        replacement[section] = retained
+
+    _bundles, manifest = _semantic_evidence_bundles(events)
+    partitions = []
+    for bundle in manifest:
+        positions = [
+            index for index, evidence_id in enumerate(bundle["evidence_ids"], 1)
+            if evidence_id in quarantined_ids
+        ]
+        if not positions:
+            continue
+        ranges = []
+        for position in positions:
+            if ranges and position == ranges[-1][1] + 1:
+                ranges[-1][1] = position
+            else:
+                ranges.append([position, position])
+        partitions.append({"bundle_ref": bundle["bundle_ref"], "member_ranges": ranges})
+    if not partitions:
+        return None
+    replacement["exceptions"].append({
+        "kind": "analyzer_review_partial_quarantine",
+        "evidence_partitions": partitions,
+        "reason": (
+            "Locally derived whole-row citation quarantine for overlapping or "
+            "omitted evidence; manual review required and no effort assigned"
+        ),
+    })
+    return replacement
+
+
 def _normalize_provider_response(
     response: Mapping[str, Any], *, mode: str
 ) -> dict[str, Any]:
@@ -1311,8 +1374,23 @@ def _review_messages(
     review_scope: str = "extraction",
     review_prompt_version: str = REVIEW_PROMPT_VERSION,
     include_repair_contract: bool = True,
+    failed_review_retry_code: str | None = None,
+    local_coverage_repair: bool = False,
+    scoped_failed_review: Mapping[str, str] | None = None,
 ) -> list[dict[str, str]]:
     """Build an independent semantic-review request for one extraction."""
+    scoped_v2 = (
+        scoped_failed_review is not None
+        and scoped_failed_review.get("mode") == "scoped_review_v2"
+    )
+    scoped_v3_invalid_effort = (
+        scoped_failed_review is not None
+        and scoped_failed_review.get("mode") == "scoped_review_v3_invalid_effort"
+    )
+    scoped_v4_citation_quarantine = (
+        scoped_failed_review is not None
+        and scoped_failed_review.get("mode") == "scoped_review_v4_citation_quarantine"
+    )
     system = f"""You are the independent Clockify accounting reviewer.
 Use the evidence bundles as authority. The first-pass candidate is untrusted and
 may be accepted, corrected, split, merged, omitted, or replaced by an exception.
@@ -1448,6 +1526,15 @@ domain, path-shaped token, abbreviation chain, or embedded prefix. Count the
 complete `Prefix — action object outcome` render before returning it and keep it
 between 8 and 14 words.
 """
+    elif review_scope == "failed_review_scoped_recovery":
+        system += """
+
+FOCUSED FAILED-REVIEW RECOVERY: Review only the supplied source-bound evidence.
+An earlier citation-conflicted decision is not evidence that no work occurred.
+Reconstruct each supported outcome and its citations independently. Account for
+every supplied member exactly once; use an exception when support is insufficient.
+Do not infer duration from a session envelope or reuse a prior disputed citation.
+"""
     elif review_scope != "extraction":
         raise AnalyzerError("semantic review scope is invalid")
     if repair_failure_code is not None:
@@ -1467,17 +1554,20 @@ between 8 and 14 words.
             "schema-valid replacement. "
             "Do not discuss the prior response."
         )
-        if include_repair_contract:
-            system += (
-                " Follow repair_response_contract for exact provider field names and types. "
-                "Its record examples are alternatives, not evidence or inferred defaults: "
-                "replace their semantic values, effort and timestamps with supported values. "
-                "Return activities, exceptions and omissions as lists; empty lists are valid. "
-                "Cite only evidence_partitions with bundle_ref and inclusive integer "
-                "member_ranges. Never return evidence_ids or original/local IDs. "
-                "Every supplied member must occur exactly once across all three lists. "
-                "Copy evidence_spans from cited member time_span values, not example dates."
-            )
+    if include_repair_contract and (
+        repair_failure_code is not None or scoped_v2 or scoped_v3_invalid_effort
+        or scoped_v4_citation_quarantine
+    ):
+        system += (
+            " Follow repair_response_contract for exact provider field names and types. "
+            "Its record examples are alternatives, not evidence or inferred defaults: "
+            "replace their semantic values, effort and timestamps with supported values. "
+            "Return activities, exceptions and omissions as lists; empty lists are valid. "
+            "Cite only evidence_partitions with bundle_ref and inclusive integer "
+            "member_ranges. Never return evidence_ids or original/local IDs. "
+            "Every supplied member must occur exactly once across all three lists. "
+            "Copy evidence_spans from cited member time_span values, not example dates."
+        )
     if transport_recovery_attempt is not None:
         if (
             transport_failure_code not in {"transport_timeout", "transport_error"}
@@ -1543,8 +1633,11 @@ between 8 and 14 words.
                 "attempt": repair_attempt,
                 "maximum_attempts": MAX_CONTRACT_REPAIR_ATTEMPTS,
             })
-        if include_repair_contract:
-            payload["repair_response_contract"] = {
+    if include_repair_contract and (
+        repair_failure_code is not None or scoped_v2 or scoped_v3_invalid_effort
+        or scoped_v4_citation_quarantine
+    ):
+        payload["repair_response_contract"] = {
                 "top_level": {"activities": "list", "exceptions": "list", "omissions": "list"},
                 "activity_example": {
                     "lifecycle": "completed", "workstream": "Review recovery",
@@ -1572,13 +1665,55 @@ between 8 and 14 words.
                 "lifecycle_values": ["completed", "advanced", "investigated", "meeting", "planned", "blocked", "noise"],
                 "confidence_values": ["low", "medium", "high"],
                 "coverage": "each supplied member exactly once across all lists; ranges are 1-based inclusive",
-            }
+        }
+        if scoped_v3_invalid_effort:
+            payload["repair_response_contract"]["effort_rule"] = (
+                "Activities require positive ordered integer human-attention minutes "
+                "supported by cited evidence: minimum <= recommended <= maximum. "
+                "Exceptions and omissions require no effort. If positive effort is "
+                "unsupported, classify those exact evidence_partitions as an omission "
+                "or exception; never invent minutes or replace missing/zero effort "
+                "with defaults. Every supplied member remains covered exactly once."
+            )
     if transport_recovery_attempt is not None:
         payload["review_transport_recovery"] = {
             "failure_code": transport_failure_code,
             "attempt": transport_recovery_attempt,
             "maximum_attempts": MAX_TIMEOUT_RECOVERY_ATTEMPTS,
         }
+    if failed_review_retry_code is not None:
+        payload["failed_review_retry"] = {
+            "attempt": 1,
+            "maximum_attempts": 1,
+            "failure_code": failed_review_retry_code,
+        }
+    if local_coverage_repair:
+        payload["local_coverage_repair"] = "whole_row_quarantine_v1"
+    if scoped_failed_review is not None:
+        if (
+            review_scope != "failed_review_scoped_recovery"
+            or (
+                set(scoped_failed_review) != {
+                    "source_semantic_sha256", "group_digest", "subset_digest"
+                }
+                and not (
+                    set(scoped_failed_review) == {
+                        "source_semantic_sha256", "group_digest", "subset_digest", "mode"
+                    }
+                    and scoped_failed_review.get("mode") in {
+                        "scoped_review_v2", "scoped_review_v3_invalid_effort",
+                        "scoped_review_v4_citation_quarantine",
+                    }
+                )
+            )
+            or not re.fullmatch(r"[a-f0-9]{64}", scoped_failed_review["source_semantic_sha256"])
+            or any(
+                re.fullmatch(r"frt-[a-f0-9]{64}", scoped_failed_review[key]) is None
+                for key in ("group_digest", "subset_digest")
+            )
+        ):
+            raise AnalyzerError("scoped failed-review binding is invalid")
+        payload["scoped_failed_review"] = dict(scoped_failed_review)
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": canonical_json(payload)},
@@ -1598,6 +1733,9 @@ def _review_body(
     review_scope: str = "extraction",
     review_prompt_version: str = REVIEW_PROMPT_VERSION,
     include_repair_contract: bool = True,
+    failed_review_retry_code: str | None = None,
+    local_coverage_repair: bool = False,
+    scoped_failed_review: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     return {
         "model": model,
@@ -1623,6 +1761,9 @@ def _review_body(
             review_scope=review_scope,
             review_prompt_version=review_prompt_version,
             include_repair_contract=include_repair_contract,
+            failed_review_retry_code=failed_review_retry_code,
+            local_coverage_repair=local_coverage_repair,
+            scoped_failed_review=scoped_failed_review,
         ),
     }
 
@@ -2665,8 +2806,9 @@ class AnalyzerResponseCache:
     immutable replay independent of provider wording drift.
     """
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, record_review_diagnostics: bool = False):
         self.path = path
+        self.record_review_diagnostics = record_review_diagnostics
         self._lock = threading.RLock()
         self._records: dict[str, dict[str, Any]] = {}
         self.hits = 0
@@ -3036,6 +3178,139 @@ class AnalyzerResponseCache:
             }
         )
 
+    def record_rejected_review(
+        self,
+        endpoint: AnalyzerEndpoint,
+        body: Mapping[str, Any],
+        *,
+        failure_code: str,
+        review_scope: str,
+        response: Any,
+    ) -> None:
+        """Best-effort private citation ledger for a fresh rejected review only."""
+        if not self.record_review_diagnostics:
+            return
+
+        def safe_range(value: Any) -> list[int] | None:
+            if (
+                not isinstance(value, list)
+                or len(value) != 2
+                or any(
+                    isinstance(number, bool)
+                    or not isinstance(number, int)
+                    or abs(number) > 1_000_000
+                    for number in value
+                )
+            ):
+                return None
+            return [value[0], value[1]]
+
+        def safe_ref(value: Any) -> str | None:
+            return value if isinstance(value, str) and BUNDLE_REF_RE.fullmatch(value) else None
+
+        def safe_partitions(value: Any) -> list[dict[str, Any]]:
+            if not isinstance(value, list):
+                return []
+            partitions: list[dict[str, Any]] = []
+            for partition in value:
+                if not isinstance(partition, Mapping):
+                    partitions.append({"bundle_ref": None, "member_ranges": []})
+                    continue
+                raw_ranges = partition.get("member_ranges")
+                partitions.append({
+                    "bundle_ref": safe_ref(partition.get("bundle_ref")),
+                    "member_ranges": [
+                        bounds for item in raw_ranges
+                        if (bounds := safe_range(item)) is not None
+                    ] if isinstance(raw_ranges, list) else [],
+                })
+            return partitions
+
+        def effort_category(value: Any) -> str:
+            if not isinstance(value, Mapping):
+                return "missing_or_nonobject"
+            parsed = []
+            for field in ("minimum_minutes", "recommended_minutes", "maximum_minutes"):
+                raw = value.get(field)
+                if isinstance(raw, bool):
+                    return "missing_or_nonintegral_field"
+                try:
+                    minutes = int(raw)
+                except (TypeError, ValueError, OverflowError):
+                    return "missing_or_nonintegral_field"
+                if minutes <= 0:
+                    return "nonpositive"
+                parsed.append(minutes)
+            minimum, recommended, maximum = parsed
+            if not minimum <= recommended <= maximum:
+                return "inverted"
+            return "valid"
+
+        def safe_rows(section: str) -> list[dict[str, Any]]:
+            rows = response.get(section) if isinstance(response, Mapping) else None
+            if not isinstance(rows, list):
+                return []
+            output: list[dict[str, Any]] = []
+            for index, row in enumerate(rows):
+                record = {
+                    "evidence_partitions": safe_partitions(row.get("evidence_partitions"))
+                    if isinstance(row, Mapping) else [],
+                }
+                if section == "activities" and failure_code == "contract_rejected_invalid_effort":
+                    lifecycle = (
+                        str(row.get("lifecycle") or "").strip().lower()
+                        if isinstance(row, Mapping) else ""
+                    )
+                    record.update({
+                        "row_index": index,
+                        "lifecycle": lifecycle if lifecycle in LIFECYCLES else None,
+                        "effort_category": effort_category(row.get("effort"))
+                        if isinstance(row, Mapping) else "missing_or_nonobject",
+                    })
+                output.append(record)
+            return output
+
+        try:
+            payload = json.loads(body["messages"][1]["content"])
+            identity = self._request_identity(endpoint, body)
+            coverage = [
+                {"bundle_ref": ref, "allowed_member_range": bounds}
+                for item in payload["coverage_contract"]
+                if isinstance(item, Mapping)
+                and (ref := safe_ref(item.get("bundle_ref"))) is not None
+                and (bounds := safe_range(item.get("allowed_member_range"))) is not None
+            ]
+            diagnostic = {
+                "cache_key": identity["cache_key"],
+                "body_digest": identity["body_digest"],
+                "failure_code": failure_code,
+                "review_scope": review_scope,
+                "coverage_contract": coverage,
+                **{section: safe_rows(section) for section in ("activities", "exceptions", "omissions")},
+            }
+            sidecar = self.path.with_name(self.path.name + ".review-diagnostics.jsonl")
+            descriptor = os.open(
+                sidecar, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600
+            )
+            with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
+                metadata = os.fstat(handle.fileno())
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_uid != os.getuid()
+                    or metadata.st_mode & 0o777 != 0o600
+                ):
+                    return
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    handle.write(canonical_json(diagnostic) + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except (KeyError, IndexError, TypeError, ValueError, OSError):
+            # Diagnostics must not change the accounting decision or retry budget.
+            return
+
     def sealed_endpoints(self) -> tuple[AnalyzerEndpoint, ...]:
         """Return credential-free routes sealed into cache records."""
         routes = {
@@ -3286,6 +3561,9 @@ def _call_semantic_review_once(
     review_scope: str = "extraction",
     review_prompt_version: str = REVIEW_PROMPT_VERSION,
     extractor_model: str | None = None,
+    failed_review_retry_code: str | None = None,
+    local_coverage_repair: bool = False,
+    scoped_failed_review: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     request_options = dict(
         candidate=candidate,
@@ -3297,6 +3575,9 @@ def _call_semantic_review_once(
         transport_failure_code=transport_failure_code,
         review_scope=review_scope,
         review_prompt_version=review_prompt_version,
+        failed_review_retry_code=failed_review_retry_code,
+        local_coverage_repair=local_coverage_repair,
+        scoped_failed_review=scoped_failed_review,
     )
     body = _review_body(events, **request_options)
     if len(canonical_json(body).encode("utf-8")) > DEFAULT_MAX_BODY_BYTES:
@@ -3349,6 +3630,10 @@ def _call_semantic_review_once(
                     body,
                     failure_code=_contract_failure_code(exc),
                 )
+                cache.record_rejected_review(
+                    endpoint, body, failure_code=_contract_failure_code(exc),
+                    review_scope=review_scope, response=raw_response,
+                )
             raise AnalyzerContractError(str(exc)) from exc
     reviewer_model, reviewer_revision = _response_provider_identity(
         response, endpoint
@@ -3364,15 +3649,62 @@ def _call_semantic_review_once(
             restored,
             evidence_time_spans=evidence_time_spans,
         )
-        result = validate_result(
-            restored,
-            known_evidence_ids=known_evidence_ids,
-            provider_model=reviewer_model,
-            analyzer_tier=tier,
-            provider_revision=reviewer_revision,
-            evidence_time_spans=evidence_time_spans,
-            semantic_validation=False,
-        )
+        try:
+            result = validate_result(
+                restored,
+                known_evidence_ids=known_evidence_ids,
+                provider_model=reviewer_model,
+                analyzer_tier=tier,
+                provider_revision=reviewer_revision,
+                evidence_time_spans=evidence_time_spans,
+                semantic_validation=False,
+            )
+        except AnalyzerError as exc:
+            if not (
+                local_coverage_repair
+                and cache_miss
+                and (
+                    failed_review_retry_code in {
+                        "contract_rejected_duplicate_evidence",
+                        "contract_rejected_omitted_evidence",
+                    }
+                    or (
+                        review_scope == "failed_review_scoped_recovery"
+                        and scoped_failed_review is not None
+                        and scoped_failed_review.get("mode")
+                        == "scoped_review_v4_citation_quarantine"
+                    )
+                )
+                and _contract_failure_code(exc) in {
+                    "contract_rejected_duplicate_evidence",
+                    "contract_rejected_omitted_evidence",
+                }
+            ):
+                raise
+            # Coverage is checked after every row's ordinary fields, but before
+            # taxonomy. Check the original rows too: quarantine must not hide
+            # an unrelated project-selection failure on a conflicted row.
+            _validate_review_taxonomy(restored, taxonomy)
+            replacement = _quarantine_review_citation_conflicts(
+                response, restored, events=events,
+                known_evidence_ids=known_evidence_ids,
+            )
+            if replacement is None:
+                raise
+            response = replacement
+            repaired = _restore_extraction_partitions(response, events=events)
+            repaired = bind_activity_evidence_spans(
+                repaired, evidence_time_spans=evidence_time_spans,
+            )
+            result = validate_result(
+                repaired,
+                known_evidence_ids=known_evidence_ids,
+                provider_model=reviewer_model,
+                analyzer_tier=tier,
+                provider_revision=reviewer_revision,
+                evidence_time_spans=evidence_time_spans,
+                semantic_validation=False,
+            )
         _validate_review_taxonomy(result, taxonomy)
     except (AnalyzerTimeoutError, AnalyzerTransportError):
         raise
@@ -3383,6 +3715,10 @@ def _call_semantic_review_once(
                 endpoint,
                 body,
                 failure_code=_contract_failure_code(exc),
+            )
+            cache.record_rejected_review(
+                endpoint, body, failure_code=_contract_failure_code(exc),
+                review_scope=review_scope, response=response,
             )
         raise AnalyzerContractError(str(exc)) from exc
     _raise_if_cancelled(cancelled)
@@ -3412,6 +3748,7 @@ def _call_semantic_review(
     review_scope: str = "extraction",
     review_prompt_version: str = REVIEW_PROMPT_VERSION,
     extractor_model: str | None = None,
+    failed_review_retry_targets: Mapping[tuple[str, ...], str] | None = None,
 ) -> dict[str, Any]:
     def failure(reason: str) -> dict[str, Any]:
         return {
@@ -3425,6 +3762,33 @@ def _call_semantic_review(
             }],
             "omissions": [],
         }
+
+    target_code = (
+        failed_review_retry_targets.get(tuple(sorted(known_evidence_ids)))
+        if failed_review_retry_targets is not None else None
+    )
+    if target_code is not None:
+        if target_code not in CONTRACT_FAILURE_CODES:
+            raise AnalyzerError("failed review retry code is invalid")
+        try:
+            return _call_semantic_review_once(
+                endpoint, events, candidate=candidate, taxonomy=taxonomy,
+                tier=tier, transport=transport, known_evidence_ids=known_evidence_ids,
+                evidence_time_spans=evidence_time_spans, cache=cache,
+                before_transport=before_transport, cancelled=cancelled,
+                review_scope=review_scope, review_prompt_version=review_prompt_version,
+                extractor_model=extractor_model, failed_review_retry_code=target_code,
+                repair_failure_code=target_code, repair_attempt=1,
+                local_coverage_repair=target_code in {
+                    "contract_rejected_duplicate_evidence",
+                    "contract_rejected_omitted_evidence",
+                },
+            )
+        except AnalyzerContractError as exc:
+            return failure(
+                "Flash reviewer exhausted bounded failed-review retry: "
+                + _contract_failure_code(exc)
+            )
 
     def call_with_structural_repair(
         *,
@@ -3526,6 +3890,7 @@ def _call_validated(
     timeout_recovery_attempt: int | None = None,
     connection_recovery_attempt: int | None = None,
     review_taxonomy: list[dict[str, Any]] | None = None,
+    failed_review_retry_targets: Mapping[tuple[str, ...], str] | None = None,
 ) -> dict[str, Any]:
     body = _body_for(
         events,
@@ -3612,6 +3977,7 @@ def _call_validated(
                 before_transport=before_transport,
                 cancelled=cancelled,
                 extractor_model=provider_model,
+                failed_review_retry_targets=failed_review_retry_targets,
             )
             return _ValidatedAnalysis(
                 reviewed,
@@ -3849,9 +4215,34 @@ def analyze_tiered(
     private_text_approved: bool | None = None,
     cache: AnalyzerResponseCache | None = None,
     review_taxonomy: list[dict[str, Any]] | None = None,
+    failed_review_retry_targets: Mapping[tuple[str, ...], str] | None = None,
 ) -> dict[str, Any]:
     if max_workers <= 0:
         raise AnalyzerError("max_workers must be positive")
+    if failed_review_retry_targets is not None:
+        if cache is None or review_taxonomy is None or not failed_review_retry_targets:
+            raise AnalyzerError("failed-review retry requires cache and review taxonomy")
+        for evidence_ids, code in failed_review_retry_targets.items():
+            if not evidence_ids or tuple(sorted(set(evidence_ids))) != evidence_ids or code not in CONTRACT_FAILURE_CODES:
+                raise AnalyzerError("failed-review retry targets are invalid")
+        original_transport = transport
+        retry_transport_lock = threading.Lock()
+        retry_transport_calls = 0
+        def retry_transport(endpoint: AnalyzerEndpoint, body: dict[str, Any]) -> dict[str, Any]:
+            nonlocal retry_transport_calls
+            try:
+                payload = json.loads(body["messages"][1]["content"])
+            except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+                raise AnalyzerError("failed-review retry forbids unrelated transport") from exc
+            marker = payload.get("failed_review_retry")
+            if not isinstance(marker, dict) or marker.get("attempt") != 1:
+                raise AnalyzerError("failed-review retry forbids unrelated transport")
+            with retry_transport_lock:
+                if retry_transport_calls >= len(failed_review_retry_targets):
+                    raise AnalyzerError("failed-review retry exceeded its bounded transport budget")
+                retry_transport_calls += 1
+            return original_transport(endpoint, body)
+        transport = retry_transport
     original_events = sorted((dict(event) for event in events), key=_event_sort_key)
     if not original_events:
         return {
@@ -3908,6 +4299,10 @@ def analyze_tiered(
                     f"analyzer endpoint {endpoint.name} probe previously failed"
                 ) from prior_error
             if endpoint in probed:
+                return
+            if failed_review_retry_targets is not None:
+                require_current_live_flash_route(endpoint)
+                probed.add(endpoint)
                 return
             try:
                 probe_endpoint(endpoint, transport=transport)
@@ -4063,6 +4458,7 @@ def analyze_tiered(
                 before_transport=before_extraction_transport,
                 cancelled=cancellation.is_set,
                 review_taxonomy=review_taxonomy,
+                failed_review_retry_targets=failed_review_retry_targets,
             )
         except AnalyzerContractError as initial_error:
             # A sealed contract rejection receives a small, deterministic
@@ -4088,6 +4484,7 @@ def analyze_tiered(
                         repair_failure_code=repair_failure_code,
                         repair_attempt=repair_attempt,
                         review_taxonomy=review_taxonomy,
+                        failed_review_retry_targets=failed_review_retry_targets,
                     )
                 except AnalyzerContractError as error:
                     repair_error = error
@@ -4156,6 +4553,7 @@ def analyze_tiered(
                                 cancelled=cancellation.is_set,
                                 timeout_recovery_attempt=timeout_attempt,
                                 review_taxonomy=review_taxonomy,
+                                failed_review_retry_targets=failed_review_retry_targets,
                             )
                         except AnalyzerTimeoutError:
                             continue
@@ -4228,6 +4626,7 @@ def analyze_tiered(
                                 cancelled=cancellation.is_set,
                                 connection_recovery_attempt=connection_attempt,
                                 review_taxonomy=review_taxonomy,
+                                failed_review_retry_targets=failed_review_retry_targets,
                             )
                         except AnalyzerTransportError:
                             continue
@@ -4340,6 +4739,7 @@ def analyze_tiered(
                             repair_failure_code=fallback_feedback,
                             repair_attempt=(fallback_attempt or None),
                             review_taxonomy=review_taxonomy,
+                            failed_review_retry_targets=failed_review_retry_targets,
                         )
                     except AnalyzerContractError as error:
                         fallback_error = error
@@ -4413,6 +4813,7 @@ def analyze_tiered(
                         before_transport=before_extraction_transport,
                         cancelled=cancellation.is_set,
                         review_taxonomy=review_taxonomy,
+                        failed_review_retry_targets=failed_review_retry_targets,
                     )
                 except AnalyzerContractError:
                     # A validated low-confidence primary decision is still useful
@@ -4536,6 +4937,16 @@ def analyze_tiered(
         chunk_outcomes = [outcomes[index] for index in range(len(chunks))]
     results = [result for result, _metadata in chunk_outcomes]
     metadata = [chunk_metadata for _result, chunk_metadata in chunk_outcomes]
+    if (
+        target_body_bytes != DEFAULT_CHUNK_BODY_BYTES
+        or max_events_per_chunk != DEFAULT_MAX_EVENTS_PER_CHUNK
+    ):
+        chunking = {
+            "target_body_bytes": target_body_bytes,
+            "max_events_per_chunk": max_events_per_chunk,
+        }
+        for chunk_metadata in metadata:
+            chunk_metadata["chunking"] = chunking.copy()
     bundle_manifest: list[dict[str, Any]] = []
     for chunk_metadata in metadata:
         chunk_number = int(chunk_metadata["chunk"])

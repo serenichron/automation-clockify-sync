@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime as dt
 import hashlib
 import importlib.util
@@ -82,6 +83,85 @@ def run_tree_snapshot(*roots: Path) -> dict[str, dict[str, str]]:
     }
 
 
+class FailedReviewRetryCliTests(unittest.TestCase):
+    def test_retry_flag_requires_repair_source_and_one_target_digest(self):
+        args = review_run.parse_args([
+            "--repair-from", "/tmp/source", "--retry-failed-reviews",
+            "--retry-review-digest", "frt-" + "a" * 64,
+        ])
+        self.assertTrue(args.retry_failed_reviews)
+        self.assertEqual(["frt-" + "a" * 64], args.retry_review_digest)
+
+    def test_retry_cli_accepts_distinct_repeated_digests_and_rejects_duplicate(self):
+        first, second = "frt-" + "a" * 64, "frt-" + "b" * 64
+        args = review_run.parse_args([
+            "--repair-from", "/tmp/source", "--retry-failed-reviews",
+            "--retry-review-digest", second, "--retry-review-digest", first,
+        ])
+        self.assertEqual([second, first], args.retry_review_digest)
+        with mock.patch.object(review_run, "_prepare_repair_run", side_effect=AssertionError("must reject before child")):
+            with redirect_stderr(io.StringIO()):
+                self.assertEqual(2, review_run.main([
+                    "--repair-from", "/tmp/source", "--retry-failed-reviews",
+                    "--retry-review-digest", first, "--retry-review-digest", first,
+                ]))
+
+    def test_retry_process_uses_copied_source_cache_not_shared_state_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp) / "runs" / "child"
+            run.mkdir(parents=True)
+            args = review_run.parse_args([
+                "--repair-from", str(Path(tmp) / "runs" / "source"),
+                "--retry-failed-reviews", "--retry-review-digest", "frt-" + "a" * 64,
+                "--state", str(Path(tmp) / "state" / "review-items.json"),
+            ])
+            args._repair_analysis_fixture = None
+            args._repair_analyzer_cache = run / "analyzer-cache-used.jsonl"
+            args._failed_review_retry_source = run / "repair-fixture" / "semantic-analysis.json"
+            commands = []
+            def stop_after_command(command):
+                commands.append(command)
+                raise RuntimeError("command captured")
+            with mock.patch.object(review_run, "_run", side_effect=stop_after_command):
+                with self.assertRaisesRegex(RuntimeError, "command captured"):
+                    review_run._process_run(args, run, {})
+            command = commands[0]
+            self.assertEqual(str(args._repair_analyzer_cache), command[command.index("--analyzer-cache") + 1])
+            self.assertEqual(str(args._failed_review_retry_source), command[command.index("--failed-review-retry-source") + 1])
+            self.assertNotIn("--analysis-fixture", command)
+
+    def test_replay_finalizer_seals_child_without_backlog_transition(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp) / "runs"
+            source, replay = runs / "source", runs / "replay"
+            for run in (source, replay):
+                write_json(run / "run-report.json", {
+                    "runtime_identity": {"git_sha": "fixture"},
+                    "date_range": {"since": "2026-08-01T00:00:00Z", "until": "2026-08-02T00:00:00Z"},
+                    "evidence_ledger": {"source_completeness": {"status": "complete", "incomplete_sources": []}},
+                })
+                write_json(run / "evidence" / "evidence-ledger.json", {"manifest": {"source_completeness": {"status": "complete", "incomplete_sources": []}}})
+                for name in ("semantic-analysis.json", "work-accounting-result.json", "quality_report.json", "review-snapshot.json"):
+                    write_json(run / name, {"status": "pass"})
+            write_json(replay / "replay-integrity.json", {"status": "pass", "failures": []})
+            slice_ = review_run.clockify_sync_collect.plan_slices(
+                dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 8, 2, tzinfo=dt.timezone.utc),
+                zone=review_run.clockify_sync_collect.BUCHAREST,
+            )[0]
+            source_bundle = collector_receipts.build_completion_bundle(source, slice_=slice_)
+            collector_receipts.write_completion_bundle(source / "completion-bundle.json", source_bundle)
+            source_bytes = (source / "completion-bundle.json").read_bytes()
+            with mock.patch.object(review_run, "RUNS", runs), mock.patch.object(
+                review_run, "derive_replay_integrity", return_value={"status": "pass", "failures": []},
+            ):
+                bundle = review_run._finalize_replay_completion(source, replay)
+            self.assertTrue(bundle.replay)
+            self.assertEqual(source_bundle.slice_id, bundle.slice_id)
+            self.assertEqual(source_bytes, (source / "completion-bundle.json").read_bytes())
+            self.assertFalse((replay / "slice-finalization.json").exists())
+
+
 def analyzer_provider_response(payload: dict) -> dict:
     members = [
         {"bundle_ref": bundle["bundle_ref"], **member}
@@ -109,6 +189,27 @@ def analyzer_provider_response(payload: dict) -> dict:
 
 
 class ReviewRunResultTests(unittest.TestCase):
+    @staticmethod
+    def _write_pending_slice(run_dir: Path) -> None:
+        since = dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc)
+        until = dt.datetime(2026, 8, 2, tzinfo=dt.timezone.utc)
+        slice_ = review_run.clockify_sync_collect.plan_slices(
+            since, until, zone=review_run.clockify_sync_collect.BUCHAREST,
+        )[0]
+        identity = review_run.clockify_sync_collect.BacklogIdentity(
+            since_utc="2026-08-01T00:00:00Z",
+            until_utc="2026-08-02T00:00:00Z",
+            timezone="Europe/Bucharest", max_days=2,
+            compatibility_version="fixture/v1",
+        )
+        write_json(run_dir / "slice-finalization.json", {
+            "schema_version": "collector-slice-finalization/v1",
+            "backlog_identity": identity.document(),
+            "slice_id": slice_.slice_id,
+            "since_utc": review_run.clockify_sync_collect.iso_utc(slice_.since),
+            "until_utc": review_run.clockify_sync_collect.iso_utc(slice_.until),
+        })
+
     def test_normal_inference_run_seals_used_cache_then_replays_without_mutable_state(self):
         """Removing run-cache sealing must strand a real normal run after cleanup."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -712,6 +813,7 @@ class ReviewRunResultTests(unittest.TestCase):
             second = runs / "20260816T130000Z"
             for run_dir in (first, second):
                 run_dir.mkdir(parents=True)
+                self._write_pending_slice(run_dir)
                 (run_dir / "run-report.json").write_text(json.dumps({
                     "evidence": {
                         "calendly": {"status": "ok", "complete": True},
@@ -1571,6 +1673,7 @@ class ReviewRunResultTests(unittest.TestCase):
     @staticmethod
     def _write_real_offline_replay_source(
         runs: Path, root: Path, *, mixed_evidence: bool = False,
+        failed_review: bool = False,
     ) -> Path:
         source = runs / "source-run"
         source.mkdir(parents=True)
@@ -1628,13 +1731,22 @@ class ReviewRunResultTests(unittest.TestCase):
             )
             member_identities = ("member@example.test",)
         else:
-            events = (evidence_ledger.evidence_event(
+            first_event = evidence_ledger.evidence_event(
                 "codex_sessions_event",
                 {"source_type": "codex_sessions", "source_id": "offline-1", "machine": "fixture", "session_id": "session-1"},
                 observed_at="2026-08-01T10:00:00Z",
                 raw_source_span={"start": "2026-08-01T10:00:00Z", "end": "2026-08-01T10:10:00Z", "path": "/offline/replay.jsonl"},
                 attributes={"role": "user", "kind": "message", "content": "Validate offline replay"},
-            ),)
+            )
+            events = (first_event,)
+            if failed_review:
+                events += (evidence_ledger.evidence_event(
+                    "codex_sessions_event",
+                    {"source_type": "codex_sessions", "source_id": "offline-2", "machine": "fixture", "session_id": "session-2"},
+                    observed_at="2026-08-02T11:00:00Z",
+                    raw_source_span={"start": "2026-08-02T11:00:00Z", "end": "2026-08-02T11:10:00Z", "path": "/offline/second.jsonl"},
+                    attributes={"role": "user", "kind": "message", "content": "Complete independent offline review"},
+                ),)
             member_identities = ()
         ledger = evidence_ledger.EvidenceLedger(
             events, inventory, member_identities=member_identities,
@@ -1649,7 +1761,7 @@ class ReviewRunResultTests(unittest.TestCase):
             "runtime_identity": {"git_sha": "fixture"},
             "date_range": {
                 "since": "2026-08-01T00:00:00Z",
-                "until": "2026-08-02T00:00:00Z",
+                "until": "2026-08-03T00:00:00Z" if failed_review else "2026-08-02T00:00:00Z",
             },
             "evidence_ledger": {
                 "source_completeness": ledger.manifest.document()["source_completeness"],
@@ -1673,9 +1785,21 @@ class ReviewRunResultTests(unittest.TestCase):
             model=semantic_analyzer.DEFAULT_PRIMARY_MODEL,
             revision=semantic_analyzer.DEFAULT_PRIMARY_REVISION,
         )
+        review_calls = 0
         def transport(_endpoint, body):
+            nonlocal review_calls
             payload = json.loads(body["messages"][-1]["content"])
-            return {"probe": "ok"} if payload.get("probe") else analyzer_provider_response(payload)
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            response = analyzer_provider_response(payload)
+            if failed_review and payload.get("mode") == "review" and review_calls >= 3:
+                response["activities"][0]["workstream"] = "Independent verification"
+                response["activities"][0]["object"] = "independent review"
+            if failed_review and payload.get("mode") == "review" and review_calls < 3:
+                response["activities"].append(copy.deepcopy(response["activities"][0]))
+            if payload.get("mode") == "review":
+                review_calls += 1
+            return response
 
         member_identity_set = (
             work_accounting_pipeline.meeting_reconciliation.manifest_member_identities(
@@ -1711,6 +1835,13 @@ class ReviewRunResultTests(unittest.TestCase):
         ], cwd=ROOT, text=True, capture_output=True, check=False)
         if completed.returncode:
             raise AssertionError(completed.stderr or completed.stdout)
+        if failed_review:
+            # Fixture-backed accounting omits extractor provenance that a real
+            # inference-backed source retains; restore it for this retry case.
+            source_semantic = json.loads((source / "semantic-analysis.json").read_text())
+            for activity in source_semantic["activities"]:
+                activity["extractor_model"] = endpoint.model
+            write_json(source / "semantic-analysis.json", source_semantic)
         quality = subprocess.run([
             sys.executable, str(ROOT / "scripts" / "clockify_sync_quality.py"),
             source.name, "--runs-root", str(runs), "--root", str(ROOT),
@@ -1724,11 +1855,18 @@ class ReviewRunResultTests(unittest.TestCase):
         ], cwd=ROOT, text=True, capture_output=True, check=False)
         if state.returncode:
             raise AssertionError(state.stderr or state.stdout)
-        slice_ = review_run.clockify_sync_collect.plan_slices(
-            dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc),
-            dt.datetime(2026, 8, 2, tzinfo=dt.timezone.utc),
-            zone=review_run.clockify_sync_collect.BUCHAREST,
-        )[0]
+        slice_ = (
+            argparse.Namespace(
+                slice_id="fixture-two-day",
+                since=dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc),
+                until=dt.datetime(2026, 8, 3, tzinfo=dt.timezone.utc),
+            )
+            if failed_review else review_run.clockify_sync_collect.plan_slices(
+                dt.datetime(2026, 8, 1, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 8, 2, tzinfo=dt.timezone.utc),
+                zone=review_run.clockify_sync_collect.BUCHAREST,
+            )[0]
+        )
         bundle = collector_receipts.build_completion_bundle(source, slice_=slice_)
         bundle_path = source / "completion-bundle.json"
         collector_receipts.write_completion_bundle(bundle_path, bundle)
@@ -1739,7 +1877,7 @@ class ReviewRunResultTests(unittest.TestCase):
                 "compatibility_version": reconciliation_manifest.PERIOD_COMPATIBILITY_VERSION,
                 "member_id": "member-fixture", "workspace_id": "workspace-fixture",
                 "timezone": "Europe/Bucharest", "since_utc": "2026-08-01T00:00:00Z",
-                "until_utc": "2026-08-02T00:00:00Z", "revision": 1,
+                "until_utc": "2026-08-03T00:00:00Z" if failed_review else "2026-08-02T00:00:00Z", "revision": 1,
             },
             "state": "reconciling", "event_count": 2,
             "events_digest": "sha256:" + "d" * 64,
@@ -1756,6 +1894,240 @@ class ReviewRunResultTests(unittest.TestCase):
         ).hexdigest()
         write_json(source / "period-manifest.json", manifest)
         return source
+
+    def test_failed_review_repair_replays_from_sealed_cache_without_transport(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs = root / "runs"
+            source = self._write_real_offline_replay_source(runs, root, failed_review=True)
+            source_analysis = json.loads((source / "semantic-analysis.json").read_text())
+            failures = [row for row in source_analysis["exceptions"] if row["kind"] == "analyzer_review_failure"]
+            self.assertEqual(1, len(failures))
+            target_ids = failures[0]["evidence_ids"]
+            self.assertTrue(any(
+                not set(activity["evidence_ids"]) & set(target_ids)
+                for activity in source_analysis["activities"]
+            ))
+            digest = semantic_analyzer.stable_digest("frt-", target_ids, length=64)
+            source_cache = (source / "analyzer-cache-used.jsonl").read_bytes()
+            with mock.patch.object(review_run, "RUNS", runs):
+                repair = review_run._prepare_repair_run(source)
+                fixture = review_run._repair_analysis_fixture(repair)
+            retry_cache = repair / "analyzer-cache-retry.jsonl"
+            retry_cache.write_bytes((repair / "analyzer-cache-used.jsonl").read_bytes())
+            endpoint = semantic_analyzer.AnalyzerEndpoint(
+                "clockify_analyzer_primary", "https://offline.invalid/v1/chat/completions",
+                semantic_analyzer.DEFAULT_PRIMARY_MODEL,
+                revision=semantic_analyzer.DEFAULT_PRIMARY_REVISION,
+            )
+            transport_calls = []
+            def transport(_endpoint, body):
+                payload = json.loads(body["messages"][-1]["content"])
+                transport_calls.append(payload)
+                return analyzer_provider_response(payload)
+            real_analyze = semantic_analyzer.analyze_tiered
+            with (
+                mock.patch.object(semantic_analyzer.AnalyzerEndpoint, "from_env", side_effect=lambda name, **_kwargs: endpoint if name == "CLOCKIFY_ANALYZER_PRIMARY" else None),
+                mock.patch.object(semantic_analyzer, "analyze_tiered", side_effect=lambda events, **kwargs: real_analyze(events, transport=transport, private_text_approved=True, **kwargs)),
+            ):
+                work_accounting_pipeline.run_accounting(
+                    repair, root=ROOT, routing_path=repair / "routing.json",
+                    corrections_path=repair / "review-corrections.jsonl",
+                    analyzer_cache_path=retry_cache,
+                    failed_review_retry_source=fixture,
+                    failed_review_retry_digest=digest,
+                    analyzer_workers=1,
+                )
+            self.assertEqual(1, len(transport_calls))
+            self.assertTrue(retry_cache.read_bytes().startswith(source_cache))
+            repaired = json.loads((repair / "semantic-analysis.json").read_text())
+            self.assertEqual(digest, repaired["failed_review_retry"]["target_digest"])
+            self.assertEqual([], [row for row in repaired["exceptions"] if row["kind"] == "analyzer_review_failure"])
+            quality = subprocess.run([
+                sys.executable, str(ROOT / "scripts" / "clockify_sync_quality.py"),
+                repair.name, "--runs-root", str(runs), "--root", str(ROOT),
+                "--routing", str(repair / "routing.json"), "--strict",
+            ], cwd=ROOT, text=True, capture_output=True, check=False)
+            self.assertEqual(0, quality.returncode, quality.stderr or quality.stdout)
+            state = subprocess.run([
+                sys.executable, str(ROOT / "scripts" / "clockify_review_state.py"),
+                str(repair), "--state", str(root / "repair-items.json"),
+            ], cwd=ROOT, text=True, capture_output=True, check=False)
+            self.assertEqual(0, state.returncode, state.stderr or state.stdout)
+            with mock.patch.object(review_run, "RUNS", runs):
+                review_run._finalize_repair_completion(repair)
+                replay_code = review_run.main([
+                    "--replay-from", str(repair), "--runs-root", str(runs),
+                    "--state", str(root / "replay-items.json"),
+                ])
+            self.assertEqual(0, replay_code)
+            replays = list(runs.glob("*-replay-*"))
+            self.assertEqual(1, len(replays))
+            replay = replays[0]
+            self.assertTrue((replay / "replay-fixture" / "analyzer-cache-used.jsonl").is_file())
+            replay_bundle = collector_receipts.load_completion_bundle(replay / "completion-bundle.json", run_dir=replay)
+            self.assertTrue(replay_bundle.replay)
+            self.assertEqual("pass", json.loads((replay / "replay-integrity.json").read_text())["status"])
+
+    def test_failed_review_retry_resumes_same_repair_child_with_appended_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs = root / "runs"
+            source = self._write_real_offline_replay_source(runs, root, failed_review=True)
+            analysis = json.loads((source / "semantic-analysis.json").read_text())
+            failure = next(row for row in analysis["exceptions"] if row["kind"] == "analyzer_review_failure")
+            digest = semantic_analyzer.stable_digest("frt-", failure["evidence_ids"], length=64)
+            with mock.patch.object(review_run, "RUNS", runs):
+                child = review_run._prepare_repair_run(source)
+            retry_cache = child / "analyzer-cache-retry.jsonl"
+            retry_cache.write_bytes((child / "analyzer-cache-used.jsonl").read_bytes())
+            ledger, all_events = work_accounting_pipeline.load_ledger(child / "evidence" / "evidence-ledger.json")
+            member_ids = work_accounting_pipeline.meeting_reconciliation.manifest_member_identities(ledger.manifest.document())
+            events, _noise = work_accounting_pipeline._analysis_events(all_events, member_ids)
+            routing = json.loads((child / "routing.json").read_text())
+            endpoint = semantic_analyzer.AnalyzerEndpoint(
+                "clockify_analyzer_primary", "https://offline.invalid/v1/chat/completions",
+                semantic_analyzer.DEFAULT_PRIMARY_MODEL, revision=semantic_analyzer.DEFAULT_PRIMARY_REVISION,
+            )
+            real_analyze = semantic_analyzer.analyze_tiered
+            attempts = []
+            def rejected_transport(_endpoint, body):
+                payload = json.loads(body["messages"][-1]["content"])
+                attempts.append(payload)
+                response = analyzer_provider_response(payload)
+                response["activities"].append(copy.deepcopy(response["activities"][0]))
+                return response
+            retry_options = {
+                "analyzer_cache_path": retry_cache,
+                "failed_review_retry_source": child / "repair-fixture" / "semantic-analysis.json",
+                "failed_review_retry_digest": digest,
+                "review_taxonomy": work_accounting_pipeline._semantic_review_taxonomy(routing),
+                "review_routing": routing,
+                "analyzer_workers": 1,
+            }
+            with (
+                mock.patch.object(semantic_analyzer.AnalyzerEndpoint, "from_env", side_effect=lambda name, **_kwargs: endpoint if name == "CLOCKIFY_ANALYZER_PRIMARY" else None),
+                mock.patch.object(semantic_analyzer, "analyze_tiered", side_effect=lambda values, **kwargs: real_analyze(values, transport=rejected_transport, private_text_approved=True, **kwargs)),
+            ):
+                first = work_accounting_pipeline.analyze_ledger(events, **retry_options)
+            self.assertEqual(1, len(attempts))
+            self.assertEqual(
+                hashlib.sha256((child / "analyzer-cache-used.jsonl").read_bytes()).hexdigest(),
+                first["failed_review_retry"]["source_cache_sha256"],
+            )
+            cache_before = retry_cache.read_bytes()
+            def forbidden(*_args):
+                self.fail("same-child cached rejection must not call transport")
+            with (
+                mock.patch.object(semantic_analyzer.AnalyzerEndpoint, "from_env", side_effect=lambda name, **_kwargs: endpoint if name == "CLOCKIFY_ANALYZER_PRIMARY" else None),
+                mock.patch.object(semantic_analyzer, "analyze_tiered", side_effect=lambda values, **kwargs: real_analyze(values, transport=forbidden, private_text_approved=True, **kwargs)),
+            ):
+                second = work_accounting_pipeline.analyze_ledger(events, **retry_options)
+            self.assertEqual(first["exceptions"], second["exceptions"])
+            self.assertEqual(cache_before, retry_cache.read_bytes())
+            processed = []
+            def capture(args, run_dir, _gate):
+                processed.append((args, run_dir))
+                return 0, run_dir / "autopilot-result.json"
+            with mock.patch.object(review_run, "_process_run", side_effect=capture):
+                code = review_run.main([
+                    "--resume-from", str(child), "--retry-failed-reviews",
+                    "--retry-review-digest", digest, "--runs-root", str(runs),
+                    "--state", str(root / "resume-items.json"),
+                ])
+            self.assertEqual(0, code)
+            self.assertEqual(child, processed[0][1])
+            self.assertEqual(retry_cache, processed[0][0]._repair_analyzer_cache)
+            self.assertEqual(child / "repair-fixture" / "semantic-analysis.json", processed[0][0]._failed_review_retry_source)
+            self.assertEqual(cache_before, retry_cache.read_bytes())
+            retry_cache.write_bytes(b" " + cache_before[1:])
+            with mock.patch.object(review_run, "_process_run", side_effect=AssertionError("must fail before accounting")):
+                with redirect_stderr(io.StringIO()):
+                    tampered_code = review_run.main([
+                        "--resume-from", str(child), "--retry-failed-reviews",
+                        "--retry-review-digest", digest, "--runs-root", str(runs),
+                        "--state", str(root / "resume-items.json"),
+                    ])
+            self.assertEqual(2, tampered_code)
+            retry_cache.write_bytes(cache_before)
+            routing_path = child / "routing.json"
+            routing_path.write_bytes(routing_path.read_bytes() + b" ")
+            with mock.patch.object(review_run, "_process_run", side_effect=AssertionError("must fail before accounting")):
+                with redirect_stderr(io.StringIO()):
+                    routing_code = review_run.main([
+                        "--resume-from", str(child), "--retry-failed-reviews",
+                        "--retry-review-digest", digest, "--runs-root", str(runs),
+                        "--state", str(root / "resume-items.json"),
+                    ])
+            self.assertEqual(2, routing_code)
+
+    def test_completed_failed_review_retry_adopts_only_matching_digest_without_writes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs = root / "runs"
+            source = self._write_real_offline_replay_source(runs, root, failed_review=True)
+            analysis = json.loads((source / "semantic-analysis.json").read_text())
+            failure = next(row for row in analysis["exceptions"] if row["kind"] == "analyzer_review_failure")
+            digest = semantic_analyzer.stable_digest("frt-", failure["evidence_ids"], length=64)
+            with mock.patch.object(review_run, "RUNS", runs):
+                child = review_run._prepare_repair_run(source)
+                fixture = review_run._repair_analysis_fixture(child)
+            original_cache_hash = hashlib.sha256((child / "analyzer-cache-used.jsonl").read_bytes()).hexdigest()
+            retry_cache = child / "analyzer-cache-retry.jsonl"
+            retry_cache.write_bytes((child / "analyzer-cache-used.jsonl").read_bytes())
+            endpoint = semantic_analyzer.AnalyzerEndpoint(
+                "clockify_analyzer_primary", "https://offline.invalid/v1/chat/completions",
+                semantic_analyzer.DEFAULT_PRIMARY_MODEL,
+                revision=semantic_analyzer.DEFAULT_PRIMARY_REVISION,
+            )
+            real_analyze = semantic_analyzer.analyze_tiered
+            def transport(_endpoint, body):
+                return analyzer_provider_response(json.loads(body["messages"][-1]["content"]))
+            with (
+                mock.patch.object(semantic_analyzer.AnalyzerEndpoint, "from_env", side_effect=lambda name, **_kwargs: endpoint if name == "CLOCKIFY_ANALYZER_PRIMARY" else None),
+                mock.patch.object(semantic_analyzer, "analyze_tiered", side_effect=lambda events, **kwargs: real_analyze(events, transport=transport, private_text_approved=True, **kwargs)),
+            ):
+                work_accounting_pipeline.run_accounting(
+                    child, root=ROOT, routing_path=child / "routing.json",
+                    corrections_path=child / "review-corrections.jsonl",
+                    analyzer_cache_path=retry_cache,
+                    failed_review_retry_source=fixture,
+                    failed_review_retry_digest=digest,
+                    analyzer_workers=1,
+                )
+            self.assertNotEqual(original_cache_hash, hashlib.sha256((child / "analyzer-cache-used.jsonl").read_bytes()).hexdigest())
+            self.assertEqual(digest, json.loads((child / "semantic-analysis.json").read_text())["failed_review_retry"]["target_digest"])
+            quality = subprocess.run([
+                sys.executable, str(ROOT / "scripts" / "clockify_sync_quality.py"),
+                child.name, "--runs-root", str(runs), "--root", str(ROOT),
+                "--routing", str(child / "routing.json"), "--strict",
+            ], cwd=ROOT, text=True, capture_output=True, check=False)
+            self.assertEqual(0, quality.returncode, quality.stderr or quality.stdout)
+            state = subprocess.run([
+                sys.executable, str(ROOT / "scripts" / "clockify_review_state.py"),
+                str(child), "--state", str(root / "review-items.json"),
+            ], cwd=ROOT, text=True, capture_output=True, check=False)
+            self.assertEqual(0, state.returncode, state.stderr or state.stdout)
+            with mock.patch.object(review_run, "RUNS", runs):
+                review_run._finalize_repair_completion(child)
+            result = child / "autopilot-result.json"
+            write_json(result, {"quality_status": "pass", "external_writes": False})
+            before = run_tree_snapshot(source, child)
+            options = [
+                "--resume-from", str(child), "--retry-failed-reviews",
+                "--retry-review-digest", digest, "--runs-root", str(runs),
+                "--state", str(root / "review-items.json"),
+            ]
+            with mock.patch.object(review_run, "_process_run", side_effect=AssertionError("must not account")):
+                for _ in range(2):
+                    with redirect_stdout(io.StringIO()) as output:
+                        self.assertEqual(0, review_run.main(options))
+                    self.assertEqual(str(result), output.getvalue().strip())
+                with redirect_stderr(io.StringIO()):
+                    self.assertEqual(2, review_run.main([
+                        *options[:4], "frt-" + "0" * 64, *options[5:]
+                    ]))
+            self.assertEqual(before, run_tree_snapshot(source, child))
 
     def test_replay_range_options_are_rejected_before_any_process_runs(self):
         with mock.patch.object(review_run, "_run") as run:
@@ -1943,6 +2315,7 @@ class ReviewRunResultTests(unittest.TestCase):
             self._write_reconciliation_snapshots(inputs)
             run_dir = runs / "run-blocked"
             run_dir.mkdir(parents=True)
+            self._write_pending_slice(run_dir)
             (run_dir / "run-report.json").write_text(json.dumps({
                 "evidence": {
                     "calendly": {"status": "ok", "complete": True},
@@ -2027,6 +2400,7 @@ class ReviewRunResultTests(unittest.TestCase):
             runs = Path(tmp) / "runs"
             run_dir = runs / "run-invalid-manifest"
             run_dir.mkdir(parents=True)
+            self._write_pending_slice(run_dir)
             (run_dir / "run-report.md").write_text("# fixture\n", encoding="utf-8")
             write_json(run_dir / "run-report.json", {
                 "evidence": {"calendly": {"status": "excluded", "complete": True}},
@@ -2073,6 +2447,7 @@ class ReviewRunResultTests(unittest.TestCase):
             runs = Path(tmp) / "runs"
             run_dir = runs / "run-collecting-manifest"
             run_dir.mkdir(parents=True)
+            self._write_pending_slice(run_dir)
             (run_dir / "run-report.md").write_text("# fixture\n", encoding="utf-8")
             write_json(run_dir / "run-report.json", {
                 "evidence": {"calendly": {"status": "excluded", "complete": True}},
@@ -2126,6 +2501,149 @@ class ReviewRunResultTests(unittest.TestCase):
 
             self.assertEqual(0, code)
             process_run.assert_called_once()
+
+    def test_fresh_unsealed_collector_run_accounts_and_seals_real_bundle(self):
+        """A collector's pending slice must not need its own future completion bundle."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs = root / "runs"
+            source = self._write_real_offline_replay_source(runs, root)
+            report = json.loads((source / "run-report.json").read_text())
+            report["evidence"] = {"calendly": {"status": "excluded", "complete": True}}
+            write_json(source / "run-report.json", report)
+            manifest = json.loads((source / "period-manifest.json").read_text())
+            manifest.update(state="collecting", event_count=1, artifacts=[], blockers=[])
+            manifest["manifest_digest"] = reconciliation_manifest._digest({
+                key: value for key, value in manifest.items() if key != "manifest_digest"
+            })
+            write_json(source / "period-manifest.json", manifest)
+            self._write_pending_slice(source)
+            cache_path = root / "state" / "analyzer-cache.jsonl"
+            cache_path.parent.mkdir()
+            shutil.copyfile(source / "analyzer-cache-used.jsonl", cache_path)
+            for name in (
+                "completion-bundle.json", "semantic-analysis.json",
+                "work-accounting-result.json", "quality_report.json",
+                "review-snapshot.json", "analyzer-cache-used.jsonl",
+            ):
+                (source / name).unlink()
+            collector = subprocess.CompletedProcess(
+                ["collector"], 0, str(source / "run-report.md") + "\n", ""
+            )
+            real_run = review_run._run
+
+            def offline_collector(command):
+                if command[1].endswith("clockify_sync_collect.py"):
+                    return collector
+                return real_run(command)
+
+            with mock.patch.object(review_run, "_run", side_effect=offline_collector), \
+                 mock.patch.dict(os.environ, {
+                     "CLOCKIFY_ANALYZER_PRIMARY_URL": "https://offline.invalid/v1/chat/completions",
+                     "CLOCKIFY_ANALYZER_PRIMARY_MODEL": semantic_analyzer.DEFAULT_PRIMARY_MODEL,
+                     "CLOCKIFY_ANALYZER_PRIMARY_REVISION": semantic_analyzer.DEFAULT_PRIMARY_REVISION,
+                     "CLOCKIFY_ANALYZER_FALLBACK_URL": "",
+                     "CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED": "approved",
+                     "CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT": str(root / "checkpoints"),
+                 }, clear=False):
+                code = review_run.main([
+                    "--runs-root", str(runs),
+                    "--since", "2026-08-01", "--until", "2026-08-01",
+                    "--calendly-optional",
+                    "--period-manifest", str(source / "period-manifest.json"),
+                    "--routing", str(source / "routing.json"),
+                    "--corrections", str(source / "review-corrections.jsonl"),
+                    "--acceptance-ledger", str(source / "review-acceptance.jsonl"),
+                    "--state", str(root / "state" / "review-items.json"),
+                    "--analyzer-cache", str(cache_path),
+                ])
+
+            self.assertEqual(0, code)
+            self.assertTrue((source / "work-accounting-result.json").is_file())
+            self.assertEqual("pass", json.loads((source / "quality_report.json").read_text())["status"])
+            bundle = collector_receipts.load_completion_bundle(
+                source / "completion-bundle.json", run_dir=source
+            )
+            self.assertFalse(bundle.replay)
+            self.assertEqual(
+                bundle.bundle_digest,
+                json.loads((source / "autopilot-result.json").read_text())["completion_bundle_digest"],
+            )
+            self.assertFalse(any(path.name == "collector-source.json" for path in source.iterdir()))
+            self.assertEqual(1, len(list(runs.iterdir())))
+
+    def test_sealed_collector_source_derives_without_new_parent_snapshots(self):
+        """A reused completed source must stay byte-for-byte immutable."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs = root / "runs"
+            source = runs / "sealed-source"
+            (source / "evidence").mkdir(parents=True)
+            coverage = {"status": "complete", "incomplete_sources": []}
+            write_json(source / "run-report.json", {
+                "run_id": source.name,
+                "runtime_identity": {"git_sha": "fixture"},
+                "evidence": {"calendly": {"status": "excluded", "complete": True}},
+                "evidence_ledger": {"source_completeness": coverage},
+            })
+            write_json(source / "evidence" / "evidence-ledger.json", {
+                "manifest": {"source_completeness": coverage},
+            })
+            (source / "run-report.md").write_text("# sealed collector\n")
+            (source / "completion-bundle.json").write_text("sealed fixture\n")
+            for name in review_run._COLLECTOR_EVIDENCE_FILES:
+                write_json(source / "evidence" / name, {})
+            before = run_tree_snapshot(source)
+            inputs = root / "inputs"
+            self._write_reconciliation_snapshots(inputs)
+            artifact_paths = {
+                "run-report.json": source / "run-report.json",
+                "evidence/evidence-ledger.json": source / "evidence" / "evidence-ledger.json",
+                **{
+                    f"evidence/{name}": source / "evidence" / name
+                    for name in review_run._COLLECTOR_EVIDENCE_FILES
+                },
+            }
+            contents = {name: path.read_bytes() for name, path in artifact_paths.items()}
+            identity = SimpleNamespace(
+                source_bundle_digest="sha256:" + "1" * 64,
+                slice_id="slice-fixture",
+                since_utc="2026-08-01T00:00:00Z",
+                until_utc="2026-08-02T00:00:00Z",
+                collector_runtime_identity={"git_sha": "fixture"},
+                verified_artifact_bytes=contents,
+                verified_artifact_digests={
+                    name: "sha256:" + hashlib.sha256(value).hexdigest()
+                    for name, value in contents.items()
+                },
+            )
+            collector = subprocess.CompletedProcess(
+                ["collector"], 0, str(source / "run-report.md") + "\n", ""
+            )
+            with mock.patch.object(review_run, "_run", return_value=collector), \
+                 mock.patch.object(
+                     review_run.collector_receipts,
+                     "load_collector_source_bundle", return_value=identity,
+                 ), \
+                 mock.patch.object(
+                     review_run, "_process_run",
+                     side_effect=lambda _args, run_dir, _gate: (0, run_dir / "autopilot-result.json"),
+                 ) as processed:
+                code = review_run.main([
+                    "--runs-root", str(runs),
+                    "--period-manifest", str(inputs / "period-manifest.json"),
+                    "--routing", str(inputs / "routing.json"),
+                    "--corrections", str(inputs / "review-corrections.jsonl"),
+                    "--acceptance-ledger", str(inputs / "review-acceptance.jsonl"),
+                ])
+
+            self.assertEqual(0, code)
+            self.assertEqual(before, run_tree_snapshot(source))
+            child = processed.call_args.args[1]
+            self.assertNotEqual(source, child)
+            self.assertTrue((child / "collector-source.json").is_file())
+            for name in review_run._RECONCILIATION_INPUTS.values():
+                self.assertEqual((inputs / name).read_bytes(), (child / name).read_bytes())
 
     def test_healthy_carried_queue_requires_no_comment(self):
         snapshot = {

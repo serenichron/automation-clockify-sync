@@ -8,6 +8,8 @@ reuse rather than silently altering the review record.
 from __future__ import annotations
 
 import copy
+import base64
+import binascii
 import hashlib
 import json
 import re
@@ -28,6 +30,10 @@ PATCH_FIELDS = {
     "duration_seconds",
     "billable",
 }
+VERIFIED_POSTED_CREDIT = "verified_posted_credit"
+MAX_CAPTURED_PRIOR_PROPOSALS_BYTES = 16 * 1024 * 1024
+_SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_EVIDENCE_FINGERPRINT_RE = re.compile(r"evfp:sha256:[0-9a-f]{64}\Z")
 
 
 class ReviewDecisionError(ValueError):
@@ -263,6 +269,81 @@ def validate_decision(record: Mapping[str, Any], *, item: Mapping[str, Any] | No
     return result
 
 
+def validate_verified_posted_credit(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate an explicit machine credit, never a human review decision."""
+    required = {
+        "schema_version", "record_type", "evidence_fingerprint", "project_suffix",
+        "current_description_sha256", "prior_run_id", "sheet_publication_run_id", "prior_proposals_sha256",
+        "prior_proposals_base64", "posted_rows",
+    }
+    if not isinstance(record, Mapping) or set(_without_integrity(record)) != required:
+        raise ReviewDecisionError("verified posted credit must have its complete, exact proof shape")
+    if record.get("schema_version") != SCHEMA_VERSION or record.get("record_type") != VERIFIED_POSTED_CREDIT:
+        raise ReviewDecisionError("unsupported verified posted credit schema")
+    fingerprint = _one_line(record.get("evidence_fingerprint"), "evidence_fingerprint")
+    if not _EVIDENCE_FINGERPRINT_RE.fullmatch(fingerprint):
+        raise ReviewDecisionError("verified posted credit evidence fingerprint is invalid")
+    project = _one_line(record.get("project_suffix"), "project_suffix")
+    description_digest = _one_line(record.get("current_description_sha256"), "current_description_sha256")
+    prior_digest = _one_line(record.get("prior_proposals_sha256"), "prior_proposals_sha256")
+    if not _SHA256_RE.fullmatch(description_digest) or not _SHA256_RE.fullmatch(prior_digest):
+        raise ReviewDecisionError("verified posted credit digest is invalid")
+    capture = record.get("prior_proposals_base64")
+    if not isinstance(capture, str) or len(capture) > (MAX_CAPTURED_PRIOR_PROPOSALS_BYTES + 2) // 3 * 4:
+        raise ReviewDecisionError("verified posted credit prior proposal capture is missing or too large")
+    try:
+        captured_bytes = base64.b64decode(capture, validate=True)
+        captured_proposals = json.loads(captured_bytes)
+    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ReviewDecisionError("verified posted credit prior proposal capture is invalid") from exc
+    if (
+        len(captured_bytes) > MAX_CAPTURED_PRIOR_PROPOSALS_BYTES
+        or base64.b64encode(captured_bytes).decode("ascii") != capture
+        or "sha256:" + hashlib.sha256(captured_bytes).hexdigest() != prior_digest
+        or not isinstance(captured_proposals, list)
+    ):
+        raise ReviewDecisionError("verified posted credit prior proposal capture does not match its digest")
+    prior_run_id = _one_line(record.get("prior_run_id"), "prior_run_id")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", prior_run_id) or prior_run_id in {".", ".."}:
+        raise ReviewDecisionError("verified posted credit prior run ID is invalid")
+    sheet_publication_run_id = _one_line(record.get("sheet_publication_run_id"), "sheet_publication_run_id")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", sheet_publication_run_id) or sheet_publication_run_id in {".", ".."}:
+        raise ReviewDecisionError("verified posted credit Sheet publication run ID is invalid")
+    rows = record.get("posted_rows")
+    if not isinstance(rows, list) or not rows:
+        raise ReviewDecisionError("verified posted credit needs captured posted rows")
+    normalized_rows = []
+    seen: set[str] = set()
+    for entry in rows:
+        if not isinstance(entry, Mapping) or set(entry) != {"sheet_row", "clockify_block_id"}:
+            raise ReviewDecisionError("verified posted credit posted row is malformed")
+        sheet_row = entry["sheet_row"]
+        block_id = _one_line(entry["clockify_block_id"], "clockify_block_id")
+        if not isinstance(sheet_row, list) or len(sheet_row) != 15 or not all(
+            isinstance(cell, (str, int, float, bool)) or cell is None for cell in sheet_row
+        ):
+            raise ReviewDecisionError("verified posted credit Sheet row is malformed")
+        review_id = _one_line(sheet_row[0], "posted Review ID")
+        if review_id in seen or block_id in {row["clockify_block_id"] for row in normalized_rows}:
+            raise ReviewDecisionError("verified posted credit contains a duplicate posted row or block")
+        seen.add(review_id)
+        if str(sheet_row[13]).strip().lower() != "posted":
+            raise ReviewDecisionError("verified posted credit requires a posted Sheet status")
+        normalized_rows.append({"sheet_row": copy.deepcopy(sheet_row), "clockify_block_id": block_id})
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "record_type": VERIFIED_POSTED_CREDIT,
+        "evidence_fingerprint": fingerprint,
+        "project_suffix": project,
+        "current_description_sha256": description_digest,
+        "prior_run_id": prior_run_id,
+        "sheet_publication_run_id": sheet_publication_run_id,
+        "prior_proposals_sha256": prior_digest,
+        "prior_proposals_base64": capture,
+        "posted_rows": normalized_rows,
+    }
+
+
 def _read_log(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -275,7 +356,11 @@ def _read_log(path: Path) -> list[dict[str, Any]]:
             record = json.loads(line)
         except json.JSONDecodeError as exc:
             raise ReviewDecisionError(f"invalid decision JSON at line {number}") from exc
-        normalized = validate_decision(record)
+        normalized = (
+            validate_verified_posted_credit(record)
+            if isinstance(record, Mapping) and record.get("record_type") == VERIFIED_POSTED_CREDIT
+            else validate_decision(record)
+        )
         digest = canonical_digest(_without_integrity(record))
         if record.get("canonical_digest") != digest or record.get("previous_digest") != previous:
             raise ReviewDecisionError(f"decision log integrity failure at line {number}")
@@ -288,7 +373,62 @@ def _read_log(path: Path) -> list[dict[str, Any]]:
 
 def load_decisions(path: Path) -> list[dict[str, Any]]:
     """Read and integrity-check an immutable correction JSONL file."""
-    return _read_log(path)
+    return [record for record in _read_log(path) if record.get("record_type") != VERIFIED_POSTED_CREDIT]
+
+
+def load_verified_posted_credits(path: Path) -> list[dict[str, Any]]:
+    """Read machine credits from the same validated immutable snapshot."""
+    return [record for record in _read_log(path) if record.get("record_type") == VERIFIED_POSTED_CREDIT]
+
+
+def append_verified_posted_credit(
+    path: Path,
+    record: Mapping[str, Any],
+    *,
+    runs_root: Path,
+    current_proposals: list[dict[str, Any]],
+    existing_blocks: list[dict[str, Any]],
+) -> bool:
+    """Append only after checking the source capture and current baseline proof."""
+    normalized = validate_verified_posted_credit(record)
+    source_dir = runs_root / normalized["prior_run_id"]
+    if source_dir.is_symlink() or source_dir.resolve().parent != runs_root.resolve():
+        raise ReviewDecisionError("verified posted credit prior source is outside the runs root")
+    source_path = source_dir / "proposals.json"
+    if source_path.is_symlink() or not source_path.is_file():
+        raise ReviewDecisionError("verified posted credit prior source is missing")
+    if source_path.read_bytes() != base64.b64decode(normalized["prior_proposals_base64"]):
+        raise ReviewDecisionError("verified posted credit prior source differs from captured proof")
+    try:
+        from scripts import work_accounting_pipeline as pipeline
+    except ModuleNotFoundError:  # pragma: no cover - direct script execution fallback
+        import work_accounting_pipeline as pipeline  # type: ignore[no-redef]
+    _, credited = pipeline._apply_verified_posted_credits(
+        current_proposals, existing_blocks, [normalized]
+    )
+    if not credited:
+        raise ReviewDecisionError("verified posted credit does not prove a current posted accomplishment")
+    existing = _read_log(path)
+    target = tuple(normalized[key] for key in (
+        "evidence_fingerprint", "project_suffix", "current_description_sha256"
+    ))
+    for prior in existing:
+        if prior.get("record_type") != VERIFIED_POSTED_CREDIT:
+            continue
+        if tuple(prior[key] for key in (
+            "evidence_fingerprint", "project_suffix", "current_description_sha256"
+        )) != target:
+            continue
+        if canonical_json(_without_integrity(prior)) == canonical_json(normalized):
+            return False
+        raise ReviewDecisionError("conflicting verified posted credit already exists for this target")
+    line = dict(normalized)
+    line["previous_digest"] = existing[-1]["canonical_digest"] if existing else None
+    line["canonical_digest"] = canonical_digest(_without_integrity(line))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(canonical_json(line) + "\n")
+    return True
 
 
 def append_decision(path: Path, record: Mapping[str, Any], *, item: Mapping[str, Any] | None = None) -> bool:
@@ -300,6 +440,8 @@ def append_decision(path: Path, record: Mapping[str, Any], *, item: Mapping[str,
     existing = _read_log(path)
     target = tuple(normalized[key] for key in ("review_item_id", "activity_id", "evidence_fingerprint"))
     for prior in existing:
+        if prior.get("record_type") == VERIFIED_POSTED_CREDIT:
+            continue
         prior_target = tuple(prior[key] for key in ("review_item_id", "activity_id", "evidence_fingerprint"))
         if prior_target != target:
             continue

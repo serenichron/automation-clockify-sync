@@ -332,6 +332,12 @@ def _quality_routes(routing: dict[str, Any]) -> list[dict[str, Any]]:
         *routing.get("session_routes", []),
         *routing.get("meeting_routes", []),
     ]
+    for lifecycle in routing.get("client_lifecycle_routes", []):
+        if not isinstance(lifecycle, dict):
+            continue
+        activation = lifecycle.get("activation")
+        if isinstance(activation, dict) and isinstance(activation.get("route"), dict):
+            routes.append(activation["route"])
     expanded = [dict(route) for route in routes if isinstance(route, dict)]
     for override in routing.get("prefix_overrides", []):
         if not isinstance(override, dict):

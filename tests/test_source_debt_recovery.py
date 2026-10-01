@@ -1274,13 +1274,10 @@ class SourceDebtRecoveryTests(unittest.TestCase):
             [(row["start"], row["end"]) for row in proposals],
         )
         publisher.validate_recovery_proposal_groups(proposals)
-        overlap = next(
-            proposal for proposal in proposals
-            if any(
-                warning["type"] == "existing_clockify_overlap"
-                for warning in proposal["review_warnings"]
-            )
-        )
+        self.assertFalse(any(
+            row.get("reason") == "proposal fully credited to existing Clockify time"
+            for row in replay["skipped"]
+        ))
         existing_event = next(
             event for event in ledger["events"] if event["source_type"] == "clockify"
         )
@@ -1294,22 +1291,33 @@ class SourceDebtRecoveryTests(unittest.TestCase):
                 "overlap_duration_seconds": 600,
             },
             next(
-                warning for warning in overlap["review_warnings"]
+                warning
+                for proposal in proposals
+                for warning in proposal["review_warnings"]
                 if warning["type"] == "existing_clockify_overlap"
             ),
         )
+        self.assertEqual(1, sum(
+            warning["type"] == "existing_clockify_overlap"
+            for proposal in proposals
+            for warning in proposal["review_warnings"]
+        ))
+        self.assertEqual(1800, sum(row["duration_seconds"] for row in proposals))
         self.assertEqual(
             {
-                "type": "allocation_capacity_recovery",
                 "requested_minutes": 20,
                 "allocator_allocated_minutes": 10,
                 "recovered_minutes": 10,
+                "credited_minutes": 0,
                 "residual_minutes": 0,
             },
-            next(
-                warning for warning in overlap["review_warnings"]
-                if warning["type"] == "allocation_capacity_recovery"
-            ),
+            {
+                key: replay["allocation"]["capacity_recoveries"][0][key]
+                for key in (
+                    "requested_minutes", "allocator_allocated_minutes",
+                    "recovered_minutes", "credited_minutes", "residual_minutes",
+                )
+            },
         )
         rows = [
             publisher.proposal_row(proposal, recovered.run_dir.name)

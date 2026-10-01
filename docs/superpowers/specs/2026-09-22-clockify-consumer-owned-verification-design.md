@@ -19,7 +19,8 @@ exceptional backlog.
   It records optional, unavailable, and failed sources explicitly; they are
   never silently treated as empty.
 - Calendly is optional. Gemini is planned but non-blocking. Live inference uses
-  only `deepseek-v4-flash:cloud`.
+  only the approved, pinned `deepseek-v4.1-flash:cloud` revision. Older routes
+  remain usable only to replay their already sealed decisions.
 - The run keeps the evidence, coverage result, Clockify read-only baseline, and
   replay inputs needed to explain and reproduce its result. Replaying a run
   uses that saved snapshot and valid cache only; it does not recollect or use
@@ -39,6 +40,10 @@ exceptional backlog.
   Unrelated work at the same time remains separate and keeps its warning.
 - Evidence with invalid or missing routing or required fields remains visible
   as unresolved with an explicit warning; it is not discarded.
+- A recovery of a rejected review can retain whole activities whose evidence
+  is uncontested. Conflicting or uncited evidence stays visible for manual
+  review, without invented minutes or choosing a winner between conflicting
+  claims. The saved result identifies this local repair and replays unchanged.
 
 ## Publication and progress
 

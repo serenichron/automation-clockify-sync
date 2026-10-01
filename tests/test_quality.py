@@ -86,6 +86,39 @@ class QualityMatchingTests(unittest.TestCase):
             quality.check_prefix_match(row, quality._quality_routes(routing))
         )
 
+    def test_activated_client_lifecycle_prefix_is_accepted(self):
+        routing = {
+            "session_routes": [{
+                "pattern": "serenichron",
+                "project_name": "Serenichron Level 2",
+                "project_suffix": "775f9f",
+                "prefix": "SC",
+            }],
+            "meeting_routes": [],
+            "client_lifecycle_routes": [{
+                "client": "Mazilu & Partners",
+                "pattern": "Mazilu",
+                "activation": {
+                    "effective_at": "2026-09-24T00:00:00+03:00",
+                    "route": {
+                        "project_name": "Mazilu & Partners — Retainer",
+                        "project_suffix": "54ecf6",
+                        "prefix": "M&P",
+                    },
+                },
+            }],
+        }
+        row = proposal(
+            source_label="Serenichron client coordination",
+            client_project="Mazilu & Partners — Retainer",
+            clockify_project_suffix="54ecf6",
+            description="M&P — Evidence-backed retainer work",
+        )
+
+        self.assertIsNone(
+            quality.check_prefix_match(row, quality._quality_routes(routing))
+        )
+
     def test_exact_session_identity_wins_over_same_label(self):
         enriched = {
             "claude_contexts": [

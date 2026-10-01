@@ -394,6 +394,7 @@ class ProcessIntegrationTests(unittest.TestCase):
                 "semantic_analysis", "proposals", "ambiguous", "skipped",
                 "allocation", "fathom_reconciliation", "correction_regression",
                 "external_writes", "member_identities", "coverage_warnings",
+                "review_tombstones",
             },
             set(accounting["required"]),
         )

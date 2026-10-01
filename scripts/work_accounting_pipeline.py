@@ -8,9 +8,11 @@ inside the selected local run directory.
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 import dataclasses
 import datetime as dt
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import os
@@ -18,7 +20,7 @@ from pathlib import Path
 import re
 import sys
 import tempfile
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 try:
     from scripts import caveman_renderer
@@ -68,6 +70,316 @@ AUTONOMOUS_MULTICA_SESSION_RE = re.compile(
 
 class WorkAccountingError(RuntimeError):
     """Invalid or incomplete local accounting input."""
+
+
+def _failed_review_retry_targets(
+    source: Mapping[str, Any],
+    events: list[dict[str, Any]],
+    cache_path: Path,
+    selected_digest: str | Sequence[str],
+) -> dict[tuple[str, ...], str]:
+    """Bind selected failed reviewer groups to one exact source ledger and cache."""
+    selected = _canonical_retry_digests(selected_digest)
+    ids = sorted(str(event["evidence_id"]) for event in events)
+    if (
+        source.get("ledger_event_count") != len(ids)
+        or source.get("ledger_evidence_digest") != semantic_analyzer.stable_digest("led-", ids)
+    ):
+        raise WorkAccountingError("failed-review retry source ledger binding differs")
+    cache_summary = source.get("analyzer_cache")
+    snapshot = cache_summary.get("snapshot") if isinstance(cache_summary, Mapping) else None
+    if (
+        not isinstance(snapshot, Mapping)
+        or snapshot.get("path") != "analyzer-cache-used.jsonl"
+        or not cache_path.is_file()
+    ):
+        raise WorkAccountingError("failed-review retry source cache binding is missing")
+    content = cache_path.read_bytes()
+    record_count = snapshot.get("record_count")
+    if not isinstance(record_count, int) or isinstance(record_count, bool) or record_count < 0:
+        raise WorkAccountingError("failed-review retry source cache binding differs")
+    lines = content.splitlines(keepends=True)
+    source_prefix = b"".join(lines[:record_count])
+    if (
+        len(lines) < record_count
+        or snapshot.get("sha256") != hashlib.sha256(source_prefix).hexdigest()
+    ):
+        raise WorkAccountingError("failed-review retry source cache binding differs")
+    semantic_analyzer.AnalyzerResponseCache(cache_path)
+    targets: dict[str, tuple[tuple[str, ...], str]] = {}
+    for row in source.get("exceptions", []):
+        if not isinstance(row, Mapping) or row.get("kind") not in {
+            "analyzer_review_failure", "analyzer_review_partial_quarantine"
+        }:
+            continue
+        evidence_ids = row.get("evidence_ids")
+        if not isinstance(evidence_ids, list) or not evidence_ids:
+            raise WorkAccountingError("failed-review retry source failure is unsupported")
+        key = tuple(sorted(str(value) for value in evidence_ids))
+        if len(set(key)) != len(key) or not set(key) <= set(ids):
+            raise WorkAccountingError("failed-review retry source evidence is invalid")
+        digest = semantic_analyzer.stable_digest("frt-", list(key), length=64)
+        if row["kind"] == "analyzer_review_partial_quarantine":
+            # The accepted quarantine may be only a subset of the earlier
+            # failed request. Its original failure code is not derivable from
+            # this row and must not be guessed.
+            code = "citation_quarantine"
+        else:
+            match = re.fullmatch(
+                r"Flash reviewer exhausted bounded (?:structural repair|failed-review retry|scoped retry): "
+                r"(contract_rejected(?:_[a-z_]+)?)",
+                str(row.get("reason") or ""),
+            )
+            code = match.group(1) if match else None
+        if code != "citation_quarantine" and code not in semantic_analyzer.CONTRACT_FAILURE_CODES:
+            raise WorkAccountingError("failed-review retry source failure is unsupported")
+        if digest in targets:
+            raise WorkAccountingError("failed-review retry source has duplicate targets")
+        targets[digest] = (key, code)
+    if any(digest not in targets for digest in selected):
+        raise WorkAccountingError("failed-review retry target is absent from source")
+    chosen = [targets[digest] for digest in selected]
+    selected_ids: set[str] = set()
+    for key, _code in chosen:
+        if selected_ids.intersection(key):
+            raise WorkAccountingError("failed-review retry targets overlap")
+        selected_ids.update(key)
+    return {key: code for key, code in chosen}
+
+
+def _scoped_review_partitions(
+    events: list[dict[str, Any]], *, maximum_members: int = 64,
+) -> list[list[dict[str, Any]]]:
+    """Bound focused requests without dividing an instruction from its result."""
+    grouped: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+    for event in events:
+        grouped.setdefault(semantic_analyzer._semantic_context_key(event), []).append(event)
+    units: list[list[dict[str, Any]]] = []
+    for context in sorted(grouped):
+        source_order = context[0] == "session" and all(
+            isinstance(row.get("source_ref"), Mapping)
+            and type(row["source_ref"].get("ordinal")) is int
+            for row in grouped[context]
+        )
+        ordered = sorted(
+            grouped[context],
+            key=lambda row: (
+                row["source_ref"]["ordinal"] if source_order else 0,
+                semantic_analyzer._event_sort_key(row)[:2],
+                str(row["evidence_id"]),
+            ),
+        )
+        units.extend(semantic_analyzer._context_turn_units(context, ordered))
+    partitions: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for unit in units:
+        # The limit is soft for an indivisible source turn. The hard request
+        # byte ceiling is checked for every partition before any transport.
+        if current and len(current) + len(unit) > maximum_members:
+            partitions.append(current)
+            current = []
+        current.extend(unit)
+    if current:
+        partitions.append(current)
+    return partitions
+
+
+def run_scoped_failed_review_retry(
+    source: Mapping[str, Any],
+    events: list[dict[str, Any]],
+    *,
+    primary: semantic_analyzer.AnalyzerEndpoint,
+    cache: semantic_analyzer.AnalyzerResponseCache,
+    review_taxonomy: list[dict[str, Any]],
+    targets: Mapping[tuple[str, ...], str],
+    source_semantic_sha256: str,
+    transport: semantic_analyzer.Transport = semantic_analyzer.http_transport,
+    private_text_approved: bool | None = None,
+    scoped_review_mode: str = "fresh",
+) -> dict[str, Any]:
+    """Review only selected sealed failures, retaining every other decision."""
+    if scoped_review_mode not in {
+        "fresh", "scoped_review_v1", "scoped_review_v2",
+        "scoped_review_v3_invalid_effort", "scoped_review_v4_citation_quarantine",
+    }:
+        raise WorkAccountingError("scoped failed-review mode is invalid")
+    request_mode = scoped_review_mode
+    if scoped_review_mode == "fresh":
+        if targets and all(code == "contract_rejected_invalid_effort" for code in targets.values()):
+            request_mode = "scoped_review_v3_invalid_effort"
+        elif targets and all(code == "contract_rejected_duplicate_evidence" for code in targets.values()):
+            request_mode = "scoped_review_v4_citation_quarantine"
+        else:
+            request_mode = "scoped_review_v2"
+    if request_mode == "scoped_review_v4_citation_quarantine" and any(
+        code != "contract_rejected_duplicate_evidence" for code in targets.values()
+    ):
+        raise WorkAccountingError("scoped citation quarantine requires duplicate-evidence targets")
+    if re.fullmatch(r"[a-f0-9]{64}", source_semantic_sha256) is None or not targets:
+        raise WorkAccountingError("scoped failed-review source identity is invalid")
+    ids = {str(event.get("evidence_id")) for event in events}
+    if (
+        len(ids) != len(events)
+        or source.get("ledger_event_count") != len(events)
+        or source.get("ledger_evidence_digest")
+        != semantic_analyzer.stable_digest("led-", sorted(ids))
+    ):
+        raise WorkAccountingError("scoped failed-review source ledger binding differs")
+    selected = {evidence_id for key in targets for evidence_id in key}
+    if sum(len(key) for key in targets) != len(selected) or not selected <= ids:
+        raise WorkAccountingError("scoped failed-review targets overlap or leave source")
+    source_exceptions = source.get("exceptions")
+    if not isinstance(source_exceptions, list):
+        raise WorkAccountingError("scoped failed-review source exceptions are invalid")
+    source_groups = {
+        tuple(sorted(str(value) for value in row.get("evidence_ids", [])))
+        for row in source_exceptions
+        if isinstance(row, Mapping)
+        and row.get("kind") in {"analyzer_review_failure", "analyzer_review_partial_quarantine"}
+    }
+    if any(
+        not key or tuple(sorted(set(key))) != key or key not in source_groups
+        or (
+            code != "citation_quarantine"
+            and code not in semantic_analyzer.CONTRACT_FAILURE_CODES
+        )
+        for key, code in targets.items()
+    ):
+        raise WorkAccountingError("scoped failed-review target is not an exact source group")
+    for section in ("activities", "exceptions", "omissions"):
+        rows = source.get(section)
+        if not isinstance(rows, list):
+            raise WorkAccountingError("scoped failed-review source rows are invalid")
+        for row in rows:
+            if not isinstance(row, Mapping) or not isinstance(row.get("evidence_ids"), list):
+                raise WorkAccountingError("scoped failed-review source row is invalid")
+            cited = set(str(value) for value in row["evidence_ids"])
+            if cited & selected and not (
+                section == "exceptions"
+                and row.get("kind") in {"analyzer_review_failure", "analyzer_review_partial_quarantine"}
+                and tuple(sorted(cited)) in targets
+            ):
+                raise WorkAccountingError("scoped failed-review source overlaps a non-target row")
+    cache_summary = source.get("analyzer_cache")
+    snapshot = cache_summary.get("snapshot") if isinstance(cache_summary, Mapping) else None
+    if not isinstance(snapshot, Mapping) or snapshot.get("path") != "analyzer-cache-used.jsonl":
+        raise WorkAccountingError("scoped failed-review source cache binding is missing")
+    count = snapshot.get("record_count")
+    references = cache_summary.get("records")
+    if not isinstance(references, list):
+        raise WorkAccountingError("scoped failed-review source cache references are invalid")
+    sealed = cache.records_for_snapshot(references, configured_endpoints=(primary,))
+    source_snapshot = b"".join(
+        (semantic_analyzer.canonical_json(record) + "\n").encode("utf-8")
+        for record in sealed
+    )
+    if (
+        not isinstance(count, int) or isinstance(count, bool)
+        or count != len(sealed)
+        or hashlib.sha256(source_snapshot).hexdigest() != snapshot.get("sha256")
+    ):
+        raise WorkAccountingError("scoped failed-review source cache binding differs")
+    cache.used.update({record["cache_key"]: record["decision_digest"] for record in sealed})
+    result = copy.deepcopy(dict(source))
+    result["exceptions"] = [
+        row for row in result["exceptions"]
+        if tuple(sorted(str(value) for value in row["evidence_ids"])) not in targets
+    ]
+    events_by_id = {str(event["evidence_id"]): event for event in events}
+    jobs: list[tuple[list[dict[str, Any]], set[str], dict[str, dict[str, str]], dict[str, str]]] = []
+    for key in sorted(targets):
+        group_digest = semantic_analyzer.stable_digest("frt-", list(key), length=64)
+        for subset in _scoped_review_partitions([events_by_id[value] for value in key]):
+            subset_ids = {str(event["evidence_id"]) for event in subset}
+            subset_digest = semantic_analyzer.stable_digest(
+                "frt-", sorted(subset_ids), length=64
+            )
+            spans = {
+                evidence_id: span
+                for evidence_id in subset_ids
+                if (span := semantic_analyzer._safe_time_span(events_by_id[evidence_id])) is not None
+            }
+            marker = {
+                "source_semantic_sha256": source_semantic_sha256,
+                "group_digest": group_digest,
+                "subset_digest": subset_digest,
+            }
+            if request_mode != "scoped_review_v1":
+                marker["mode"] = request_mode
+            body = semantic_analyzer._review_body(
+                subset,
+                candidate={"activities": [], "exceptions": [], "omissions": []},
+                taxonomy=review_taxonomy, model=primary.model,
+                review_scope="failed_review_scoped_recovery",
+                scoped_failed_review=marker,
+                local_coverage_repair=request_mode == "scoped_review_v4_citation_quarantine",
+            )
+            if len(semantic_analyzer.canonical_json(body).encode("utf-8")) > semantic_analyzer.DEFAULT_MAX_BODY_BYTES:
+                raise WorkAccountingError("scoped failed-review request exceeds analyzer ceiling")
+            jobs.append((subset, subset_ids, spans, marker))
+    for subset, subset_ids, spans, marker in jobs:
+        def authorize_transport(
+            endpoint: semantic_analyzer.AnalyzerEndpoint,
+            rows: list[dict[str, Any]] = subset,
+        ) -> None:
+            semantic_analyzer.require_current_live_flash_route(endpoint)
+            semantic_analyzer._require_private_text_approval(rows, private_text_approved)
+
+        try:
+            reviewed = semantic_analyzer._call_semantic_review_once(
+                primary, subset,
+                candidate={"activities": [], "exceptions": [], "omissions": []},
+                taxonomy=review_taxonomy, tier="primary_scoped_review",
+                transport=transport, known_evidence_ids=subset_ids,
+                evidence_time_spans=spans, cache=cache,
+                before_transport=authorize_transport,
+                cancelled=None,
+                review_scope="failed_review_scoped_recovery",
+                scoped_failed_review=marker,
+                local_coverage_repair=request_mode == "scoped_review_v4_citation_quarantine",
+            )
+        except semantic_analyzer.AnalyzerContractError as exc:
+            reviewed = {
+                "activities": [], "omissions": [],
+                "exceptions": [{
+                    "kind": "analyzer_review_failure",
+                    "evidence_ids": sorted(subset_ids),
+                    "reason": "Flash reviewer exhausted bounded scoped retry: "
+                    + semantic_analyzer._contract_failure_code(exc),
+                }],
+            }
+        for section in ("activities", "exceptions", "omissions"):
+            result[section].extend(reviewed[section])
+    result["analyzer_cache"] = cache.summary()
+    failure_codes = {
+        semantic_analyzer.stable_digest("frt-", list(key), length=64): code
+        for key, code in targets.items()
+    }
+    digests = sorted(failure_codes)
+    provenance: dict[str, Any] = {
+        "mode": request_mode,
+        "source_semantic_sha256": source_semantic_sha256,
+        "source_cache_sha256": snapshot["sha256"],
+    }
+    if len(digests) == 1:
+        provenance["target_digest"] = digests[0]
+        provenance["failure_code"] = failure_codes[digests[0]]
+    else:
+        provenance["target_digests"] = digests
+        provenance["failure_codes"] = {digest: failure_codes[digest] for digest in digests}
+    result["failed_review_retry"] = provenance
+    return result
+
+
+def _canonical_retry_digests(value: str | Sequence[str]) -> tuple[str, ...]:
+    selected = (value,) if isinstance(value, str) else tuple(value)
+    if (
+        not selected
+        or any(not isinstance(digest, str) or re.fullmatch(r"frt-[a-f0-9]{64}", digest) is None for digest in selected)
+        or len(set(selected)) != len(selected)
+    ):
+        raise WorkAccountingError("failed-review retry requires distinct exact target digests")
+    return tuple(sorted(selected))
 
 
 def _read_json(path: Path) -> Any:
@@ -408,6 +720,15 @@ def _load_regression_cases(path: Path | None) -> list[dict[str, Any]]:
         raise WorkAccountingError(f"review correction log is invalid: {exc}") from exc
 
 
+def _load_verified_posted_credits(path: Path | None) -> list[dict[str, Any]]:
+    if path is None or not path.exists():
+        return []
+    try:
+        return review_corrections.load_verified_posted_credits(path)
+    except review_corrections.ReviewDecisionError as exc:
+        raise WorkAccountingError(f"review correction log is invalid: {exc}") from exc
+
+
 def analyze_ledger(
     events: list[dict[str, Any]],
     *,
@@ -419,8 +740,14 @@ def analyze_ledger(
     analyzer_workers: int | None = None,
     review_taxonomy: list[dict[str, Any]] | None = None,
     review_routing: Mapping[str, Any] | None = None,
+    failed_review_retry_source: Path | None = None,
+    failed_review_retry_digest: str | Sequence[str] | None = None,
 ) -> dict[str, Any]:
     known = {str(event.get("evidence_id")) for event in events}
+    if (failed_review_retry_source is None) != (failed_review_retry_digest is None):
+        raise WorkAccountingError("failed-review retry source and target must be paired")
+    if failed_review_retry_source is not None and analysis_fixture is not None:
+        raise WorkAccountingError("failed-review retry cannot use an analysis fixture")
     if analysis_fixture:
         fixture = _read_json(analysis_fixture)
         raw_activities = fixture.get("activities", [])
@@ -436,6 +763,20 @@ def analyze_ledger(
             analyzer_tier="fixture",
             semantic_validation=not reviewed,
         )
+        # Live scoped recovery retains source rows and appends reviewed rows.
+        # Validation sorts them by identity, which changes the order of the
+        # allocator's serialized evidence during an otherwise identical replay.
+        for section in ("activities", "exceptions", "omissions"):
+            source_rows = fixture.get(section, [])
+            order = {
+                tuple(sorted(str(value) for value in row["evidence_ids"])): index
+                for index, row in enumerate(source_rows)
+            }
+            if len(order) != len(source_rows):
+                raise WorkAccountingError("analysis fixture has duplicate evidence groups")
+            result[section].sort(
+                key=lambda row: order[tuple(row["evidence_ids"])]
+            )
         if reviewed:
             semantic_analyzer._validate_review_taxonomy(
                 result,
@@ -448,10 +789,12 @@ def analyze_ledger(
                         "analyzer_model",
                         "analyzer_tier",
                         "analyzer_revision",
+                        "extractor_model",
                         "semantic_reviewer_model",
                         "semantic_reviewer_revision",
                         "review_prompt_version",
                     )
+                    if key != "extractor_model" or key in activity
                 }
                 for activity in raw_activities
             }
@@ -470,6 +813,7 @@ def analyze_ledger(
             "ledger_evidence_digest",
             "analysis_chunks",
             "analyzer_cache",
+            "failed_review_retry",
         ):
             if key in fixture:
                 result[key] = copy.deepcopy(fixture[key])
@@ -482,9 +826,24 @@ def analyze_ledger(
         raise WorkAccountingError(
             "semantic analyzer is not configured; CLOCKIFY_ANALYZER_PRIMARY_URL is required"
         )
+    retry_targets = None
+    retry_cache_sha256 = None
+    retry_source_document = None
+    if failed_review_retry_source is not None:
+        if analyzer_cache_path is None:
+            raise WorkAccountingError("failed-review retry requires a bound analyzer cache")
+        semantic_analyzer.require_current_live_flash_route(primary)
+        retry_source_document = _read_json(failed_review_retry_source)
+        retry_targets = _failed_review_retry_targets(
+            retry_source_document, events,
+            analyzer_cache_path, failed_review_retry_digest,
+        )
+        retry_cache_sha256 = retry_source_document["analyzer_cache"]["snapshot"]["sha256"]
     fallback = semantic_analyzer.AnalyzerEndpoint.from_env("CLOCKIFY_ANALYZER_FALLBACK")
     cache = (
-        semantic_analyzer.AnalyzerResponseCache(analyzer_cache_path)
+        semantic_analyzer.AnalyzerResponseCache(
+            analyzer_cache_path, record_review_diagnostics=retry_targets is not None,
+        )
         if analyzer_cache_path is not None
         else None
     )
@@ -509,15 +868,77 @@ def analyze_ledger(
                     "confidence": "medium",
                 })
     hinted_events = _with_semantic_route_hints(events, routing)
-    return semantic_analyzer.analyze_tiered(
-        hinted_events,
-        primary=primary,
-        fallback=fallback,
-        corrections=corrections,
-        cache=cache,
-        review_taxonomy=review_taxonomy,
-        **tuning,
+    scoped_retry = retry_targets is not None and any(
+        isinstance(row, Mapping)
+        and tuple(sorted(str(value) for value in row.get("evidence_ids", []))) in retry_targets
+        and (
+            row.get("kind") == "analyzer_review_partial_quarantine"
+            or str(row.get("reason") or "").startswith(
+                "Flash reviewer exhausted bounded failed-review retry:"
+            )
+            or str(row.get("reason") or "").startswith(
+                "Flash reviewer exhausted bounded scoped retry:"
+            )
+        )
+        for row in retry_source_document.get("exceptions", [])
     )
+    if scoped_retry:
+        result = run_scoped_failed_review_retry(
+            retry_source_document, hinted_events, primary=primary, cache=cache,
+            review_taxonomy=review_taxonomy or [], targets=retry_targets,
+            source_semantic_sha256=hashlib.sha256(
+                failed_review_retry_source.read_bytes()
+            ).hexdigest(),
+        )
+    else:
+        result = semantic_analyzer.analyze_tiered(
+            hinted_events,
+            primary=primary,
+            fallback=fallback,
+            corrections=corrections,
+            cache=cache,
+            review_taxonomy=review_taxonomy,
+            **({"failed_review_retry_targets": retry_targets} if retry_targets is not None else {}),
+            **tuning,
+        )
+    if retry_targets is not None and not scoped_retry:
+        target_ids = set().union(*retry_targets)
+        for section in ("activities", "exceptions", "omissions"):
+            source_rows = retry_source_document.get(section, [])
+            result_rows = result.get(section, [])
+            if not isinstance(source_rows, list) or not isinstance(result_rows, list):
+                raise WorkAccountingError("failed-review retry semantic output is invalid")
+            for row in result_rows:
+                cited = set(str(value) for value in row.get("evidence_ids", []))
+                if cited & target_ids and not cited <= target_ids:
+                    raise WorkAccountingError("failed-review retry crossed target evidence boundary")
+            def unaffected(rows: list[dict[str, Any]]) -> list[str]:
+                return sorted(
+                    semantic_analyzer.canonical_json(
+                        {key: value for key, value in row.items() if key != "rendered_description"}
+                        if section == "activities" else row
+                    )
+                    for row in rows
+                    if not set(str(value) for value in row.get("evidence_ids", [])) & target_ids
+                )
+            if unaffected(source_rows) != unaffected(result_rows):
+                raise WorkAccountingError("failed-review retry changed non-target semantic output")
+        selected = _canonical_retry_digests(failed_review_retry_digest)
+        provenance = {
+            "source_semantic_sha256": hashlib.sha256(failed_review_retry_source.read_bytes()).hexdigest(),
+            "source_cache_sha256": retry_cache_sha256,
+        }
+        if len(selected) == 1:
+            provenance["target_digest"] = selected[0]
+            provenance["failure_code"] = next(iter(retry_targets.values()))
+        else:
+            provenance["target_digests"] = list(selected)
+            provenance["failure_codes"] = {
+                semantic_analyzer.stable_digest("frt-", list(key), length=64): code
+                for key, code in retry_targets.items()
+            }
+        result["failed_review_retry"] = provenance
+    return result
 
 
 def _semantic_review_taxonomy(routing: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -1028,6 +1449,7 @@ def _existing_blocks(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
         start, end = _span(event)
         if not start or not end:
             continue
+        attributes = _attributes(event)
         blocks.append(
             {
                 "block_id": str(event["evidence_id"]),
@@ -1035,8 +1457,9 @@ def _existing_blocks(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
                 "end": end,
                 "kind": "existing_clockify",
                 "project_id_suffix": str(
-                    _attributes(event).get("project_id_suffix") or ""
+                    attributes.get("project_id_suffix") or ""
                 ),
+                "description": str(attributes.get("description") or "").strip(),
                 "meeting_identity_keys": _existing_meeting_identity_keys(
                     event, start, end
                 ),
@@ -1705,23 +2128,65 @@ def _slice_proposal_around_credits(
     return sliced
 
 
+def _exact_existing_accomplishment_match(
+    proposal: Mapping[str, Any], block: Mapping[str, Any],
+    start: dt.datetime | None, end: dt.datetime | None,
+) -> bool:
+    """Require reciprocal time plus explicit meeting identity or exact work labels."""
+    if start is None or end is None or start != block.get("start") or end != block.get("end"):
+        return False
+    provenance = proposal.get("provenance")
+    meeting_id = str(
+        provenance.get("canonical_meeting_id") or ""
+        if isinstance(provenance, Mapping) else ""
+    ).casefold()
+    if meeting_id and f"explicit:{meeting_id}" in block.get("meeting_identity_keys", []):
+        return True
+    project = str(proposal.get("clockify_project_suffix") or "")
+    description = str(proposal.get("description") or "").strip()
+    return bool(
+        project and description
+        and project == block.get("project_id_suffix")
+        and description == block.get("description")
+    )
+
+
 def _normalize_postable_proposals(
     proposals: list[dict[str, Any]],
     existing: list[dict[str, Any]],
     skipped: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Credit live time first, then deterministically remove proposal overlap."""
-    live_normalized = [
-        sliced
-        for proposal in proposals
-        for sliced in _slice_proposal_around_credits(
-            proposal,
-            (block for block in existing if block.get("kind") == "existing_clockify"),
-            "existing_clockify_overlap",
-            skipped,
-            fully_credited_reason="proposal fully credited to existing Clockify time",
-        )
+    """Credit exact existing work; keep other overlaps visible for review."""
+    existing_blocks = [
+        block for block in existing if block.get("kind") == "existing_clockify"
     ]
+    live_normalized = []
+    for proposal in proposals:
+        start = _parse_dt(proposal.get("start"))
+        end = _parse_dt(proposal.get("end"))
+        exact = [
+            block for block in existing_blocks
+            if _exact_existing_accomplishment_match(proposal, block, start, end)
+        ]
+        if exact:
+            live_normalized.extend(_slice_proposal_around_credits(
+                proposal, exact, "existing_clockify_overlap", skipped,
+                fully_credited_reason="proposal fully credited to existing Clockify time",
+            ))
+            continue
+        retained = copy.deepcopy(proposal)
+        if start is not None and end is not None:
+            retained["review_warnings"] = [
+                *retained.get("review_warnings", []),
+                *(
+                    warning
+                    for block in existing_blocks
+                    if (warning := _overlap_warning(
+                        start, end, block, "existing_clockify_overlap"
+                    )) is not None
+                ),
+            ]
+        live_normalized.append(retained)
 
     def priority(row: Mapping[str, Any]) -> tuple[int, str, str]:
         provenance = row.get("provenance") or {}
@@ -1738,17 +2203,19 @@ def _normalize_postable_proposals(
 
     accepted: list[dict[str, Any]] = []
     for proposal in sorted(live_normalized, key=priority):
-        proposal_is_meeting = bool(
-            (proposal.get("provenance") or {}).get("canonical_meeting_id")
+        proposal_meeting_id = str(
+            (proposal.get("provenance") or {}).get("canonical_meeting_id") or ""
         )
+        proposal_is_meeting = bool(proposal_meeting_id)
         blocks = [
             {
                 "block_id": str(row.get("candidate_key") or ""),
                 "start": _parse_dt(row.get("start")),
                 "end": _parse_dt(row.get("end")),
                 "project_id_suffix": row.get("clockify_project_suffix"),
-                "is_meeting": bool(
-                    (row.get("provenance") or {}).get("canonical_meeting_id")
+                "activity_id": str(row.get("activity_id") or ""),
+                "canonical_meeting_id": str(
+                    (row.get("provenance") or {}).get("canonical_meeting_id") or ""
                 ),
             }
             for row in accepted
@@ -1760,12 +2227,26 @@ def _normalize_postable_proposals(
             and _parse_dt(proposal.get("start")) < block["end"]
             and block["start"] < _parse_dt(proposal.get("end"))
         ]
+        activity_id = str(proposal.get("activity_id") or "")
+        credited = [
+            block for block in overlapping
+            if (
+                proposal_meeting_id
+                and proposal_meeting_id == block["canonical_meeting_id"]
+            ) or (
+                not proposal_meeting_id
+                and not block["canonical_meeting_id"]
+                and activity_id
+                and activity_id == block["activity_id"]
+            )
+        ]
+        distinct = [block for block in overlapping if block not in credited]
         warning_type = (
             "meeting_proposal_overlap"
-            if proposal_is_meeting and any(block["is_meeting"] for block in overlapping)
+            if proposal_is_meeting and any(block["canonical_meeting_id"] for block in credited)
             else "review_proposal_overlap"
         )
-        winner = overlapping[0] if overlapping else None
+        winner = credited[0] if credited else None
         winner_precedence = None
         if winner is not None:
             winner_row = next(
@@ -1791,18 +2272,187 @@ def _normalize_postable_proposals(
                 "winner_candidate_key": str(winner["block_id"]),
                 "loser_candidate_key": str(proposal.get("candidate_key") or ""),
             }
-        accepted.extend(_slice_proposal_around_credits(
+        survivors = _slice_proposal_around_credits(
             proposal,
-            overlapping,
+            credited,
             warning_type,
             skipped,
             fully_credited_reason="proposal fully credited to higher-priority review time",
             precedence=winner_precedence,
-        ))
+        )
+        for row in survivors:
+            start = _parse_dt(row.get("start"))
+            end = _parse_dt(row.get("end"))
+            if start is not None and end is not None:
+                row["review_warnings"] = [
+                    *row.get("review_warnings", []),
+                    *(
+                        warning
+                        for block in distinct
+                        if (warning := _overlap_warning(start, end, block, "review_proposal_overlap"))
+                        is not None
+                    ),
+                ]
+        accepted.extend(survivors)
     return sorted(
         accepted,
         key=lambda row: (str(row.get("start") or ""), str(row.get("candidate_key") or "")),
     )
+
+
+def _apply_verified_posted_credits(
+    proposals: list[dict[str, Any]],
+    existing_blocks: list[dict[str, Any]],
+    credits: Iterable[Mapping[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Credit only a fully proved posted accomplishment, never a temporal overlap."""
+    def fingerprint(proposal: Mapping[str, Any]) -> str | None:
+        provenance = proposal.get("provenance")
+        evidence = provenance.get("evidence_ids") if isinstance(provenance, Mapping) else None
+        if not isinstance(evidence, list) or not evidence:
+            return None
+        try:
+            return review_corrections.evidence_fingerprint(evidence)
+        except review_corrections.ReviewDecisionError:
+            return None
+
+    def digest(description: Any) -> str | None:
+        if not isinstance(description, str) or not description.strip():
+            return None
+        return "sha256:" + hashlib.sha256(description.encode("utf-8")).hexdigest()
+
+    def sheet_minutes(value: Any) -> int | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            return None
+        try:
+            number = Decimal(str(value).strip())
+        except InvalidOperation:
+            return None
+        if not number.is_finite() or number <= 0 or number != number.to_integral_value():
+            return None
+        return int(number)
+
+    def proves(current_segments: list[Mapping[str, Any]], credit: Mapping[str, Any]) -> bool:
+        try:
+            content = base64.b64decode(credit["prior_proposals_base64"], validate=True)
+            if "sha256:" + hashlib.sha256(content).hexdigest() != credit["prior_proposals_sha256"]:
+                return False
+            prior_proposals = json.loads(content)
+            if not isinstance(prior_proposals, list):
+                return False
+            by_id: dict[str, list[Mapping[str, Any]]] = {}
+            for prior in prior_proposals:
+                if not isinstance(prior, Mapping):
+                    return False
+                key = prior.get("review_activity_key")
+                segment = prior.get("allocation_segment")
+                if not isinstance(key, str) or not key.startswith("wka-") or type(segment) is not int or segment < 1:
+                    return False
+                by_id.setdefault(f"{key}-s{segment:02d}", []).append(prior)
+            total_seconds = 0
+            for posted in credit["posted_rows"]:
+                sheet = posted["sheet_row"]
+                matches = by_id.get(sheet[0], [])
+                if len(matches) != 1:
+                    return False
+                prior = matches[0]
+                start, end = _parse_dt(prior.get("start")), _parse_dt(prior.get("end"))
+                if start is None or end is None or end <= start:
+                    return False
+                if (
+                    fingerprint(prior) != credit["evidence_fingerprint"]
+                    or prior.get("clockify_project_suffix") != credit["project_suffix"]
+                    or sheet[1] != start.strftime("%Y-%m-%d %H:%M")
+                    or sheet[2] != end.strftime("%Y-%m-%d %H:%M")
+                    or sheet_minutes(sheet[3]) != prior.get("duration_minutes")
+                    or sheet[4] != prior.get("client_project")
+                    or sheet[8] != prior.get("description")
+                    or str(sheet[9]).strip().lower() not in {"approved", "posted"}
+                    or sheet[11] != credit["sheet_publication_run_id"]
+                    or str(sheet[13]).strip().lower() != "posted"
+                ):
+                    return False
+                exact = [
+                    block for block in existing_blocks
+                    if block.get("kind") == "existing_clockify"
+                    and block.get("start") == start
+                    and block.get("end") == end
+                    and block.get("project_id_suffix") == credit["project_suffix"]
+                    and block.get("description") == prior.get("description")
+                ]
+                if len(exact) != 1 or exact[0].get("block_id") != posted["clockify_block_id"]:
+                    return False
+                seconds = int((end - start).total_seconds())
+                if (
+                    seconds <= 0
+                    or type(prior.get("duration_minutes")) is not int
+                    or seconds // 60 != prior["duration_minutes"]
+                    or (
+                        "duration_seconds" in prior
+                        and (type(prior["duration_seconds"]) is not int or seconds != prior["duration_seconds"])
+                    )
+                ):
+                    return False
+                total_seconds += seconds
+            current_seconds = [segment.get("duration_seconds") for segment in current_segments]
+            return (
+                all(type(seconds) is int and seconds > 0 for seconds in current_seconds)
+                and total_seconds == sum(current_seconds)
+            )
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            return False
+
+    survivors = list(proposals)
+    skipped: list[dict[str, Any]] = []
+    for raw in credits:
+        try:
+            credit = review_corrections.validate_verified_posted_credit(raw)
+        except review_corrections.ReviewDecisionError:
+            continue
+        matches = [
+            proposal for proposal in survivors
+            if fingerprint(proposal) == credit["evidence_fingerprint"]
+            and proposal.get("clockify_project_suffix") == credit["project_suffix"]
+            and digest(proposal.get("description")) == credit["current_description_sha256"]
+        ]
+        activity_ids = {str(row.get("activity_id") or "") for row in matches}
+        review_keys = {str(row.get("review_activity_key") or "") for row in matches}
+        segments = [row.get("allocation_segment") for row in matches]
+        candidate_keys = [str(row.get("candidate_key") or "") for row in matches]
+        if (
+            not matches
+            or len(activity_ids) != 1 or "" in activity_ids
+            or len(review_keys) != 1 or "" in review_keys
+            or any(type(segment) is not int or segment < 1 for segment in segments)
+            or len(set(segments)) != len(segments)
+            or "" in candidate_keys or len(set(candidate_keys)) != len(candidate_keys)
+            or not proves(matches, credit)
+        ):
+            continue
+        for current in matches:
+            survivors.remove(current)
+            skipped.append({
+                "id": str(current.get("candidate_key") or current.get("id") or ""),
+                "activity_id": current.get("activity_id"),
+                "candidate_key": current.get("candidate_key"),
+                "review_activity_key": current.get("review_activity_key"),
+                "allocation_segment": current.get("allocation_segment"),
+                "reason": "verified previously posted accomplishment",
+                "evidence_fingerprint": credit["evidence_fingerprint"],
+                "evidence_ids": list((current.get("provenance") or {}).get("evidence_ids", [])),
+                "project_suffix": credit["project_suffix"],
+                "prior_run_id": credit["prior_run_id"],
+                "sheet_publication_run_id": credit["sheet_publication_run_id"],
+                "publication_artifact_provenance": (
+                    "matching_publication_run_snapshot"
+                    if credit["prior_run_id"] == credit["sheet_publication_run_id"]
+                    else "later_matching_snapshot_original_not_reconstructed"
+                ),
+                "prior_proposals_sha256": credit["prior_proposals_sha256"],
+                "posted_review_ids": [entry["sheet_row"][0] for entry in credit["posted_rows"]],
+                "clockify_block_ids": [entry["clockify_block_id"] for entry in credit["posted_rows"]],
+            })
+    return survivors, skipped
 
 
 def run_accounting(
@@ -1816,6 +2466,8 @@ def run_accounting(
     analyzer_target_body_bytes: int | None = None,
     analyzer_max_events_per_chunk: int | None = None,
     analyzer_workers: int | None = None,
+    failed_review_retry_source: Path | None = None,
+    failed_review_retry_digest: str | Sequence[str] | None = None,
 ) -> dict[str, Any]:
     ledger_path = run_dir / "evidence" / "evidence-ledger.json"
     ledger, all_events = load_ledger(ledger_path)
@@ -1847,6 +2499,7 @@ def run_accounting(
     routing = _read_json(routing_path or (root / "routing.json"))
     corrections = _load_corrections(corrections_path)
     regression_cases = _load_regression_cases(corrections_path)
+    verified_posted_credits = _load_verified_posted_credits(corrections_path)
     _write_json(run_dir / "review-learning-cases.json", corrections)
     _write_json(run_dir / "review-regression-cases.json", regression_cases)
     analysis = analyze_ledger(
@@ -1859,6 +2512,8 @@ def run_accounting(
         analyzer_workers=analyzer_workers,
         review_taxonomy=_semantic_review_taxonomy(routing),
         review_routing=routing,
+        failed_review_retry_source=failed_review_retry_source,
+        failed_review_retry_digest=failed_review_retry_digest,
     )
     if analysis_fixture is None and analyzer_cache_path is not None:
         analysis["analyzer_cache"]["snapshot"] = _seal_analyzer_cache_snapshot(
@@ -2402,6 +3057,10 @@ def run_accounting(
     )
 
     proposals = _normalize_postable_proposals(proposals, existing, skipped)
+    proposals, posted_skipped = _apply_verified_posted_credits(
+        proposals, existing, verified_posted_credits
+    )
+    skipped.extend(posted_skipped)
     _refresh_capacity_recovery_warnings(proposals, skipped, recovery_records)
     proposed_meeting_ids = {
         str((proposal.get("provenance") or {}).get("canonical_meeting_id") or "")
@@ -2603,6 +3262,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--analyzer-target-body-bytes", type=int)
     parser.add_argument("--analyzer-max-events-per-chunk", type=int)
     parser.add_argument("--analyzer-workers", type=int)
+    parser.add_argument("--failed-review-retry-source", type=Path)
+    parser.add_argument("--failed-review-retry-digest", action="append")
     return parser.parse_args(argv)
 
 
@@ -2619,6 +3280,8 @@ def main(argv: list[str] | None = None) -> int:
             analyzer_target_body_bytes=args.analyzer_target_body_bytes,
             analyzer_max_events_per_chunk=args.analyzer_max_events_per_chunk,
             analyzer_workers=args.analyzer_workers,
+            failed_review_retry_source=args.failed_review_retry_source,
+            failed_review_retry_digest=args.failed_review_retry_digest,
         )
     except (WorkAccountingError, semantic_analyzer.AnalyzerError, work_allocator.AllocationError, ValueError) as exc:
         print(f"work accounting blocked: {exc}", file=sys.stderr)

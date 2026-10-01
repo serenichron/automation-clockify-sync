@@ -30,6 +30,7 @@ try:
         collector_receipts,
         collector_slices,
         reconciliation_manifest,
+        semantic_analyzer,
         source_coverage,
     )
     from scripts.clockify_sheet_publish import (
@@ -45,6 +46,7 @@ except ModuleNotFoundError:  # pragma: no cover
     import collector_receipts  # type: ignore[no-redef]
     import collector_slices  # type: ignore[no-redef]
     import reconciliation_manifest  # type: ignore[no-redef]
+    import semantic_analyzer  # type: ignore[no-redef]
     import source_coverage  # type: ignore[no-redef]
     from clockify_sheet_publish import (  # type: ignore[no-redef]
         _publication_receipt,
@@ -56,6 +58,8 @@ except ModuleNotFoundError:  # pragma: no cover
 
 SCHEMA_VERSION = "clockify-review-cycle/v1"
 RECEIPT_SCHEMA_VERSION = "clockify-review-delivery/v1"
+HISTORICAL_ADOPTION_SCHEMA_VERSION = "clockify-historical-adoption/v1"
+HISTORICAL_ADOPTION_REQUEST_SCHEMA_VERSION = "clockify-historical-adoption-request/v1"
 GENERIC_COMPATIBILITY_VERSION = "runner-unclassified/v1"
 GENERIC_RETRY_LIMIT = 2
 EXACT_RETRY_LIMIT = 2
@@ -1325,7 +1329,8 @@ def _stage_from_state(
 
 
 def _migrate_legacy_stage_runtime(
-    config: Mapping[str, Any], state: dict[str, Any], state_path: Path,
+    config: Mapping[str, Any], state: dict[str, Any], state_path: Path, *,
+    persist: bool = True,
 ) -> None:
     """Bind bab6 stage shapes once to their bundle-bound historical runtime."""
     for since, raw_record in list(state.get("slices", {}).items()):
@@ -1394,7 +1399,10 @@ def _migrate_legacy_stage_runtime(
             record["replay"] = verified_replay
             changed = True
         if changed:
-            _persist_state(state_path, state, str(since), record)
+            if persist:
+                _persist_state(state_path, state, str(since), record)
+            else:
+                state["slices"][since] = record
 
 
 def completion_status(result: Mapping[str, Any]) -> dict[str, Any]:
@@ -1539,11 +1547,11 @@ def _expected_publication_receipts(
     ]
 
 
-def _publisher_result(
-    stdout: str, runs: Path, expected: list[dict[str, Any]],
+def _validated_publication_document(
+    document: object, expected: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    path = _result(stdout, runs)
-    document = _json_file(path, "publisher result")
+    if not isinstance(document, Mapping):
+        raise CycleError("publisher result contract is invalid")
     publications = document.get("publications")
     if (
         document.get("schema_version") != "sheet-publication-result/v1"
@@ -1564,6 +1572,15 @@ def _publisher_result(
     if len(retained) != len(publications) or retained != expected:
         raise CycleError("publisher result destinations or readbacks differ")
     return retained
+
+
+def _publisher_result(
+    stdout: str, runs: Path, expected: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    path = _result(stdout, runs)
+    return _validated_publication_document(
+        _json_file(path, "publisher result"), expected,
+    )
 
 
 def _delivery_document(
@@ -1638,8 +1655,259 @@ def _attempted_at() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _collector_ancestor_from_repair(
+    config: Mapping[str, Any], run_dir: Path,
+    bundle: collector_receipts.SliceCompletionBundle,
+) -> tuple[Path, collector_receipts.SliceCompletionBundle]:
+    """Follow sealed repair inputs back to the collector, without changing a run."""
+    runs = _runs_dir(config)
+    selected = bundle
+    seen: set[Path] = set()
+    pending_retry_sources: set[tuple[str, str]] = set()
+    while True:
+        current = _canonical_runtime_path(run_dir, label="repair ancestry run")
+        if current.parent != runs or not current.is_dir():
+            raise CycleError("repair ancestry run is not a direct configured run")
+        if current in seen:
+            raise CycleError("repair ancestry cycle detected")
+        seen.add(current)
+        lineage_path = current / "repair-source.json"
+        if not lineage_path.exists():
+            if pending_retry_sources:
+                raise CycleError("repair retry source binding is missing")
+            return current, bundle
+        lineage = _json_file(
+            _safe_run_file(current, str(lineage_path), "repair provenance"),
+            "repair provenance",
+        )
+        base_keys = {
+            "schema_version", "source_run_id", "source_completion_sha256",
+            "ledger_identity", "source_coverage", "semantic_analysis_fixture",
+            "semantic_analysis_sha256", "source_routing_sha256",
+            "repair_routing_sha256",
+        }
+        cache_keys = {"analyzer_cache_path", "analyzer_cache_sha256"}
+        correction_keys = {"source_corrections_sha256", "repair_corrections_sha256"}
+        if not isinstance(lineage, dict) or (
+            set(lineage) not in (
+                base_keys, base_keys | cache_keys, base_keys | correction_keys,
+                base_keys | cache_keys | correction_keys,
+            ) or lineage.get("schema_version") != 1
+        ):
+            raise CycleError("repair provenance schema is invalid")
+        source_id = lineage["source_run_id"]
+        allowed = string.ascii_letters + string.digits + "._-"
+        if (
+            not isinstance(source_id, str) or not source_id
+            or source_id in {".", ".."} or source_id[0] not in allowed[:-3]
+            or any(char not in allowed for char in source_id)
+        ):
+            raise CycleError("repair source run ID is invalid")
+        parent = runs / source_id
+        if parent in seen:
+            raise CycleError("repair ancestry cycle detected")
+        parent = _canonical_runtime_path(parent, label="repair source run")
+        if parent.parent != runs or not parent.is_dir():
+            raise CycleError("repair source run is missing or unsafe")
+        parent_bundle_path = _safe_run_file(
+            parent, str(parent / "completion-bundle.json"), "repair source completion"
+        )
+        if _digest(parent_bundle_path) != lineage["source_completion_sha256"]:
+            raise CycleError("repair source completion digest differs")
+        try:
+            parent_bundle = collector_receipts.load_completion_bundle(
+                parent_bundle_path, run_dir=parent,
+            )
+            parent_coverage = collector_receipts.completion_coverage(parent_bundle)
+            child_coverage = collector_receipts.completion_coverage(bundle)
+            child_ledger = clockify_review_run._ledger_identity(current)
+            parent_ledger = clockify_review_run._ledger_identity(parent)
+        except (OSError, ValueError, collector_receipts.CollectorReceiptError) as exc:
+            raise CycleError("repair ancestry completion or ledger is invalid") from exc
+        if parent_bundle.replay or (
+            parent_bundle.slice_id != selected.slice_id
+            or parent_bundle.since_utc != selected.since_utc
+            or parent_bundle.until_utc != selected.until_utc
+            or parent_bundle.runtime_identity_digest != selected.runtime_identity_digest
+        ):
+            raise CycleError("repair ancestry slice or runtime differs")
+        if (
+            parent_coverage != lineage["source_coverage"]
+            or child_coverage != parent_coverage
+            or child_ledger != parent_ledger
+            or child_ledger != lineage["ledger_identity"]
+        ):
+            raise CycleError("repair ancestry coverage or ledger differs")
+        report = _json_file(
+            _safe_run_file(current, str(current / "run-report.json"), "repair report"),
+            "repair report",
+        )
+        if not isinstance(report, dict) or (
+            report.get("run_id") != current.name
+            or report.get("repair_of_run_id") != source_id
+        ):
+            raise CycleError("repair report parent identity differs")
+        for filename in (
+            "period-manifest.json", "routing.json", "review-corrections.jsonl",
+            "review-acceptance.jsonl",
+        ):
+            child_path = _safe_run_file(current, str(current / filename), "repair snapshot")
+            source_path = _safe_run_file(parent, str(parent / filename), "repair source snapshot")
+            if filename == "routing.json":
+                if (
+                    _digest(source_path) != lineage["source_routing_sha256"]
+                    or _digest(child_path) != lineage["repair_routing_sha256"]
+                ):
+                    raise CycleError("repair routing provenance differs")
+            elif filename == "review-corrections.jsonl" and correction_keys <= set(lineage):
+                try:
+                    transition = clockify_review_run._validate_repair_credit_transition(
+                        parent, child_path, runs_root=runs,
+                    )
+                except (OSError, ValueError, clockify_review_run.ReviewRunError) as exc:
+                    raise CycleError("repair posted credit provenance is invalid") from exc
+                if transition != (
+                    lineage["source_corrections_sha256"],
+                    lineage["repair_corrections_sha256"],
+                ):
+                    raise CycleError("repair posted credit provenance differs")
+            elif _digest(child_path) != _digest(source_path):
+                raise CycleError("repair reconciliation snapshot differs")
+        if lineage["semantic_analysis_fixture"] != "repair-fixture/semantic-analysis.json":
+            raise CycleError("repair semantic fixture path is invalid")
+        fixture = _safe_run_file(
+            current, str(current / "repair-fixture" / "semantic-analysis.json"),
+            "repair semantic fixture",
+        )
+        semantic = _safe_run_file(
+            parent, str(parent / "semantic-analysis.json"), "repair source semantic"
+        )
+        expected_semantic = "sha256:" + str(lineage["semantic_analysis_sha256"])
+        if _digest(fixture) != expected_semantic or _digest(semantic) != expected_semantic:
+            raise CycleError("repair semantic provenance differs")
+        parent_semantic_sha = _digest(semantic).removeprefix("sha256:")
+        if "analyzer_cache_path" in lineage:
+            if lineage["analyzer_cache_path"] != "analyzer-cache-used.jsonl":
+                raise CycleError("repair analyzer cache path is invalid")
+            expected_cache = "sha256:" + str(lineage["analyzer_cache_sha256"])
+            source_cache = _safe_run_file(
+                parent, str(parent / "analyzer-cache-used.jsonl"),
+                "repair source analyzer cache",
+            )
+            child_cache = _safe_run_file(
+                current, str(current / "analyzer-cache-used.jsonl"),
+                "repair analyzer cache",
+            )
+            if _digest(source_cache) != expected_cache:
+                raise CycleError("repair analyzer cache provenance differs")
+            pending_retry_sources.discard((
+                parent_semantic_sha, expected_cache.removeprefix("sha256:")
+            ))
+            if _digest(child_cache) != expected_cache:
+                child_analysis = _json_file(
+                    _safe_run_file(
+                        current, str(current / "semantic-analysis.json"),
+                        "repair semantic analysis",
+                    ), "repair semantic analysis",
+                )
+                cache_summary = (
+                    child_analysis.get("analyzer_cache")
+                    if isinstance(child_analysis, Mapping) else None
+                )
+                snapshot = (
+                    cache_summary.get("snapshot")
+                    if isinstance(cache_summary, Mapping) else None
+                )
+                retry = (
+                    child_analysis.get("failed_review_retry")
+                    if isinstance(child_analysis, Mapping) else None
+                )
+                content = child_cache.read_bytes()
+                if (
+                    not isinstance(snapshot, Mapping)
+                    or set(snapshot) != {"path", "record_count", "sha256"}
+                    or snapshot.get("path") != "analyzer-cache-used.jsonl"
+                    or snapshot.get("sha256") != _digest(child_cache).removeprefix("sha256:")
+                    or not isinstance(snapshot.get("record_count"), int)
+                    or isinstance(snapshot.get("record_count"), bool)
+                    or snapshot["record_count"] != sum(bool(line.strip()) for line in content.splitlines())
+                    or not isinstance(retry, Mapping)
+                    or retry.get("mode") not in {
+                        None, "scoped_review_v1", "scoped_review_v2",
+                        "scoped_review_v3_invalid_effort",
+                        "scoped_review_v4_citation_quarantine",
+                    }
+                ):
+                    raise CycleError("repair retry cache binding is invalid")
+                try:
+                    clockify_review_run._retry_provenance_digests(retry)
+                    semantic_analyzer.AnalyzerResponseCache(source_cache)
+                    semantic_analyzer.AnalyzerResponseCache(child_cache)
+                    source_records = {
+                        row["cache_key"]: row
+                        for row in (json.loads(line) for line in source_cache.read_text().splitlines())
+                        if isinstance(row, dict)
+                    }
+                    child_records = {
+                        row["cache_key"]: row
+                        for row in (json.loads(line) for line in content.splitlines())
+                        if isinstance(row, dict)
+                    }
+                except (OSError, UnicodeDecodeError, ValueError, KeyError,
+                        semantic_analyzer.AnalyzerError) as exc:
+                    raise CycleError("repair retry cache records are invalid") from exc
+                if (
+                    len(source_records) != sum(bool(line.strip()) for line in source_cache.read_bytes().splitlines())
+                    or len(child_records) != snapshot["record_count"]
+                    or not (set(child_records) - set(source_records))
+                    or any(
+                        child_records[key] != source_records[key]
+                        for key in set(source_records) & set(child_records)
+                    )
+                    or (
+                        retry.get("mode") is not None
+                        and not set(source_records) <= set(child_records)
+                    )
+                ):
+                    raise CycleError("repair retry cache does not preserve source decisions")
+                pending_retry_sources.add((
+                    str(retry.get("source_semantic_sha256")),
+                    str(retry.get("source_cache_sha256")),
+                ))
+                pending_retry_sources.discard((
+                    parent_semantic_sha, expected_cache.removeprefix("sha256:")
+                ))
+        run_dir, bundle = parent, parent_bundle
+
+
+def _verify_credit_adoption_transition(
+    config: Mapping[str, Any], source_run: Path, frozen_digest: str,
+    adopted_digest: str,
+) -> None:
+    """Bind changed corrections to frozen collector input and proved repair hops."""
+    runs = _runs_dir(config)
+    source = _canonical_runtime_path(source_run, label="credit adoption source")
+    if source.parent != runs or not source.is_dir():
+        raise CycleError("credit adoption source is outside configured runs")
+    try:
+        bundle = collector_receipts.load_completion_bundle(
+            source / "completion-bundle.json", run_dir=source,
+        )
+    except (OSError, ValueError, collector_receipts.CollectorReceiptError) as exc:
+        raise CycleError("credit adoption completion is invalid") from exc
+    if bundle.replay or _digest(source / "review-corrections.jsonl") != adopted_digest:
+        raise CycleError("credit adoption source corrections differ")
+    ancestor, _bundle = _collector_ancestor_from_repair(config, source, bundle)
+    if ancestor == source or _digest(ancestor / "review-corrections.jsonl") != frozen_digest:
+        raise CycleError("credit adoption does not descend from frozen corrections")
+
+
 def _interval_from_stage(
     config: Mapping[str, Any], source: str, stage: Mapping[str, Any],
+    *, checkpoint_root: Path | None = None,
+    checkpoint_manifest_digest: str | None = None,
+    checkpoint_manifest_text: str | None = None,
+    checkpoint_capture: dict[str, str] | None = None,
 ) -> source_coverage.SourceInterval:
     if stage.get("stage_kind") == "collector_source":
         try:
@@ -1661,6 +1929,7 @@ def _interval_from_stage(
         raise CycleError("verified source completion bundle cannot be reloaded") from exc
     if bundle.bundle_digest != stage.get("bundle_digest"):
         raise CycleError("verified source completion bundle identity drifted")
+    run_dir, bundle = _collector_ancestor_from_repair(config, run_dir, bundle)
     finalization_path = _safe_run_file(
         run_dir, str(run_dir / "slice-finalization.json"), "slice finalization"
     )
@@ -1697,13 +1966,47 @@ def _interval_from_stage(
     compatibility = identity.compatibility_version
     if not isinstance(compatibility, str) or not compatibility:
         raise CycleError("slice finalization compatibility lineage is invalid")
-    checkpoint_root = _collector_checkpoint_root(config, os.environ)
-    try:
-        backlog = collector_slices.BacklogStore(checkpoint_root).read_existing(
-            identity, tuple(planned)
+    if checkpoint_root is None:
+        checkpoint_root = _collector_checkpoint_root(config, os.environ)
+    else:
+        checkpoint_root = _canonical_runtime_path(
+            checkpoint_root, label="historical checkpoint root"
         )
+        if checkpoint_manifest_text is None:
+            if checkpoint_root.is_symlink() or not checkpoint_root.is_dir():
+                raise CycleError("historical checkpoint root is unsafe")
+            details = checkpoint_root.stat()
+            if details.st_uid != os.getuid() or stat.S_IMODE(details.st_mode) & 0o022:
+                raise CycleError("historical checkpoint root is not owner-controlled")
+    if checkpoint_manifest_text is not None and checkpoint_manifest_digest is None:
+        raise CycleError("historical checkpoint proof has no digest")
+    try:
+        store = collector_slices.BacklogStore(checkpoint_root)
+        if checkpoint_manifest_text is None:
+            backlog = store.read_existing(identity, tuple(planned))
+            manifest_text = (backlog.directory / "backlog-manifest.json").read_text(
+                encoding="utf-8"
+            )
+        else:
+            manifest_text = checkpoint_manifest_text
+            document = json.loads(manifest_text)
+            plan = collector_slices._plan_document(identity, tuple(planned))
+            directory = checkpoint_root / collector_slices._digest(plan)[7:]
+            backlog = store._state_from_manifest(
+                identity, tuple(planned), directory, document,
+            )
     except collector_slices.BacklogError as exc:
         raise CycleError("sealed collector backlog binding is invalid") from exc
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CycleError("historical checkpoint manifest is invalid") from exc
+    if checkpoint_manifest_digest is not None:
+        manifest_digest = "sha256:" + hashlib.sha256(
+            manifest_text.encode("utf-8")
+        ).hexdigest()
+        if manifest_digest != checkpoint_manifest_digest:
+            raise CycleError("historical checkpoint manifest identity differs")
+    if checkpoint_capture is not None:
+        checkpoint_capture["manifest_text"] = manifest_text
     bundle_path = (run_dir / "completion-bundle.json").resolve()
     file_digest = _digest(bundle_path)
     receipt = next(
@@ -2215,6 +2518,88 @@ def _stored_snapshot_digests(record: Mapping[str, Any]) -> dict[str, str]:
     return dict(value)
 
 
+def _historical_adoption_document(
+    config: Mapping[str, Any], record: Mapping[str, Any], since: str, until: str,
+) -> dict[str, Any] | None:
+    raw_path = record.get("historical_adoption_receipt")
+    if raw_path is None:
+        return None
+    expected_path = _path(config, "state_dir") / "historical-adoption-receipts" / f"{since}.json"
+    if raw_path != str(expected_path) or expected_path.is_symlink() or not expected_path.is_file():
+        raise CycleError("historical adoption receipt path is invalid")
+    document = _json_file(expected_path, "historical adoption receipt")
+    if not isinstance(document, dict):
+        raise CycleError("historical adoption receipt is invalid")
+    digest = document.get("receipt_digest")
+    unsigned = {key: value for key, value in document.items() if key != "receipt_digest"}
+    if (
+        document.get("schema_version") != HISTORICAL_ADOPTION_SCHEMA_VERSION
+        or document.get("since") != since or document.get("until") != until
+        or digest != _value_digest(unsigned)
+        or record.get("historical_adoption_receipt_digest") != digest
+        or document.get("frozen_snapshot_digests") != _stored_snapshot_digests(record)
+    ):
+        raise CycleError("historical adoption receipt identity differs")
+    adopted = document.get("adopted_snapshot_digests")
+    if not isinstance(adopted, Mapping) or set(adopted) != set(_stored_snapshot_digests(record)):
+        raise CycleError("historical adoption input transition is invalid")
+    for name in adopted:
+        if not _valid_digest(adopted[name]):
+            raise CycleError("historical adoption input digest is invalid")
+        if name not in {"routing.json", "review-corrections.jsonl"} and adopted[name] != document["frozen_snapshot_digests"][name]:
+            raise CycleError("historical adoption changed non-routing frozen inputs")
+    if adopted["review-corrections.jsonl"] != document["frozen_snapshot_digests"]["review-corrections.jsonl"]:
+        source = document.get("source")
+        if not isinstance(source, Mapping):
+            raise CycleError("historical credit adoption source is invalid")
+        _verify_credit_adoption_transition(
+            config, Path(str(source.get("run_dir") or "")),
+            document["frozen_snapshot_digests"]["review-corrections.jsonl"],
+            adopted["review-corrections.jsonl"],
+        )
+    return document
+
+
+def _verify_historical_adoption(
+    config: Mapping[str, Any], record: Mapping[str, Any], document: Mapping[str, Any],
+    since: str, until: str, source: Mapping[str, Any], replay: Mapping[str, Any],
+) -> None:
+    if (
+        document.get("source") != dict(source)
+        or document.get("replay") != dict(replay)
+        or source.get("runtime_identity_digest") != document.get("runtime_identity_digest")
+        or replay.get("runtime_identity_digest") != document.get("runtime_identity_digest")
+        or source.get("coverage", {}).get("status") != "complete"
+        or source.get("coverage", {}).get("incomplete_sources") != []
+    ):
+        raise CycleError("historical adoption stage identity differs")
+    checkpoint_root = _canonical_runtime_path(
+        str(document.get("checkpoint_root")), label="historical checkpoint root"
+    )
+    checkpoint_digest = document.get("checkpoint_manifest_digest")
+    manifest_text = document.get("checkpoint_manifest_text")
+    if not _valid_digest(checkpoint_digest) or not isinstance(manifest_text, str):
+        raise CycleError("historical checkpoint digest is invalid")
+    _interval_from_stage(
+        config, "runner/unclassified", source,
+        checkpoint_root=checkpoint_root,
+        checkpoint_manifest_digest=checkpoint_digest,
+        checkpoint_manifest_text=manifest_text,
+    )
+    path = _safe_run_file(
+        _runs_dir(config), document.get("publication_result"), "historical publication result"
+    )
+    if path.name not in {"sheet-publish-result.json", "autopilot-result.json"} or (
+        _digest(path) != document.get("publication_result_digest")
+    ):
+        raise CycleError("historical publication result identity differs")
+    title = _sheet_title(config["monthly_sheet_title_template"], since=since)
+    expected = _expected_publication_receipts(config, source, sheet_title=title)
+    if document.get("publication_receipts") != expected:
+        raise CycleError("historical publication row identity differs")
+    _validated_publication_document(_json_file(path, "publisher result"), expected)
+
+
 def _validate_delivered_state(config: Mapping[str, Any], state: Mapping[str, Any]) -> None:
     slices = state.get("slices")
     if not isinstance(slices, Mapping):
@@ -2231,24 +2616,37 @@ def _validate_delivered_state(config: Mapping[str, Any], state: Mapping[str, Any
         if not events_path.is_file() or not manifest_path.is_file():
             raise CycleError("delivered slice period evidence is missing")
         expected_snapshots = _stored_snapshot_digests(raw_record)
+        adoption = _historical_adoption_document(config, raw_record, since, until)
+        stage_config = config
+        if adoption is not None:
+            expected_snapshots = dict(adoption["adopted_snapshot_digests"])
+            stage_config = dict(config)
+            stage_config.setdefault(
+                "_runtime_identity",
+                clockify_review_run.clockify_sync_collect.collector_runtime_identity(),
+            )
         verified_manifest = _ensure_period(
             config, _path(config, "state_dir"), since, until, bind_inputs=False
         )
         if raw_record.get("period_manifest") != str(verified_manifest):
             raise CycleError("delivered slice period manifest identity has drifted")
         source = _stage_from_state(
-            config, raw_record, "source", since, until, replay=False,
+            stage_config, raw_record, "source", since, until, replay=False,
             expected_snapshot_digests=expected_snapshots,
         )
         if source is None:
             raise CycleError("delivered slice has no verified source stage")
         replay = _stage_from_state(
-            config, raw_record, "replay", since, until, replay=True,
+            stage_config, raw_record, "replay", since, until, replay=True,
             expected_snapshot_digests=source["snapshot_digests"],
             source_run_id=str(source["run_id"]), source_run_dir=str(source["run_dir"]),
         )
         if replay is None:
             raise CycleError("delivered slice has no verified replay stage")
+        if adoption is not None:
+            _verify_historical_adoption(
+                stage_config, raw_record, adoption, since, until, source, replay,
+            )
         receipt = raw_record.get("delivery_receipt")
         if not isinstance(receipt, str):
             raise CycleError("delivered slice has no delivery receipt")
@@ -3096,6 +3494,186 @@ def _run_slice(
     }
 
 
+def adopt_historical_slice(
+    config: Mapping[str, Any], request: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Import one already-published, sealed slice without invoking any child."""
+    required = {
+        "schema_version", "since", "until", "source_result", "replay_result",
+        "publication_result", "checkpoint_root", "checkpoint_manifest_digest",
+        "frozen_snapshot_digests", "adopted_snapshot_digests",
+        "runtime_identity_digest", "source_result_digest", "replay_result_digest",
+        "publication_result_digest",
+    }
+    if not isinstance(request, Mapping) or set(request) != required or (
+        request.get("schema_version") != HISTORICAL_ADOPTION_REQUEST_SCHEMA_VERSION
+    ):
+        raise CycleError("historical adoption request is invalid")
+    since = str(request["since"])
+    until = str(request["until"])
+    if _date(since, "historical since") >= _date(until, "historical until"):
+        raise CycleError("historical adoption interval is invalid")
+    for name in (
+        "checkpoint_manifest_digest", "runtime_identity_digest",
+        "source_result_digest", "replay_result_digest", "publication_result_digest",
+    ):
+        if not _valid_digest(request[name]):
+            raise CycleError(f"historical adoption {name} is invalid")
+    state_dir = _path(config, "state_dir")
+    state_path = state_dir / "review-cycle-state.json"
+    debt_path = state_dir / "source-coverage.json"
+    with single_instance(state_dir / "review-cycle.lock") as acquired:
+        if not acquired:
+            return {"status": "locked", "slice": {"since": since, "until": until}}
+        state = _state(state_path, recovery_since=str(config["recovery_since"]))
+        raw_record = state["slices"].get(since)
+        if not isinstance(raw_record, Mapping) or raw_record.get("until") != until:
+            raise CycleError("historical adoption requires an existing exact slice")
+        record = dict(raw_record)
+        if record.get("status") in {"delivered", "delivered_with_exceptions"}:
+            adoption = _historical_adoption_document(config, record, since, until)
+            if adoption is None or adoption.get("request_digest") != _value_digest(dict(request)):
+                raise CycleError("delivered slice has different adoption identity")
+            _validate_delivered_state(config, state)
+            return {"status": str(record["status"]), "slice": {"since": since, "until": until}}
+        if any(record.get(key) is not None for key in (
+            "source", "replay", "delivery_receipt", "historical_adoption_receipt",
+        )):
+            raise CycleError("historical adoption cannot replace an existing stage")
+        manifest_path = _ensure_period(config, state_dir, since, until, bind_inputs=False)
+        frozen = _stored_snapshot_digests(record)
+        if record.get("period_manifest") != str(manifest_path) or (
+            frozen != request["frozen_snapshot_digests"]
+            or frozen != _expected_snapshot_digests(config, manifest_path)
+        ):
+            raise CycleError("historical adoption frozen input proof differs")
+        adopted = request["adopted_snapshot_digests"]
+        if not isinstance(adopted, Mapping) or set(adopted) != set(frozen):
+            raise CycleError("historical adoption input transition is invalid")
+        for name in frozen:
+            if not _valid_digest(adopted[name]) or (
+                name not in {"routing.json", "review-corrections.jsonl"}
+                and adopted[name] != frozen[name]
+            ):
+                raise CycleError("historical adoption changed non-routing frozen inputs")
+        source_path = _safe_run_file(
+            _runs_dir(config), request["source_result"], "historical source result"
+        )
+        if adopted["review-corrections.jsonl"] != frozen["review-corrections.jsonl"]:
+            _verify_credit_adoption_transition(
+                config, source_path.parent,
+                frozen["review-corrections.jsonl"],
+                adopted["review-corrections.jsonl"],
+            )
+        replay_path = _safe_run_file(
+            _runs_dir(config), request["replay_result"], "historical replay result"
+        )
+        publication_path = _safe_run_file(
+            _runs_dir(config), request["publication_result"], "historical publication result"
+        )
+        for name, path in (
+            ("source_result_digest", source_path),
+            ("replay_result_digest", replay_path),
+            ("publication_result_digest", publication_path),
+        ):
+            if _digest(path) != request[name]:
+                raise CycleError(f"historical adoption {name} differs")
+        validation_config = dict(config)
+        validation_config.setdefault(
+            "_runtime_identity",
+            clockify_review_run.clockify_sync_collect.collector_runtime_identity(),
+        )
+        source = _validate_stage(
+            validation_config, source_path, since, until, replay=False,
+            expected_snapshot_digests=adopted,
+            expected_runtime_digest=str(request["runtime_identity_digest"]),
+            historical_state_validation=True,
+        )
+        if source["coverage"].get("status") != "complete" or (
+            source["coverage"].get("incomplete_sources") != []
+        ):
+            raise CycleError("historical source coverage is incomplete")
+        replay = _validate_stage(
+            validation_config, replay_path, since, until, replay=True,
+            expected_snapshot_digests=adopted,
+            source_run_id=str(source["run_id"]), source_run_dir=str(source["run_dir"]),
+            expected_runtime_digest=str(request["runtime_identity_digest"]),
+            historical_state_validation=True,
+        )
+        if replay["accounting_digest"] != source["accounting_digest"]:
+            raise CycleError("historical replay accounting differs")
+        title = _sheet_title(config["monthly_sheet_title_template"], since=since)
+        expected_publications = _expected_publication_receipts(
+            config, source, sheet_title=title,
+        )
+        checkpoint_capture: dict[str, str] = {}
+        _interval_from_stage(
+            validation_config, "runner/unclassified", source,
+            checkpoint_root=Path(str(request["checkpoint_root"])),
+            checkpoint_manifest_digest=str(request["checkpoint_manifest_digest"]),
+            checkpoint_capture=checkpoint_capture,
+        )
+        unsigned = {
+            "schema_version": HISTORICAL_ADOPTION_SCHEMA_VERSION,
+            "since": since, "until": until,
+            "request_digest": _value_digest(dict(request)),
+            "frozen_snapshot_digests": frozen,
+            "adopted_snapshot_digests": dict(adopted),
+            "runtime_identity_digest": request["runtime_identity_digest"],
+            "checkpoint_root": request["checkpoint_root"],
+            "checkpoint_manifest_digest": request["checkpoint_manifest_digest"],
+            "checkpoint_manifest_text": checkpoint_capture["manifest_text"],
+            "source": source, "replay": replay,
+            "publication_result": str(publication_path),
+            "publication_result_digest": request["publication_result_digest"],
+            "publication_receipts": expected_publications,
+        }
+        adoption = {**unsigned, "receipt_digest": _value_digest(unsigned)}
+        _verify_historical_adoption(
+            validation_config, record, adoption, since, until, source, replay,
+        )
+        delivery = _delivery_document(
+            config, since, until, source, replay, sheet_title=title,
+        )
+        receipt_path = state_dir / "delivery-receipts" / f"{since}.json"
+        adoption_path = state_dir / "historical-adoption-receipts" / f"{since}.json"
+        raw_debt = _json_file(debt_path, "source coverage")
+        try:
+            debt_store = source_coverage.SourceDebtStore.from_document(raw_debt)
+        except (TypeError, ValueError) as exc:
+            raise CycleError("source coverage state is invalid") from exc
+        warnings = raw_debt.get("migration_warnings", [])
+        if not isinstance(warnings, list):
+            raise CycleError("source coverage warnings are invalid")
+        generic = debt_store.get(_generic_interval(config, since, until).debt_id)
+        before = debt_store.document()
+        _resolve_generic(debt_store, generic, source)
+        _write_delivery_receipt(receipt_path, delivery)
+        _write_delivery_receipt(adoption_path, adoption)
+        if debt_store.document() != before:
+            source_coverage.write(
+                debt_path, debt_store.document(migration_warnings=warnings)
+            )
+        record.update({
+            "status": "delivered_with_exceptions" if source["exception_ids"] else "delivered",
+            "source": source, "replay": replay,
+            "source_completeness": source["coverage"],
+            "source_run_id": source["run_id"], "replay_run_id": replay["run_id"],
+            "delivery_receipt": str(receipt_path),
+            "historical_adoption_receipt": str(adoption_path),
+            "historical_adoption_receipt_digest": adoption["receipt_digest"],
+            "review_ids": source["review_ids"],
+            "exception_ids": source["exception_ids"],
+            "exceptions_complete": not source["exception_ids"],
+        })
+        state["slices"][since] = record
+        if state.get("scheduled_through") == since:
+            state["scheduled_through"] = until
+        _recompute_completed_through(config, state)
+        _atomic(state_path, state)
+        return {"status": str(record["status"]), "slice": {"since": since, "until": until}}
+
+
 def run_cycle(config: Mapping[str, Any], *, enable_sheet_write: bool, today: dt.date | None = None) -> dict[str, Any]:
     root = _path(config, "root")
     state_dir = _path(config, "state_dir")
@@ -3107,10 +3685,12 @@ def run_cycle(config: Mapping[str, Any], *, enable_sheet_write: bool, today: dt.
         if not acquired:
             return {"status": "locked", "slices": []}
         state = _state(state_path, recovery_since=str(config["recovery_since"]))
-        _migrate_legacy_stage_runtime(config, state, state_path)
+        _migrate_legacy_stage_runtime(
+            config, state, state_path, persist=enable_sheet_write,
+        )
         debt_store, migration_warnings = _source_debt(debt_path)
         state["source_debt_warnings"] = migration_warnings
-        if _reactivate_health_transitions(config, state, debt_store):
+        if _reactivate_health_transitions(config, state, debt_store) and enable_sheet_write:
             source_coverage.write(debt_path, debt_store.document())
             _atomic(state_path, state)
         _validate_delivered_state(config, state)
@@ -3204,8 +3784,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--enable-sheet-write", action="store_true")
     parser.add_argument("--audit-coverage-output", type=Path)
+    parser.add_argument(
+        "--adopt-historical-request", type=Path,
+        help="Adopt one exact, already-proven historical delivery without scheduling children.",
+    )
     args = parser.parse_args(argv)
     try:
+        if args.adopt_historical_request is not None and (
+            args.enable_sheet_write or args.audit_coverage_output is not None
+        ):
+            raise CycleError("historical adoption and scheduling/audit modes are mutually exclusive")
         config = load_config(args.config)
         if args.audit_coverage_output is not None:
             output = _coverage_audit_output_path(
@@ -3219,9 +3807,19 @@ def main(argv: list[str] | None = None) -> int:
             clockify_review_run.clockify_sync_collect.collector_runtime_identity()
         )
         _validate_runtime_root(config, os.environ)
-        result = run_cycle(
-            config, enable_sheet_write=args.enable_sheet_write
-        )
+        if args.adopt_historical_request is not None:
+            request_path = _canonical_runtime_path(
+                args.adopt_historical_request, label="historical adoption request"
+            )
+            if not request_path.is_file() or request_path.is_symlink():
+                raise CycleError("historical adoption request is missing or unsafe")
+            result = adopt_historical_slice(
+                config, _json_file(request_path, "historical adoption request")
+            )
+        else:
+            result = run_cycle(
+                config, enable_sheet_write=args.enable_sheet_write
+            )
         print(json.dumps(result, sort_keys=True))
     except (CycleError, OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"clockify review cycle blocked: {exc}", file=sys.stderr)
