@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from scripts import clockify_review_cycle as cycle
-from scripts import clockify_review_run, collector_receipts, semantic_analyzer, source_coverage
+from scripts import clockify_review_run, collector_receipts, evidence_ledger, semantic_analyzer, source_coverage
 from test_review_cycle_delivery import make_run, write_json
 
 
@@ -239,6 +239,326 @@ class HistoricalAdoptionTests(unittest.TestCase):
             shutil.copyfile(source / filename, repair / filename)
         bundle = clockify_review_run._finalize_repair_completion(repair)
         return {"run_dir": str(repair), "bundle_digest": bundle.bundle_digest}
+
+    def _derived_adoption_request(
+        self, *, incomplete_peer: bool = False,
+    ) -> tuple[dict[str, object], Path, Path]:
+        """Seal a real collector derivation; leave its old backlog receipt stale."""
+        collector = self.source_result.parent
+        raw = {
+            "clockify": {"status": "complete", "entries": []},
+            "fathom": {"status": "complete", "meetings": []},
+            "calendly": {"status": "complete", "recordings": []},
+            "multica_issues": {"status": "complete", "issues": []},
+            "sessions": ([{
+                "machine": "macbook", "status": "unavailable", "reason": "offline",
+                "repository_evidence_status": "complete", "repository_events": [],
+            }] if incomplete_peer else []),
+        }
+        names = {
+            "clockify": "clockify-existing.json",
+            "fathom": "fathom-meetings.json",
+            "calendly": "calendly-recordings.json",
+            "multica_issues": "multica-issues.json",
+            "sessions": "sessions.json",
+        }
+        for key, filename in names.items():
+            write_json(collector / "evidence" / filename, raw[key])
+        ledger = evidence_ledger.EvidenceLedger(
+            tuple(evidence_ledger.normalize_collector_snapshot(raw)),
+            evidence_ledger.source_inventory_from_collector(raw),
+        )
+        write_json(collector / "evidence" / "evidence-ledger.json", {
+            "schema_version": evidence_ledger.SCHEMA_VERSION,
+            "manifest": ledger.manifest.document(),
+            "events": [event.document() for event in ledger.events],
+        })
+        report = json.loads((collector / "run-report.json").read_text())
+        report["evidence_ledger"] = {
+            "source_completeness": ledger.manifest.document()["source_completeness"]
+        }
+        write_json(collector / "run-report.json", report)
+        old_bundle = json.loads((collector / "completion-bundle.json").read_text())
+        slice_ = type("Slice", (), {
+            "slice_id": old_bundle["slice_id"],
+            "since": dt.datetime.fromisoformat(old_bundle["since_utc"].replace("Z", "+00:00")),
+            "until": dt.datetime.fromisoformat(old_bundle["until_utc"].replace("Z", "+00:00")),
+        })()
+        raw_bundle = collector_receipts.build_completion_bundle(collector, slice_=slice_)
+        write_json(collector / "completion-bundle.json", raw_bundle.document())
+        collector_receipts.load_collector_source_bundle(
+            collector / "completion-bundle.json", run_dir=collector,
+        )
+        # The old manifest still names the pre-rebuild bundle and cannot serve
+        # as this child's proof.
+        derived = clockify_review_run._prepare_collector_derivation_run(
+            collector,
+            {name: collector / name for name in clockify_review_run._RECONCILIATION_INPUTS.values()},
+            executor_runtime_identity={"git_sha": "fixture-sha"},
+            environment={},
+        )
+        for filename in (
+            "semantic-analysis.json", "work-accounting-result.json", "quality_report.json",
+            "review-snapshot.json", "proposals.json", "fathom-reconciliation.json",
+        ):
+            shutil.copyfile(collector / filename, derived / filename)
+        analysis = json.loads((derived / "semantic-analysis.json").read_text())
+        analysis["activities"][0]["analyzer_tier"] = "fixture"
+        write_json(derived / "semantic-analysis.json", analysis)
+        bundle = clockify_review_run._finalize_collector_derivation_completion(derived)
+        result = json.loads(self.source_result.read_text())
+        result.update(
+            run_id=derived.name, run_dir=str(derived),
+            completion_bundle_digest=bundle.bundle_digest,
+            completion_bundle=bundle.document(),
+        )
+        result["paths"] = {
+            key: (value.replace(str(collector), str(derived), 1) if value else value)
+            for key, value in result["paths"].items()
+        }
+        derived_result = derived / "autopilot-result.json"
+        write_json(derived_result, result)
+        replay = clockify_review_run._prepare_replay_run(derived)
+        for filename in (
+            "semantic-analysis.json", "work-accounting-result.json", "quality_report.json",
+            "review-snapshot.json", "proposals.json", "fathom-reconciliation.json",
+        ):
+            shutil.copyfile(derived / filename, replay / filename)
+        clockify_review_run._verify_replay_integrity(derived, replay)
+        replay_bundle = clockify_review_run._finalize_replay_completion(derived, replay)
+        replay_document = dict(result)
+        replay_document.update(
+            run_id=replay.name, run_dir=str(replay),
+            completion_bundle_digest=replay_bundle.bundle_digest,
+            completion_bundle=replay_bundle.document(),
+        )
+        replay_document["paths"] = {
+            key: (value.replace(str(derived), str(replay), 1) if value else value)
+            for key, value in result["paths"].items()
+        }
+        replay_document["paths"]["replay_integrity"] = str(replay / "replay-integrity.json")
+        replay_result = replay / "autopilot-result.json"
+        write_json(replay_result, replay_document)
+        publication_result = derived / "sheet-publish-result.json"
+        write_json(publication_result, {
+            "schema_version": "sheet-publication-result/v1", "status": "published",
+            "external_writes": True, "clockify_writes": 0,
+            "publications": cycle._expected_publication_receipts(
+                self.config, {"run_dir": str(derived), "run_id": derived.name},
+                sheet_title="September 2026 portfolio review",
+            ),
+        })
+        request = {
+            **{key: value for key, value in self.request.items()
+               if key not in {"checkpoint_root", "checkpoint_manifest_digest"}},
+            "schema_version": "clockify-historical-adoption-request/v2",
+            "source_provenance": {
+                "kind": "collector_derivation",
+                "derivation_run_dir": str(derived),
+                "lineage_digest": cycle._digest(derived / "collector-source.json"),
+            },
+            "source_result": str(derived_result),
+            "source_result_digest": cycle._digest(derived_result),
+            "replay_result": str(replay_result),
+            "replay_result_digest": cycle._digest(replay_result),
+            "publication_result": str(publication_result),
+            "publication_result_digest": cycle._digest(publication_result),
+            "runtime_identity_digest": bundle.runtime_identity_digest,
+        }
+        return request, derived, collector
+
+    def test_adopts_verified_derived_collector_without_old_backlog_receipt(self):
+        """Catches rejecting authentic derived source solely on stale parent backlog."""
+        request, derived, _collector = self._derived_adoption_request()
+        self.assertFalse((derived / "slice-finalization.json").exists())
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=AssertionError("child")):
+            result = cycle.adopt_historical_slice(self.config, request)
+            repeated = cycle.adopt_historical_slice(self.config, request)
+        self.assertEqual("delivered", result["status"])
+        self.assertEqual(result, repeated)
+
+    def test_derived_adoption_rejects_rewritten_lineage(self):
+        """Catches trusting a matching request digest instead of verifying ancestry."""
+        request, derived, _collector = self._derived_adoption_request()
+        path = derived / "collector-source.json"
+        lineage = json.loads(path.read_text())
+        lineage["source_bundle_digest"] = "sha256:" + "f" * 64
+        unsigned = {key: value for key, value in lineage.items() if key != "lineage_digest"}
+        lineage["lineage_digest"] = "sha256:" + hashlib.sha256(
+            json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        write_json(path, lineage)
+        request["source_provenance"]["lineage_digest"] = cycle._digest(path)
+        with self.assertRaisesRegex(cycle.CycleError, "collector derivation provenance"):
+            cycle.adopt_historical_slice(self.config, request)
+
+    def test_derived_adoption_rejects_changed_raw_collector_evidence(self):
+        """Catches accepting lineage whose verified raw source bytes have drifted."""
+        request, _derived, collector = self._derived_adoption_request()
+        write_json(collector / "evidence" / "clockify-existing.json", {
+            "status": "complete", "entries": [{"tampered": True}],
+        })
+        with self.assertRaisesRegex(cycle.CycleError, "collector derivation provenance"):
+            cycle.adopt_historical_slice(self.config, request)
+
+    def test_derived_adoption_receipt_rechecks_raw_collector_evidence(self):
+        """Catches trusting a stored delivery after its collector ancestry drifts."""
+        request, _derived, collector = self._derived_adoption_request()
+        cycle.adopt_historical_slice(self.config, request)
+        write_json(collector / "evidence" / "clockify-existing.json", {
+            "status": "complete", "entries": [{"tampered": True}],
+        })
+        with self.assertRaisesRegex(cycle.CycleError, "collector derivation provenance"):
+            cycle.adopt_historical_slice(self.config, request)
+
+    def test_derived_adoption_rejects_rebound_slice(self):
+        """Catches assigning a sealed derivation to another collector slice."""
+        request, derived, _collector = self._derived_adoption_request()
+        path = derived / "collector-source.json"
+        lineage = json.loads(path.read_text())
+        lineage["source_slice_id"] = "sha256:" + "a" * 64
+        unsigned = {key: value for key, value in lineage.items() if key != "lineage_digest"}
+        lineage["lineage_digest"] = "sha256:" + hashlib.sha256(
+            json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        write_json(path, lineage)
+        request["source_provenance"]["lineage_digest"] = cycle._digest(path)
+        with self.assertRaisesRegex(cycle.CycleError, "collector derivation provenance"):
+            cycle.adopt_historical_slice(self.config, request)
+
+    def test_derived_adoption_rejects_external_finalization_symlink(self):
+        """Catches sourcing unsealed compatibility metadata outside the raw run."""
+        request, _derived, collector = self._derived_adoption_request()
+        finalization = collector / "slice-finalization.json"
+        outside = self.root / "external-finalization.json"
+        outside.write_bytes(finalization.read_bytes())
+        finalization.unlink()
+        finalization.symlink_to(outside)
+        with self.assertRaisesRegex(cycle.CycleError, "collector source finalization path"):
+            cycle.adopt_historical_slice(self.config, request)
+
+    def test_adopts_repair_descendant_of_verified_derivation(self):
+        """Catches stopping a sealed repair chain before its derived collector node."""
+        request, derived, _collector = self._derived_adoption_request()
+        repair = clockify_review_run._prepare_repair_run(derived)
+        for filename in (
+            "semantic-analysis.json", "work-accounting-result.json", "quality_report.json",
+            "review-snapshot.json", "proposals.json", "fathom-reconciliation.json",
+        ):
+            shutil.copyfile(derived / filename, repair / filename)
+        repair_bundle = clockify_review_run._finalize_repair_completion(repair)
+        derived_result = json.loads((derived / "autopilot-result.json").read_text())
+        repair_document = dict(derived_result)
+        repair_document.update(
+            run_id=repair.name, run_dir=str(repair),
+            completion_bundle_digest=repair_bundle.bundle_digest,
+            completion_bundle=repair_bundle.document(),
+        )
+        repair_document["paths"] = {
+            key: (value.replace(str(derived), str(repair), 1) if value else value)
+            for key, value in derived_result["paths"].items()
+        }
+        repair_result = repair / "autopilot-result.json"
+        write_json(repair_result, repair_document)
+        replay = clockify_review_run._prepare_replay_run(repair)
+        for filename in (
+            "semantic-analysis.json", "work-accounting-result.json", "quality_report.json",
+            "review-snapshot.json", "proposals.json", "fathom-reconciliation.json",
+        ):
+            shutil.copyfile(repair / filename, replay / filename)
+        clockify_review_run._verify_replay_integrity(repair, replay)
+        replay_bundle = clockify_review_run._finalize_replay_completion(repair, replay)
+        replay_document = dict(repair_document)
+        replay_document.update(
+            run_id=replay.name, run_dir=str(replay),
+            completion_bundle_digest=replay_bundle.bundle_digest,
+            completion_bundle=replay_bundle.document(),
+        )
+        replay_document["paths"] = {
+            key: (value.replace(str(repair), str(replay), 1) if value else value)
+            for key, value in repair_document["paths"].items()
+        }
+        replay_document["paths"]["replay_integrity"] = str(replay / "replay-integrity.json")
+        replay_result = replay / "autopilot-result.json"
+        write_json(replay_result, replay_document)
+        publication_result = repair / "sheet-publish-result.json"
+        write_json(publication_result, {
+            "schema_version": "sheet-publication-result/v1", "status": "published",
+            "external_writes": True, "clockify_writes": 0,
+            "publications": cycle._expected_publication_receipts(
+                self.config, {"run_dir": str(repair), "run_id": repair.name},
+                sheet_title="September 2026 portfolio review",
+            ),
+        })
+        request.update({
+            "source_result": str(repair_result),
+            "source_result_digest": cycle._digest(repair_result),
+            "replay_result": str(replay_result),
+            "replay_result_digest": cycle._digest(replay_result),
+            "publication_result": str(publication_result),
+            "publication_result_digest": cycle._digest(publication_result),
+        })
+        result = cycle.adopt_historical_slice(self.config, request)
+        self.assertEqual("delivered", result["status"])
+
+    def test_incomplete_pass_derivation_records_exact_peer_debt(self):
+        """Catches demanding a derived child's absent finalization for peer recovery."""
+        request, _derived, _collector = self._derived_adoption_request(
+            incomplete_peer=True,
+        )
+        stage = cycle._validate_stage(
+            self.config, Path(request["source_result"]), self.since, self.until,
+            replay=False, expected_snapshot_digests=request["adopted_snapshot_digests"],
+            expected_runtime_digest=request["runtime_identity_digest"],
+            historical_state_validation=True,
+        )
+        self.assertEqual(["sessions/macbook"], stage["coverage"]["incomplete_sources"])
+        store = source_coverage.SourceDebtStore()
+        self.assertTrue(cycle._record_exact_debts(self.config, store, stage))
+        active = store.active()
+        self.assertEqual(1, len(active))
+        self.assertEqual("peer/macbook", active[0].interval.source)
+        self.assertEqual("2026-09-06T21:00:00Z", active[0].interval.since_utc)
+        self.assertEqual("2026-09-08T21:00:00Z", active[0].interval.until_utc)
+
+    def test_legacy_checkpoint_request_cannot_borrow_derived_proof(self):
+        """Catches silently treating a v1 checkpoint claim as v2 derivation proof."""
+        request, _derived, _collector = self._derived_adoption_request()
+        request.pop("source_provenance")
+        request.update({
+            "schema_version": "clockify-historical-adoption-request/v1",
+            "checkpoint_root": self.request["checkpoint_root"],
+            "checkpoint_manifest_digest": self.request["checkpoint_manifest_digest"],
+        })
+        with self.assertRaisesRegex(cycle.CycleError, "slice finalization"):
+            cycle.adopt_historical_slice(self.config, request)
+
+    def test_derived_interval_rejects_executor_bundle_drift_after_stage_validation(self):
+        """Catches consuming a new completion bundle under an old verified stage."""
+        request, derived, _collector = self._derived_adoption_request()
+        stage = cycle._validate_stage(
+            self.config, Path(request["source_result"]), self.since, self.until,
+            replay=False, expected_snapshot_digests=request["adopted_snapshot_digests"],
+            expected_runtime_digest=request["runtime_identity_digest"],
+            historical_state_validation=True,
+        )
+        quality_path = derived / "quality_report.json"
+        quality = json.loads(quality_path.read_text())
+        quality["summary"]["audit_marker"] = "changed after stage verification"
+        write_json(quality_path, quality)
+        old_bundle = json.loads((derived / "completion-bundle.json").read_text())
+        slice_ = type("Slice", (), {
+            "slice_id": old_bundle["slice_id"],
+            "since": dt.datetime.fromisoformat(old_bundle["since_utc"].replace("Z", "+00:00")),
+            "until": dt.datetime.fromisoformat(old_bundle["until_utc"].replace("Z", "+00:00")),
+        })()
+        changed = collector_receipts.build_completion_bundle(derived, slice_=slice_)
+        write_json(derived / "completion-bundle.json", changed.document())
+        with self.assertRaisesRegex(cycle.CycleError, "derived executor completion drifted"):
+            cycle._interval_from_derived_stage(
+                self.config, self.since, self.until, stage,
+                request["source_provenance"],
+            )
 
     def test_repair_interval_uses_digest_bound_collector_checkpoint(self):
         """Catches treating a repair as a new collector with its own finalization."""

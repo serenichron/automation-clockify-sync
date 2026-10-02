@@ -60,6 +60,8 @@ SCHEMA_VERSION = "clockify-review-cycle/v1"
 RECEIPT_SCHEMA_VERSION = "clockify-review-delivery/v1"
 HISTORICAL_ADOPTION_SCHEMA_VERSION = "clockify-historical-adoption/v1"
 HISTORICAL_ADOPTION_REQUEST_SCHEMA_VERSION = "clockify-historical-adoption-request/v1"
+DERIVED_ADOPTION_SCHEMA_VERSION = "clockify-historical-adoption/v2"
+DERIVED_ADOPTION_REQUEST_SCHEMA_VERSION = "clockify-historical-adoption-request/v2"
 GENERIC_COMPATIBILITY_VERSION = "runner-unclassified/v1"
 GENERIC_RETRY_LIMIT = 2
 EXACT_RETRY_LIMIT = 2
@@ -1908,6 +1910,7 @@ def _interval_from_stage(
     checkpoint_manifest_digest: str | None = None,
     checkpoint_manifest_text: str | None = None,
     checkpoint_capture: dict[str, str] | None = None,
+    allow_verified_derivation: bool = False,
 ) -> source_coverage.SourceInterval:
     if stage.get("stage_kind") == "collector_source":
         try:
@@ -1930,6 +1933,21 @@ def _interval_from_stage(
     if bundle.bundle_digest != stage.get("bundle_digest"):
         raise CycleError("verified source completion bundle identity drifted")
     run_dir, bundle = _collector_ancestor_from_repair(config, run_dir, bundle)
+    if allow_verified_derivation and (run_dir / "collector-source.json").exists():
+        zone = ZoneInfo(str(config["timezone"]))
+        since = dt.datetime.fromisoformat(
+            bundle.since_utc.replace("Z", "+00:00")
+        ).astimezone(zone).date().isoformat()
+        until = dt.datetime.fromisoformat(
+            bundle.until_utc.replace("Z", "+00:00")
+        ).astimezone(zone).date().isoformat()
+        return _interval_from_derived_stage(
+            config, since, until, stage, {
+                "kind": "collector_derivation",
+                "derivation_run_dir": str(run_dir),
+                "lineage_digest": _digest(run_dir / "collector-source.json"),
+            }, source_name=source,
+        )
     finalization_path = _safe_run_file(
         run_dir, str(run_dir / "slice-finalization.json"), "slice finalization"
     )
@@ -2026,6 +2044,96 @@ def _interval_from_stage(
     )
 
 
+def _interval_from_derived_stage(
+    config: Mapping[str, Any], since: str, until: str,
+    stage: Mapping[str, Any], provenance: Mapping[str, Any],
+    *, source_name: str = "runner/unclassified",
+) -> source_coverage.SourceInterval:
+    """Bind a review stage to a genuine collector derivation, not old backlog state."""
+    if not isinstance(provenance, Mapping) or set(provenance) != {
+        "kind", "derivation_run_dir", "lineage_digest",
+    } or provenance.get("kind") != "collector_derivation" or not _valid_digest(
+        provenance.get("lineage_digest")
+    ):
+        raise CycleError("historical collector derivation provenance is invalid")
+    runs = _runs_dir(config)
+    derived = _canonical_runtime_path(
+        str(provenance["derivation_run_dir"]), label="historical derivation run"
+    )
+    if derived.parent != runs or not derived.is_dir():
+        raise CycleError("historical collector derivation provenance is invalid")
+    selected = Path(str(stage["run_dir"]))
+    try:
+        selected_bundle = collector_receipts.load_completion_bundle(
+            selected / "completion-bundle.json", run_dir=selected,
+        )
+        if selected_bundle.bundle_digest != stage.get("bundle_digest"):
+            raise CycleError("historical derived executor completion drifted")
+        ancestor, _bundle = _collector_ancestor_from_repair(
+            config, selected, selected_bundle,
+        )
+        if ancestor != derived:
+            raise CycleError("historical collector derivation ancestry differs")
+        lineage_path = _safe_run_file(
+            derived, str(derived / "collector-source.json"), "collector derivation lineage"
+        )
+        if _digest(lineage_path) != provenance["lineage_digest"]:
+            raise CycleError("historical collector derivation lineage digest differs")
+        raw, identity, lineage = clockify_review_run._verified_collector_derivation(
+            derived
+        )
+        finalization_path = _safe_run_file(
+            raw, str(raw / "slice-finalization.json"), "collector source finalization"
+        )
+        collector_stage = _validate_collector_source_stage(
+            config, derived / "autopilot-result.json", since, until,
+            expected_snapshot_digests=lineage["snapshot_digests"],
+        )
+    except (OSError, ValueError, KeyError, collector_receipts.CollectorReceiptError) as exc:
+        raise CycleError("historical collector derivation provenance is invalid") from exc
+    if (
+        collector_stage["run_dir"] != str(raw)
+        or collector_stage["bundle_digest"] != identity.source_bundle_digest
+        or collector_stage["slice_id"] != selected_bundle.slice_id
+        or collector_stage["since_utc"] != selected_bundle.since_utc
+        or collector_stage["until_utc"] != selected_bundle.until_utc
+    ):
+        raise CycleError("historical collector derivation slice differs")
+    finalization = _json_file(finalization_path, "collector source finalization")
+    if not isinstance(finalization, Mapping) or set(finalization) != {
+        "schema_version", "backlog_identity", "slice_id", "since_utc", "until_utc",
+    } or finalization.get("schema_version") != "collector-slice-finalization/v1" or (
+        finalization.get("slice_id") != identity.slice_id
+        or finalization.get("since_utc") != identity.since_utc
+        or finalization.get("until_utc") != identity.until_utc
+    ):
+        raise CycleError("historical collector derivation finalization differs")
+    raw_identity = finalization["backlog_identity"]
+    if not isinstance(raw_identity, Mapping) or set(raw_identity) != {
+        "since_utc", "until_utc", "timezone", "max_days", "compatibility_version",
+    }:
+        raise CycleError("historical collector derivation finalization is invalid")
+    try:
+        backlog_identity = collector_slices.BacklogIdentity(**raw_identity)
+        planned = collector_slices.plan_slices(
+            dt.datetime.fromisoformat(backlog_identity.since_utc.replace("Z", "+00:00")),
+            dt.datetime.fromisoformat(backlog_identity.until_utc.replace("Z", "+00:00")),
+            zone=ZoneInfo(backlog_identity.timezone), max_days=backlog_identity.max_days,
+        )
+    except (TypeError, ValueError, KeyError, ZoneInfoNotFoundError, collector_slices.BacklogError) as exc:
+        raise CycleError("historical collector derivation finalization is invalid") from exc
+    matched = next((item for item in planned if item.slice_id == identity.slice_id), None)
+    if matched is None or (
+        matched.since.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        != identity.since_utc
+        or matched.until.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        != identity.until_utc
+        or collector_stage["compatibility_version"] != backlog_identity.compatibility_version
+    ):
+        raise CycleError("historical collector derivation slice differs")
+    return _interval_from_stage(config, source_name, collector_stage)
+
+
 def _same_active_failure(
     store: source_coverage.SourceDebtStore,
     interval: source_coverage.SourceInterval,
@@ -2075,7 +2183,10 @@ def _record_exact_debts(
             return False
         peers.setdefault(machine, []).append(name)
     for machine, required_sources in sorted(peers.items()):
-        interval = _interval_from_stage(config, f"peer/{machine}", source)
+        interval = _interval_from_stage(
+            config, f"peer/{machine}", source,
+            allow_verified_derivation=True,
+        )
         resume_digest = _value_digest({
             "bundle_digest": source["bundle_digest"],
             "debt_id": interval.debt_id,
@@ -2533,7 +2644,9 @@ def _historical_adoption_document(
     digest = document.get("receipt_digest")
     unsigned = {key: value for key, value in document.items() if key != "receipt_digest"}
     if (
-        document.get("schema_version") != HISTORICAL_ADOPTION_SCHEMA_VERSION
+        document.get("schema_version") not in {
+            HISTORICAL_ADOPTION_SCHEMA_VERSION, DERIVED_ADOPTION_SCHEMA_VERSION,
+        }
         or document.get("since") != since or document.get("until") != until
         or digest != _value_digest(unsigned)
         or record.get("historical_adoption_receipt_digest") != digest
@@ -2573,19 +2686,28 @@ def _verify_historical_adoption(
         or source.get("coverage", {}).get("incomplete_sources") != []
     ):
         raise CycleError("historical adoption stage identity differs")
-    checkpoint_root = _canonical_runtime_path(
-        str(document.get("checkpoint_root")), label="historical checkpoint root"
-    )
-    checkpoint_digest = document.get("checkpoint_manifest_digest")
-    manifest_text = document.get("checkpoint_manifest_text")
-    if not _valid_digest(checkpoint_digest) or not isinstance(manifest_text, str):
-        raise CycleError("historical checkpoint digest is invalid")
-    _interval_from_stage(
-        config, "runner/unclassified", source,
-        checkpoint_root=checkpoint_root,
-        checkpoint_manifest_digest=checkpoint_digest,
-        checkpoint_manifest_text=manifest_text,
-    )
+    if document.get("schema_version") == DERIVED_ADOPTION_SCHEMA_VERSION:
+        if any(key in document for key in (
+            "checkpoint_root", "checkpoint_manifest_digest", "checkpoint_manifest_text",
+        )):
+            raise CycleError("derived adoption cannot claim a checkpoint proof")
+        _interval_from_derived_stage(
+            config, since, until, source, document.get("source_provenance"),
+        )
+    else:
+        checkpoint_root = _canonical_runtime_path(
+            str(document.get("checkpoint_root")), label="historical checkpoint root"
+        )
+        checkpoint_digest = document.get("checkpoint_manifest_digest")
+        manifest_text = document.get("checkpoint_manifest_text")
+        if not _valid_digest(checkpoint_digest) or not isinstance(manifest_text, str):
+            raise CycleError("historical checkpoint digest is invalid")
+        _interval_from_stage(
+            config, "runner/unclassified", source,
+            checkpoint_root=checkpoint_root,
+            checkpoint_manifest_digest=checkpoint_digest,
+            checkpoint_manifest_text=manifest_text,
+        )
     path = _safe_run_file(
         _runs_dir(config), document.get("publication_result"), "historical publication result"
     )
@@ -2864,7 +2986,9 @@ def _bind_incomplete_recovery_parents(
                 compatibility_version=interval_template.compatibility_version,
             )
             if interval_template is not None
-            else _interval_from_stage(config, source, stage)
+            else _interval_from_stage(
+                config, source, stage, allow_verified_derivation=True,
+            )
         )
         current = debt_store.get(interval.debt_id)
         if interval.debt_id not in parents or current is None or current.status != "active":
@@ -3498,24 +3622,35 @@ def adopt_historical_slice(
     config: Mapping[str, Any], request: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Import one already-published, sealed slice without invoking any child."""
-    required = {
+    common_required = {
         "schema_version", "since", "until", "source_result", "replay_result",
-        "publication_result", "checkpoint_root", "checkpoint_manifest_digest",
+        "publication_result",
         "frozen_snapshot_digests", "adopted_snapshot_digests",
         "runtime_identity_digest", "source_result_digest", "replay_result_digest",
         "publication_result_digest",
     }
-    if not isinstance(request, Mapping) or set(request) != required or (
-        request.get("schema_version") != HISTORICAL_ADOPTION_REQUEST_SCHEMA_VERSION
-    ):
+    legacy = (
+        isinstance(request, Mapping)
+        and request.get("schema_version") == HISTORICAL_ADOPTION_REQUEST_SCHEMA_VERSION
+        and set(request) == common_required | {
+            "checkpoint_root", "checkpoint_manifest_digest",
+        }
+    )
+    derived = (
+        isinstance(request, Mapping)
+        and request.get("schema_version") == DERIVED_ADOPTION_REQUEST_SCHEMA_VERSION
+        and set(request) == common_required | {"source_provenance"}
+    )
+    if not (legacy or derived):
         raise CycleError("historical adoption request is invalid")
     since = str(request["since"])
     until = str(request["until"])
     if _date(since, "historical since") >= _date(until, "historical until"):
         raise CycleError("historical adoption interval is invalid")
     for name in (
-        "checkpoint_manifest_digest", "runtime_identity_digest",
-        "source_result_digest", "replay_result_digest", "publication_result_digest",
+        *(["checkpoint_manifest_digest"] if legacy else []),
+        "runtime_identity_digest", "source_result_digest", "replay_result_digest",
+        "publication_result_digest",
     ):
         if not _valid_digest(request[name]):
             raise CycleError(f"historical adoption {name} is invalid")
@@ -3607,27 +3742,41 @@ def adopt_historical_slice(
             config, source, sheet_title=title,
         )
         checkpoint_capture: dict[str, str] = {}
-        _interval_from_stage(
-            validation_config, "runner/unclassified", source,
-            checkpoint_root=Path(str(request["checkpoint_root"])),
-            checkpoint_manifest_digest=str(request["checkpoint_manifest_digest"]),
-            checkpoint_capture=checkpoint_capture,
-        )
+        if derived:
+            _interval_from_derived_stage(
+                validation_config, since, until, source,
+                request["source_provenance"],
+            )
+        else:
+            _interval_from_stage(
+                validation_config, "runner/unclassified", source,
+                checkpoint_root=Path(str(request["checkpoint_root"])),
+                checkpoint_manifest_digest=str(request["checkpoint_manifest_digest"]),
+                checkpoint_capture=checkpoint_capture,
+            )
         unsigned = {
-            "schema_version": HISTORICAL_ADOPTION_SCHEMA_VERSION,
+            "schema_version": (
+                DERIVED_ADOPTION_SCHEMA_VERSION if derived
+                else HISTORICAL_ADOPTION_SCHEMA_VERSION
+            ),
             "since": since, "until": until,
             "request_digest": _value_digest(dict(request)),
             "frozen_snapshot_digests": frozen,
             "adopted_snapshot_digests": dict(adopted),
             "runtime_identity_digest": request["runtime_identity_digest"],
-            "checkpoint_root": request["checkpoint_root"],
-            "checkpoint_manifest_digest": request["checkpoint_manifest_digest"],
-            "checkpoint_manifest_text": checkpoint_capture["manifest_text"],
             "source": source, "replay": replay,
             "publication_result": str(publication_path),
             "publication_result_digest": request["publication_result_digest"],
             "publication_receipts": expected_publications,
         }
+        if derived:
+            unsigned["source_provenance"] = dict(request["source_provenance"])
+        else:
+            unsigned.update({
+                "checkpoint_root": request["checkpoint_root"],
+                "checkpoint_manifest_digest": request["checkpoint_manifest_digest"],
+                "checkpoint_manifest_text": checkpoint_capture["manifest_text"],
+            })
         adoption = {**unsigned, "receipt_digest": _value_digest(unsigned)}
         _verify_historical_adoption(
             validation_config, record, adoption, since, until, source, replay,
