@@ -20,6 +20,48 @@
   ],
   "evidence_routes": [
     {
+      "pattern": "(?=.*\\b(?:mihaelabrailescu|MBrailescu/site|Mihaela\\s+Br[ăa]ilescu|Reset\\s*Feminin|rf-access-ops|MAB\\s+Food\\s+Fairy)\\b)(?=.*\\b(?:project management|delivery planning|PM|assignment|project operations)\\b)",
+      "project_name": "MAB Food Fairy PM",
+      "project_suffix": "d07be7",
+      "tag_suffixes": [
+        "35aa9aef"
+      ],
+      "tag_names": [
+        "Project Management"
+      ],
+      "billable": true,
+      "confidence": "high",
+      "prefix": "MAB"
+    },
+    {
+      "pattern": "\\b(?:Reset\\s*Feminin|rf-access-ops)\\b",
+      "project_name": "MAB Food Fairy Level 2",
+      "project_suffix": "7cb152",
+      "tag_suffixes": [
+        "35aa9afb"
+      ],
+      "tag_names": [
+        "System development"
+      ],
+      "billable": true,
+      "confidence": "high",
+      "prefix": "MAB"
+    },
+    {
+      "pattern": "\\b(?:mihaelabrailescu|MBrailescu/site|Mihaela\\s+Br[ăa]ilescu|Reset\\s*Feminin|rf-access-ops|MAB\\s+Food\\s+Fairy)\\b",
+      "project_name": "MAB Food Fairy Level 2",
+      "project_suffix": "7cb152",
+      "tag_suffixes": [
+        "35aa9b54"
+      ],
+      "tag_names": [
+        "Technical development"
+      ],
+      "billable": true,
+      "confidence": "high",
+      "prefix": "MAB"
+    },
+    {
       "pattern": "\\bBNI\\b",
       "project_name": "Serenichron Level 1",
       "project_suffix": "31b39a",
@@ -135,6 +177,132 @@
       "action": "skip",
       "reason": "Personal/non-billable",
       "prefix": "SC"
+    },
+    {
+      "pattern": "MAB Food Fairy PM",
+      "project_name": "MAB Food Fairy PM",
+      "project_suffix": "d07be7",
+      "tag_suffixes": [
+        "35aa9aef"
+      ],
+      "tag_names": [
+        "Project Management"
+      ],
+      "billable": true,
+      "confidence": "high",
+      "prefix": "MAB"
+    },
+    {
+      "pattern": "rf-access-ops",
+      "project_name": "MAB Food Fairy Level 2",
+      "project_suffix": "7cb152",
+      "tag_suffixes": [
+        "35aa9afb"
+      ],
+      "tag_names": [
+        "System development"
+      ],
+      "billable": true,
+      "confidence": "high",
+      "prefix": "MAB"
+    },
+    {
+      "pattern": "Reset Feminin",
+      "project_name": "MAB Food Fairy Level 2",
+      "project_suffix": "7cb152",
+      "tag_suffixes": [
+        "35aa9afb"
+      ],
+      "tag_names": [
+        "System development"
+      ],
+      "billable": true,
+      "confidence": "high",
+      "prefix": "MAB"
+    },
+    {
+      "pattern": "ResetFeminin",
+      "project_name": "MAB Food Fairy Level 2",
+      "project_suffix": "7cb152",
+      "tag_suffixes": [
+        "35aa9afb"
+      ],
+      "tag_names": [
+        "System development"
+      ],
+      "billable": true,
+      "confidence": "high",
+      "prefix": "MAB"
+    },
+    {
+      "pattern": "MBrailescu/site",
+      "project_name": "MAB Food Fairy Level 2",
+      "project_suffix": "7cb152",
+      "tag_suffixes": [
+        "35aa9b54"
+      ],
+      "tag_names": [
+        "Technical development"
+      ],
+      "billable": true,
+      "confidence": "high",
+      "prefix": "MAB"
+    },
+    {
+      "pattern": "Mihaela Brăilescu",
+      "project_name": "MAB Food Fairy Level 2",
+      "project_suffix": "7cb152",
+      "tag_suffixes": [
+        "35aa9b54"
+      ],
+      "tag_names": [
+        "Technical development"
+      ],
+      "billable": true,
+      "confidence": "high",
+      "prefix": "MAB"
+    },
+    {
+      "pattern": "Mihaela Brailescu",
+      "project_name": "MAB Food Fairy Level 2",
+      "project_suffix": "7cb152",
+      "tag_suffixes": [
+        "35aa9b54"
+      ],
+      "tag_names": [
+        "Technical development"
+      ],
+      "billable": true,
+      "confidence": "high",
+      "prefix": "MAB"
+    },
+    {
+      "pattern": "MAB Food Fairy",
+      "project_name": "MAB Food Fairy Level 2",
+      "project_suffix": "7cb152",
+      "tag_suffixes": [
+        "35aa9b54"
+      ],
+      "tag_names": [
+        "Technical development"
+      ],
+      "billable": true,
+      "confidence": "high",
+      "prefix": "MAB"
+    },
+    {
+      "pattern": "mihaelabrailescu",
+      "project_name": "MAB Food Fairy Level 2",
+      "project_suffix": "7cb152",
+      "tag_suffixes": [
+        "35aa9b54"
+      ],
+      "tag_names": [
+        "Technical development"
+      ],
+      "billable": true,
+      "confidence": "high",
+      "prefix": "MAB"
     },
     {
       "pattern": "multica-command",
@@ -299,12 +467,6 @@
       "billable": true,
       "confidence": "low",
       "prefix": "SZ"
-    },
-    {
-      "pattern": "mihaelabrailescu",
-      "action": "skip",
-      "reason": "Personal/non-billable",
-      "prefix": "SC"
     },
     {
       "pattern": "family-bank",
@@ -542,6 +704,20 @@
     }
   ],
   "meeting_routes": [
+    {
+      "project_name": "MAB Food Fairy PM",
+      "project_suffix": "d07be7",
+      "tag_suffixes": [
+        "35aa9aef"
+      ],
+      "tag_names": [
+        "Project Management"
+      ],
+      "billable": true,
+      "confidence": "high",
+      "prefix": "MAB",
+      "title_regex": "\\b(?:mihaelabrailescu|MBrailescu/site|Mihaela\\s+Br[ăa]ilescu|Reset\\s*Feminin|rf-access-ops|MAB\\s+Food\\s+Fairy)\\b"
+    },
     {
       "email_domain": "tstprep.com",
       "prefix": "TSTP",

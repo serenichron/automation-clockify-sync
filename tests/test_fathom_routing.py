@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from scripts.clockify_sheet_publish import project_allowlist
+from scripts import work_accounting_pipeline as pipeline
 
 
 MODULE_PATH = Path(__file__).parents[1] / "scripts" / "clockify_sync_collect.py"
@@ -48,6 +49,95 @@ def meeting(title: str = "Daily Meet", recording_id: int = 42):
 
 
 class FathomRoutingTests(unittest.TestCase):
+    def test_mab_session_aliases_are_billable_client_work(self):
+        """Catches the legacy personal skip and SC fallback for MAB implementation."""
+        routing = collector.load_json(MODULE_PATH.parents[1] / "routing.json")
+        for label, tags, suffixes in (
+            ("mihaelabrailescu", ["Technical development"], ["35aa9b54"]),
+            ("MBrailescu/site", ["Technical development"], ["35aa9b54"]),
+            ("Mihaela Brăilescu", ["Technical development"], ["35aa9b54"]),
+            ("Reset Feminin", ["System development"], ["35aa9afb"]),
+            ("ResetFeminin", ["System development"], ["35aa9afb"]),
+            ("MAB Food Fairy", ["Technical development"], ["35aa9b54"]),
+            ("rf-access-ops", ["System development"], ["35aa9afb"]),
+        ):
+            with self.subTest(label=label):
+                route = collector.route_session({"label": label}, routing)
+                self.assertEqual("propose", route["action"])
+                self.assertEqual("MAB Food Fairy Level 2", route["project_name"])
+                self.assertEqual("7cb152", route["project_suffix"])
+                self.assertEqual(tags, route["tag_names"])
+                self.assertEqual(suffixes, route["tag_suffixes"])
+                self.assertTrue(route["billable"])
+                event = {
+                    "source_type": "codex_sessions", "observed_at": "2026-09-25T10:00:00+03:00",
+                    "raw_source_span": {"cwd": "/work/" + label},
+                    "attributes": {"label": label, "content": "Implement the approved client changes."},
+                }
+                resolved, error = pipeline.resolve_route({}, [event], routing)
+                self.assertIsNone(error)
+                self.assertEqual("7cb152", resolved["project_suffix"])
+                self.assertEqual(tags, resolved["tag_names"])
+
+    def test_mab_evidence_routes_require_client_identity(self):
+        """Catches absent authored-evidence routing and cross-client keyword capture."""
+        routing = collector.load_json(MODULE_PATH.parents[1] / "routing.json")
+        for content, project, suffix, tags in (
+            ("Implement Mihaela Brăilescu website fixes.", "MAB Food Fairy Level 2", "7cb152", ["Technical development"]),
+            ("Implement rf-access-ops workflow for Reset Feminin.", "MAB Food Fairy Level 2", "7cb152", ["System development"]),
+            ("MAB Food Fairy project management and delivery planning.", "MAB Food Fairy PM", "d07be7", ["Project Management"]),
+            ("Fix TST Prep scorecard and access workflow.", "Serenichron Level 2", "775f9f", ["System development"]),
+        ):
+            with self.subTest(content=content):
+                event = {
+                    "source_type": "codex_sessions", "observed_at": "2026-09-25T10:00:00+03:00",
+                    "raw_source_span": {"cwd": "/work/general"},
+                    "attributes": {"content": content},
+                }
+                route, error = pipeline.resolve_route({}, [event], routing)
+                self.assertIsNone(error)
+                self.assertEqual(project, route["project_name"])
+                self.assertEqual(suffix, route["project_suffix"])
+                self.assertEqual(tags, route["tag_names"])
+
+    def test_mab_client_meetings_route_to_pm_before_internal_fallback(self):
+        """Catches a client sync silently becoming a Serenichron internal meeting."""
+        routing = collector.load_json(MODULE_PATH.parents[1] / "routing.json")
+        for title in ("MAB Food Fairy — Sync", "Mihaela Brăilescu — Planning", "Reset Feminin — Review"):
+            with self.subTest(title=title):
+                item = meeting(title)
+                route = collector.route_meeting(item, routing)
+                self.assertEqual("MAB Food Fairy PM", route["project_name"])
+                self.assertEqual("d07be7", route["project_suffix"])
+                self.assertEqual(["Project Management"], route["tag_names"])
+                self.assertEqual(["35aa9aef"], route["tag_suffixes"])
+                self.assertTrue(route["billable"])
+                event = {"source_type": "fathom", "attributes": item}
+                resolved, error = pipeline.resolve_route({}, [event], routing)
+                self.assertIsNone(error)
+                self.assertEqual("d07be7", resolved["project_suffix"])
+
+    def test_mab_incidental_content_does_not_take_over_other_client_route(self):
+        """Catches evidence rules overriding an unrelated deterministic client route."""
+        routing = collector.load_json(MODULE_PATH.parents[1] / "routing.json")
+        event = {
+            "source_type": "codex_sessions", "observed_at": "2026-09-25T10:00:00+03:00",
+            "raw_source_span": {"cwd": "/work/tstprep-com-site-codebase"},
+            "attributes": {"content": "Fix scorecard access; compare Reset Feminin workflow."},
+        }
+        route, error = pipeline.resolve_route({}, [event], routing)
+        self.assertIsNone(error)
+        self.assertEqual("TST Prep Level 2", route["project_name"])
+        self.assertEqual("bc17f7", route["project_suffix"])
+
+    def test_mab_label_does_not_override_unattended_session_exclusion(self):
+        """Catches a billable client alias bypassing the unattended-agent skip guard."""
+        routing = collector.load_json(MODULE_PATH.parents[1] / "routing.json")
+        route = collector.route_session(
+            {"label": "MAB Food Fairy", "path": "/work/multica-command/session.jsonl"}, routing
+        )
+        self.assertEqual("skip", route["action"])
+
     def test_release_routing_pins_clockify_identity_and_has_stable_digest(self):
         """Catches a release routing artifact that cannot pass the cycle identity gate."""
         path = MODULE_PATH.parents[1] / "routing.json"
@@ -58,7 +148,7 @@ class FathomRoutingTests(unittest.TestCase):
         self.assertEqual("5f5b5121a551633f6dfa31e6", routing["member_id"])
         self.assertEqual(routing["clockify_user_id"], routing["member_id"])
         self.assertEqual(
-            "4af23249b814475131b1602d8966e3c8565cc5b5820e0c163d97c791359911ac",
+            "8c3cbf3b044aa667a9917f7f8ae53eb9ea269f418d3b7d1df0ad11867b540e2b",
             hashlib.sha256(raw).hexdigest(),
         )
         self.assertEqual(
