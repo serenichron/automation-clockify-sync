@@ -14,6 +14,7 @@ import email.utils
 import fnmatch
 import gzip
 import hashlib
+import inspect
 import json
 import os
 import pwd
@@ -1528,7 +1529,12 @@ except Exception as e: res['errors'].append('codex scan: '+str(e)[:200])
 
 def _remote_hermes_contract() -> str:
     """Legacy remote Hermes extraction with local half-open window semantics."""
-    return r'''try:
+    helpers = (
+        "from typing import Any, Mapping\n"
+        f"BURST_GAP_SECONDS={BURST_GAP_SECONDS}\n"
+        + inspect.getsource(hermes_user_observed_intervals)
+    )
+    return helpers + r'''try:
     if HDB and Path(HDB).exists():
         import sqlite3
         conn=sqlite3.connect(HDB)
@@ -1559,9 +1565,9 @@ def _remote_hermes_contract() -> str:
             events=[]
             for index,(role,timestamp,content,tool_name) in enumerate(message_rows):
                 event_dt=dt.datetime.fromtimestamp(timestamp,tz=BUCHAREST) if timestamp else None
-                events.append({'timestamp':local_str(event_dt),'role':str(role or 'unknown'),'kind':'tool' if tool_name else 'message','content':str(content or ''),'tool_name':str(tool_name or ''),'ordinal':index})
+                events.append({'timestamp':event_dt.isoformat() if event_dt else None,'role':str(role or 'unknown'),'kind':'tool' if tool_name else 'message','content':str(content or ''),'tool_name':str(tool_name or ''),'ordinal':index})
             first_content=next((event['content'][:300] for event in events if event['role']=='user' and event['content']), '')
-            res['hermes_db_sessions'].append({'source':'hermes_db','machine':MACHINE,'session_id':sid,'start':local_str(start_dt),'end':local_str(end_dt),'duration_minutes':max(0,int((end_dt-start_dt).total_seconds()/60)),'message_count':len(events),'source_message_count':source_count,'model':model,'cwd':cwd or '','estimated_cost_usd':cost or 0.0,'input_tokens':in_tok or 0,'output_tokens':out_tok or 0,'title':first_content if (start_clipped or end_clipped) else (title or ''),'first_user_message':first_content,'events':events,'boundary_clipped':start_clipped or end_clipped,'start_clipped':start_clipped,'end_clipped':end_clipped})
+            res['hermes_db_sessions'].append({'source':'hermes_db','machine':MACHINE,'session_id':sid,'start':local_str(start_dt),'end':local_str(end_dt),'duration_minutes':max(0,int((end_dt-start_dt).total_seconds()/60)),'message_count':len(events),'source_message_count':source_count,'model':model,'cwd':cwd or '','estimated_cost_usd':cost or 0.0,'input_tokens':in_tok or 0,'output_tokens':out_tok or 0,'title':first_content if (start_clipped or end_clipped) else (title or ''),'first_user_message':first_content,'events':events,'observed_user_intervals':hermes_user_observed_intervals(events),'boundary_clipped':start_clipped or end_clipped,'start_clipped':start_clipped,'end_clipped':end_clipped})
         conn.close()
     else:
         res['errors'].append('hermes_db not found: '+HDB)
@@ -1821,6 +1827,42 @@ def machine_is_local(machine: dict[str, Any], hostname: str | None = None) -> bo
 
 
 
+def hermes_user_observed_intervals(events: list[Mapping[str, Any]]) -> list[dict[str, str]]:
+    """Bound same-session observation by direct user anchors, never assistant activity.
+
+    Callers supply one exact session/machine. Bounds are observed capacity, not
+    an active-effort estimate; singleton points and idle/day gaps supply no time.
+    """
+    points = sorted({
+        timestamp.astimezone(BUCHAREST)
+        for event in events
+        for timestamp in (parse_dt(str(event.get("timestamp") or "")),)
+        if event.get("role") == "user" and timestamp is not None
+        and event.get("kind", "message") == "message" and not event.get("tool_name")
+        # These wrappers are machine-injected continuations/check-ins despite
+        # transport role=user. They supply context, not human attention.
+        and not str(event.get("content") or "").lstrip().casefold().startswith((
+            "<task-notification", "<system-reminder", "<teammate-message",
+            "<command-message", "<local-command", "<codex_internal_context",
+            "this session is being continued from a previous conversation",
+        ))
+    })
+    intervals: list[dict[str, str]] = []
+    cluster: list[dt.datetime] = []
+    for point in points:
+        if cluster and (
+            point.date() != cluster[-1].date()
+            or (point - cluster[-1]).total_seconds() > BURST_GAP_SECONDS
+        ):
+            if len(cluster) >= 2:
+                intervals.append({"start": cluster[0].isoformat(), "end": cluster[-1].isoformat()})
+            cluster = []
+        cluster.append(point)
+    if len(cluster) >= 2:
+        intervals.append({"start": cluster[0].isoformat(), "end": cluster[-1].isoformat()})
+    return intervals
+
+
 def collect_hermes_db_sessions(db_path: str, machine: str, since: dt.datetime, until: dt.datetime) -> list[dict[str, Any]]:
     """Query Hermes state.db for sessions with timestamps, messages, model, and cost data."""
     out: list[dict[str, Any]] = []
@@ -1890,7 +1932,7 @@ def collect_hermes_db_sessions(db_path: str, machine: str, since: dt.datetime, u
                 )
                 events.append(
                     {
-                        "timestamp": local_dt_string(event_dt),
+                        "timestamp": event_dt.isoformat() if event_dt else None,
                         "role": str(role or "unknown"),
                         "kind": "tool" if tool_name else "message",
                         "content": str(content or ""),
@@ -1923,6 +1965,7 @@ def collect_hermes_db_sessions(db_path: str, machine: str, since: dt.datetime, u
                 "title": first_content if (start_clipped or end_clipped) else (title or ""),
                 "first_user_message": first_content,
                 "events": events,
+                "observed_user_intervals": hermes_user_observed_intervals(events),
                 "boundary_clipped": start_clipped or end_clipped,
                 "start_clipped": start_clipped,
                 "end_clipped": end_clipped,
@@ -2832,8 +2875,8 @@ def fetch_fathom(
             meetings.append({
                 "recording_id": recording_id,
                 "title": m.get("title") or m.get("meeting_title"),
-                "start": local_dt_string(start),
-                "end": local_dt_string(end),
+                "start": start.isoformat() if start else None,
+                "end": end.isoformat() if end else None,
                 "timing_basis": timing_basis,
                 "share_url": m.get("share_url") or m.get("url"),
                 "calendar_invitees": [{"email": i.get("email"), "name": i.get("name"), "is_external": i.get("is_external")} for i in m.get("calendar_invitees", [])[:20]],

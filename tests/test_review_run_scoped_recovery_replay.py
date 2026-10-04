@@ -90,7 +90,7 @@ class ScopedRecoveryReplayTests(unittest.TestCase):
                     )
                 self.assertEqual(1, len(calls))
                 recovered = json.loads((child / 'semantic-analysis.json').read_text())
-                self.assertEqual('scoped_review_v2', recovered['failed_review_retry']['mode'])
+                self.assertEqual('scoped_review_v4_citation_quarantine', recovered['failed_review_retry']['mode'])
                 self.assertTrue(recovered['activities'])
                 self.assertFalse(any(row['kind'] == 'analyzer_review_partial_quarantine'
                                      for row in recovered['exceptions']))

@@ -446,6 +446,18 @@ class EvidenceLedgerTests(unittest.TestCase):
         self.assertEqual("/private/session.jsonl", session.raw_source_span["path"])
         self.assertTrue(all("allocation" not in item.document() for item in events))
 
+    def test_derived_hermes_user_intervals_do_not_rehash_raw_evidence(self):
+        snapshot = {"sessions": [{"machine": "precision", "hermes_db_sessions": [{
+            "session_id": "hermes-raw", "start": "2026-09-10 08:00", "end": "2026-09-10 20:00",
+            "events": [{"timestamp": "2026-09-10T12:10:43+03:00", "role": "user",
+                        "kind": "message", "content": "Complete direct work"}],
+        }]}]}
+        original = [item.document() for item in ledger.normalize_collector_snapshot(snapshot)]
+        snapshot["sessions"][0]["hermes_db_sessions"][0]["observed_user_intervals"] = [
+            {"start": "2026-09-10T12:10:43+03:00", "end": "2026-09-10T12:41:05+03:00"}]
+        derived = [item.document() for item in ledger.normalize_collector_snapshot(snapshot)]
+        self.assertEqual(original, derived)
+
     def test_internal_datetime_helpers_do_not_leak_into_immutable_evidence(self) -> None:
         parsed = __import__("datetime").datetime(2026, 8, 1, 10, 0)
         snapshot = {

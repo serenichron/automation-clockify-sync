@@ -166,6 +166,18 @@ def clockify_event(start: str, end: str, **attributes):
     )
 
 
+def hermes_event(timestamp: str, role: str = "user", *, session="hermes-one", machine="precision"):
+    return evidence_ledger.evidence_event(
+        "hermes_db_sessions_event",
+        {"source_type": "hermes_db_sessions", "source_id": f"{session}:{role}:{timestamp}",
+         "machine": machine, "session_id": session},
+        observed_at=timestamp,
+        raw_source_span={"timestamp": timestamp, "session_start": "2026-09-10 08:00",
+                         "session_end": "2026-09-11 20:00"},
+        attributes={"role": role, "kind": "message", "content": "Completed work"},
+    )
+
+
 def fathom_event(start: str, end: str, status: str = "title_only"):
     return evidence_ledger.evidence_event(
         "fathom",
@@ -2023,6 +2035,64 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             timing["reason"],
         )
 
+    def test_hermes_user_anchors_recover_31_minutes_without_assistant_extension(self):
+        points = [hermes_event("2026-09-10 12:10"), hermes_event("2026-09-10 12:12"),
+                  hermes_event("2026-09-10 12:41"),
+                  hermes_event("2026-09-10 13:10", "assistant")]
+        _, result = self.make_run(
+            points, analysis_for([point.evidence_id for point in points], recommended=35),
+        )
+        self.assertEqual(31, sum(row["duration_minutes"] for row in result["proposals"]))
+        self.assertEqual("2026-09-10T12:10:00+03:00", result["proposals"][0]["start"])
+        self.assertEqual("2026-09-10T12:41:00+03:00", result["proposals"][0]["end"])
+        self.assertEqual(35, result["proposals"][0]["review_warnings"][0]["requested_minutes"])
+
+    def test_hermes_assistant_points_cannot_bridge_idle_user_gap(self):
+        points = [hermes_event("2026-09-10 09:00"), hermes_event("2026-09-10 09:02"),
+                  hermes_event("2026-09-10 09:25", "assistant"),
+                  hermes_event("2026-09-10 09:40"), hermes_event("2026-09-10 09:45")]
+        self.assertEqual([
+            {"start": "2026-09-10T09:00:00+03:00", "end": "2026-09-10T09:02:00+03:00"},
+            {"start": "2026-09-10T09:40:00+03:00", "end": "2026-09-10T09:45:00+03:00"},
+        ], pipeline._activity_observed_intervals([point.document() for point in points]))
+
+    def test_hermes_single_user_assistant_only_and_session_envelope_have_no_duration(self):
+        summary = evidence_ledger.evidence_event(
+            "hermes_db_sessions", {"source_type": "hermes_db_sessions", "source_id": "summary"},
+            raw_source_span={"start": "2026-09-10 09:00", "end": "2026-09-10 19:00"},
+            attributes={"first_user_message": "Completed work"},
+        ).document()
+        for points in (
+            [hermes_event("2026-09-10 09:00"), hermes_event("2026-09-10 09:10", "assistant")],
+            [hermes_event("2026-09-10 09:00", "assistant"), hermes_event("2026-09-10 09:10", "assistant")],
+        ):
+            with self.subTest(roles=[point.attributes["role"] for point in points]):
+                self.assertEqual([], pipeline._activity_observed_intervals(
+                    [summary, *(point.document() for point in points)]))
+
+    def test_hermes_user_clusters_split_by_local_day_machine_and_session(self):
+        points = [hermes_event("2026-09-10T20:55:00Z"),
+                  hermes_event("2026-09-10T21:05:00Z"),
+                  hermes_event("2026-09-10T21:10:00Z"),
+                  hermes_event("2026-09-10T21:20:00Z", session="other"),
+                  hermes_event("2026-09-10T21:25:00Z", machine="desktop")]
+        self.assertEqual([{
+            "start": "2026-09-11T00:05:00+03:00", "end": "2026-09-11T00:10:00+03:00",
+        }], pipeline._activity_observed_intervals([point.document() for point in points]))
+
+    def test_hermes_user_points_require_exact_session_and_machine_provenance(self):
+        for session, machine in (("", "precision"), ("one", "")):
+            points = [hermes_event("2026-09-10 09:00", session=session, machine=machine),
+                      hermes_event("2026-09-10 09:10", session=session, machine=machine)]
+            with self.subTest(session=session, machine=machine):
+                self.assertEqual([], pipeline._activity_observed_intervals([point.document() for point in points]))
+
+    def test_hermes_automatic_user_wrapper_is_not_a_human_duration_anchor(self):
+        human = hermes_event("2026-09-10 09:00").document()
+        wrapper = hermes_event("2026-09-10 09:10").document()
+        wrapper["attributes"]["content"] = "<system-reminder>Continue background work</system-reminder>"
+        self.assertEqual([], pipeline._activity_observed_intervals([human, wrapper]))
+
     def test_point_timestamp_is_not_paired_with_session_end(self):
         """Catches point evidence borrowing unrelated session metadata duration."""
         carried = session_event(
@@ -2092,6 +2162,7 @@ class WorkAccountingPipelineTests(unittest.TestCase):
                 ),
                 "max_consecutive_gap_seconds": pipeline.collector.BURST_GAP_SECONDS,
                 "source_types": ["claude_bursts_event", "codex_sessions_event"],
+                "user_anchor_source_types": ["hermes_db_sessions_event", "hermes_sessions_event"],
             },
             result["allocation"]["deterministic_inputs"]
             ["point_observation_clustering"],

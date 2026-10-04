@@ -51,6 +51,7 @@ POINT_OBSERVATION_CLUSTERING_INPUT = {
     "configuration_source": "scripts.clockify_sync_collect.BURST_GAP_SECONDS",
     "max_consecutive_gap_seconds": collector.BURST_GAP_SECONDS,
     "source_types": sorted(POINT_OBSERVATION_GAP_THRESHOLDS_SECONDS),
+    "user_anchor_source_types": ["hermes_db_sessions_event", "hermes_sessions_event"],
 }
 NOISE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("heartbeat", re.compile(r"^\s*(?:heartbeat|health[- ]?check)(?:\s*[:—-].*)?\s*$", re.I)),
@@ -207,12 +208,15 @@ def run_scoped_failed_review_retry(
     if scoped_review_mode == "fresh":
         if targets and all(code == "contract_rejected_invalid_effort" for code in targets.values()):
             request_mode = "scoped_review_v3_invalid_effort"
-        elif targets and all(code == "contract_rejected_duplicate_evidence" for code in targets.values()):
+        elif targets and all(code in {
+            "contract_rejected_duplicate_evidence", "citation_quarantine",
+        } for code in targets.values()):
             request_mode = "scoped_review_v4_citation_quarantine"
         else:
             request_mode = "scoped_review_v2"
     if request_mode == "scoped_review_v4_citation_quarantine" and any(
-        code != "contract_rejected_duplicate_evidence" for code in targets.values()
+        code not in {"contract_rejected_duplicate_evidence", "citation_quarantine"}
+        for code in targets.values()
     ):
         raise WorkAccountingError("scoped citation quarantine requires duplicate-evidence targets")
     if re.fullmatch(r"[a-f0-9]{64}", source_semantic_sha256) is None or not targets:
@@ -1736,14 +1740,36 @@ def _activity_observed_intervals(
     """Union actual bounds and authoritative per-source point clusters."""
     candidates: list[tuple[dt.datetime, dt.datetime]] = []
     point_groups: dict[tuple[str, str, str, str], list[dt.datetime]] = {}
+    hermes_groups: dict[tuple[str, str, str], list[dict[str, str]]] = {}
     for event in cited_events:
+        source_type = str(event.get("source_type") or "")
+        if source_type in {"hermes_db_sessions", "hermes_sessions"}:
+            # Hermes session_start/end describe an unattended envelope. Only
+            # its timestamped direct-user messages can establish capacity.
+            continue
+        if source_type in {"hermes_db_sessions_event", "hermes_sessions_event"}:
+            source = event.get("source_ref") if isinstance(event.get("source_ref"), Mapping) else {}
+            raw = event.get("raw_source_span") if isinstance(event.get("raw_source_span"), Mapping) else {}
+            if (
+                _attributes(event).get("role") == "user"
+                and source.get("machine") and source.get("session_id")
+                and source.get("source_type") == source_type.removesuffix("_event")
+            ):
+                group = (source_type, str(source["machine"]), str(source["session_id"]))
+                hermes_groups.setdefault(group, []).append({
+                    "role": "user",
+                    "kind": str(_attributes(event).get("kind") or "message"),
+                    "tool_name": str(_attributes(event).get("tool_name") or ""),
+                    "content": str(_attributes(event).get("content") or ""),
+                    "timestamp": str(raw.get("timestamp") or event.get("observed_at") or ""),
+                })
+            continue
         start, end = _observed_span(event)
         if start is None:
             continue
         if end is not None:
             candidates.append((start, end))
             continue
-        source_type = str(event.get("source_type") or "")
         if source_type not in POINT_OBSERVATION_GAP_THRESHOLDS_SECONDS:
             continue
         source_ref = (
@@ -1758,6 +1784,9 @@ def _activity_observed_intervals(
             str(source_ref.get("session_id") or ""),
         )
         point_groups.setdefault(group, []).append(start)
+    for group in sorted(hermes_groups):
+        for interval in collector.hermes_user_observed_intervals(hermes_groups[group]):
+            candidates.append((_parse_dt(interval["start"]), _parse_dt(interval["end"])))
     for group in sorted(point_groups):
         points = sorted(set(point_groups[group]))
         threshold = POINT_OBSERVATION_GAP_THRESHOLDS_SECONDS[group[1]]

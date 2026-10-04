@@ -8,7 +8,7 @@ from unittest import mock
 
 from scripts import semantic_analyzer as semantic
 from scripts import work_accounting_pipeline as pipeline
-from test_semantic_analyzer import event, provider_response
+from test_semantic_analyzer import event, provider_response, provider_members, provider_partitions
 
 
 class ScopedFailedReviewRecoveryTests(unittest.TestCase):
@@ -104,6 +104,108 @@ class ScopedFailedReviewRecoveryTests(unittest.TestCase):
             self.assertEqual(result["failed_review_retry"], replay["failed_review_retry"])
             self.assertEqual(sealed, cache_path.read_bytes())
 
+    def test_partial_quarantine_retry_keeps_disjoint_work_when_one_member_is_duplicated(self):
+        """Catches rejecting all seven members for two singleton citations of member four."""
+        events = []
+        for number, role, minute in (
+            (1, "assistant", "38"), (2, "user", "38"),
+            (3, "assistant", "38"), (4, "assistant", "50"),
+            (5, "user", "55"), (6, "user", "55"),
+            (7, "assistant", "55"), (8, "assistant", "59"),
+        ):
+            row = event(f"ev-{number}")
+            row.update({
+                "source_type": "claude_bursts_event",
+                "observed_at": f"2026-09-26T12:{minute}:00+03:00",
+                "raw_source_span": {"timestamp": f"2026-09-26T12:{minute}:00+03:00"},
+                "source_ref": {
+                    "source_type": "claude_bursts", "machine": "fixture",
+                    "session_id": "cleanup", "source_id": f"message-{number}",
+                    "ordinal": number,
+                },
+                "attributes": {"role": role, "kind": "message", "content": "Cleanup work"},
+            })
+            row.pop("observed_start")
+            row.pop("observed_end")
+            events.append(row)
+        target = tuple(f"ev-{number}" for number in range(1, 8))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original_cache = semantic.AnalyzerResponseCache(root / "analyzer-cache-used.jsonl")
+            original_cache.store_accepted(
+                self.endpoint,
+                {"model": self.endpoint.model, "messages": [{"role": "user", "content": "prior"}]},
+                {"activities": [], "exceptions": [], "omissions": []},
+            )
+            source = self.source(events, original_cache, set(target))
+            source["activities"] = [{"activity_id": "prior-accepted", "evidence_ids": ["ev-8"]}]
+            source["omissions"] = []
+            source_path = root / "semantic-analysis.json"
+            source_path.write_text(json.dumps(source))
+            source_hashes = {
+                path: hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in (source_path, original_cache.path)
+            }
+            frozen_source = copy.deepcopy(source)
+            retry_path = root / "analyzer-cache-retry.jsonl"
+            retry_path.write_bytes(original_cache.path.read_bytes())
+            calls = []
+
+            def transport(_endpoint, body):
+                payload = json.loads(body["messages"][1]["content"])
+                calls.append(payload)
+                members = provider_members(payload)
+                valid_members = [members[index - 1] for index in (2, 3, 5, 6, 7)]
+                response = provider_response(payload, members=valid_members)
+                response["activities"][0].update({
+                    "action": "Cleaned", "object": "merged branches and worktrees",
+                    "outcome": "preserved the active session",
+                    "effort": {"minimum_minutes": 3, "recommended_minutes": 6, "maximum_minutes": 10},
+                })
+                singleton = provider_response(payload, members=[members[3]])["activities"][0]
+                response["activities"].extend([singleton, copy.deepcopy(singleton)])
+                response["exceptions"] = [{
+                    "kind": "insufficient_evidence", "reason": "Cleanup intention only",
+                    "evidence_partitions": provider_partitions([members[0]]),
+                }]
+                return response
+
+            result = pipeline.run_scoped_failed_review_retry(
+                source, events, primary=self.endpoint,
+                cache=semantic.AnalyzerResponseCache(retry_path),
+                review_taxonomy=self.taxonomy, targets={target: "citation_quarantine"},
+                source_semantic_sha256=hashlib.sha256(source_path.read_bytes()).hexdigest(),
+                transport=transport, private_text_approved=True,
+            )
+            self.assertEqual(2, len(result["activities"]))
+            self.assertEqual(source["activities"][0], result["activities"][0])
+            self.assertEqual(["ev-2", "ev-3", "ev-5", "ev-6", "ev-7"], result["activities"][1]["evidence_ids"])
+            self.assertEqual(6, result["activities"][1]["effort"]["recommended_minutes"])
+            self.assertEqual([
+                ("insufficient_evidence", ["ev-1"]),
+                ("analyzer_review_partial_quarantine", ["ev-4"]),
+            ], [(row["kind"], row["evidence_ids"]) for row in result["exceptions"]])
+            self.assertEqual([{
+                "start": "2026-09-26T12:38:00+03:00", "end": "2026-09-26T12:55:00+03:00",
+            }], pipeline._activity_observed_intervals([events[index - 1] for index in (2, 3, 5, 6, 7)]))
+            self.assertEqual([], pipeline._activity_observed_intervals([events[3]]))
+            self.assertEqual(frozen_source, source)
+            self.assertEqual(source_hashes, {
+                path: hashlib.sha256(path.read_bytes()).hexdigest() for path in source_hashes
+            })
+            self.assertEqual(1, len(calls))
+            replay = pipeline.run_scoped_failed_review_retry(
+                source, events, primary=self.endpoint,
+                cache=semantic.AnalyzerResponseCache(retry_path),
+                review_taxonomy=self.taxonomy, targets={target: "citation_quarantine"},
+                source_semantic_sha256=hashlib.sha256(source_path.read_bytes()).hexdigest(),
+                transport=lambda *_: self.fail("accepted partial recovery must replay offline"),
+                private_text_approved=False,
+                scoped_review_mode=result["failed_review_retry"]["mode"],
+            )
+            for section in ("activities", "exceptions", "omissions"):
+                self.assertEqual(result[section], replay[section])
+
     def test_large_session_is_split_only_between_complete_user_turns(self):
         events = []
         for number in range(1, 41):
@@ -154,6 +256,32 @@ class ScopedFailedReviewRecoveryTests(unittest.TestCase):
             self.assertTrue(all(sum(bundle["member_count"] for bundle in request["bundles"]) <= 64 for request in requests))
             self.assertEqual(80, sum(len(row["evidence_ids"]) for row in result["omissions"]))
             self.assertEqual([], result["exceptions"])
+
+    def test_partial_quarantine_does_not_hide_invalid_project_on_duplicate_rows(self):
+        """Whole-row quarantine must not sanitize invalid semantic routing."""
+        events = [event("ev-1"), event("ev-2")]
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = semantic.AnalyzerResponseCache(Path(temporary) / "analyzer-cache-used.jsonl")
+            source = self.source(events, cache, {"ev-1"})
+
+            def transport(_endpoint, body):
+                payload = json.loads(body["messages"][1]["content"])
+                response = provider_response(payload)
+                response["activities"][0]["project_recommendation"]["name"] = "Unknown client"
+                response["activities"].append(copy.deepcopy(response["activities"][0]))
+                return response
+
+            result = pipeline.run_scoped_failed_review_retry(
+                source, events, primary=self.endpoint, cache=cache,
+                review_taxonomy=self.taxonomy,
+                targets={("ev-1",): "citation_quarantine"},
+                source_semantic_sha256=self.source_digest,
+                transport=transport, private_text_approved=True,
+            )
+            self.assertEqual([], result["activities"])
+            self.assertEqual(source["omissions"], result["omissions"])
+            self.assertEqual("analyzer_review_failure", result["exceptions"][0]["kind"])
+            self.assertIn("contract_rejected_other", result["exceptions"][0]["reason"])
 
     def test_multi_target_provenance_is_sorted_by_digest_not_evidence_id(self):
         events = [event("ev-1"), event("ev-2")]

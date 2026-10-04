@@ -116,17 +116,19 @@ class CitationV4ReplayTests(unittest.TestCase):
                     first, digest(quarantine), scoped=True,
                     transport=duplicate_transport,
                 )
-                rejected = exception(second, "analyzer_review_failure")
-                self.assertIn("contract_rejected_duplicate_evidence", rejected["reason"])
-                self.assertIn("bounded scoped retry", rejected["reason"])
+                residual = exception(second, "analyzer_review_partial_quarantine")
+                self.assertFalse(any(
+                    row["kind"] == "analyzer_review_failure"
+                    for row in json.loads((second / "semantic-analysis.json").read_text())["exceptions"]
+                ))
                 self.assertEqual(
-                    "scoped_review_v2",
+                    "scoped_review_v4_citation_quarantine",
                     json.loads((second / "semantic-analysis.json").read_text())[
                         "failed_review_retry"
                     ]["mode"],
                 )
                 third, bundle = retry(
-                    second, digest(rejected), scoped=True,
+                    second, digest(residual), scoped=True,
                     transport=valid_transport,
                 )
                 recovered = json.loads((third / "semantic-analysis.json").read_text())

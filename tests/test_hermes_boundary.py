@@ -316,6 +316,78 @@ class HermesBoundaryTests(unittest.TestCase):
         self.assertEqual([], enriched)
         self.assertEqual([], remote["hermes_db_sessions"])
 
+    def test_user_observed_intervals_ignore_envelope_and_assistant_tail_locally_and_remotely(self):
+        self.add_session(
+            "user-burst", SINCE + dt.timedelta(hours=8), SINCE + dt.timedelta(hours=20),
+            [("user", SINCE + dt.timedelta(hours=12, minutes=10, seconds=43), "Direct work request"),
+             ("user", SINCE + dt.timedelta(hours=12, minutes=12, seconds=11), "Interactive follow-up"),
+             ("user", SINCE + dt.timedelta(hours=12, minutes=41, seconds=5), "Confirm completed work"),
+             ("assistant", SINCE + dt.timedelta(hours=15), "unattended result")],
+        )
+        local = collector.collect_hermes_db_sessions(str(self.db_path), "remote-test", SINCE, UNTIL)
+        remote = self.collect_legacy_remote()["hermes_db_sessions"]
+        expected = [{"start": "2026-09-10T12:10:43+03:00", "end": "2026-09-10T12:41:05+03:00"}]
+        for records in (local, remote):
+            self.assertEqual(expected, records[0].get("observed_user_intervals"))
+            self.assertEqual("2026-09-10T12:10:43+03:00", records[0]["events"][0]["timestamp"])
+            self.assertEqual("2026-09-10 08:00", records[0]["start"])
+            self.assertEqual("2026-09-10 20:00", records[0]["end"])
+
+    def test_user_observed_intervals_split_idle_and_local_midnight(self):
+        self.add_session(
+            "split-bursts", SINCE, UNTIL + dt.timedelta(hours=1),
+            [("user", SINCE + dt.timedelta(hours=9), "Begin first task"),
+             ("user", SINCE + dt.timedelta(hours=9, minutes=30), "Finish first task"),
+             ("assistant", SINCE + dt.timedelta(hours=9, minutes=50), "not a user anchor"),
+             ("user", SINCE + dt.timedelta(hours=10, seconds=1), "Isolated task point"),
+             ("user", SINCE + dt.timedelta(hours=23, minutes=55), "Before midnight"),
+             ("user", UNTIL + dt.timedelta(minutes=5), "After midnight"),
+             ("user", UNTIL + dt.timedelta(minutes=10), "Complete next day task")],
+        )
+        record = collector.collect_hermes_db_sessions(
+            str(self.db_path), "precision", SINCE, UNTIL + dt.timedelta(days=1))[0]
+        self.assertEqual([
+            {"start": "2026-09-10T09:00:00+03:00", "end": "2026-09-10T09:30:00+03:00"},
+            {"start": "2026-09-11T00:05:00+03:00", "end": "2026-09-11T00:10:00+03:00"},
+        ], record.get("observed_user_intervals"))
+
+    def test_assistant_only_and_one_user_have_no_observed_user_interval(self):
+        for index, roles in enumerate((("assistant", "assistant"), ("user", "assistant"))):
+            self.add_session(str(index), SINCE, SINCE + dt.timedelta(hours=1),
+                             [(role, SINCE + dt.timedelta(minutes=minute), "Work context")
+                              for role, minute in zip(roles, (10, 20))])
+        for record in collector.collect_hermes_db_sessions(str(self.db_path), "precision", SINCE, UNTIL):
+            self.assertEqual([], record.get("observed_user_intervals"))
+
+    def test_user_role_tool_result_is_context_not_an_interactive_anchor(self):
+        self.add_session("tool-result", SINCE, SINCE + dt.timedelta(hours=1),
+                         [("user", SINCE + dt.timedelta(minutes=10), "Direct request"),
+                          ("user", SINCE + dt.timedelta(minutes=20), "Tool output")])
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("UPDATE messages SET tool_name = 'exec_command' WHERE content = 'Tool output'")
+        conn.commit()
+        conn.close()
+        for records in (
+            collector.collect_hermes_db_sessions(str(self.db_path), "remote-test", SINCE, UNTIL),
+            self.collect_legacy_remote()["hermes_db_sessions"],
+        ):
+            self.assertEqual([], records[0]["observed_user_intervals"])
+
+    def test_automated_user_notifications_cannot_create_or_bridge_human_duration(self):
+        self.add_session("automatic-context", SINCE, SINCE + dt.timedelta(hours=1), [
+            ("user", SINCE + dt.timedelta(minutes=1), "Please review the client delivery"),
+            ("user", SINCE + dt.timedelta(minutes=10), "<task-notification>Task completed</task-notification>"),
+            ("user", SINCE + dt.timedelta(minutes=20), "<system-reminder>Resume the task</system-reminder>"),
+            ("user", SINCE + dt.timedelta(minutes=30), "<teammate-message>Done</teammate-message>"),
+            ("user", SINCE + dt.timedelta(minutes=35), "This session is being continued from a previous conversation."),
+            ("user", SINCE + dt.timedelta(minutes=45), "I reviewed the final delivery myself"),
+        ])
+        for records in (
+            collector.collect_hermes_db_sessions(str(self.db_path), "remote-test", SINCE, UNTIL),
+            self.collect_legacy_remote()["hermes_db_sessions"],
+        ):
+            self.assertEqual([], records[0]["observed_user_intervals"])
+
 
 if __name__ == "__main__":
     unittest.main()

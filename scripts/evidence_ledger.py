@@ -728,6 +728,9 @@ def _snapshot_attributes(source_type: str, record: Mapping[str, Any]) -> dict[st
     excluded = {
         "id", "recording_id", "session_id", "machine", "source", "provenance",
         "start", "end", "time", "timestamp", "path", "cwd", "events", "allocation",
+        # Timing is deterministically reconstructed from raw user message
+        # events. Derived collector capacity must not rehash sealed evidence.
+        "observed_user_intervals",
     }
     for key, value in record.items():
         if key not in excluded and key not in shared:

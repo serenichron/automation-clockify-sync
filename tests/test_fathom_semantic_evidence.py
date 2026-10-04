@@ -5,12 +5,56 @@ import unittest
 from unittest import mock
 
 from scripts import clockify_sync_collect as collector
+from scripts import evidence_ledger, meeting_reconciliation
 
 
 UTC = dt.timezone.utc
 
 
 class FathomSemanticEvidenceTests(unittest.TestCase):
+    def test_recording_seconds_and_timezone_survive_collection_ledger_and_canonical_meeting(self):
+        """Catches minute rendering replacing authoritative recording boundaries."""
+        for start, end, expected_start, expected_end in (
+            ("2026-09-10T09:03:41Z", "2026-09-10T09:05:27Z",
+             "2026-09-10T09:03:41+00:00", "2026-09-10T09:05:27+00:00"),
+            ("2026-09-10T12:03:41+03:00", "2026-09-10T12:05:27+03:00",
+             "2026-09-10T12:03:41+03:00", "2026-09-10T12:05:27+03:00"),
+        ):
+            with self.subTest(start=start):
+                page = {"items": [{
+                    "recording_id": "precise-recording", "title": "Client delivery review",
+                    "recording_start_time": start, "recording_end_time": end,
+                    "scheduled_start_time": "2026-09-10T09:00:00Z",
+                    "scheduled_end_time": "2026-09-10T10:00:00Z",
+                    "default_summary": "Reviewed client delivery scope",
+                    "recorded_by": {"email": "vlad@serenichron.com"},
+                    "calendar_invitees": [{"email": "vlad@serenichron.com"},
+                                          {"email": "client@example.test"}],
+                }]}
+                with mock.patch.object(collector, "http_json", return_value=page):
+                    result = collector.fetch_fathom(
+                        {"FATHOM_API_KEY": "synthetic-not-logged"},
+                        dt.datetime(2026, 9, 10, tzinfo=UTC),
+                        dt.datetime(2026, 9, 11, tzinfo=UTC),
+                    )
+                meeting = result["meetings"][0]
+                self.assertEqual("recording", meeting["timing_basis"])
+                self.assertEqual(expected_start, meeting["start"])
+                self.assertEqual(expected_end, meeting["end"])
+                events = evidence_ledger.normalize_collector_snapshot({"fathom": result})
+                span = events[0].raw_source_span
+                self.assertEqual(expected_start, span["start"])
+                self.assertEqual(expected_end, span["end"])
+                normalized = meeting_reconciliation.normalize_ledger_recordings(
+                    [event.document() for event in events], {"timezone": "Europe/Bucharest"})
+                reconciliation = meeting_reconciliation.reconcile_meetings(
+                    normalized, [], vlad_identities={"vlad@serenichron.com"})
+                self.assertEqual(1, len(reconciliation.meetings))
+                canonical = reconciliation.meetings[0]
+                self.assertEqual("2026-09-10T09:03:41Z", canonical.start)
+                self.assertEqual("2026-09-10T09:05:27Z", canonical.end)
+                self.assertEqual(106, canonical.duration_seconds)
+
     def test_bucharest_rendering_respects_winter_and_summer_offsets(self):
         winter = collector.parse_dt("2026-01-15T10:00:00Z")
         summer = collector.parse_dt("2026-07-15T10:00:00Z")
@@ -129,8 +173,8 @@ class FathomSemanticEvidenceTests(unittest.TestCase):
 
         meeting = result["meetings"][0]
         self.assertEqual("scheduled", meeting["timing_basis"])
-        self.assertEqual("2026-07-01 12:00", meeting["start"])
-        self.assertEqual("2026-07-01 13:00", meeting["end"])
+        self.assertEqual("2026-07-01T09:00:00+00:00", meeting["start"])
+        self.assertEqual("2026-07-01T10:00:00+00:00", meeting["end"])
 
     def test_malformed_success_envelope_marks_fathom_incomplete(self):
         with mock.patch.object(collector, "http_json", return_value={"status": "ok"}):
