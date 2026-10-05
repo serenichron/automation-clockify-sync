@@ -307,17 +307,20 @@ def validate_recurring_credit(record: Mapping[str, Any]) -> dict[str, Any]:
         prior_seconds = sum(_seconds(proof["payload"]) for proof in priors)
         current_seconds = sum(target["proposal"]["duration_seconds"] for target in targets)
         kind = record["coverage_kind"]
-        if kind in {"equal_accomplishment", "disjoint_aggregate"}:
+        if kind == "equal_accomplishment":
+            if len(priors) != 1:
+                raise AdoptionError("equal recurring coverage must have one prior")
+            # Explicit aliases describe the same accomplishment, not additive work.
+            if any(target["proposal"]["duration_seconds"] != prior_seconds for target in targets):
+                raise AdoptionError("recurring exact group duration differs")
+        elif kind == "disjoint_aggregate":
             if len(targets) != 1 or prior_seconds != current_seconds:
                 raise AdoptionError("recurring exact group duration differs")
-            if kind == "equal_accomplishment" and len(priors) != 1:
-                raise AdoptionError("equal recurring coverage must have one prior")
-            if kind == "disjoint_aggregate":
-                if len(priors) < 2:
-                    raise AdoptionError("aggregate recurring coverage must have disjoint priors")
-                spans = sorted((native.legacy._parse(proof["payload"]["start"]), native.legacy._parse(proof["payload"]["end"])) for proof in priors)
-                if any(right[0] < left[1] for left, right in zip(spans, spans[1:])):
-                    raise AdoptionError("aggregate prior coverage overlaps")
+            if len(priors) < 2:
+                raise AdoptionError("aggregate recurring coverage must have disjoint priors")
+            spans = sorted((native.legacy._parse(proof["payload"]["start"]), native.legacy._parse(proof["payload"]["end"])) for proof in priors)
+            if any(right[0] < left[1] for left, right in zip(spans, spans[1:])):
+                raise AdoptionError("aggregate prior coverage overlaps")
         elif kind == "whole_recording_aliases":
             if len(priors) != 1:
                 raise AdoptionError("whole recording coverage must consume one prior")

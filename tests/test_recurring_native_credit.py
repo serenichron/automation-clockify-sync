@@ -106,6 +106,47 @@ class RecurringNativeCreditTests(unittest.TestCase):
             self.assertEqual([], survivors)
             self.assertEqual(1, len(skipped))
 
+    def test_one_equal_unit_covers_explicit_equal_duration_aliases_only(self):
+        """Catches summing duplicate aliases instead of each matching one prior."""
+        for minutes in (2, 4):
+            with self.subTest(minutes=minutes), tempfile.TemporaryDirectory() as tmp:
+                current, declaration, proof = self.fixture(
+                    Path(tmp), prior_minutes=(minutes,), current_minutes=(minutes, minutes))
+                independent = copy.deepcopy(current[0])
+                independent.update(activity_id="independent", review_activity_key="wka-independent",
+                                   candidate_key="independent")
+                credit = self.seal(declaration)
+                survivors, skipped = self.apply([*current, independent], [credit], proof)
+                self.assertEqual([independent], survivors)
+                self.assertEqual(2, len(skipped))
+                self.assertTrue(all(row["clockify_entry_ids"] == ["created-1"] for row in skipped))
+
+    def test_equal_aliases_require_each_duration_to_match_one_prior(self):
+        for priors, currents in (((2,), (2, 1)), ((2,), (1, 1)), ((2, 2), (4,))):
+            with self.subTest(priors=priors, currents=currents), tempfile.TemporaryDirectory() as tmp:
+                _current, declaration, _proof = self.fixture(
+                    Path(tmp), prior_minutes=priors, current_minutes=currents)
+                with self.assertRaises(ValueError):
+                    self.seal(declaration)
+
+    def test_disjoint_aggregate_does_not_accept_multiple_current_aliases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _current, declaration, _proof = self.fixture(
+                Path(tmp), prior_minutes=(2, 1), current_minutes=(2, 1), kind="disjoint_aggregate")
+            with self.assertRaises(ValueError):
+                self.seal(declaration)
+
+    def test_equal_aliases_in_separate_units_cannot_reuse_one_prior(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            current, declaration, proof = self.fixture(
+                Path(tmp), prior_minutes=(2,), current_minutes=(2, 2))
+            units = []
+            for review_id in declaration["current_review_ids"]:
+                unit = copy.deepcopy(declaration)
+                unit["current_review_ids"] = [review_id]
+                units.append(self.seal(unit))
+            self.assertEqual((current, []), self.apply(current, units, proof))
+
     def test_one_whole_recording_unit_covers_both_declared_aliases_without_offsets(self):
         with tempfile.TemporaryDirectory() as tmp:
             current, declaration, proof = self.fixture(Path(tmp), prior_minutes=(86,), current_minutes=(15, 6), kind="whole_recording_aliases")
