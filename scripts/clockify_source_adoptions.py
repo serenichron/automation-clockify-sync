@@ -7,6 +7,7 @@ adopts that exact declaration. Shared evidence, timing and wording imply nothing
 from __future__ import annotations
 
 import hashlib
+import copy
 import json
 from pathlib import Path
 import re
@@ -25,6 +26,7 @@ FIELDS = frozenset({
     "operation_anchor", "current_review_id", "current_payload_digest", "prior_review_id",
     "clockify_entry_id", "artifacts",
 })
+PRIOR_ARTIFACTS = ARTIFACTS - {"current_proposals", "current_source_ledger"}
 
 
 class AdoptionError(ValueError):
@@ -42,7 +44,12 @@ def _capture(handle: Mapping[str, Any], cache: dict[tuple[str, str], bytes]) -> 
     path = Path(handle["path"])
     if not path.is_absolute() or path.resolve() != path or not path.is_file():
         raise AdoptionError("source adoption artifact must be an absolute original file")
+    before = path.stat()
     content = path.read_bytes()
+    after = path.stat()
+    identity = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+    if identity(before) != identity(after) or path.resolve() != path:
+        raise AdoptionError("source adoption artifact changed while being read")
     if handle["sha256"] != "sha256:" + hashlib.sha256(content).hexdigest():
         raise AdoptionError("source adoption artifact bytes drifted")
     cache[key] = content
@@ -96,6 +103,91 @@ def current_live_matches(payload: Mapping[str, Any], entry: Mapping[str, Any], *
             and entry.get("taskId") == payload.get("taskId"))
 
 
+def _source_events(proposal: Mapping[str, Any], ledger: Mapping[str, Any]) -> list[dict[str, Any]]:
+    ids = set(proposal["provenance"]["evidence_ids"])
+    return [copy.deepcopy(event) for event in ledger["events"] if event["evidence_id"] in ids]
+
+
+def validate_prior_native_proof(proof: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Recheck original approved payload/target/source/event links, without IO."""
+    from scripts import clockify_native_sheet_post as native
+    expected = {"clockify_entry_id", "prior_review_id", "workspace_id", "member_id", "payload", "payload_digest",
+                "prior_proposal", "source_events", "native_plan", "native_approval", "native_intent",
+                "native_confirmed", "artifact_handles", "proof_digest"}
+    if not isinstance(proof, Mapping) or set(proof) != expected or proof["proof_digest"] != native._document_digest(proof, "proof_digest"):
+        raise AdoptionError("sealed prior native proof integrity differs")
+    plan, approval = proof["native_plan"], proof["native_approval"]
+    if (plan.get("workspace_id"), plan.get("member_id")) != (proof["workspace_id"], proof["member_id"]):
+        raise AdoptionError("source adoption prior Clockify target differs")
+    approval_digest = native._validate_approval(plan, approval, native.legacy._parse(approval["approved_at"]))
+    rows = [row for row in plan["entries"] if row["review_id"] == proof["prior_review_id"]]
+    if len(rows) != 1 or "prior_entry_credit" in rows[0]:
+        raise AdoptionError("source adoption must bind one original native POST row")
+    row = rows[0]
+    if row["payload_digest"] != native._digest(row["payload"]) or row["payload_digest"] != proof["payload_digest"] or row["payload"] != proof["payload"]:
+        raise AdoptionError("source adoption prior payload digest differs")
+    _validate_source_target(proof["prior_proposal"], proof["source_events"], proof["prior_review_id"])
+    if proof["prior_proposal"].get("duration_seconds") != _seconds(proof["payload"]):
+        raise AdoptionError("source adoption prior exact duration differs")
+    terminal, intent = proof["native_confirmed"], proof["native_intent"]
+    for event in (terminal, intent):
+        if (event["event_digest"] != native._document_digest(event, "event_digest")
+                or event.get("approval_digest") != approval_digest or event.get("plan_digest") != plan["plan_digest"]
+                or event.get("review_id") != row["review_id"] or event.get("payload_digest") != row["payload_digest"]):
+            raise AdoptionError("source adoption lacks an exact native confirmed-entry binding")
+    if (intent.get("event_type") != "intent" or terminal.get("event_type") != "confirmed"
+            or terminal.get("clockify_entry_id") != proof["clockify_entry_id"]
+            or terminal.get("disposition") not in {"created", "recovered_after_ambiguous_response"}
+            or not isinstance(terminal.get("readback_digest"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", terminal["readback_digest"])):
+        raise AdoptionError("source adoption lacks an exact native confirmed-entry binding")
+    if not isinstance(proof["artifact_handles"], Mapping) or set(proof["artifact_handles"]) != PRIOR_ARTIFACTS:
+        raise AdoptionError("sealed prior source artifact inventory differs")
+    return proof
+
+
+def _validate_source_target(proposal: Mapping[str, Any], events: Sequence[Mapping[str, Any]], review_id: str) -> None:
+    if (not isinstance(proposal, Mapping) or type(proposal.get("allocation_segment")) is not int
+            or f'{proposal.get("review_activity_key")}-s{proposal["allocation_segment"]:02d}' != review_id
+            or type(proposal.get("duration_seconds")) is not int or proposal["duration_seconds"] <= 0):
+        raise AdoptionError("sealed source proposal identity or duration differs")
+    ids = proposal["provenance"]["evidence_ids"]
+    if not isinstance(ids, list) or not ids or len(ids) != len(set(ids)):
+        raise AdoptionError("sealed source proposal evidence differs")
+    parsed = [evidence_ledger.EvidenceEvent.from_document(event) for event in events]
+    if len(parsed) != len(ids) or set(ids) != {event.evidence_id for event in parsed}:
+        raise AdoptionError("sealed source evidence membership differs")
+
+
+def verify_prior_native_proof(artifact_handles: Mapping[str, Any], prior_review_id: str,
+                              entry_id: str, *, workspace_id: str, member_id: str,
+                              capture_cache: dict[tuple[str, str], bytes] | None = None) -> dict[str, Any]:
+    from scripts import clockify_native_sheet_post as native
+    if not isinstance(artifact_handles, Mapping) or set(artifact_handles) != PRIOR_ARTIFACTS:
+        raise AdoptionError("source adoption is missing original native proof artifacts")
+    cache = {} if capture_cache is None else capture_cache
+    captures = {name: _capture(handle, cache) for name, handle in artifact_handles.items()}
+    documents = {name: json.loads(raw) for name, raw in captures.items() if name != "native_events"}
+    prior = _source(documents["prior_proposals"], documents["source_ledger"], prior_review_id)
+    plan, approval = documents["native_plan"], documents["native_approval"]
+    if (plan.get("workspace_id"), plan.get("member_id")) != (workspace_id, member_id):
+        raise AdoptionError("source adoption prior Clockify target differs")
+    approval_digest = native._validate_approval(plan, approval, native.legacy._parse(approval["approved_at"]))
+    rows = [row for row in plan["entries"] if row["review_id"] == prior_review_id]
+    if len(rows) != 1:
+        raise AdoptionError("source adoption must bind one original native POST row")
+    intents, _responses, confirmed = native._confirmed_by_review(native._decode_events(captures["native_events"]), approval_digest, plan["plan_digest"])
+    if prior_review_id not in intents or prior_review_id not in confirmed:
+        raise AdoptionError("source adoption lacks an exact native confirmed-entry binding")
+    proof = dict(clockify_entry_id=entry_id, prior_review_id=prior_review_id, workspace_id=workspace_id, member_id=member_id,
+                 payload=rows[0]["payload"], payload_digest=rows[0]["payload_digest"], prior_proposal=prior,
+                 source_events=_source_events(prior, documents["source_ledger"]), native_plan=plan, native_approval=approval,
+                 native_intent=intents[prior_review_id], native_confirmed=confirmed[prior_review_id], artifact_handles=dict(artifact_handles))
+    proof["proof_digest"] = native._digest(proof)
+    validate_prior_native_proof(proof)
+    return copy.deepcopy(proof)
+
+
 def _credit(declaration: Mapping[str, Any], current: Mapping[str, Any], *,
             workspace_id: str, member_id: str,
             capture_cache: dict[tuple[str, str], bytes],
@@ -116,36 +208,20 @@ def _credit(declaration: Mapping[str, Any], current: Mapping[str, Any], *,
         raise AdoptionError("source adoption is missing original source or confirmed POST artifacts")
     captures = {name: _capture(handle, capture_cache) for name, handle in handles.items()}
     documents = {name: json.loads(content) for name, content in captures.items() if name != "native_events"}
-    prior = _source(documents["prior_proposals"], documents["source_ledger"], declaration["prior_review_id"])
     present = _source(documents["current_proposals"], documents["current_source_ledger"], declaration["current_review_id"])
-    plan, approval = documents["native_plan"], documents["native_approval"]
-    if (plan.get("workspace_id"), plan.get("member_id")) != (workspace_id, member_id):
-        raise AdoptionError("source adoption prior Clockify target differs")
-    # Historical approval is checked at its actual validity boundary, not now.
-    approval_digest = native._validate_approval(plan, approval, native.legacy._parse(approval["approved_at"]))
-    rows = [row for row in plan["entries"] if row["review_id"] == declaration["prior_review_id"]]
-    if len(rows) != 1 or "prior_entry_credit" in rows[0]:
-        raise AdoptionError("source adoption must bind one original native POST row")
-    row = rows[0]
-    if row["payload_digest"] != native._digest(row["payload"]):
-        raise AdoptionError("source adoption prior payload digest differs")
+    proof = verify_prior_native_proof({name: handles[name] for name in PRIOR_ARTIFACTS}, declaration["prior_review_id"],
+                                      declaration["clockify_entry_id"], workspace_id=workspace_id, member_id=member_id,
+                                      capture_cache=capture_cache)
+    prior, plan, approval = proof["prior_proposal"], proof["native_plan"], proof["native_approval"]
+    row = next(row for row in plan["entries"] if row["review_id"] == declaration["prior_review_id"])
+    approval_digest = native._digest(approval)
     seconds = _seconds(row["payload"])
     if (seconds != _seconds(current["payload"]) or prior.get("duration_seconds") != seconds
             or present.get("duration_seconds") != seconds
             or type(prior.get("duration_seconds")) is not int
             or type(present.get("duration_seconds")) is not int):
         raise AdoptionError("source adoption is not a one-to-one exact-duration accomplishment")
-    records = native._decode_events(captures["native_events"])
-    intents, _responses, confirmed = native._confirmed_by_review(records, approval_digest, plan["plan_digest"])
-    terminal, intent = confirmed.get(row["review_id"]), intents.get(row["review_id"])
-    if (terminal is None or intent is None
-            or terminal.get("clockify_entry_id") != declaration["clockify_entry_id"]
-            or terminal.get("payload_digest") != row["payload_digest"]
-            or intent.get("payload_digest") != row["payload_digest"]
-            or terminal.get("disposition") not in {"created", "recovered_after_ambiguous_response"}
-            or not isinstance(terminal.get("readback_digest"), str)
-            or not re.fullmatch(r"[0-9a-f]{64}", terminal["readback_digest"])):
-        raise AdoptionError("source adoption lacks an exact native confirmed-entry binding")
+    terminal = proof["native_confirmed"]
     result = {
         "declaration": dict(declaration), "declaration_digest": native._digest(declaration),
         "clockify_entry_id": terminal["clockify_entry_id"], "payload": dict(row["payload"]),
@@ -173,6 +249,125 @@ def _credit(declaration: Mapping[str, Any], current: Mapping[str, Any], *,
                       readback_digest=native._live_digest(matches))
     result["credit_digest"] = native._digest(result)
     return result
+
+
+def _review_id(proposal: Mapping[str, Any]) -> str:
+    return f'{proposal["review_activity_key"]}-s{proposal["allocation_segment"]:02d}'
+
+
+def recurring_proposal_digest(proposal: Mapping[str, Any]) -> str:
+    """Bind all proposal facts except the ephemeral S/P presentation ID."""
+    from scripts import clockify_native_sheet_post as native
+    return native._digest({key: value for key, value in proposal.items() if key != "id"})
+
+
+def _recording(event: Mapping[str, Any]) -> tuple[str, str, str] | None:
+    from scripts import clockify_native_sheet_post as native
+    if event.get("source_type") not in {"fathom", "calendly"}:
+        return None
+    ref, span = event.get("source_ref"), event.get("raw_source_span")
+    if not isinstance(ref, Mapping) or not isinstance(span, Mapping) or not ref.get("source_id"):
+        return None
+    return (str(ref["source_id"]), native.legacy._utc(span["start"]), native.legacy._utc(span["end"]))
+
+
+def validate_recurring_credit(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate an audited coverage unit using sealed original facts only."""
+    from scripts import clockify_native_sheet_post as native
+    required = {"schema_version", "record_type", "verification_basis", "operation_anchor", "coverage_kind",
+                "current_targets", "prior_proofs", "credit_digest"}
+    try:
+        if (not isinstance(record, Mapping) or set(record) != required or record["schema_version"] != 2
+                or record["record_type"] != review_corrections.VERIFIED_POSTED_CREDIT
+                or record["verification_basis"] != "preserved_collection_snapshot"
+                or record["credit_digest"] != native._document_digest(record, "credit_digest")):
+            raise AdoptionError("sealed recurring credit integrity or basis differs")
+        anchor = record["operation_anchor"]
+        if not isinstance(anchor, str) or not anchor.strip() or len(anchor) > 512 or not anchor.isprintable():
+            raise AdoptionError("recurring credit needs an explicit audited operation anchor")
+        targets, priors = record["current_targets"], record["prior_proofs"]
+        if not isinstance(targets, list) or not targets or not isinstance(priors, list) or not priors:
+            raise AdoptionError("recurring credit needs exact current and prior targets")
+        review_ids = set()
+        for target in targets:
+            if set(target) != {"proposal", "proposal_digest", "source_events"} or target["proposal_digest"] != recurring_proposal_digest(target["proposal"]):
+                raise AdoptionError("recurring current target digest differs")
+            proposal = target["proposal"]
+            review_id = _review_id(proposal)
+            if review_id in review_ids or not proposal.get("activity_id") or not proposal.get("candidate_key"):
+                raise AdoptionError("recurring current target identity is absent or repeated")
+            review_ids.add(review_id)
+            _validate_source_target(proposal, target["source_events"], review_id)
+        for proof in priors:
+            validate_prior_native_proof(proof)
+        ids = [proof["clockify_entry_id"] for proof in priors]
+        scopes = {(proof["workspace_id"], proof["member_id"]) for proof in priors}
+        if len(ids) != len(set(ids)) or len(scopes) != 1:
+            raise AdoptionError("recurring coverage repeats a prior entry or target scope")
+        prior_seconds = sum(_seconds(proof["payload"]) for proof in priors)
+        current_seconds = sum(target["proposal"]["duration_seconds"] for target in targets)
+        kind = record["coverage_kind"]
+        if kind in {"equal_accomplishment", "disjoint_aggregate"}:
+            if len(targets) != 1 or prior_seconds != current_seconds:
+                raise AdoptionError("recurring exact group duration differs")
+            if kind == "equal_accomplishment" and len(priors) != 1:
+                raise AdoptionError("equal recurring coverage must have one prior")
+            if kind == "disjoint_aggregate":
+                if len(priors) < 2:
+                    raise AdoptionError("aggregate recurring coverage must have disjoint priors")
+                spans = sorted((native.legacy._parse(proof["payload"]["start"]), native.legacy._parse(proof["payload"]["end"])) for proof in priors)
+                if any(right[0] < left[1] for left, right in zip(spans, spans[1:])):
+                    raise AdoptionError("aggregate prior coverage overlaps")
+        elif kind == "whole_recording_aliases":
+            if len(priors) != 1:
+                raise AdoptionError("whole recording coverage must consume one prior")
+            proof = priors[0]
+            objects = {_recording(event) for event in proof["source_events"]}
+            if None in objects or len(objects) != 1:
+                raise AdoptionError("whole recording lacks exact canonical source timing")
+            recording = next(iter(objects))
+            if recording[1:] != (proof["payload"]["start"], proof["payload"]["end"]):
+                raise AdoptionError("approved prior does not account for the whole recording")
+            for target in targets:
+                if {_recording(event) for event in target["source_events"]} != objects or target["proposal"]["duration_seconds"] > prior_seconds:
+                    raise AdoptionError("recording alias does not bind the same whole source")
+        else:
+            raise AdoptionError("unsupported explicit recurring coverage kind")
+        return copy.deepcopy(dict(record))
+    except (ValueError, TypeError, KeyError, AttributeError) as error:
+        if isinstance(error, AdoptionError):
+            raise
+        raise AdoptionError("sealed recurring proof binding is invalid") from error
+
+
+def build_recurring_credit(declaration: Mapping[str, Any], *, workspace_id: str, member_id: str) -> dict[str, Any]:
+    """Seal one explicitly audited accomplishment; never discover aliases."""
+    from scripts import clockify_native_sheet_post as native
+    try:
+        if set(declaration) != {"operation_anchor", "coverage_kind", "current_review_ids", "artifacts", "prior_entries"}:
+            raise AdoptionError("recurring declaration proof shape differs")
+        cache: dict[tuple[str, str], bytes] = {}
+        handles = declaration["artifacts"]
+        if set(handles) != {"current_proposals", "current_source_ledger"}:
+            raise AdoptionError("recurring declaration lacks current source artifacts")
+        proposals = json.loads(_capture(handles["current_proposals"], cache))
+        ledger = json.loads(_capture(handles["current_source_ledger"], cache))
+        targets = []
+        for review_id in declaration["current_review_ids"]:
+            proposal = _source(proposals, ledger, review_id)
+            targets.append(dict(proposal=proposal, proposal_digest=recurring_proposal_digest(proposal), source_events=_source_events(proposal, ledger)))
+        priors = [verify_prior_native_proof(prior["artifacts"], prior["prior_review_id"], prior["clockify_entry_id"],
+                                           workspace_id=workspace_id, member_id=member_id, capture_cache=cache)
+                  for prior in declaration["prior_entries"]]
+        record = dict(schema_version=2, record_type=review_corrections.VERIFIED_POSTED_CREDIT,
+                      verification_basis="preserved_collection_snapshot", operation_anchor=declaration["operation_anchor"],
+                      coverage_kind=declaration["coverage_kind"], current_targets=targets, prior_proofs=priors)
+        record["credit_digest"] = native._digest(record)
+        return validate_recurring_credit(record)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+        if isinstance(error, AdoptionError):
+            raise
+        raise AdoptionError("recurring original proof validation failed") from error
 
 
 def credits(snapshot: Mapping[str, Any], entries: Sequence[Mapping[str, Any]], *,

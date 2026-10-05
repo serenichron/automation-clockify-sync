@@ -271,6 +271,12 @@ def validate_decision(record: Mapping[str, Any], *, item: Mapping[str, Any] | No
 
 def validate_verified_posted_credit(record: Mapping[str, Any]) -> dict[str, Any]:
     """Validate an explicit machine credit, never a human review decision."""
+    if isinstance(record, Mapping) and record.get("schema_version") == 2:
+        from scripts import clockify_source_adoptions
+        try:
+            return clockify_source_adoptions.validate_recurring_credit(_without_integrity(record))
+        except (ValueError, TypeError, KeyError) as error:
+            raise ReviewDecisionError("recurring posted credit proof is invalid") from error
     required = {
         "schema_version", "record_type", "evidence_fingerprint", "project_suffix",
         "current_description_sha256", "prior_run_id", "sheet_publication_run_id", "prior_proposals_sha256",
@@ -388,9 +394,34 @@ def append_verified_posted_credit(
     runs_root: Path,
     current_proposals: list[dict[str, Any]],
     existing_blocks: list[dict[str, Any]],
+    collection_snapshot: Any = None,
 ) -> bool:
     """Append only after checking the source capture and current baseline proof."""
     normalized = validate_verified_posted_credit(record)
+    if normalized["schema_version"] == 2:
+        from scripts import work_accounting_pipeline as pipeline
+        _, credited = pipeline._apply_verified_posted_credits(
+            current_proposals, existing_blocks, [normalized], collection_snapshot=collection_snapshot,
+        )
+        if not credited:
+            raise ReviewDecisionError("recurring credit does not prove current source-accounted targets")
+        existing = _read_log(path)
+        prior_ids = {proof["clockify_entry_id"] for proof in normalized["prior_proofs"]}
+        target_ids = {target["proposal"]["candidate_key"] for target in normalized["current_targets"]}
+        for prior in existing:
+            if prior.get("record_type") != VERIFIED_POSTED_CREDIT or prior.get("schema_version") != 2:
+                continue
+            if _without_integrity(prior) == normalized:
+                return False
+            if prior_ids & {proof["clockify_entry_id"] for proof in prior["prior_proofs"]} or target_ids & {target["proposal"]["candidate_key"] for target in prior["current_targets"]}:
+                raise ReviewDecisionError("recurring credit reuses a prior accomplishment or current target")
+        line = dict(normalized)
+        line["previous_digest"] = existing[-1]["canonical_digest"] if existing else None
+        line["canonical_digest"] = canonical_digest(_without_integrity(line))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(canonical_json(line) + "\n")
+        return True
     source_dir = runs_root / normalized["prior_run_id"]
     if source_dir.is_symlink() or source_dir.resolve().parent != runs_root.resolve():
         raise ReviewDecisionError("verified posted credit prior source is outside the runs root")
@@ -413,7 +444,7 @@ def append_verified_posted_credit(
         "evidence_fingerprint", "project_suffix", "current_description_sha256"
     ))
     for prior in existing:
-        if prior.get("record_type") != VERIFIED_POSTED_CREDIT:
+        if prior.get("record_type") != VERIFIED_POSTED_CREDIT or prior.get("schema_version") != 1:
             continue
         if tuple(prior[key] for key in (
             "evidence_fingerprint", "project_suffix", "current_description_sha256"

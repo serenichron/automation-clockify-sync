@@ -755,6 +755,16 @@ only the verified bytes. These are original collection snapshots, not fresh GETs
 or historical POST receipts, and they do not by themselves authorize credits or
 Clockify writes. Historical runs without this optional proof remain readable.
 
+Accounting can consume audited `verified_posted_credit` schema 2 records from
+the frozen corrections snapshot. Each record identifies exactly which current
+proposals are already covered by approved native posts: one accomplishment,
+a disjoint aggregate, or aliases of one fully recorded meeting. Accounting
+checks the prior entries against that run's preserved native collection and
+keeps unrelated work visible. Missing or mismatched proof does not hide time.
+Repair may append effective credits without replacing parent corrections or
+reusing a prior entry; replay reads only sealed facts and copied snapshots.
+This does not automatically discover equivalences or authorize Clockify writes.
+
 Native posting accepts explicit source-accounted declarations through
 `--source-adoptions`. The `clockify-source-accounted-adoptions/v1` schema keeps
 its historical readback-digest requirement without fallback. Explicitly choosing

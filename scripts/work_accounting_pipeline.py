@@ -2333,6 +2333,7 @@ def _apply_verified_posted_credits(
     proposals: list[dict[str, Any]],
     existing_blocks: list[dict[str, Any]],
     credits: Iterable[Mapping[str, Any]],
+    *, collection_snapshot: Any = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Credit only a fully proved posted accomplishment, never a temporal overlap."""
     def fingerprint(proposal: Mapping[str, Any]) -> str | None:
@@ -2431,9 +2432,52 @@ def _apply_verified_posted_credits(
         except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
             return False
 
+    credits = list(credits)
+    recurring = [raw for raw in credits if raw.get("schema_version") == 2]
     survivors = list(proposals)
     skipped: list[dict[str, Any]] = []
+    if recurring and collection_snapshot is not None:
+        from scripts import clockify_source_adoptions as adoptions
+        try:
+            sealed = [review_corrections.validate_verified_posted_credit(raw) for raw in recurring]
+            prior_ids = [proof["clockify_entry_id"] for credit in sealed for proof in credit["prior_proofs"]]
+            target_ids = [target["proposal"]["candidate_key"] for credit in sealed for target in credit["current_targets"]]
+            if len(prior_ids) != len(set(prior_ids)) or len(target_ids) != len(set(target_ids)):
+                sealed = []  # Repeated coverage must not cause partial suppression.
+            for credit in sealed:
+                matched = []
+                for target in credit["current_targets"]:
+                    rows = [row for row in survivors if row.get("candidate_key") == target["proposal"]["candidate_key"]
+                            and adoptions.recurring_proposal_digest(row) == target["proposal_digest"]]
+                    if len(rows) != 1:
+                        break
+                    matched.extend(rows)
+                else:
+                    for proof in credit["prior_proofs"]:
+                        entries = [entry for entry in collection_snapshot.entries if entry.get("id") == proof["clockify_entry_id"]]
+                        request = collection_snapshot.manifest["request"]
+                        if (len(entries) != 1 or request["workspace_id"] != proof["workspace_id"]
+                                or request["user_id"] != proof["member_id"]
+                                or not adoptions.current_live_matches(proof["payload"], entries[0], workspace_id=proof["workspace_id"],
+                                                                     member_id=proof["member_id"], entry_id=proof["clockify_entry_id"])):
+                            break
+                    else:
+                        for row in matched:
+                            survivors.remove(row)
+                            skipped.append({"id": row["candidate_key"], "activity_id": row["activity_id"],
+                                            "candidate_key": row["candidate_key"], "review_activity_key": row["review_activity_key"],
+                                            "allocation_segment": row["allocation_segment"], "evidence_ids": list(row["provenance"]["evidence_ids"]),
+                                            "reason": "verified previously posted accomplishment",
+                                            "verification_basis": "preserved_collection_snapshot", "operation_anchor": credit["operation_anchor"],
+                                            "coverage_kind": credit["coverage_kind"], "credit_digest": credit["credit_digest"],
+                                            "collection_snapshot_sha256": collection_snapshot.manifest_sha256,
+                                            "clockify_entry_ids": [proof["clockify_entry_id"] for proof in credit["prior_proofs"]]})
+        except (ValueError, TypeError, KeyError, AttributeError):
+            # An invalid recurring group must never hide a reviewable proposal.
+            survivors, skipped = list(proposals), []
     for raw in credits:
+        if raw.get("schema_version") == 2:
+            continue
         try:
             credit = review_corrections.validate_verified_posted_credit(raw)
         except review_corrections.ReviewDecisionError:
@@ -2482,6 +2526,49 @@ def _apply_verified_posted_credits(
                 "clockify_block_ids": [entry["clockify_block_id"] for entry in credit["posted_rows"]],
             })
     return survivors, skipped
+
+
+def _accounting_collection_snapshot(run_dir: Path, events: list[dict[str, Any]]) -> Any:
+    """Load active-run preserved proof, binding its projection to this ledger.
+
+    Accounting runs before completion sealing. Never substitute a live GET or
+    infer native approved fields from the sanitized ledger. Absent or invalid
+    proof leaves every recurring target reviewable.
+    """
+    from scripts import clockify_checkpoint_snapshot, collector_receipts
+    try:
+        report_path = collector_receipts._safe_path(run_dir / "run-report.json", run_dir=run_dir)
+        report = json.loads(collector_receipts._safe_read_bytes_and_digest(report_path)[0])
+        metadata = report.get("clockify_native_checkpoint")
+        if not isinstance(metadata, Mapping) or set(metadata) != {"manifest_sha256", "request"}:
+            return None
+        request = metadata["request"]
+        if not isinstance(request, Mapping) or set(request) != {"workspace_id", "user_id", "since_utc", "until_utc"}:
+            return None
+        since, until = _parse_dt(report["date_range"]["since"]), _parse_dt(report["date_range"]["until"])
+        if since is None or until is None or (collector.iso_utc(since), collector.iso_utc(until)) != (request["since_utc"], request["until_utc"]):
+            return None
+        snapshot = clockify_checkpoint_snapshot.load_checkpoint_snapshot(
+            run_dir / collector_receipts.NATIVE_CHECKPOINT_PREFIX,
+            workspace_id=request["workspace_id"], user_id=request["user_id"], since=since, until=until,
+            expected_manifest_sha256=metadata["manifest_sha256"],
+        )
+        if snapshot is None or snapshot.manifest["request"] != request:
+            return None
+        inventory = {collector_receipts.NATIVE_CHECKPOINT_PREFIX + name for name in snapshot.verified_artifact_bytes}
+        if collector_receipts.native_checkpoint_inventory(run_dir) != inventory:
+            return None
+        evidence_path = collector_receipts._safe_path(run_dir / "evidence/clockify-existing.json", run_dir=run_dir)
+        evidence = collector_receipts._safe_read_bytes_and_digest(evidence_path)[0]
+        if evidence != snapshot.verified_artifact_bytes["clockify-existing.json"]:
+            return None
+        normalized = [event.document() for event in evidence_ledger.normalize_collector_snapshot({"clockify": json.loads(evidence)})]
+        ledger_clockify = [event for event in events if event.get("source_type") == "clockify"]
+        if sorted(normalized, key=lambda event: event["evidence_id"]) != sorted(ledger_clockify, key=lambda event: event["evidence_id"]):
+            return None
+        return snapshot
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
 
 
 def run_accounting(
@@ -3086,8 +3173,10 @@ def run_accounting(
     )
 
     proposals = _normalize_postable_proposals(proposals, existing, skipped)
+    collection_snapshot = (_accounting_collection_snapshot(run_dir, all_events)
+                           if any(credit.get("schema_version") == 2 for credit in verified_posted_credits) else None)
     proposals, posted_skipped = _apply_verified_posted_credits(
-        proposals, existing, verified_posted_credits
+        proposals, existing, verified_posted_credits, collection_snapshot=collection_snapshot
     )
     skipped.extend(posted_skipped)
     _refresh_capacity_recovery_warnings(proposals, skipped, recovery_records)

@@ -1796,8 +1796,54 @@ def _validate_repair_credit_transition(
         blocks = work_accounting_pipeline._existing_blocks(events)
         used_review_ids: set[str] = set()
         used_block_ids: set[str] = set()
+        # A coverage unit consumes its original native entry once, including
+        # across a chained repair. Original handles in record2 are provenance;
+        # the sealed native/source facts, not those locators, drive replay.
+        recurring_records = [record for record in child_records
+                             if record.get("record_type") == review_corrections.VERIFIED_POSTED_CREDIT
+                             and record.get("schema_version") == 2]
+        native_ids: set[str] = set()
+        current_ids: set[str] = set()
+        for record in recurring_records:
+            credit = review_corrections.validate_verified_posted_credit(record)
+            for proof in credit["prior_proofs"]:
+                identity = proof["clockify_entry_id"]
+                if identity in native_ids:
+                    raise ReviewRunError("posted credit reuses a native Clockify entry")
+                native_ids.add(identity)
+            for target in credit["current_targets"]:
+                identity = target["proposal"]["candidate_key"]
+                if identity in current_ids:
+                    raise ReviewRunError("posted credit reuses a current proposal")
+                current_ids.add(identity)
+        collection_snapshot = None
+        if any(record.get("schema_version") == 2 for record in tail):
+            report, artifacts = collector_receipts.verified_run_native_checkpoint(source)
+            if not artifacts:
+                raise ReviewRunError("recurring posted credits require sealed collection proof")
+            try:
+                from scripts import clockify_checkpoint_snapshot
+            except ModuleNotFoundError:
+                import clockify_checkpoint_snapshot
+            metadata = report["clockify_native_checkpoint"]
+            request = metadata["request"]
+            collection_snapshot = clockify_checkpoint_snapshot.load_checkpoint_snapshot(
+                source / collector_receipts.NATIVE_CHECKPOINT_PREFIX,
+                workspace_id=request["workspace_id"], user_id=request["user_id"],
+                since=dt.datetime.fromisoformat(request["since_utc"].replace("Z", "+00:00")),
+                until=dt.datetime.fromisoformat(request["until_utc"].replace("Z", "+00:00")),
+                expected_manifest_sha256=metadata["manifest_sha256"],
+            )
         survivors = proposals
         for credit in tail:
+            if credit.get("schema_version") == 2:
+                survivors, skipped = work_accounting_pipeline._apply_verified_posted_credits(
+                    survivors, blocks, [credit], collection_snapshot=collection_snapshot,
+                )
+                expected = {target["proposal"]["candidate_key"] for target in credit["current_targets"]}
+                if {row["candidate_key"] for row in skipped} != expected:
+                    raise ReviewRunError("recurring posted credit does not prove every declared parent proposal")
+                continue
             prior = runs_root / credit["prior_run_id"]
             if (
                 not prior.is_absolute() or prior != prior.resolve()
