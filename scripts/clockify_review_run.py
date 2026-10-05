@@ -877,6 +877,10 @@ def _prepare_collector_derivation_run(
     collector_runtime = dict(identity.collector_runtime_identity)
     source_artifact_bytes = dict(identity.verified_artifact_bytes)
     source_artifact_digests = dict(identity.verified_artifact_digests)
+    native_artifacts = {
+        relative for relative in source_artifact_bytes
+        if relative.startswith(collector_receipts.NATIVE_CHECKPOINT_PREFIX)
+    }
     evidence_files = _COLLECTOR_EVIDENCE_FILES + (
         ("enriched-context.json",)
         if "evidence/enriched-context.json" in source_artifact_bytes else ()
@@ -884,6 +888,7 @@ def _prepare_collector_derivation_run(
     required_source_artifacts = {
         "run-report.json", "evidence/evidence-ledger.json",
         *(f"evidence/{name}" for name in evidence_files),
+        *native_artifacts,
     }
     if set(source_artifact_bytes) != required_source_artifacts or set(
         source_artifact_digests
@@ -975,6 +980,13 @@ def _prepare_collector_derivation_run(
                 content,
                 label=f"collector derivation evidence {filename}",
             )
+        for relative in sorted(native_artifacts):
+            destination = target / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            _write_snapshot(
+                destination, source_artifact_bytes[relative],
+                label=f"collector derivation native checkpoint {relative}",
+            )
         ledger_content = source_artifact_bytes["evidence/evidence-ledger.json"]
         _write_snapshot(
             evidence_target / "evidence-ledger.json",
@@ -1016,6 +1028,7 @@ def _prepare_collector_derivation_run(
             label="collector derivation run report",
         )
         derived_artifact_digests = {
+            **{relative: source_artifact_digests[relative] for relative in native_artifacts},
             **{
                 f"evidence/{filename}": source_artifact_digests[f"evidence/{filename}"]
                 for filename in evidence_files
@@ -1098,6 +1111,10 @@ def _verified_collector_derivation(
     ):
         raise ReviewRunError("collector derivation source binding differs")
     derived_digests = lineage.get("derived_artifact_digests")
+    native_artifacts = {
+        relative for relative in identity.verified_artifact_bytes
+        if relative.startswith(collector_receipts.NATIVE_CHECKPOINT_PREFIX)
+    }
     evidence_files = _COLLECTOR_EVIDENCE_FILES + (
         ("enriched-context.json",)
         if "evidence/enriched-context.json" in identity.verified_artifact_digests else ()
@@ -1105,6 +1122,7 @@ def _verified_collector_derivation(
     expected_derived_artifacts = {
         "run-report.json", "run-report.md", "evidence/evidence-ledger.json",
         *(f"evidence/{name}" for name in evidence_files),
+        *native_artifacts,
     }
     if (
         not isinstance(derived_digests, Mapping)
@@ -1121,6 +1139,16 @@ def _verified_collector_derivation(
         if digest != expected_digest:
             raise ReviewRunError("collector derivation derived artifact differs")
         derived_contents[relative] = content
+    if native_artifacts:
+        try:
+            inventory = collector_receipts.native_checkpoint_inventory(run_dir)
+        except (OSError, collector_receipts.CollectorReceiptError) as exc:
+            raise ReviewRunError("collector derivation native checkpoint inventory is invalid") from exc
+        if inventory != native_artifacts or any(
+            derived_contents[relative] != identity.verified_artifact_bytes[relative]
+            for relative in native_artifacts
+        ):
+            raise ReviewRunError("collector derivation native checkpoint copy differs")
     try:
         ledger_document = json.loads(derived_contents["evidence/evidence-ledger.json"])
     except (KeyError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -1163,6 +1191,12 @@ def _verified_collector_derivation(
         or report.get("runtime_identity") != lineage["executor_runtime_identity"]
     ):
         raise ReviewRunError("collector derivation runtime provenance differs")
+    source_report = json.loads(identity.verified_artifact_bytes["run-report.json"])
+    native_key = "clockify_native_checkpoint"
+    if (native_key in report) != (native_key in source_report) or (
+        native_key in source_report and report[native_key] != source_report[native_key]
+    ):
+        raise ReviewRunError("collector derivation native checkpoint report binding differs")
     return source, identity, lineage
 
 
@@ -1465,9 +1499,57 @@ def _analysis_bound_models(document: Mapping[str, Any]) -> set[str]:
     return models
 
 
+def _native_checkpoint_provenance(report: Mapping, artifacts: Mapping[str, bytes]) -> dict:
+    if not artifacts:
+        return {}
+    return {
+        "clockify_native_checkpoint": report["clockify_native_checkpoint"],
+        "clockify_native_artifact_digests": {
+            relative: "sha256:" + hashlib.sha256(content).hexdigest()
+            for relative, content in sorted(artifacts.items())
+        },
+    }
+
+
+def _copy_native_checkpoint_artifacts(target: Path, artifacts: Mapping[str, bytes]) -> None:
+    for relative, content in sorted(artifacts.items()):
+        destination = target / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        _write_snapshot(destination, content, label=f"native checkpoint {relative}")
+
+
+def _verified_native_checkpoint_copy(source: Path, target: Path, provenance: Mapping) -> None:
+    """Prove a child kept the original collection basis, never a live refresh."""
+    try:
+        report, artifacts = collector_receipts.verified_run_native_checkpoint(source)
+        expected = _native_checkpoint_provenance(report, artifacts)
+        keys = {"clockify_native_checkpoint", "clockify_native_artifact_digests"}
+        if {key: provenance[key] for key in keys if key in provenance} != expected:
+            raise ValueError("provenance differs")
+        target_report, _content, _digest = _read_snapshot_json(
+            target / "run-report.json", label="native checkpoint copied report"
+        )
+        key = "clockify_native_checkpoint"
+        if not isinstance(target_report, Mapping) or (key in report) != (key in target_report) or (
+            key in report and report[key] != target_report[key]
+        ):
+            raise ValueError("copied metadata differs")
+        if artifacts:
+            native_paths = {relative for relative in artifacts
+                            if relative.startswith(collector_receipts.NATIVE_CHECKPOINT_PREFIX)}
+            if collector_receipts.native_checkpoint_inventory(target) != native_paths:
+                raise ValueError("copied inventory differs")
+            for relative, original in artifacts.items():
+                if _read_snapshot_source(target / relative, label="native checkpoint copied artifact") != original:
+                    raise ValueError("copied bytes differ")
+    except (OSError, TypeError, ValueError) as exc:
+        raise ReviewRunError("native checkpoint copied collection basis differs") from exc
+
+
 def _prepare_replay_run(source: Path) -> Path:
     """Create a distinct run with immutable ledger and semantic fixture copies."""
     source = _run_child(source, label="replay source")
+    source_report, native_artifacts = collector_receipts.verified_run_native_checkpoint(source)
     for required in (
         "run-report.json", "run-report.md", "semantic-analysis.json",
         "work-accounting-result.json",
@@ -1579,6 +1661,7 @@ def _prepare_replay_run(source: Path) -> Path:
         suffix += 1
     try:
         (target / "evidence").mkdir(parents=True)
+        _copy_native_checkpoint_artifacts(target, native_artifacts)
         _write_snapshot(
             target / "evidence" / "evidence-ledger.json", ledger_content,
             label="replay evidence ledger",
@@ -1603,7 +1686,7 @@ def _prepare_replay_run(source: Path) -> Path:
             reused_cache_records = _preflight_replay_analyzer_cache(
                 target, cache_fixture, source_analysis, retry_origin=source,
             )
-        report = _read_json(source / "run-report.json")
+        report = source_report
         if not isinstance(report, dict):
             raise ValueError("replay source run report must be an object")
         report = dict(report)
@@ -1621,6 +1704,7 @@ def _prepare_replay_run(source: Path) -> Path:
                 "semantic_analysis_sha256": source_analysis_sha256,
                 "semantic_analysis_fixture": str(fixture_path.relative_to(target)),
                 "work_accounting_result_sha256": source_accounting_identity["file_sha256"],
+                **_native_checkpoint_provenance(source_report, native_artifacts),
             }
         if cache_fixture is not None and cache_sha256 is not None:
             provenance.update({
@@ -1646,6 +1730,7 @@ def _replay_analysis_fixture(source: Path, replay: Path) -> Path:
     provenance = _read_json(replay / "replay-source.json")
     if not isinstance(provenance, dict):
         raise ValueError("replay source provenance must be an object")
+    _verified_native_checkpoint_copy(source, replay, provenance)
     relative = str(provenance.get("semantic_analysis_fixture") or "")
     expected = str(provenance.get("semantic_analysis_sha256") or "")
     if not relative or len(expected) != 64:
@@ -1761,6 +1846,7 @@ def _prepare_repair_run(
         raise ReviewRunError("repair requires a verified completed source") from exc
     if source_bundle.replay:
         raise ReviewRunError("repair requires a verified completed source")
+    source_report, native_artifacts = collector_receipts.verified_run_native_checkpoint(source)
     _validated_period_manifest(snapshots["period-manifest.json"], allow_collecting_bootstrap=True)
     correction_provenance: dict[str, str] = {}
     if corrections_override is not None:
@@ -1775,6 +1861,7 @@ def _prepare_repair_run(
         prefix=dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ") + "-repair-",
         dir=RUNS.resolve(),
     ))
+    _copy_native_checkpoint_artifacts(target, native_artifacts)
     # All source reads are verified before a destination is eligible for resume.
     for filename in ("run-report.md", "evidence/evidence-ledger.json", *_RECONCILIATION_INPUTS.values()):
         input_path = (
@@ -1838,7 +1925,7 @@ def _prepare_repair_run(
             "analyzer_cache_path": "analyzer-cache-used.jsonl",
             "analyzer_cache_sha256": cache_digest,
         }
-    report = dict(_read_json(source / "run-report.json"))
+    report = dict(source_report)
     report.update(run_id=target.name, repair_of_run_id=source.name)
     _write_json(target / "run-report.json", report)
     _write_snapshot(target / "repair-source.json", json.dumps({
@@ -1857,6 +1944,7 @@ def _prepare_repair_run(
         ),
         **correction_provenance,
         **cache_provenance,
+        **_native_checkpoint_provenance(source_report, native_artifacts),
     }, sort_keys=True).encode("utf-8") + b"\n", label="repair provenance")
     return target
 
@@ -1870,6 +1958,7 @@ def _repair_analysis_fixture(repair: Path) -> Path:
     source = _run_child(
         RUNS / str(lineage.get("source_run_id") or ""), label="repair source"
     )
+    _verified_native_checkpoint_copy(source, repair, lineage)
     relative = str(lineage.get("semantic_analysis_fixture") or "")
     expected = str(lineage.get("semantic_analysis_sha256") or "")
     fixture = (repair / relative).resolve()
@@ -1911,6 +2000,7 @@ def _finalize_repair_completion(run_dir: Path) -> collector_receipts.SliceComple
     ):
         raise ReviewRunError("repair posted credit provenance is incomplete")
     source = _run_child(RUNS / str(lineage.get("source_run_id", "")), label="repair source")
+    _verified_native_checkpoint_copy(source, run_dir, lineage)
     source_bundle_path = source / "completion-bundle.json"
     if _file_sha256(source_bundle_path, label="repair source completion") != lineage.get("source_completion_sha256"):
         raise ReviewRunError("repair source completion changed")
@@ -2271,6 +2361,7 @@ def _replay_source_provenance_matches(
         )
         if not isinstance(provenance, dict):
             return False
+        _verified_native_checkpoint_copy(source, replay, provenance)
         expected = {
             "source_run_id": source.name,
             "source_run_dir": str(source),

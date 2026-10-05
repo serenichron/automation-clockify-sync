@@ -748,6 +748,13 @@ the reviewed files in the repository does not activate it.
 
 ## Safety contract
 
+Fresh, configured Clockify collections retain full native checkpoint pages in
+`evidence/clockify-native-checkpoint/`, separately from the sanitized semantic
+ledger. The report binds their hash, exact target and period; derivation copies
+only the verified bytes. These are original collection snapshots, not fresh GETs
+or historical POST receipts, and they do not by themselves authorize credits or
+Clockify writes. Historical runs without this optional proof remain readable.
+
 Native posting accepts explicit source-accounted declarations through
 `--source-adoptions`. The `clockify-source-accounted-adoptions/v1` schema keeps
 its historical readback-digest requirement without fallback. Explicitly choosing

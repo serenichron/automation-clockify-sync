@@ -23,6 +23,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -4185,6 +4186,37 @@ def _collect_slice(
     write_json(run_dir / "evidence" / "calendly-recordings.json", evidence["calendly"])
     write_json(run_dir / "evidence" / "multica-issues.json", evidence["multica_issues"])
     write_json(run_dir / "evidence" / "sessions.json", evidence["sessions"])
+    if (
+        evidence_override is None
+        and evidence["clockify"].get("status") == "ok"
+        and evidence["clockify"].get("complete") is True
+        and cenv.get("CLOCKIFY_WORKSPACE_ID")
+        and routing.get("clockify_user_id")
+    ):
+        # Keep complete native IDs/payloads separate from the stable sanitized
+        # ledger. Only this newly claimed run is changed; cache bytes are read
+        # through the snapshot validator, never rewritten.
+        try:
+            from scripts.clockify_checkpoint_snapshot import capture_checkpoint_snapshot
+        except ModuleNotFoundError:
+            from clockify_checkpoint_snapshot import capture_checkpoint_snapshot
+        identity = _clockify_checkpoint_identity(
+            cenv["CLOCKIFY_WORKSPACE_ID"], routing["clockify_user_id"], since, until
+        )
+        with tempfile.TemporaryDirectory(prefix="native-checkpoint-", dir=run_dir.parent) as staging:
+            staged = Path(staging) / "snapshot"
+            native = capture_checkpoint_snapshot(
+                checkpoint_manifest=checkpoint_store._directory_for(identity) / "manifest.json",
+                clockify_evidence=run_dir / "evidence" / "clockify-existing.json",
+                destination=staged,
+                workspace_id=cenv["CLOCKIFY_WORKSPACE_ID"],
+                user_id=routing["clockify_user_id"], since=since, until=until,
+            )
+            staged.rename(run_dir / "evidence" / "clockify-native-checkpoint")
+        report["clockify_native_checkpoint"] = {
+            "manifest_sha256": native.manifest_sha256,
+            "request": native.manifest["request"],
+        }
     if "enriched_context" in evidence:
         write_json(run_dir / "evidence" / "enriched-context.json", evidence["enriched_context"])
     try:

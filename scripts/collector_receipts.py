@@ -43,6 +43,7 @@ _COLLECTOR_RAW_ARTIFACTS = {
 }
 _BUNDLE_SCHEMA_VERSION = "collector-completion-bundle/v1"
 _PERIOD_TIMEZONE = ZoneInfo("Europe/Bucharest")
+NATIVE_CHECKPOINT_PREFIX = "evidence/clockify-native-checkpoint/"
 
 
 def _canonical(value: object) -> bytes:
@@ -122,6 +123,110 @@ def _safe_read_bytes_and_digest(path: Path) -> tuple[bytes, str]:
         return b"".join(chunks), "sha256:" + digest.hexdigest()
     finally:
         os.close(descriptor)
+
+
+def native_checkpoint_inventory(run_dir: Path) -> set[str]:
+    """Inventory the optional proof tree without following unbound symlinks."""
+    root = _safe_path(run_dir / NATIVE_CHECKPOINT_PREFIX, run_dir=run_dir)
+    if not root.is_dir():
+        raise CollectorReceiptError("native checkpoint directory is missing")
+    inventory: set[str] = set()
+    for directory, directories, files in os.walk(root, followlinks=False):
+        for name in directories:
+            _safe_path(Path(directory) / name, run_dir=run_dir)
+        for name in files:
+            path = _safe_path(Path(directory) / name, run_dir=run_dir)
+            if not stat.S_ISREG(path.stat(follow_symlinks=False).st_mode):
+                raise CollectorReceiptError("native checkpoint artifact is not a regular file")
+            inventory.add(path.relative_to(_absolute(run_dir)).as_posix())
+    return inventory
+
+
+def _verified_native_checkpoint(
+    report: Mapping, *, run_dir: Path, since_utc: str, until_utc: str,
+    clockify_evidence: bytes,
+) -> dict[str, bytes]:
+    # Only the digest-bound original report opts in. A stray optional directory
+    # must never change a historical source identity or become new evidence.
+    if "clockify_native_checkpoint" not in report:
+        return {}
+    try:
+        metadata = report["clockify_native_checkpoint"]
+        if not isinstance(metadata, Mapping) or set(metadata) != {"manifest_sha256", "request"}:
+            raise ValueError("metadata schema")
+        manifest_hash = metadata["manifest_sha256"]
+        if not isinstance(manifest_hash, str) or re.fullmatch(r"[0-9a-f]{64}", manifest_hash) is None:
+            raise ValueError("manifest hash")
+        request = metadata["request"]
+        if not isinstance(request, Mapping) or set(request) != {
+            "workspace_id", "user_id", "since_utc", "until_utc",
+        }:
+            raise ValueError("request schema")
+        if (
+            _utc_string(request["since_utc"], "native checkpoint since") != since_utc
+            or _utc_string(request["until_utc"], "native checkpoint until") != until_utc
+        ):
+            raise ValueError("period differs from completion slice")
+        # Lazy import: the snapshot validator uses the receipt safe-read helpers.
+        try:
+            from scripts import clockify_checkpoint_snapshot
+        except ModuleNotFoundError:  # direct script execution
+            import clockify_checkpoint_snapshot  # type: ignore[no-redef]
+        snapshot = clockify_checkpoint_snapshot.load_checkpoint_snapshot(
+            run_dir / NATIVE_CHECKPOINT_PREFIX,
+            workspace_id=request["workspace_id"], user_id=request["user_id"],
+            since=datetime.fromisoformat(since_utc.replace("Z", "+00:00")),
+            until=datetime.fromisoformat(until_utc.replace("Z", "+00:00")),
+            expected_manifest_sha256=manifest_hash,
+        )
+        if snapshot is None:
+            raise ValueError("snapshot is missing")
+        artifacts = {
+            NATIVE_CHECKPOINT_PREFIX + relative: content
+            for relative, content in snapshot.verified_artifact_bytes.items()
+        }
+        if artifacts.get(NATIVE_CHECKPOINT_PREFIX + "clockify-existing.json") != clockify_evidence:
+            raise ValueError("copied evidence differs byte-for-byte from source evidence")
+        if native_checkpoint_inventory(run_dir) != set(artifacts):
+            raise ValueError("artifact inventory differs")
+        return artifacts
+    except (OSError, TypeError, ValueError) as exc:
+        raise CollectorReceiptError("collector source native checkpoint is invalid") from exc
+
+
+def verified_run_native_checkpoint(run_dir: Path) -> tuple[dict, dict[str, bytes]]:
+    """Read a sealed run's optional native basis without requiring all raw sources.
+
+    Repair/replay historically carry the ledger, not every collector raw file.
+    A metadata-free report keeps that compatibility; opting in requires its
+    exact original completion binding before any destination can be created.
+    """
+    run_dir = _safe_path(Path(run_dir))
+    try:
+        report_content, report_digest = _safe_read_bytes_and_digest(
+            _safe_path(run_dir / "run-report.json", run_dir=run_dir)
+        )
+        report = json.loads(report_content)
+        if not isinstance(report, dict):
+            raise ValueError("report shape")
+        if "clockify_native_checkpoint" not in report:
+            return report, {}
+        bundle = load_completion_bundle(run_dir / "completion-bundle.json", run_dir=run_dir)
+        expected_report_digest = next(
+            artifact.digest for artifact in bundle.artifacts if artifact.kind == "run_report"
+        )
+        if report_digest != expected_report_digest:
+            raise ValueError("report differs from completion binding")
+        evidence, _digest = _safe_read_bytes_and_digest(
+            _safe_path(run_dir / "evidence/clockify-existing.json", run_dir=run_dir)
+        )
+        artifacts = _verified_native_checkpoint(
+            report, run_dir=run_dir, since_utc=bundle.since_utc, until_utc=bundle.until_utc,
+            clockify_evidence=evidence,
+        )
+        return report, {"evidence/clockify-existing.json": evidence, **artifacts}
+    except (OSError, TypeError, ValueError) as exc:
+        raise CollectorReceiptError("run native checkpoint completion binding is invalid") from exc
 
 
 def _digest_string(value: object, label: str) -> str:
@@ -691,6 +796,16 @@ def load_collector_source_bundle(path: Path, *, run_dir: Path) -> CollectorSourc
         raise CollectorReceiptError(
             "collector source raw evidence does not match its bound ledger"
         ) from exc
+    native_artifacts = _verified_native_checkpoint(
+        report, run_dir=run_dir, since_utc=str(document["since_utc"]),
+        until_utc=str(document["until_utc"]),
+        clockify_evidence=verified_bytes["evidence/clockify-existing.json"],
+    )
+    for relative, content in native_artifacts.items():
+        digest = "sha256:" + hashlib.sha256(content).hexdigest()
+        verified_bytes[relative] = content
+        verified_digests[relative] = digest
+        raw_digests[relative] = digest
     source_unsigned = {
         "schema_version": "collector-source-bundle/v1",
         "legacy_completion_bundle_digest": legacy_digest,
