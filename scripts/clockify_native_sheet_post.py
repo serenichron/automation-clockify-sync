@@ -3,7 +3,9 @@
 
 `plan` is read-only. `execute` requires an approval receipt bound to the exact
 plan and records durable per-row intent/readback events before reporting
-completion. Distinct reviewed rows and all approved intervals are preserved.
+completion. Optional explicit source adoptions account for retained prior
+accomplishments; their current payload is not reposted or applied as an update.
+Distinct reviewed rows and all approved intervals are otherwise preserved.
 """
 from __future__ import annotations
 
@@ -25,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts import clockify_period_readback, clockify_post_approved_portfolio as legacy
+from scripts import clockify_period_readback, clockify_post_approved_portfolio as legacy, clockify_source_adoptions
 from scripts.clockify_sync_collect import clockify_env_candidates, load_env_file
 
 
@@ -237,7 +239,8 @@ def _overlap(payload: Mapping[str, Any], entry: Mapping[str, Any]) -> dict[str, 
 def build_plan(document: Mapping[str, Any], *, capture_sha256: str, routing: Mapping[str, Any],
                routing_sha256: str, timezone: str, workspace_id: str, member_id: str,
                projects: Sequence[Mapping[str, Any]], tags: Sequence[Mapping[str, Any]],
-               live_entries: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+               live_entries: Sequence[Mapping[str, Any]],
+               source_adoptions: Mapping[str, Any] | None = None) -> dict[str, Any]:
     spreadsheet_id, sheet_title, rows = _sheet_rows(document)
     routes = _resolve_routes(routing, projects, tags)
     entries: list[dict[str, Any]] = []
@@ -278,6 +281,19 @@ def build_plan(document: Mapping[str, Any], *, capture_sha256: str, routing: Map
               "row_count": len(entries),
               "total_minutes": total_seconds // 60 if total_seconds % 60 == 0 else total_seconds / 60}
     result["review_ids_sha256"] = _digest(sorted(seen))
+    if source_adoptions is not None:
+        try:
+            credits = clockify_source_adoptions.credits(
+                source_adoptions, entries, workspace_id=workspace_id, member_id=member_id,
+            )
+        except clockify_source_adoptions.AdoptionError as error:
+            raise NativePostError(str(error)) from error
+        for item in entries:
+            if item["review_id"] in credits:
+                item["prior_entry_credit"] = credits[item["review_id"]]
+        result["source_adoptions_sha256"] = _digest(sorted(
+            source_adoptions["declarations"], key=lambda value: value["current_review_id"],
+        ))
     result["plan_digest"] = _document_digest(result, "plan_digest")
     return result
 
@@ -318,9 +334,13 @@ def _validate_approval(plan: Mapping[str, Any], approval: Mapping[str, Any], now
 def _events(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
+    return _decode_events(path.read_bytes())
+
+
+def _decode_events(content: bytes) -> list[dict[str, Any]]:
     output = []
     previous = None
-    for sequence, line in enumerate(path.read_text(encoding="utf-8").splitlines()):
+    for sequence, line in enumerate(content.decode("utf-8").splitlines()):
         record = json.loads(line)
         payload = {key: value for key, value in record.items() if key != "event_digest"}
         expected = _digest(payload)
@@ -399,6 +419,15 @@ def execute_plan(plan: Mapping[str, Any], approval: Mapping[str, Any], events_pa
         return _execute_plan_locked(plan, approval, events_path, receipt_path, gateway, now=now)
 
 
+def _item_matches(item: Mapping[str, Any], entry: Mapping[str, Any]) -> bool:
+    credit = item.get("prior_entry_credit")
+    if credit is None:
+        return _payload_matches(item["payload"], entry)
+    return (str(entry.get("id") or "") == credit["clockify_entry_id"]
+            and _payload_matches(credit["payload"], entry)
+            and _live_digest([entry]) == credit["readback_digest"])
+
+
 def _execute_plan_locked(plan: Mapping[str, Any], approval: Mapping[str, Any], events_path: Path,
                          receipt_path: Path, gateway: Any, *, now: dt.datetime) -> dict[str, Any]:
     approval_digest = _validate_approval(plan, approval, now)
@@ -413,18 +442,51 @@ def _execute_plan_locked(plan: Mapping[str, Any], approval: Mapping[str, Any], e
     if not records and _live_digest(current) != plan["live_snapshot_sha256"]:
         raise NativePostError("live Clockify snapshot drifted after approval")
 
+    # Consume only sealed plan facts and fresh direct GETs before creating even
+    # an unrelated row. Original artifact paths are provenance, not replay IO.
+    declared = [item["prior_entry_credit"]["declaration"] for item in entries if "prior_entry_credit" in item]
+    credited_readbacks: dict[str, Mapping[str, Any]] = {}
+    if declared or "source_adoptions_sha256" in plan:
+        if _digest(sorted(declared, key=lambda value: value["current_review_id"])) != plan.get("source_adoptions_sha256"):
+            raise NativePostError("source adoption snapshot differs from approved plan")
+        try:
+            credits = clockify_source_adoptions.validate_sealed_credits(
+                entries, workspace_id=str(plan["workspace_id"]), member_id=str(plan["member_id"]),
+            )
+        except clockify_source_adoptions.AdoptionError as error:
+            raise NativePostError(str(error)) from error
+        for item in entries:
+            if "prior_entry_credit" not in item:
+                continue
+            readback = gateway.entry_by_id(credits[item["review_id"]]["clockify_entry_id"])
+            if not isinstance(readback, Mapping) or not _item_matches(item, readback):
+                raise NativePostError("source adoption prior entry failed exact direct GET readback")
+            credited_readbacks[item["review_id"]] = readback
+
     for item in entries:
         review_id = item["review_id"]
         payload = item["payload"]
         terminal = confirmed.get(review_id)
         if terminal is not None:
             readback = gateway.entry_by_id(str(terminal.get("clockify_entry_id") or ""))
-            if not isinstance(readback, Mapping) or not _payload_matches(payload, readback):
+            if not isinstance(readback, Mapping) or not _item_matches(item, readback):
                 raise NativePostError("receipt-bound Clockify entry failed exact GET readback")
             continue
         intent = intents.get(review_id)
         response = responses.get(review_id)
-        if response is not None:
+        if "prior_entry_credit" in item:
+            if response is not None:
+                raise NativePostError("source adoption row unexpectedly has a create response")
+            if intent is None:
+                _append_event(events_path, {"event_type": "intent", "approval_digest": approval_digest,
+                              "plan_digest": plan_digest, "review_id": review_id,
+                              "payload_digest": item["payload_digest"],
+                              "before_entry_ids": sorted(str(entry["id"]) for entry in current if entry.get("id")),
+                              "recorded_at": _utc(now)})
+            entry_id = item["prior_entry_credit"]["clockify_entry_id"]
+            proof_entry = credited_readbacks[review_id]
+            disposition = "credited_prior_source"
+        elif response is not None:
             entry_id = str(response["clockify_entry_id"])
             recovered = gateway.entry_by_id(entry_id)
             if not isinstance(recovered, Mapping) or not _payload_matches(payload, recovered):
@@ -495,13 +557,21 @@ def _execute_plan_locked(plan: Mapping[str, Any], approval: Mapping[str, Any], e
     for item in entries:
         event = confirmed[item["review_id"]]
         readback = gateway.entry_by_id(str(event["clockify_entry_id"]))
-        if not isinstance(readback, Mapping) or not _payload_matches(item["payload"], readback):
+        if not isinstance(readback, Mapping) or not _item_matches(item, readback):
             raise NativePostError("final per-ID Clockify readback differs from approved payload")
-        receipt_entries.append({"review_id": item["review_id"], "row_number": item["row_number"],
+        receipt_entry = {"review_id": item["review_id"], "row_number": item["row_number"],
                                 "payload_digest": item["payload_digest"],
                                 "clockify_entry_id": event["clockify_entry_id"],
                                 "disposition": event["disposition"],
-                                "live_overlaps": item["live_overlaps"]})
+                                "live_overlaps": item["live_overlaps"]}
+        if "prior_entry_credit" in item:
+            credit = item["prior_entry_credit"]
+            receipt_entry.update(
+                posting_semantics="prior_accomplishment_retained_current_payload_not_posted",
+                prior_approved_payload=credit["payload"], prior_payload_digest=_digest(credit["payload"]),
+                adoption_declaration_digest=credit["declaration_digest"],
+            )
+        receipt_entries.append(receipt_entry)
     receipt = {"schema_version": RECEIPT_SCHEMA, "status": "complete",
                "approval_id": approval["approval_id"], "approval_digest": approval_digest,
                "plan_digest": plan_digest, "row_count": len(entries),
@@ -580,6 +650,8 @@ def main(argv: list[str] | None = None) -> int:
     plan_parser.add_argument("--sheet-capture", type=Path, required=True)
     plan_parser.add_argument("--expected-capture-sha256", required=True)
     plan_parser.add_argument("--routing", type=Path, required=True)
+    plan_parser.add_argument("--source-adoptions", type=Path,
+                             help="optional explicit audited source/confirmed-POST adoption snapshot")
     plan_parser.add_argument("--timezone", default="Europe/Bucharest")
     plan_parser.add_argument("--output", type=Path, required=True)
     approval_parser = commands.add_parser("approval-template")
@@ -616,7 +688,8 @@ def main(argv: list[str] | None = None) -> int:
             plan = build_plan(document, capture_sha256=actual, routing=routing,
                               routing_sha256=hashlib.sha256(routing_bytes).hexdigest(),
                               timezone=args.timezone, workspace_id=workspace, member_id=member,
-                              projects=projects, tags=tags, live_entries=live_entries)
+                              projects=projects, tags=tags, live_entries=live_entries,
+                              source_adoptions=_load(args.source_adoptions) if args.source_adoptions else None)
             _atomic_write(args.output, plan)
             result = {"status": "planned", "row_count": plan["row_count"],
                       "total_minutes": plan["total_minutes"], "plan_digest": plan["plan_digest"]}
