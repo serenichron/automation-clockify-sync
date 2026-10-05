@@ -285,6 +285,7 @@ def build_plan(document: Mapping[str, Any], *, capture_sha256: str, routing: Map
         try:
             credits = clockify_source_adoptions.credits(
                 source_adoptions, entries, workspace_id=workspace_id, member_id=member_id,
+                live_entries=live_entries,
             )
         except clockify_source_adoptions.AdoptionError as error:
             raise NativePostError(str(error)) from error
@@ -423,6 +424,13 @@ def _item_matches(item: Mapping[str, Any], entry: Mapping[str, Any]) -> bool:
     credit = item.get("prior_entry_credit")
     if credit is None:
         return _payload_matches(item["payload"], entry)
+    if credit.get("verification_basis") == "current_live_snapshot":
+        binding = credit["confirmed_binding"]
+        if not clockify_source_adoptions.current_live_matches(
+            credit["payload"], entry, workspace_id=binding["workspace_id"],
+            member_id=binding["member_id"], entry_id=credit["clockify_entry_id"],
+        ):
+            return False
     return (str(entry.get("id") or "") == credit["clockify_entry_id"]
             and _payload_matches(credit["payload"], entry)
             and _live_digest([entry]) == credit["readback_digest"])
@@ -570,6 +578,7 @@ def _execute_plan_locked(plan: Mapping[str, Any], approval: Mapping[str, Any], e
                 posting_semantics="prior_accomplishment_retained_current_payload_not_posted",
                 prior_approved_payload=credit["payload"], prior_payload_digest=_digest(credit["payload"]),
                 adoption_declaration_digest=credit["declaration_digest"],
+                adoption_verification_basis=credit.get("verification_basis", "historical_native_readback"),
             )
         receipt_entries.append(receipt_entry)
     receipt = {"schema_version": RECEIPT_SCHEMA, "status": "complete",

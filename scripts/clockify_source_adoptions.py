@@ -16,6 +16,7 @@ from scripts import evidence_ledger, review_corrections
 
 
 SCHEMA = "clockify-source-accounted-adoptions/v1"
+CURRENT_LIVE_SCHEMA = "clockify-source-accounted-adoptions/v2"
 ARTIFACTS = frozenset({
     "prior_proposals", "source_ledger", "current_proposals", "current_source_ledger",
     "native_plan", "native_approval", "native_events",
@@ -84,9 +85,22 @@ def _seconds(payload: Mapping[str, Any]) -> int:
     return int(seconds)
 
 
+def current_live_matches(payload: Mapping[str, Any], entry: Mapping[str, Any], *,
+                         workspace_id: str, member_id: str, entry_id: str) -> bool:
+    """Exact approved fields and target, without historical-recipe inference."""
+    from scripts import clockify_native_sheet_post as native
+    return (entry.get("id") == entry_id and entry.get("workspaceId") == workspace_id
+            and entry.get("userId") == member_id and native._payload_matches(payload, entry)
+            and entry.get("description") == payload["description"]
+            and entry.get("projectId") == payload["projectId"]
+            and entry.get("taskId") == payload.get("taskId"))
+
+
 def _credit(declaration: Mapping[str, Any], current: Mapping[str, Any], *,
             workspace_id: str, member_id: str,
-            capture_cache: dict[tuple[str, str], bytes]) -> dict[str, Any]:
+            capture_cache: dict[tuple[str, str], bytes],
+            current_live: bool = False,
+            live_entries: Sequence[Mapping[str, Any]] = ()) -> dict[str, Any]:
     from scripts import clockify_native_sheet_post as native
     if not isinstance(declaration, Mapping) or set(declaration) != FIELDS:
         raise AdoptionError("source adoption declaration has an invalid proof shape")
@@ -146,15 +160,28 @@ def _credit(declaration: Mapping[str, Any], current: Mapping[str, Any], *,
             "readback_digest": terminal["readback_digest"], "event_digest": terminal["event_digest"],
         },
     }
+    if current_live:
+        matches = [entry for entry in live_entries if entry.get("id") == terminal["clockify_entry_id"]]
+        if len(matches) != 1:
+            raise AdoptionError("source adoption current live entry is missing or duplicated")
+        if not current_live_matches(row["payload"], matches[0], workspace_id=workspace_id,
+                                    member_id=member_id, entry_id=terminal["clockify_entry_id"]):
+            raise AdoptionError("source adoption current live target or approved payload differs")
+        # The original confirmed digest remains historical, not reproduced.
+        result.update(verification_basis="current_live_snapshot",
+                      historical_readback_digest=terminal["readback_digest"],
+                      readback_digest=native._live_digest(matches))
     result["credit_digest"] = native._digest(result)
     return result
 
 
 def credits(snapshot: Mapping[str, Any], entries: Sequence[Mapping[str, Any]], *,
-            workspace_id: str, member_id: str) -> dict[str, dict[str, Any]]:
+            workspace_id: str, member_id: str,
+            live_entries: Sequence[Mapping[str, Any]] = ()) -> dict[str, dict[str, Any]]:
     """Validate every explicitly declared adoption; invalid proof never credits."""
     if (not isinstance(snapshot, Mapping) or set(snapshot) != {"schema_version", "declarations"}
-            or snapshot.get("schema_version") != SCHEMA or not isinstance(snapshot["declarations"], list)):
+            or snapshot.get("schema_version") not in {SCHEMA, CURRENT_LIVE_SCHEMA}
+            or not isinstance(snapshot["declarations"], list)):
         raise AdoptionError("source adoption snapshot schema is invalid")
     by_review = {entry["review_id"]: entry for entry in entries}
     result: dict[str, dict[str, Any]] = {}
@@ -166,7 +193,9 @@ def credits(snapshot: Mapping[str, Any], entries: Sequence[Mapping[str, Any]], *
             if review_id not in by_review or review_id in result:
                 raise AdoptionError("source adoption current review identity is absent or repeated")
             value = _credit(declaration, by_review[review_id], workspace_id=workspace_id,
-                            member_id=member_id, capture_cache=capture_cache)
+                            member_id=member_id, capture_cache=capture_cache,
+                            current_live=snapshot["schema_version"] == CURRENT_LIVE_SCHEMA,
+                            live_entries=live_entries)
             if value["clockify_entry_id"] in used_ids:
                 raise AdoptionError("source adoption reuses one prior entry for different current rows")
             used_ids.add(value["clockify_entry_id"])
@@ -193,12 +222,24 @@ bindings that the plan-time artifact consumer sealed, without replaying IO.
             if "prior_entry_credit" not in item:
                 continue
             value = item["prior_entry_credit"]
-            if not isinstance(value, Mapping) or set(value) != {
+            expected_fields = {
                 "declaration", "declaration_digest", "clockify_entry_id", "payload", "readback_digest",
                 "prior_source_fingerprint", "current_source_fingerprint", "confirmed_binding", "credit_digest",
-            } or value["credit_digest"] != native._document_digest(value, "credit_digest"):
+            }
+            current_live = isinstance(value, Mapping) and "verification_basis" in value
+            if current_live:
+                expected_fields |= {"verification_basis", "historical_readback_digest"}
+            if (not isinstance(value, Mapping) or set(value) != expected_fields
+                    or value["credit_digest"] != native._document_digest(value, "credit_digest")):
                 raise AdoptionError("sealed source adoption credit integrity differs")
             declaration, binding = value["declaration"], value["confirmed_binding"]
+            if current_live and (
+                value["verification_basis"] != "current_live_snapshot"
+                or not isinstance(value["readback_digest"], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", value["readback_digest"])
+                or value["historical_readback_digest"] != binding["readback_digest"]
+            ):
+                raise AdoptionError("sealed source adoption verification basis differs")
             if (not isinstance(declaration, Mapping) or set(declaration) != FIELDS
                     or value["declaration_digest"] != native._digest(declaration)
                     or declaration["current_review_id"] != item["review_id"]
@@ -209,7 +250,7 @@ bindings that the plan-time artifact consumer sealed, without replaying IO.
                     or binding["prior_payload_digest"] != native._digest(value["payload"])
                     or binding["clockify_entry_id"] != value["clockify_entry_id"]
                     or value["clockify_entry_id"] != declaration["clockify_entry_id"]
-                    or binding["readback_digest"] != value["readback_digest"]
+                    or (not current_live and binding["readback_digest"] != value["readback_digest"])
                     or _seconds(value["payload"]) != _seconds(item["payload"])):
                 raise AdoptionError("sealed source adoption proof binding differs")
             if value["clockify_entry_id"] in used_ids or item["review_id"] in result:

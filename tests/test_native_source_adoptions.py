@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import datetime as dt
 import hashlib
 import json
@@ -100,6 +101,137 @@ class SourceAdoptionTests(unittest.TestCase):
         return native.execute_plan(plan, self._approval(plan), root / "new-events.jsonl",
                                    root / "new-receipt.json", gateway, now=NOW)
 
+    def current_live_proof(self, root, *, independent=False):
+        doc, gateway, snapshot = self.proof(root, independent=independent)
+        # A different historical recipe cannot be silently interpreted as the
+        # current recipe. Preserve the original receipt and seal a new basis.
+        records = native._events(root / "old-events.jsonl")
+        path = root / "historical-events.jsonl"
+        for record in records:
+            event = {key: value for key, value in record.items() if key not in {
+                "schema_version", "sequence", "previous_digest", "event_digest",
+            }}
+            if event["event_type"] == "confirmed":
+                event["readback_digest"] = "1" * 64
+            native._append_event(path, event)
+        snapshot["declarations"][0]["artifacts"]["native_events"] = {
+            "path": str(path), "sha256": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        snapshot["schema_version"] = "clockify-source-accounted-adoptions/v2"
+        gateway.entries[0].update(userId="user-1", workspaceId="workspace-1")
+        gateway.posts.clear()
+        return doc, gateway, snapshot
+
+    def test_v2_current_verification_credits_without_claiming_historical_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            doc, gateway, snapshot = self.current_live_proof(root)
+            originals = {path: path.read_bytes() for path in root.iterdir() if path.is_file()}
+            plan = self.adopted_plan(doc, gateway, snapshot)
+            receipt = self.execute(root, plan, gateway)
+            credit = plan["entries"][0]["prior_entry_credit"]
+            self.assertEqual("current_live_snapshot", credit["verification_basis"])
+            self.assertEqual("1" * 64, credit["historical_readback_digest"])
+            self.assertEqual("1" * 64, credit["confirmed_binding"]["readback_digest"])
+            self.assertNotEqual(credit["historical_readback_digest"], credit["readback_digest"])
+            self.assertEqual([], gateway.posts)
+            self.assertEqual("credited_prior_source", receipt["entries"][0]["disposition"])
+            self.assertEqual("current_live_snapshot", receipt["entries"][0].get("adoption_verification_basis"))
+            self.assertEqual(originals, {path: path.read_bytes() for path in originals})
+
+    def test_v1_does_not_fallback_when_historical_digest_differs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            doc, gateway, snapshot = self.current_live_proof(root)
+            snapshot["schema_version"] = "clockify-source-accounted-adoptions/v1"
+            plan = self.adopted_plan(doc, gateway, snapshot)
+            with self.assertRaisesRegex(native.NativePostError, "exact direct GET"):
+                self.execute(root, plan, gateway)
+            self.assertEqual([], gateway.posts)
+
+    def test_v2_missing_duplicate_or_wrong_target_live_entry_is_rejected(self):
+        for mutation in ("missing", "duplicate", "userId", "workspaceId", "missing-user", "missing-workspace"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                doc, gateway, snapshot = self.current_live_proof(root)
+                if mutation == "missing":
+                    gateway.entries.clear()
+                elif mutation == "duplicate":
+                    gateway.entries.append(copy.deepcopy(gateway.entries[0]))
+                elif mutation.startswith("missing-"):
+                    gateway.entries[0].pop("userId" if mutation == "missing-user" else "workspaceId")
+                else:
+                    gateway.entries[0][mutation] = "wrong-target"
+                with self.assertRaises(native.NativePostError):
+                    self.adopted_plan(doc, gateway, snapshot)
+                self.assertEqual([], gateway.posts)
+
+    def test_v2_live_payload_drift_rejects_every_approved_field(self):
+        mutations = {"description": "Human-approved corrected wording ", "projectId": "other",
+                     "tagIds": [], "taskId": "task-other", "billable": False,
+                     "start": "2026-09-07T09:00:01Z", "end": "2026-09-07T09:30:01Z",
+                     "duration": "PT29M"}
+        for field, wrong in mutations.items():
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                doc, gateway, snapshot = self.current_live_proof(root)
+                target = gateway.entries[0]["timeInterval"] if field in {"start", "end", "duration"} else gateway.entries[0]
+                target[field] = wrong
+                with self.assertRaises(native.NativePostError):
+                    self.adopted_plan(doc, gateway, snapshot)
+                self.assertEqual([], gateway.posts)
+
+    def test_v2_fresh_direct_get_drift_blocks_independent_creates(self):
+        for field, wrong in (("description", "Human-approved corrected wording "),
+                             ("userId", "other"), ("workspaceId", "other"), ("id", "other")):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                doc, gateway, snapshot = self.current_live_proof(root, independent=True)
+                plan = self.adopted_plan(doc, gateway, snapshot)
+                direct_get = gateway.entry_by_id
+                def drift(entry_id):
+                    value = direct_get(entry_id)
+                    value[field] = wrong
+                    return value
+                gateway.entry_by_id = drift
+                with self.assertRaisesRegex(native.NativePostError, "exact direct GET"):
+                    self.execute(root, plan, gateway)
+                self.assertEqual([], gateway.posts)
+
+    def test_v2_replay_uses_sealed_facts_and_preserves_independent_creation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            doc, gateway, snapshot = self.current_live_proof(root, independent=True)
+            plan = self.adopted_plan(doc, gateway, snapshot)
+            for path in {handle["path"] for handle in snapshot["declarations"][0]["artifacts"].values()}:
+                Path(path).unlink()
+            receipt = self.execute(root, plan, gateway)
+            replay = self.execute(root, plan, gateway)
+            self.assertEqual(receipt, replay)
+            self.assertEqual(["credited_prior_source", "created"], [row["disposition"] for row in receipt["entries"]])
+            self.assertEqual(1, len(gateway.posts))
+            self.assertEqual("Independent accomplishment from the same source operation", gateway.posts[0]["description"])
+
+    def test_v2_source_and_approval_artifact_drift_remains_rejected(self):
+        for name in ("prior_proposals", "source_ledger", "current_proposals", "current_source_ledger", "native_approval"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                doc, gateway, snapshot = self.current_live_proof(root)
+                Path(snapshot["declarations"][0]["artifacts"][name]["path"]).write_text("{}\n")
+                with self.assertRaisesRegex(native.NativePostError, "bytes drifted"):
+                    self.adopted_plan(doc, gateway, snapshot)
+
+    def test_v2_one_prior_entry_cannot_credit_two_current_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            doc, gateway, snapshot = self.current_live_proof(root, independent=True)
+            raw = self._plan(doc, existing=gateway.entries)
+            second = copy.deepcopy(snapshot["declarations"][0])
+            second.update(current_review_id="wka-independent-s01", current_payload_digest=raw["entries"][1]["payload_digest"])
+            snapshot["declarations"].append(second)
+            with self.assertRaisesRegex(native.NativePostError, "reuses one prior"):
+                self.adopted_plan(doc, gateway, snapshot)
+
     def test_corrected_prior_payload_and_renamed_current_review_credit_without_create(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -115,6 +247,7 @@ class SourceAdoptionTests(unittest.TestCase):
             self.assertEqual("created-1", receipt["entries"][0]["clockify_entry_id"])
             self.assertEqual("credited_prior_source", receipt["entries"][0]["disposition"])
             self.assertEqual("Human-approved corrected wording", receipt["entries"][0]["prior_approved_payload"]["description"])
+            self.assertEqual("historical_native_readback", receipt["entries"][0].get("adoption_verification_basis"))
             self.assertEqual("project-123456", receipt["entries"][0]["prior_approved_payload"]["projectId"])
             self.assertEqual("prior_accomplishment_retained_current_payload_not_posted", receipt["entries"][0]["posting_semantics"])
             self.assertEqual("Renamed rerun wording", plan["entries"][0]["payload"]["description"])

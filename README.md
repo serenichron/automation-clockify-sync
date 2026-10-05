@@ -748,6 +748,21 @@ the reviewed files in the repository does not activate it.
 
 ## Safety contract
 
+Native posting accepts explicit source-accounted declarations through
+`--source-adoptions`. The `clockify-source-accounted-adoptions/v1` schema keeps
+its historical readback-digest requirement without fallback. Explicitly choosing
+`clockify-source-accounted-adoptions/v2` instead verifies each prior entry once
+against the plan's captured live snapshot: unique ID, exact workspace/user,
+approved payload and duration. The sealed credit records
+`verification_basis: current_live_snapshot`, a new `readback_digest`, and the
+separate `historical_readback_digest`; the original confirmed digest is not
+claimed reproduced. Every credited entry must pass fresh direct GET verification
+before any create. Both versions require original source, native plan, approval,
+and confirmed event artifacts plus explicit one-to-one equivalence; shared
+sources alone never collapse independent accomplishments. Execution/replay uses
+approved sealed facts without reopening the originals. Legacy entries lacking
+the original native plan and approval remain unsupported.
+
 - Collector, quality, and review-state steps do not write to Clockify.
 - Missing analyzer configuration, incomplete required central or Precision
   evidence, invalid
