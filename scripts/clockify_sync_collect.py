@@ -1469,7 +1469,10 @@ def parse_claude(p):
 
 def _remote_codex_contract() -> str:
     """Remote Codex extraction, using the same row-local user-burst context contract."""
-    return r'''try:
+    helpers = ("from typing import Any\n" + inspect.getsource(_codex_message_event)
+               + "\n" + inspect.getsource(_deduplicate_codex_messages)
+               + "\n" + inspect.getsource(_codex_rollout_objects))
+    return helpers + r'''try:
     if CXBASE and Path(CXBASE).exists():
         db=Path(CXBASE)/'state_5.sqlite'
         if db.exists():
@@ -1481,16 +1484,16 @@ def _remote_codex_contract() -> str:
             for sid, rollout_path, cwd, session_title, first_msg, thread_source, archived in rows:
                 if thread_source=='subagent' or not rollout_path or not Path(rollout_path).exists(): continue
                 try:
-                    lines=Path(rollout_path).read_text(errors='ignore').splitlines()
-                    if not lines or json.loads(lines[0]).get('type')!='session_meta': continue
+                    records=_codex_rollout_objects(Path(rollout_path))
+                    first=next(records)
+                    if first.get('type')!='session_meta': records.close(); continue
+                    meta=first.get('payload',{})
+                    if meta.get('thread_source')=='subagent' or (isinstance(meta.get('source'),dict) and meta['source'].get('subagent')): records.close(); continue
                     events=[]
-                    for line in lines[1:]:
-                        try: o=json.loads(line)
-                        except Exception: continue
-                        if o.get('type')!='event_msg': continue
-                        p=o.get('payload',{}); kind=p.get('type'); t=parse_dt(o.get('timestamp'))
-                        if kind not in ('user_message','agent_message') or not t: continue
-                        events.append({'timestamp':t.astimezone(BUCHAREST),'role':'user' if kind=='user_message' else 'assistant','content':p.get('message','')})
+                    for o in records:
+                        message=_codex_message_event(o)
+                        if message is not None: events.append(message)
+                    events=_deduplicate_codex_messages(events)
                     users=sorted((event for event in events if event['role']=='user'), key=lambda event:event['timestamp'])
                     if not users: continue
                     bursts=[]
@@ -1518,7 +1521,7 @@ def _remote_codex_contract() -> str:
                         bs,be=user_ts[0],user_ts[-1]; raw=max(1,int((be-bs).total_seconds()/60)); active,method=active_duration(user_ts)
                         if be<SINCE or bs>=UNTIL: continue
                         title=first_user or last_assistant or ''
-                        res['codex_sessions'].append({'source':'codex','machine':MACHINE,'session_id':sid,'path':str(rollout_path),'cwd':cwd or '','title':title,'start':local_str(bs),'end':local_str(be),'duration_minutes':min(active,raw),'raw_wallclock_minutes':raw,'user_messages':len(user_ts),'first_user_message':first_user,'last_assistant_message':last_assistant,'evidence_level':method,'archived':bool(archived)})
+                        res['codex_sessions'].append({'source':'codex','machine':MACHINE,'session_id':sid,'path':str(rollout_path),'cwd':cwd or '','title':title,'start':local_str(bs),'end':local_str(be),'duration_minutes':min(active,raw),'raw_wallclock_minutes':raw,'user_messages':len(user_ts),'first_user_message':first_user,'last_assistant_message':last_assistant,'evidence_level':method,'archived':bool(archived),'events':[{**event,'timestamp':event['timestamp'].isoformat()} for event in burst]})
                 except Exception: pass
         else:
             res['errors'].append('codex state_5.sqlite not found')
@@ -1977,6 +1980,81 @@ def collect_hermes_db_sessions(db_path: str, machine: str, since: dt.datetime, u
     return out
 
 
+def _codex_message_event(obj: dict[str, Any]) -> dict[str, Any] | None:
+    """Read both legacy Codex events and current Desktop/CLI response messages."""
+    timestamp = parse_dt(obj.get("timestamp"))
+    if not timestamp:
+        return None
+    payload = obj.get("payload", {})
+    item = payload.get("item") if isinstance(payload.get("item"), dict) else payload
+    transport = obj.get("type")
+    if transport == "event_msg":
+        kind = item.get("type")
+        if kind not in {"user_message", "agent_message", "UserMessage", "AgentMessage"}:
+            return None
+        role = "user" if kind in {"user_message", "UserMessage"} else "assistant"
+        content = item.get("message") if "message" in item else item.get("content")
+    elif transport == "response_item":
+        role = item.get("role")
+        if item.get("type") != "message" or role not in {"user", "assistant"}:
+            return None
+        content = item.get("content")
+    else:
+        return None
+    if isinstance(content, list):
+        content = "\n".join(part if isinstance(part, str) else str(part.get("text") or "")
+                            for part in content if isinstance(part, str) or
+                            (isinstance(part, dict) and part.get("type") in {"text", "Text", "input_text", "output_text"}))
+    else:
+        content = str(content or "")
+    if role == "user":
+        # Desktop context arrives as role=user too, but is not human attention.
+        for marker in ("## My request:", "# My request:", "# My request for Codex:"):
+            if marker.casefold() in content.casefold():
+                content = content[content.casefold().index(marker.casefold()) + len(marker):].strip()
+                break
+        if content.lstrip().casefold().startswith((
+            "# agents.md instructions", "<environment_context>", "<turn_aborted>",
+            "<codex_delegation>", "<external_codex_apps_open_page>",
+            "<teammate-message", "<subagent_notification>", "<in-app-browser-context",
+            "<ide_opened_file>", "<ide_selection>",
+        )):
+            return None
+    return {"timestamp": timestamp.astimezone(BUCHAREST), "role": role,
+            "kind": "message", "content": content, "_transport": transport}
+
+
+def _deduplicate_codex_messages(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse paired transports, not repeated human messages or tool activity."""
+    legacy: dict[tuple[str, str], list[int]] = {}
+    for index, event in enumerate(events):
+        if event.get("_transport") == "event_msg":
+            legacy.setdefault((event["role"], event["content"]), []).append(index)
+    paired: set[int] = set()
+    for event in events:
+        if event.get("_transport") != "response_item":
+            continue
+        for index in legacy.get((event["role"], event["content"]), []):
+            if index not in paired and abs((events[index]["timestamp"] - event["timestamp"]).total_seconds()) <= 1:
+                paired.add(index)
+                break
+    return [{key: value for key, value in event.items() if key != "_transport"}
+            for index, event in enumerate(events) if index not in paired]
+
+
+def _codex_rollout_objects(path: Path):
+    """Stream JSONL so rejected subagents never load their potentially huge body."""
+    with path.open(errors="ignore") as source:
+        for index, line in enumerate(source):
+            try:
+                obj = json.loads(line)
+            except Exception:
+                if index == 0:
+                    yield {}
+                continue
+            yield obj if isinstance(obj, dict) else {}
+
+
 def parse_codex_rollout_file(path: Path, machine: str, since: dt.datetime, until: dt.datetime,
                              cwd_override: str | None = None, title_override: str | None = None) -> list[dict[str, Any]]:
     """Parse a Codex rollout JSONL file into burst records.
@@ -1987,17 +2065,13 @@ def parse_codex_rollout_file(path: Path, machine: str, since: dt.datetime, until
     timestamps with the same 30-min gap + engagement-aware duration as Claude.
     """
     out: list[dict[str, Any]] = []
+    records = _codex_rollout_objects(path)
     try:
-        lines = path.read_text(errors="ignore").splitlines()
-    except Exception:
-        return out
-    if not lines:
-        return out
-    try:
-        meta = json.loads(lines[0])
+        meta = next(records)
     except Exception:
         return out
     if meta.get("type") != "session_meta":
+        records.close()
         return out
     payload = meta.get("payload", {})
     sid = payload.get("id", path.stem)
@@ -2006,28 +2080,18 @@ def parse_codex_rollout_file(path: Path, machine: str, since: dt.datetime, until
     model_provider = payload.get("model_provider", "")
     # Skip subagent sessions — these are agent-internal, analogous to Claude /subagents/
     if payload.get("thread_source") == "subagent" or (isinstance(payload.get("source"), dict) and payload["source"].get("subagent")):
+        records.close()
         return out
 
     events: list[dict[str, Any]] = []
-    for line in lines[1:]:
-        try:
-            obj = json.loads(line)
-        except Exception:
-            continue
+    for obj in records:
         t = parse_dt(obj.get("timestamp"))
         if not t:
             continue
         p = obj.get("payload", {})
-        if obj.get("type") == "event_msg":
-            event_type = p.get("type")
-            if event_type not in ("user_message", "agent_message"):
-                continue
-            events.append({
-                "timestamp": t.astimezone(BUCHAREST),
-                "role": "user" if event_type == "user_message" else "assistant",
-                "kind": "message",
-                "content": p.get("message", ""),
-            })
+        message = _codex_message_event(obj)
+        if message is not None:
+            events.append(message)
         elif obj.get("type") == "response_item":
             item = p.get("item") if isinstance(p.get("item"), dict) else p
             item_type = str(item.get("type") or "")
@@ -2051,6 +2115,7 @@ def parse_codex_rollout_file(path: Path, machine: str, since: dt.datetime, until
                         "content": str(item.get("output") or item.get("content") or ""),
                     }
                 )
+    events = _deduplicate_codex_messages(events)
     if not events:
         return out
     for burst_events in _partition_bursts(events):
@@ -2084,7 +2149,7 @@ def parse_codex_rollout_file(path: Path, machine: str, since: dt.datetime, until
             "evidence_level": method,
             "first_user_message": first_user,
             "last_assistant_message": last_assistant,
-            "events": _serialized_events(burst_events),
+            "events": [{**event, "timestamp": event["timestamp"].isoformat()} for event in burst_events],
         })
     return out
 

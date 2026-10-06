@@ -101,6 +101,148 @@ class CollectorBurstContextTests(unittest.TestCase):
         self.assertEqual(2, bursts[1]["duration_minutes"])
         self.assertEqual("Redirect loop root cause documented.", bursts[1]["last_assistant_message"])
 
+    def test_codex_response_messages_recover_modern_desktop_work(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout.jsonl"
+            self.write_jsonl(path, [
+                {"type": "session_meta", "payload": {"id": "modern", "cwd": "/work/client"}},
+                {"timestamp": "2026-07-21T05:00:00Z", "type": "response_item", "payload": {
+                    "type": "message", "role": "user", "content": [{"type": "input_text", "text": "Repair the client billing export."}]}},
+                {"timestamp": "2026-07-21T05:01:00Z", "type": "response_item", "payload": {
+                    "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Client billing export repaired."}]}},
+                {"timestamp": "2026-07-21T05:05:00Z", "type": "response_item", "payload": {
+                    "item": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Add regression coverage for client totals."}]}}},
+                {"timestamp": "2026-07-21T05:06:00Z", "type": "response_item", "payload": {
+                    "type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Injected policy is not human work."}]}},
+            ])
+            bursts = collector.parse_codex_rollout_file(path, "precision", SINCE, UNTIL)
+
+        self.assertEqual(1, len(bursts))
+        self.assertEqual(2, bursts[0]["user_messages"])
+        self.assertEqual(5, bursts[0]["duration_minutes"])
+        self.assertEqual("Repair the client billing export.", bursts[0]["first_user_message"])
+        self.assertEqual("Client billing export repaired.", bursts[0]["last_assistant_message"])
+        self.assertEqual(["user", "assistant", "user"], [row["role"] for row in bursts[0]["events"]])
+
+    def test_codex_dual_transport_does_not_double_count_human_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout.jsonl"
+            rows = [{"type": "session_meta", "payload": {"id": "dual"}}]
+            for timestamp in ("2026-07-21T05:00:00Z", "2026-07-21T05:05:00Z"):
+                rows.extend([
+                    event(timestamp, "user_message", "Verify the client billing totals."),
+                    {"timestamp": timestamp, "type": "response_item", "payload": {
+                        "type": "message", "role": "user", "content": [{"type": "input_text", "text": "Verify the client billing totals."}]}},
+                ])
+            self.write_jsonl(path, rows)
+            bursts = collector.parse_codex_rollout_file(path, "precision", SINCE, UNTIL)
+
+        self.assertEqual(1, len(bursts))
+        self.assertEqual(2, bursts[0]["user_messages"])
+        self.assertEqual(2, len(bursts[0]["events"]))
+
+    def test_codex_modern_messages_keep_seconds_and_exclude_harness_anchors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout.jsonl"
+            rows = [{"type": "session_meta", "payload": {"id": "exact"}}]
+            for timestamp, text in [
+                ("2026-07-21T04:59:00Z", "# AGENTS.md instructions\nGenerated policy"),
+                ("2026-07-21T04:59:10Z", "<environment_context>runtime metadata</environment_context>"),
+                ("2026-07-21T04:59:20Z", '<in-app-browser-context source="ambient-ui-state">generated tab</in-app-browser-context>'),
+                ("2026-07-21T05:00:13.123Z", "<in-app-browser-context>generated tab</in-app-browser-context>\n\n## My request:\nRepair the client portal."),
+                ("2026-07-21T05:05:27.456Z", "Verify the repaired client portal."),
+            ]:
+                rows.append({"timestamp": timestamp, "type": "response_item", "payload": {
+                    "type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}})
+            self.write_jsonl(path, rows)
+            bursts = collector.parse_codex_rollout_file(path, "precision", SINCE, UNTIL)
+
+        self.assertEqual(2, bursts[0]["user_messages"])
+        self.assertEqual("Repair the client portal.", bursts[0]["first_user_message"])
+        self.assertEqual("2026-07-21T08:00:13.123000+03:00", bursts[0]["events"][0]["timestamp"])
+
+    def test_remote_codex_modern_messages_are_recovered_without_deployment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            rollout = home / "rollout.jsonl"
+            self.write_jsonl(rollout, [
+                {"type": "session_meta", "payload": {"id": "modern-remote"}},
+                {"timestamp": "2026-07-21T05:00:13Z", "type": "response_item", "payload": {
+                    "type": "message", "role": "user", "content": [{"type": "input_text", "text": "Repair the remote client portal."}]}},
+                {"timestamp": "2026-07-21T05:05:27Z", "type": "response_item", "payload": {
+                    "type": "message", "role": "user", "content": [{"type": "input_text", "text": "Verify remote portal permissions."}]}},
+            ])
+            with sqlite3.connect(home / "state_5.sqlite") as conn:
+                conn.execute("CREATE TABLE threads (id, rollout_path, cwd, title, first_user_message, thread_source, archived, updated_at)")
+                conn.execute("INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                             ("modern-remote", str(rollout), "/work/client", "", "", "user", 0, int(SINCE.timestamp())))
+            scope = {"Path": Path, "dt": dt, "json": json, "CXBASE": str(home),
+                     "SINCE": SINCE, "UNTIL": UNTIL, "BUCHAREST": collector.BUCHAREST,
+                     "MACHINE": "remote", "parse_dt": collector.parse_dt,
+                     "local_str": collector.local_dt_string, "clean_context": collector._meaningful_context,
+                     "active_duration": lambda values: collector.compute_active_duration(values)[:2],
+                     "res": {"codex_sessions": [], "errors": []}}
+            with mock.patch.object(Path, "read_text", side_effect=AssertionError("unbounded remote source read")):
+                exec(collector._remote_codex_contract(), scope)
+            rows = scope["res"]["codex_sessions"]
+
+        self.assertEqual(1, len(rows))
+        self.assertEqual(2, rows[0]["user_messages"])
+        self.assertEqual("Repair the remote client portal.", rows[0]["first_user_message"])
+        self.assertEqual("2026-07-21T08:00:13+03:00", rows[0]["events"][0]["timestamp"])
+
+    def test_codex_completed_message_items_recover_camelcase_user_turns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout.jsonl"
+            self.write_jsonl(path, [
+                {"type": "session_meta", "payload": {"id": "completed"}},
+                {"timestamp": "2026-07-21T05:00:00Z", "type": "event_msg", "payload": {
+                    "type": "item_completed", "item": {"type": "UserMessage", "content": [{"type": "text", "text": "Repair the client portal permissions."}]}}},
+                {"timestamp": "2026-07-21T05:01:00Z", "type": "event_msg", "payload": {
+                    "type": "item_completed", "item": {"type": "AgentMessage", "content": [{"type": "Text", "text": "Client portal permissions repaired."}]}}},
+                {"timestamp": "2026-07-21T05:05:00Z", "type": "event_msg", "payload": {
+                    "type": "UserMessage", "content": [{"type": "text", "text": "Verify portal access for the client."}]}},
+            ])
+            bursts = collector.parse_codex_rollout_file(path, "precision", SINCE, UNTIL)
+
+        self.assertEqual(1, len(bursts))
+        self.assertEqual(2, bursts[0]["user_messages"])
+        self.assertEqual("Client portal permissions repaired.", bursts[0]["last_assistant_message"])
+
+    def test_codex_streams_rollout_without_materializing_whole_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout.jsonl"
+            self.write_jsonl(path, [
+                {"type": "session_meta", "payload": {"id": "streamed"}},
+                event("2026-07-21T05:00:00Z", "user_message", "Repair the client portal permissions."),
+                event("2026-07-21T05:05:00Z", "user_message", "Verify the repaired portal permissions."),
+            ])
+            with mock.patch.object(Path, "read_text", side_effect=AssertionError("unbounded source read")):
+                bursts = collector.parse_codex_rollout_file(path, "precision", SINCE, UNTIL)
+        self.assertEqual(1, len(bursts))
+        self.assertEqual(2, bursts[0]["user_messages"])
+
+    def test_codex_subagent_rejection_reads_metadata_only(self) -> None:
+        consumed = []
+        class SubagentStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def __iter__(self):
+                consumed.append("metadata")
+                yield json.dumps({"type": "session_meta", "payload": {"id": "excluded", "source": {"subagent": "spawn"}}})
+                consumed.append("body")
+                raise AssertionError("subagent body must not be consumed")
+
+        with mock.patch.object(Path, "open", return_value=SubagentStream()), \
+             mock.patch.object(Path, "read_text", side_effect=AssertionError("unbounded source read")):
+            bursts = collector.parse_codex_rollout_file(Path("irrelevant.jsonl"), "precision", SINCE, UNTIL)
+        self.assertEqual([], bursts)
+        self.assertEqual(["metadata"], consumed)
+
     def test_claude_two_bursts_use_distinct_user_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp) / "projects"
