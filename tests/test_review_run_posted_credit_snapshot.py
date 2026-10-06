@@ -159,6 +159,130 @@ class PostedCreditSnapshotTests(unittest.TestCase):
                 ]))
             self.assertEqual(before, {p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()})
 
+    def test_repair_accepts_one_exact_evidence_bound_skip_without_changing_source(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runs, source, override = self.fixture(root)
+            proposals = json.loads((source / "proposals.json").read_text())
+            target = next(row for row in proposals if row["activity_id"] == "other-0")
+            unrelated = next(row for row in proposals if row["activity_id"] == "other-1")
+            item = {"id": "rvi-reviewed-other-0", "current": target}
+            decision = review_corrections.build_decision(
+                item, decision="skip", reviewer="board-user",
+                reviewed_at="2026-10-06T12:00:00+03:00",
+                correction_categories=["allocation"],
+                rationale="The exact reviewed accomplishment is already covered by a prior posted entry.",
+            )
+            self.assertTrue(review_corrections.append_decision(override, decision, item=item))
+            before = {path.relative_to(source): path.read_bytes() for path in source.rglob("*") if path.is_file()}
+
+            with mock.patch.object(run, "RUNS", runs):
+                try:
+                    child = run._prepare_repair_run(source, corrections_override=override)
+                except run.ReviewRunError as error:
+                    self.fail(f"valid source-bound skip was rejected: {error}")
+
+            self.assertEqual(override.read_bytes(), (child / "review-corrections.jsonl").read_bytes())
+            self.assertEqual(before, {path.relative_to(source): path.read_bytes() for path in source.rglob("*") if path.is_file()})
+            cases = review_corrections.derive_regression_cases(review_corrections.load_decisions(child / "review-corrections.jsonl"))
+            self.assertEqual(1, len(cases))
+            self.assertEqual((target["activity_id"], review_corrections.evidence_fingerprint(target["provenance"]["evidence_ids"])),
+                             (cases[0]["activity_id"], cases[0]["evidence_fingerprint"]))
+            self.assertNotEqual(review_corrections.proposal_target(target), review_corrections.proposal_target(unrelated))
+            self.assertFalse(cases[0]["expected_presence"])
+
+    def test_bound_skip_repair_and_replay_exclude_target_without_inference(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runs = root / "runs"
+            source = fixtures.ReviewRunResultTests._write_real_offline_replay_source(runs, root)
+            proposal = json.loads((source / "proposals.json").read_text())[0]
+            item = {"id": "rvi-reviewed-offline", "current": proposal}
+            correction = review_corrections.build_decision(
+                item, decision="skip", reviewer="board-user",
+                reviewed_at="2026-10-06T12:00:00+03:00",
+                correction_categories=["allocation"],
+                rationale="This exact accomplishment is already included in the prior posted outcome.",
+            )
+            override = root / "skip-corrections.jsonl"
+            review_corrections.append_decision(override, correction, item=item)
+            source_before = {path.relative_to(source): path.read_bytes() for path in source.rglob("*") if path.is_file()}
+
+            with mock.patch.object(run, "RUNS", runs), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(0, run.main([
+                    "--repair-from", str(source), "--corrections", str(override),
+                    "--state", str(root / "repair-items.json"),
+                ]))
+            repair = next(runs.glob("*-repair-*"))
+            result = json.loads((repair / "work-accounting-result.json").read_text())
+            self.assertEqual([], result["proposals"])
+            self.assertEqual(1, len([row for row in result["skipped"] if row.get("reason") == "preserved evidence-bound skip decision"]))
+            self.assertEqual(1, result["correction_regression"]["summary"]["fail"])
+            self.assertEqual("pass", json.loads((repair / "quality_report.json").read_text())["status"])
+            self.assertEqual(source_before, {path.relative_to(source): path.read_bytes() for path in source.rglob("*") if path.is_file()})
+
+            with mock.patch.object(run, "RUNS", runs), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(0, run.main([
+                    "--replay-from", str(repair), "--state", str(root / "replay-items.json"),
+                ]))
+            replay = next(runs.glob("*-replay-*"))
+            integrity = json.loads((replay / "replay-integrity.json").read_text())
+            self.assertEqual("pass", integrity["status"])
+            self.assertEqual([], integrity["failures"])
+
+    def test_repair_skip_rejects_wrong_target_approval_duration_patch_and_duplicate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runs, source, override = self.fixture(root)
+            proposals = json.loads((source / "proposals.json").read_text())
+            target = next(row for row in proposals if row["activity_id"] == "other-0")
+            credited_target = next(row for row in proposals if row["activity_id"] == "new-contract")
+            original = override.read_bytes()
+
+            def decision(item, kind="skip", *, categories=None, patch=None):
+                return review_corrections.build_decision(
+                    item, decision=kind, reviewer="board-user",
+                    reviewed_at="2026-10-06T12:00:00+03:00",
+                    correction_categories=categories or ["allocation"],
+                    rationale="Reviewed against the exact prior posted outcome and source evidence.",
+                    field_patch=patch,
+                )
+
+            subject = {"id": "rvi-reviewed-other-0", "current": target}
+            wrong = {"id": "rvi-wrong", "current": {
+                "activity_id": target["activity_id"], "evidence_ids": ["ev-other-source"],
+            }}
+            cases = {
+                "wrong-fingerprint": [(wrong, decision(wrong))],
+                "approve": [(subject, decision(subject, "approve"))],
+                "duration-patch": [(subject, decision(subject, "modify", patch={
+                    "duration_minutes": {"op": "replace", "value": 0},
+                }))],
+                "wrong-category": [(subject, decision(subject, categories=["wording"]))],
+                "credited-target": [({"id": "rvi-already-credited", "current": credited_target},
+                                     decision({"id": "rvi-already-credited", "current": credited_target}))],
+                "duplicate": [(subject, decision(subject)),
+                              ({"id": "rvi-reviewed-again", "current": target},
+                               decision({"id": "rvi-reviewed-again", "current": target}))],
+            }
+            for label, records in cases.items():
+                with self.subTest(label=label):
+                    candidate = root / f"{label}.jsonl"
+                    candidate.write_bytes(original)
+                    for item, record in records:
+                        review_corrections.append_decision(candidate, record, item=item)
+                    with mock.patch.object(run, "RUNS", runs), self.assertRaises(run.ReviewRunError):
+                        run._validate_repair_credit_transition(source, candidate, runs_root=runs)
+
+            parent_decision = decision(subject, "approve")
+            review_corrections.append_decision(source / "review-corrections.jsonl", parent_decision, item=subject)
+            prior = root / "prior-target.jsonl"
+            prior.write_bytes((source / "review-corrections.jsonl").read_bytes())
+            second_item = {"id": "rvi-reviewed-again", "current": target}
+            review_corrections.append_decision(prior, decision(second_item), item=second_item)
+            with mock.patch.object(run, "RUNS", runs), self.assertRaises(run.ReviewRunError):
+                run._validate_repair_credit_transition(source, prior, runs_root=runs)
+
     def test_repair_rejects_invalid_machine_tail_and_human_decision(self):
         """Catches accepting a syntactically chained but unproved correction tail."""
         with tempfile.TemporaryDirectory() as temporary:

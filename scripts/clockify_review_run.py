@@ -2032,7 +2032,7 @@ def _validate_repair_credit_transition(
     source: Path, proposed: Path, *, runs_root: Path,
     routing_snapshot: Path | None = None,
 ) -> tuple[str, str]:
-    """Prove append-only posted credits or exact source-bound editorial edits."""
+    """Prove append-only posted credits and exact source-bound review corrections."""
     original = source / "review-corrections.jsonl"
     parent_bytes = _read_snapshot_source(original, label="repair parent corrections")
     child_bytes = _read_snapshot_source(proposed, label="repair proposed corrections")
@@ -2059,15 +2059,29 @@ def _validate_repair_credit_transition(
             if record.get("record_type") != review_corrections.VERIFIED_POSTED_CREDIT
         }
         appended_decision_targets: set[tuple[str, str]] = set()
+        skip_targets: set[tuple[str, str]] = set()
         source_activities: list[Mapping[str, Any]] | None = None
         selected_routing: Mapping[str, Any] | None = None
         for record in tail:
             if record.get("record_type") == review_corrections.VERIFIED_POSTED_CREDIT:
                 continue
+            target = (record.get("activity_id"), record.get("evidence_fingerprint"))
+            if record.get("decision") == "skip":
+                if (
+                    record.get("schema_version") != 1
+                    or record.get("field_patch") != {}
+                    or not set(record.get("correction_categories", [])) <= {"allocation", "omission"}
+                    or target not in proposal_targets
+                    or target in prior_decision_targets
+                    or target in appended_decision_targets
+                ):
+                    raise ReviewRunError("repair skip decision is not exact source-bound exclusion")
+                appended_decision_targets.add(target)
+                skip_targets.add(target)
+                continue
             patch = record.get("field_patch")
             description = patch.get("description") if isinstance(patch, Mapping) else None
             value = description.get("value") if isinstance(description, Mapping) else None
-            target = (record.get("activity_id"), record.get("evidence_fingerprint"))
             fields = set(patch) if isinstance(patch, Mapping) else set()
             has_wording = "description" in fields
             has_routing = "client_project" in fields or "tag_names" in fields
@@ -2138,6 +2152,10 @@ def _validate_repair_credit_transition(
             source / "evidence" / "evidence-ledger.json"
         )
         blocks = work_accounting_pipeline._existing_blocks(events)
+        skipped_candidate_keys = {
+            proposal["candidate_key"] for proposal in proposals
+            if review_corrections.proposal_target(proposal) in skip_targets
+        }
         used_review_ids: set[str] = set()
         used_block_ids: set[str] = set()
         # A coverage unit consumes its original native entry once, including
@@ -2189,6 +2207,8 @@ def _validate_repair_credit_transition(
                 expected = {target["proposal"]["candidate_key"] for target in credit["current_targets"]}
                 if {row["candidate_key"] for row in skipped} != expected:
                     raise ReviewRunError("recurring posted credit does not prove every declared parent proposal")
+                if expected & skipped_candidate_keys:
+                    raise ReviewRunError("repair skip repeats a posted credit target")
                 continue
             prior = runs_root / credit["prior_run_id"]
             if (
@@ -2213,6 +2233,8 @@ def _validate_repair_credit_transition(
             )
             if not skipped:
                 raise ReviewRunError("posted credit does not prove a parent proposal")
+            if {row["candidate_key"] for row in skipped} & skipped_candidate_keys:
+                raise ReviewRunError("repair skip repeats a posted credit target")
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError,
             review_corrections.ReviewDecisionError,
             work_accounting_pipeline.WorkAccountingError) as exc:
