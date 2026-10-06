@@ -1845,7 +1845,7 @@ def _activity_observed_intervals(
     ]
 
 
-def _hermes_session_timing_contexts(
+def _session_timing_contexts(
     events: Iterable[dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
     """Index bounded human pools separately from atomic outcome citations.
@@ -1860,7 +1860,7 @@ def _hermes_session_timing_contexts(
         source = event.get("source_ref") or {}
         attrs = _attributes(event)
         if (
-            source_type not in {"hermes_db_sessions_event", "hermes_sessions_event"}
+            source_type not in {"hermes_db_sessions_event", "hermes_sessions_event", "claude_bursts_event"}
             or source.get("source_type") != source_type.removesuffix("_event")
             or not source.get("machine") or not source.get("session_id")
             or attrs.get("role") != "user"
@@ -1875,12 +1875,23 @@ def _hermes_session_timing_contexts(
         groups.setdefault((source_type, str(source["machine"]), str(source["session_id"])), []).append(event)
     contexts: dict[str, dict[str, Any]] = {}
     for members in groups.values():
-        for interval in _activity_observed_intervals(members):
+        # Use only actual human timestamps, not assistant points or source
+        # envelopes. The existing collector helper bounds these exact points
+        # by local day and the established idle threshold for each source group.
+        for interval in collector.hermes_user_observed_intervals([
+            {**_attributes(event), "timestamp": str(
+                (event.get("raw_source_span") or {}).get("timestamp")
+                or event.get("observed_at") or ""
+            )} for event in members
+        ]):
             start, end = _parse_dt(interval["start"]), _parse_dt(interval["end"])
             ids = sorted(
                 str(event["evidence_id"])
                 for event in members
-                if (point := _observed_span(event)[0]) is not None
+                if (point := _parse_dt(
+                    (event.get("raw_source_span") or {}).get("timestamp")
+                    or event.get("observed_at")
+                )) is not None
                 and start <= point <= end
             )
             context = {
@@ -2863,7 +2874,7 @@ def run_accounting(
     workstream_envelopes = _workstream_daily_envelopes(
         analysis.get("activities", []), events_by_id
     )
-    hermes_timing_contexts = _hermes_session_timing_contexts(analysis_events)
+    session_timing_contexts = _session_timing_contexts(analysis_events)
     shared_timing_pool_ids: set[str] = set()
     activity_context: dict[str, dict[str, Any]] = {}
     allocation_demands = []
@@ -3014,18 +3025,32 @@ def run_accounting(
             attempt["candidate"] = True
             continue
 
-        timing_contexts = {
-            hermes_timing_contexts[evidence_id]["pool_id"]: hermes_timing_contexts[evidence_id]
-            for evidence_id in evidence_ids if evidence_id in hermes_timing_contexts
-        }
+        timing_contexts = {}
+        for event in cited:
+            evidence_id = str(event["evidence_id"])
+            if evidence_id not in session_timing_contexts:
+                continue
+            if event.get("source_type") == "claude_bursts_event" and not any(
+                other.get("source_type") == "claude_bursts_event"
+                and semantic_analyzer._semantic_context_key(other) == semantic_analyzer._semantic_context_key(event)
+                and _attributes(other).get("role") == "assistant"
+                and _attributes(other).get("kind", "message") == "message"
+                and not _attributes(other).get("tool_name")
+                and str(_attributes(other).get("content") or "").strip()
+                for other in cited
+            ):
+                # Historical accepted user-only reports do not become new
+                # work merely because surrounding human activity was observed.
+                continue
+            context = session_timing_contexts[evidence_id]
+            timing_contexts[context["pool_id"]] = context
         intervals = _activity_observed_intervals(cited)
         borrowed_timing_context = not intervals and bool(timing_contexts)
         if borrowed_timing_context:
-            timing_ids = sorted({
-                value for context in timing_contexts.values()
-                for value in context["evidence_ids"]
-            })
-            intervals = _activity_observed_intervals([events_by_id[value] for value in timing_ids])
+            intervals = sorted(
+                (dict(context["interval"]) for context in timing_contexts.values()),
+                key=lambda interval: (interval["start"], interval["end"]),
+            )
             shared_timing_pool_ids.update(timing_contexts)
         if not intervals:
             ambiguous.append({"id": activity_id, "reason": "cited evidence has timestamps but no positive observed interval", "exception_kind": "timing_evidence", "evidence_ids": evidence_ids})
@@ -3080,7 +3105,7 @@ def run_accounting(
             "description": description,
             "evidence_ids": evidence_ids,
             "review_warnings": review_warnings,
-            "hermes_timing_contexts": timing_contexts,
+            "session_timing_contexts": timing_contexts,
         }
 
     for meeting_id, attempts in meeting_attempts.items():
@@ -3167,7 +3192,7 @@ def run_accounting(
         })
 
     for context in activity_context.values():
-        pools = context["hermes_timing_contexts"]
+        pools = context["session_timing_contexts"]
         if not shared_timing_pool_ids.intersection(pools):
             continue
         context["shared_timing_context"] = {

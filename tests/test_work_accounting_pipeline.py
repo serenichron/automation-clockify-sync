@@ -178,6 +178,18 @@ def hermes_event(timestamp: str, role: str = "user", *, session="hermes-one", ma
     )
 
 
+def claude_event(timestamp: str, role: str = "user", *, session="claude-one", machine="macbook", content="Completed work"):
+    return evidence_ledger.evidence_event(
+        "claude_bursts_event",
+        {"source_type": "claude_bursts", "source_id": f"{session}:{role}:{timestamp}",
+         "machine": machine, "session_id": session},
+        observed_at=timestamp,
+        raw_source_span={"timestamp": timestamp, "session_start": "2026-09-25 08:00",
+                         "session_end": "2026-09-25 23:00"},
+        attributes={"role": role, "kind": "message", "content": content},
+    )
+
+
 def fathom_event(start: str, end: str, status: str = "title_only"):
     return evidence_ledger.evidence_event(
         "fathom",
@@ -2046,6 +2058,112 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         self.assertEqual("2026-09-10T12:10:00+03:00", result["proposals"][0]["start"])
         self.assertEqual("2026-09-10T12:41:00+03:00", result["proposals"][0]["end"])
         self.assertEqual(35, result["proposals"][0]["review_warnings"][0]["requested_minutes"])
+
+    def test_claude_paired_outcomes_recover_shared_human_context_not_assistant_runtime(self):
+        """Catches supported same-instant outcomes losing adjacent human timing."""
+        first = claude_event("2026-09-25T09:00:00+03:00")
+        first_result = claude_event("2026-09-25T09:00:00+03:00", "assistant")
+        last = claude_event("2026-09-25T09:20:00+03:00")
+        last_result = claude_event("2026-09-25T09:20:00+03:00", "assistant")
+        analysis = analysis_for([first.evidence_id, first_result.evidence_id], recommended=10)
+        second = analysis_for([last.evidence_id, last_result.evidence_id], recommended=10)["activities"][0]
+        second["object"] = "Clockify client routing"
+        analysis["activities"].append(second)
+        _, result = self.make_run([first, first_result, last, last_result], analysis)
+
+        self.assertEqual(2, len(result["proposals"]))
+        self.assertEqual(20, sum(row["duration_minutes"] for row in result["proposals"]))
+        self.assertEqual({
+            frozenset([first.evidence_id, first_result.evidence_id]),
+            frozenset([last.evidence_id, last_result.evidence_id]),
+        }, {frozenset(row["provenance"]["evidence_ids"]) for row in result["proposals"]})
+        for row in result["proposals"]:
+            self.assertEqual({first.evidence_id, last.evidence_id},
+                             set(row["provenance"]["timing_context_evidence_ids"]))
+            self.assertEqual("estimated", row["provenance"]["timing_placement"])
+            self.assertGreaterEqual(row["start"], "2026-09-25T09:00:00+03:00")
+            self.assertLessEqual(row["end"], "2026-09-25T09:20:00+03:00")
+
+    def test_claude_borrowed_context_ignores_uncited_anchor_source_envelope(self):
+        """Catches borrowing raw source bounds instead of validated human points."""
+        first = claude_event("2026-09-25T09:00:00+03:00")
+        completed = claude_event("2026-09-25T09:00:00+03:00", "assistant")
+        last = claude_event("2026-09-25T09:20:00+03:00")
+        last = evidence_ledger.evidence_event(
+            last.source_type, last.source_ref, observed_at=last.observed_at,
+            raw_source_span={**last.raw_source_span,
+                             "start": "2026-09-25T08:00:00+03:00",
+                             "end": "2026-09-25T23:00:00+03:00"},
+            attributes=last.attributes,
+        )
+        analysis = analysis_for([first.evidence_id, completed.evidence_id], recommended=60)
+        analysis["omissions"] = [{
+            "lifecycle": "noise", "evidence_ids": [last.evidence_id],
+            "reason": "adjacent human timing anchor, not a completed outcome",
+        }]
+        _, result = self.make_run([first, completed, last], analysis)
+
+        self.assertEqual(20, sum(row["duration_minutes"] for row in result["proposals"]))
+        for row in result["proposals"]:
+            self.assertGreaterEqual(row["start"], "2026-09-25T09:00:00+03:00")
+            self.assertLessEqual(row["end"], "2026-09-25T09:20:00+03:00")
+            self.assertEqual("estimated", row["provenance"]["timing_placement"])
+            self.assertEqual({first.evidence_id, last.evidence_id},
+                             set(row["provenance"]["timing_context_evidence_ids"]))
+
+    def test_claude_shared_human_capacity_is_not_multiplied_by_residual_recovery(self):
+        """Catches one source human pool supplying full time to every outcome."""
+        first = claude_event("2026-09-25T09:00:00+03:00")
+        first_result = claude_event("2026-09-25T09:00:00+03:00", "assistant")
+        last = claude_event("2026-09-25T09:20:00+03:00")
+        last_result = claude_event("2026-09-25T09:20:00+03:00", "assistant")
+        analysis = analysis_for([first.evidence_id, first_result.evidence_id], recommended=15)
+        second = analysis_for([last.evidence_id, last_result.evidence_id], recommended=15)["activities"][0]
+        second["object"] = "Clockify client routing"
+        analysis["activities"].append(second)
+        _, result = self.make_run([first, first_result, last, last_result], analysis)
+
+        self.assertEqual(15, sum(row["duration_minutes"] for row in result["proposals"]))
+        self.assertEqual([], result["allocation"]["capacity_recoveries"])
+        self.assertEqual(15, sum(row["unallocated_minutes"] for row in result["allocation"]["contested_time"]))
+
+    def test_claude_user_only_or_unpaired_outcomes_cannot_borrow_adjacent_human_context(self):
+        """Catches promoting historical user-only claims just because a pool exists."""
+        first = claude_event("2026-09-25T09:00:00+03:00")
+        last = claude_event("2026-09-25T09:20:00+03:00")
+        for extra in (
+            None,
+            claude_event("2026-09-25T09:00:00+03:00", "assistant", session="other-session"),
+            claude_event("2026-09-25T09:00:00+03:00", "assistant", machine="other-machine"),
+        ):
+            with self.subTest(extra=extra.source_ref if extra else None):
+                cited = [first.evidence_id, *([extra.evidence_id] if extra else [])]
+                analysis = analysis_for(cited, recommended=10)
+                analysis["omissions"] = [{
+                    "lifecycle": "planned", "evidence_ids": [last.evidence_id],
+                    "reason": "independent context without a completed outcome",
+                }]
+                _, result = self.make_run([first, last, *([extra] if extra else [])], analysis)
+                self.assertEqual([], result["proposals"])
+
+    def test_claude_context_excludes_automation_assistant_points_idle_gaps_and_other_sources(self):
+        """Catches non-human runtime or unrelated timing widening a lone human anchor."""
+        first = claude_event("2026-09-25T23:40:00+03:00")
+        result_event = claude_event("2026-09-25T23:40:00+03:00", "assistant")
+        for other in (
+            claude_event("2026-09-25T23:50:00+03:00", "assistant"),
+            claude_event("2026-09-25T23:50:00+03:00", machine="other-machine"),
+            claude_event("2026-09-25T23:50:00+03:00", session="other-session"),
+            claude_event("2026-09-26T00:01:00+03:00"),
+            claude_event("2026-09-25T23:09:00+03:00"),
+            claude_event("2026-09-25T23:50:00+03:00", content="<task-notification>Automatic completion"),
+        ):
+            with self.subTest(source=other.source_ref):
+                analysis = analysis_for([first.evidence_id, result_event.evidence_id], recommended=10)
+                analysis["omissions"] = [{"lifecycle": "noise", "evidence_ids": [other.evidence_id],
+                                           "reason": "not timing for this supported outcome"}]
+                _, result = self.make_run([first, result_event, other], analysis)
+                self.assertEqual([], result["proposals"])
 
     def test_disjoint_hermes_outcomes_use_separate_same_session_timing_context(self):
         """Catches outcome partitioning dropping the other genuine timing anchor."""
