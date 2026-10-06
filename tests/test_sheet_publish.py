@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 from scripts import clockify_sheet_publish as publisher
+from scripts import clockify_native_sheet_post as native_post
 
 
 class FakeGateway:
@@ -260,6 +261,103 @@ def portfolio_document():
 
 
 class SheetPublicationTests(unittest.TestCase):
+    def test_sheet_duration_format_displays_fractional_minutes_without_padding_integers(self):
+        # Numeric precision is not reviewable if the emitted Sheet format hides it.
+        with mock.patch.object(publisher.subprocess, "run", return_value=mock.Mock(
+            returncode=0, stdout="{}", stderr="",
+        )) as command:
+            publisher.GwsSheetsGateway().prepare_sheet("sheet-1", 2)
+        arguments = command.call_args.args[0]
+        request = json.loads(arguments[arguments.index("--json") + 1])
+        formatting = request["requests"][0]["repeatCell"]
+        self.assertEqual(3, formatting["range"]["startColumnIndex"])
+        self.assertEqual(4, formatting["range"]["endColumnIndex"])
+        self.assertEqual({"type": "NUMBER", "pattern": "0.######"},
+                         formatting["cell"]["userEnteredFormat"]["numberFormat"])
+
+    def test_new_row_duration_format_is_scoped_to_only_appended_minute_cells(self):
+        # Appends beyond the sheet's initial 1000-row formatting must also
+        # expose precision without changing human-owned formatting elsewhere.
+        with mock.patch.object(publisher.subprocess, "run", return_value=mock.Mock(
+            returncode=0, stdout="{}", stderr="",
+        )) as command:
+            publisher.GwsSheetsGateway().prepare_new_rows("sheet-1", 2, 1001, 1002)
+        arguments = command.call_args.args[0]
+        request = json.loads(arguments[arguments.index("--json") + 1])
+        formats = [item["repeatCell"] for item in request["requests"]
+                   if item.get("repeatCell", {}).get("fields") == "userEnteredFormat.numberFormat"]
+        self.assertEqual(1, len(formats))
+        self.assertEqual({"sheetId": 2, "startRowIndex": 1000, "endRowIndex": 1002,
+                          "startColumnIndex": 3, "endColumnIndex": 4}, formats[0]["range"])
+        self.assertEqual({"type": "NUMBER", "pattern": "0.######"},
+                         formats[0]["cell"]["userEnteredFormat"]["numberFormat"])
+
+    def test_published_rows_preserve_exact_seconds_for_native_posting(self):
+        # Dropping timestamp seconds or flooring duration makes the posting
+        # consumer reject the row or silently changes the approved interval.
+        for builder, factory in (
+            (publisher.proposal_row, proposal),
+            (publisher.portfolio_row, lambda: portfolio_document()["activities"][0]),
+        ):
+            for start, end, seconds, minutes, expected_start, expected_end in (
+                ("2026-08-01T10:00:17+03:00", "2026-08-01T10:07:45+03:00",
+                 448, 7.466666666666667, "2026-08-01T07:00:17Z", "2026-08-01T07:07:45Z"),
+                ("2026-12-01T10:00:00+02:00", "2026-12-01T10:05:25+02:00",
+                 325, 5.416666666666667, "2026-12-01T08:00:00Z", "2026-12-01T08:05:25Z"),
+                ("2026-08-01T10:00:17+03:00", "2026-08-01T10:00:42+03:00",
+                 25, 0.4166666666666667, "2026-08-01T07:00:17Z", "2026-08-01T07:00:42Z"),
+            ):
+                for exact_field in (True, False):
+                    with self.subTest(builder=builder.__name__, seconds=seconds,
+                                      exact_field=exact_field):
+                        candidate = factory()
+                        candidate.update(start=start, end=end,
+                                         duration_minutes=seconds // 60 if exact_field else minutes)
+                        if exact_field:
+                            candidate["duration_seconds"] = seconds
+                        published = builder(candidate, "run-1")
+                        self.assertEqual(minutes, published[3])
+                        cells = lambda values: [{"userEnteredValue": {
+                            "numberValue" if isinstance(value, (int, float)) else "stringValue": value,
+                        }} for value in values]
+                        capture = {"structuredContent": {
+                            "spreadsheetId": "sheet-1", "sheets": [{
+                                "properties": {"title": "August 2026 review"},
+                                "data": [{"rowData": [
+                                    {"values": cells(publisher.HEADER)},
+                                    {"values": cells(published)},
+                                ]}],
+                            }],
+                        }}
+                        plan = native_post.build_plan(
+                            capture, capture_sha256="a" * 64, routing={"session_routes": [{
+                                "project_name": "Serenichron Level 2", "project_suffix": "123456",
+                                "tag_names": ["System development"], "tag_suffixes": ["654321"],
+                            }]}, routing_sha256="b" * 64, timezone="Europe/Bucharest",
+                            workspace_id="workspace-1", member_id="user-1",
+                            projects=[{"id": "project-123456"}], tags=[{"id": "tag-654321"}],
+                            live_entries=[],
+                        )
+                        payload = plan["entries"][0]["payload"]
+                        self.assertEqual(expected_start, payload["start"])
+                        self.assertEqual(expected_end, payload["end"])
+                        self.assertEqual(minutes, plan["total_minutes"])
+
+    def test_whole_minute_published_rows_keep_historical_representation(self):
+        for builder, candidate in (
+            (publisher.proposal_row, proposal()),
+            (publisher.portfolio_row, portfolio_document()["activities"][0]),
+        ):
+            for exact_field in (True, False):
+                with self.subTest(builder=builder.__name__, exact_field=exact_field):
+                    if exact_field:
+                        candidate["duration_seconds"] = 600
+                    else:
+                        candidate.pop("duration_seconds", None)
+                    row = builder(candidate, "run-1")
+                    self.assertEqual(["2026-08-01 10:00", "2026-08-01 10:10", 10], row[1:4])
+                    self.assertIs(type(row[3]), int)
+
     def test_row_uses_stable_segment_identity_and_pending_review_fields(self):
         row = publisher.proposal_row(proposal(2), "run-1")
         self.assertEqual("wka-1234567890abcdef12345678-s02", row[0])

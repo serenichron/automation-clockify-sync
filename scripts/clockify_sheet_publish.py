@@ -144,7 +144,7 @@ class GwsSheetsGateway:
                         "endColumnIndex": 4,
                     },
                     "cell": {"userEnteredFormat": {
-                        "numberFormat": {"type": "NUMBER", "pattern": "0"}
+                        "numberFormat": {"type": "NUMBER", "pattern": "0.######"}
                     }},
                     "fields": "userEnteredFormat.numberFormat",
                 }},
@@ -167,7 +167,12 @@ class GwsSheetsGateway:
                 "sheetId": sheet_id, "startRowIndex": start_row - 1, "endRowIndex": end_row,
                 "startColumnIndex": 0, "endColumnIndex": len(HEADER),
             }, "cell": {"userEnteredFormat": {"backgroundColor": {"red": 1, "green": 1, "blue": 1}}},
-            "fields": "userEnteredFormat.backgroundColor"}}, {"setDataValidation": {"range": {
+            "fields": "userEnteredFormat.backgroundColor"}}, {"repeatCell": {"range": {
+                "sheetId": sheet_id, "startRowIndex": start_row - 1, "endRowIndex": end_row,
+                "startColumnIndex": 3, "endColumnIndex": 4,
+            }, "cell": {"userEnteredFormat": {
+                "numberFormat": {"type": "NUMBER", "pattern": "0.######"},
+            }}, "fields": "userEnteredFormat.numberFormat"}}, {"setDataValidation": {"range": {
                 "sheetId": sheet_id, "startRowIndex": start_row - 1, "endRowIndex": end_row,
                 "startColumnIndex": 13, "endColumnIndex": 14,
             }, "rule": {"condition": {"type": "ONE_OF_LIST", "values": [
@@ -222,7 +227,18 @@ def _timestamp(value: Any) -> str:
         parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError as exc:
         raise PublicationError(f"invalid proposal timestamp: {text}") from exc
-    return parsed.strftime("%Y-%m-%d %H:%M")
+    return parsed.strftime("%Y-%m-%d %H:%M:%S" if parsed.second else "%Y-%m-%d %H:%M")
+
+
+def _duration_minutes(value: Mapping[str, Any]) -> int | float:
+    # Exact proposal/portfolio artifacts retain floored legacy minutes alongside
+    # their authoritative seconds. The Sheet's minute cell must retain both.
+    if "duration_seconds" in value:
+        seconds = value["duration_seconds"]
+        return seconds // 60 if seconds % 60 == 0 else seconds / 60
+    minutes = float(value.get("duration_minutes") or 0)
+    whole_minutes = int(minutes)
+    return whole_minutes if whole_minutes == minutes else minutes
 
 
 def stable_review_id(proposal: Mapping[str, Any]) -> str:
@@ -501,7 +517,7 @@ def proposal_row(
         stable_review_id(proposal),
         _timestamp(proposal.get("start")),
         _timestamp(proposal.get("end")),
-        int(proposal.get("duration_minutes") or 0),
+        _duration_minutes(proposal),
         project,
         tag_text,
         str(proposal.get("activity_id") or ""),
@@ -613,7 +629,7 @@ def portfolio_row(activity: Mapping[str, Any], run_id: str) -> list[Any]:
         or any(not isinstance(value, str) or not value.strip() for value in sources)
     ):
         raise PublicationError("portfolio activity sources are invalid")
-    duration = int(activity.get("duration_minutes") or 0)
+    duration = _duration_minutes(activity)
     if duration <= 0:
         raise PublicationError("portfolio activity duration is invalid")
     return [
