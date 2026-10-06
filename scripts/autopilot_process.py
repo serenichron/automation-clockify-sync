@@ -148,15 +148,31 @@ def _close_pipes(selector: selectors.BaseSelector) -> None:
         stream.close()
 
 
-def _action_contract_stdout(value: bytearray, cwd: str) -> str:
+def _runs_root(cwd: str, environment: Mapping[str, str]) -> Path:
+    explicit = environment.get("CLOCKIFY_AUTOPILOT_RUNS_ROOT")
+    if explicit is None:
+        return (Path(cwd) / "runs").resolve()
+    requested = Path(explicit)
+    if not requested.is_absolute() or requested != requested.resolve():
+        raise ValueError("CLOCKIFY_AUTOPILOT_RUNS_ROOT must be an absolute canonical path")
+    if requested.exists() and not requested.is_dir():
+        raise ValueError("CLOCKIFY_AUTOPILOT_RUNS_ROOT must be a directory")
+    return requested
+
+
+def _action_contract_stdout(value: bytearray, runs: Path) -> str:
     """Keep only bounded, in-root action-contract paths from child stdout."""
-    runs = (Path(cwd) / "runs").resolve()
     paths: list[str] = []
     for line in bytes(value).decode("utf-8", errors="replace").splitlines():
         candidate = line.strip()
         if not candidate:
             continue
-        path = Path(candidate).expanduser().resolve()
+        requested = Path(candidate)
+        if not requested.is_absolute():
+            continue
+        path = requested.resolve()
+        if requested != path:
+            continue
         if path.name == "autopilot-result.json" and runs in path.parents:
             paths.append(str(path))
     return "".join(f"{path}\n" for path in paths)
@@ -182,6 +198,7 @@ def run_child_bounded(
     values = _validate_command(command)
     working_directory = _validate_cwd(cwd)
     child_environment = _validate_environment(environment)
+    runs = _runs_root(working_directory, child_environment)
     if not isinstance(timeout, ChildTimeoutConfig):
         raise ValueError("timeout must be a ChildTimeoutConfig")
 
@@ -210,7 +227,7 @@ def run_child_bounded(
         if finished:
             return ChildResult(
                 process.returncode,
-                _action_contract_stdout(stdout, working_directory),
+                _action_contract_stdout(stdout, runs),
                 "child stderr suppressed" if saw_stderr[0] else "",
                 False,
                 time.monotonic() - started,
@@ -231,7 +248,7 @@ def run_child_bounded(
             )
         return ChildResult(
             None,
-            _action_contract_stdout(stdout, working_directory),
+            _action_contract_stdout(stdout, runs),
             "child stderr suppressed" if saw_stderr[0] else "",
             True,
             time.monotonic() - started,

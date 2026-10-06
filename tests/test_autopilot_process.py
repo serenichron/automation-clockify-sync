@@ -49,6 +49,57 @@ class AutopilotProcessTests(unittest.TestCase):
         self.assertEqual(f"{contract}\n", result.stdout)
         self.assertNotIn("secret-stdout", result.stdout)
 
+    def test_configured_runs_root_keeps_only_canonical_in_root_result(self):
+        """Catches filtering a valid operational result through the release's runs dir."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "release"
+            release.mkdir()
+            runs = root / "operational" / "runs"
+            contract = runs / "run-1" / "autopilot-result.json"
+            contract.parent.mkdir(parents=True)
+            contract.write_text("{}")
+            release_contract = release / "runs" / "run-1" / "autopilot-result.json"
+            release_contract.parent.mkdir(parents=True)
+            release_contract.write_text("{}")
+            alias = root / "runs-alias"
+            alias.symlink_to(runs, target_is_directory=True)
+            result = run_child_bounded(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys; sys.stdout.write(''.join(p + '\\n' for p in sys.argv[1:]))",
+                    str(release_contract),
+                    str(alias / "run-1" / "autopilot-result.json"),
+                    str(runs / "run-1" / ".." / "run-1" / "autopilot-result.json"),
+                    "secret-stdout=abc123",
+                    str(contract),
+                ],
+                cwd=release,
+                timeout=ChildTimeoutConfig(total_seconds=2, grace_seconds=1),
+                environment={"CLOCKIFY_AUTOPILOT_RUNS_ROOT": str(runs)},
+            )
+
+        self.assertEqual(0, result.returncode)
+        self.assertEqual(f"{contract}\n", result.stdout)
+
+    def test_invalid_explicit_runs_root_fails_closed(self):
+        """Catches accepting an unanchored or aliased root as a broad stdout scope."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = root / "runs"
+            runs.mkdir()
+            alias = root / "alias"
+            alias.symlink_to(runs, target_is_directory=True)
+            for invalid in ("relative/runs", str(alias)):
+                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                    run_child_bounded(
+                        [sys.executable, "-c", "pass"],
+                        cwd=root,
+                        timeout=ChildTimeoutConfig(total_seconds=2, grace_seconds=1),
+                        environment={"CLOCKIFY_AUTOPILOT_RUNS_ROOT": invalid},
+                    )
+
     def test_hung_child_is_terminated_and_returns_sanitized_timeout(self):
         """Catches a timeout path that leaves its owned child running."""
         with tempfile.TemporaryDirectory() as directory:
