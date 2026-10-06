@@ -103,7 +103,12 @@ class FathomRoutingTests(unittest.TestCase):
     def test_mab_client_meetings_route_to_pm_before_internal_fallback(self):
         """Catches a client sync silently becoming a Serenichron internal meeting."""
         routing = collector.load_json(MODULE_PATH.parents[1] / "routing.json")
-        for title in ("MAB Food Fairy — Sync", "Mihaela Brăilescu — Planning", "Reset Feminin — Review"):
+        for title in (
+            "MAB Food Fairy — Sync", "Mihaela Brăilescu — Planning", "Reset Feminin — Review",
+            "MB - Vlad & Alex - Flow Consiliere",
+            "MB - Client Call - Vlad & Mihaela - Consiliere & Scorecard Hormonal",
+            "MB — Delivery planning",
+        ):
             with self.subTest(title=title):
                 item = meeting(title)
                 route = collector.route_meeting(item, routing)
@@ -116,6 +121,14 @@ class FathomRoutingTests(unittest.TestCase):
                 resolved, error = pipeline.resolve_route({}, [event], routing)
                 self.assertIsNone(error)
                 self.assertEqual("d07be7", resolved["project_suffix"])
+
+    def test_mb_meeting_alias_requires_a_delimited_client_prefix(self):
+        """Catches a short alias stealing unrelated internal meetings."""
+        routing = collector.load_json(MODULE_PATH.parents[1] / "routing.json")
+        for title in ("Discuss MB storage", "MB storage planning", "Mihaela — General sync"):
+            with self.subTest(title=title):
+                route = collector.route_meeting(meeting(title), routing)
+                self.assertEqual("Serenichron Level 1", route["project_name"])
 
     def test_mab_incidental_content_does_not_take_over_other_client_route(self):
         """Catches evidence rules overriding an unrelated deterministic client route."""
@@ -148,7 +161,7 @@ class FathomRoutingTests(unittest.TestCase):
         self.assertEqual("5f5b5121a551633f6dfa31e6", routing["member_id"])
         self.assertEqual(routing["clockify_user_id"], routing["member_id"])
         self.assertEqual(
-            "7af74f973bbadb05100b23801c922eeac5369c2e9070a411af0c97cd7760979e",
+            "3d3d1bcee73414d5d94729d196899f10c1b56a08949456fc2bf0810293925e3f",
             hashlib.sha256(raw).hexdigest(),
         )
         self.assertEqual(

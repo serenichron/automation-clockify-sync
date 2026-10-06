@@ -1843,7 +1843,9 @@ def _activity_observed_intervals(
         else:
             merged.append((start, end))
     return [
-        {"start": _iso(start), "end": _iso(end)}
+        # Source observations can differ only by milliseconds. Keep their
+        # precision rather than collapsing a positive span to equal seconds.
+        {"start": start.isoformat(), "end": end.isoformat()}
         for start, end in merged
     ]
 
@@ -3055,8 +3057,14 @@ def run_accounting(
                 key=lambda interval: (interval["start"], interval["end"]),
             )
             shared_timing_pool_ids.update(timing_contexts)
-        if not intervals:
-            ambiguous.append({"id": activity_id, "reason": "cited evidence has timestamps but no positive observed interval", "exception_kind": "timing_evidence", "evidence_ids": evidence_ids})
+        observed_capacity = _interval_capacity_minutes(intervals)
+        if not intervals or observed_capacity == 0:
+            reason = (
+                "cited evidence has timestamps but no positive observed interval"
+                if not intervals else
+                "cited evidence has no whole-minute observed capacity"
+            )
+            ambiguous.append({"id": activity_id, "reason": reason, "exception_kind": "timing_evidence", "evidence_ids": evidence_ids})
             if corrected_route is not None:
                 correction_observations.append({
                     "activity_id": activity_id,
@@ -3078,7 +3086,6 @@ def run_accounting(
         ]
         requested_effort = dict(activity.get("effort") or {})
         requested_minutes = int(requested_effort.get("recommended_minutes") or 0)
-        observed_capacity = _interval_capacity_minutes(intervals)
         review_warnings: list[dict[str, Any]] = list(routing_warnings)
         demand_effort = requested_effort
         if requested_minutes > observed_capacity:

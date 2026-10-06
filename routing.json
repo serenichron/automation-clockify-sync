@@ -710,7 +710,7 @@
       "billable": true,
       "confidence": "high",
       "prefix": "MB",
-      "title_regex": "\\b(?:mihaelabrailescu|MBrailescu/site|Mihaela\\s+Br[ăa]ilescu|Reset\\s*Feminin|rf-access-ops|MAB\\s+Food\\s+Fairy)\\b"
+      "title_regex": "(?:^\\s*MB\\s*[-–—:]\\s*|\\b(?:mihaelabrailescu|MBrailescu/site|Mihaela\\s+Br[ăa]ilescu|Reset\\s*Feminin|rf-access-ops|MAB\\s+Food\\s+Fairy)\\b)"
     },
     {
       "email_domain": "tstprep.com",
