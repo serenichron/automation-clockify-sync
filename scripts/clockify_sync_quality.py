@@ -375,6 +375,41 @@ def check_prefix_match(
     return None
 
 
+def _recorded_attendance_contract(proposal: dict[str, Any]) -> bool:
+    """Allow factual source attendance, never an unreviewed semantic outcome."""
+    provenance = _provenance(proposal)
+    title = provenance.get("recorded_meeting_title")
+    description = proposal.get("description")
+    start, end = parse_timestamp(proposal.get("start")), parse_timestamp(proposal.get("end"))
+    source_start = parse_timestamp(provenance.get("recorded_meeting_start"))
+    source_end = parse_timestamp(provenance.get("recorded_meeting_end"))
+    evidence_ids = provenance.get("evidence_ids")
+    warnings = proposal.get("review_warnings") or []
+    return bool(
+        provenance.get("source_type") == "recorded_meeting"
+        and provenance.get("semantic_fallback") is True
+        and re.fullmatch(r"cm-[a-f0-9]{64}", str(provenance.get("canonical_meeting_id") or ""))
+        and isinstance(title, str) and title and title == title.strip()
+        and not any(character in title for character in "\r\n\t")
+        and proposal.get("source_label") == title
+        and isinstance(description, str)
+        and re.fullmatch(r"[A-Za-z][A-Za-z0-9 &-]{0,24} — Attended " + re.escape(title), description)
+        and isinstance(evidence_ids, list) and evidence_ids
+        and all(re.fullmatch(r"ev-[a-f0-9]{64}", str(value)) for value in evidence_ids)
+        and proposal.get("source") == [f"evidence:{value}" for value in evidence_ids]
+        and start and end and source_start and source_end
+        and source_start <= start < end <= source_end
+        and [warning for warning in warnings if isinstance(warning, dict) and warning.get("type") == "semantic_meeting_fallback"] == [{
+            "type": "semantic_meeting_fallback",
+            "reason": "No usable semantic activity; recorded attendance only, no outcome inferred.",
+        }]
+        and not any(provenance.get(field) for field in (
+            "analyzer_model", "semantic_reviewer_model", "semantic_reviewer_revision",
+            "review_prompt_version", "prompt_version",
+        ))
+    )
+
+
 def review_proposal(
     proposal: dict[str, Any],
     enriched: dict[str, list[dict[str, Any]]],
@@ -385,6 +420,9 @@ def review_proposal(
     improved_description = None
     description = str(proposal.get("description") or "")
     flash_reviewed = bool(_provenance(proposal).get("semantic_reviewer_model"))
+    recorded_attendance = _recorded_attendance_contract(proposal)
+    if _provenance(proposal).get("source_type") == "recorded_meeting" and not recorded_attendance:
+        issues.append("Recorded attendance fallback contract is invalid")
 
     unresolved_warning = {
         "type": "unresolved_routing",
@@ -414,14 +452,15 @@ def review_proposal(
         issues.append("Unresolved routing contract is invalid")
 
     if proposal.get("allocation_mode") == "non_overlapping_v1":
-        try:
-            caveman_renderer.validate_description(description)
-        except caveman_renderer.CavemanValidationError as exc:
-            message = f"Caveman description advisory: {exc}"
-            if flash_reviewed:
-                suggestions.append(message)
-            else:
-                issues.append(message)
+        if not recorded_attendance:
+            try:
+                caveman_renderer.validate_description(description)
+            except caveman_renderer.CavemanValidationError as exc:
+                message = f"Caveman description advisory: {exc}"
+                if flash_reviewed:
+                    suggestions.append(message)
+                else:
+                    issues.append(message)
         if not proposal.get("activity_id") or not proposal.get("workstream_id"):
             issues.append("Semantic proposal lacks stable activity/workstream identity")
         provenance_ids = (_provenance(proposal).get("evidence_ids") or [])
@@ -483,7 +522,15 @@ def review_proposal(
         except (TypeError, ValueError):
             duration = 0
         wall_minutes = int((end - start).total_seconds() / 60)
-        if duration <= 0 or duration > wall_minutes:
+        positive_recorded_seconds = (
+            recorded_attendance
+            and type(proposal.get("duration_seconds")) is int
+            and proposal["duration_seconds"] == int((end - start).total_seconds())
+            and duration == wall_minutes
+        )
+        if (recorded_attendance and not positive_recorded_seconds) or (
+            not recorded_attendance and (duration <= 0 or duration > wall_minutes)
+        ):
             issues.append("Proposal duration is invalid for its time window")
 
     return {

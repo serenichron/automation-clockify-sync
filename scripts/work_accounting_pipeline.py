@@ -1544,6 +1544,12 @@ def _existing_blocks(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
                 "meeting_identity_keys": _existing_meeting_identity_keys(
                     event, start, end
                 ),
+                **({"tag_suffixes": list(attributes["tag_suffixes"])}
+                   if isinstance(attributes.get("tag_suffixes"), list) else
+                   {"tag_suffixes": list(attributes["tag_id_suffixes"])}
+                   if isinstance(attributes.get("tag_id_suffixes"), list) else {}),
+                **({"billable": attributes["billable"]}
+                   if type(attributes.get("billable")) is bool else {}),
             }
         )
     return blocks
@@ -2308,7 +2314,7 @@ def _exact_existing_accomplishment_match(
     start: dt.datetime | None, end: dt.datetime | None,
 ) -> bool:
     """Require reciprocal time plus explicit meeting identity or exact work labels."""
-    if start is None or end is None or start != block.get("start") or end != block.get("end"):
+    if start is None or end is None:
         return False
     provenance = proposal.get("provenance")
     meeting_id = str(
@@ -2316,7 +2322,20 @@ def _exact_existing_accomplishment_match(
         if isinstance(provenance, Mapping) else ""
     ).casefold()
     if meeting_id and f"explicit:{meeting_id}" in block.get("meeting_identity_keys", []):
-        return True
+        if start == block.get("start") and end == block.get("end"):
+            return True  # Historical exact-full-identity contract is unchanged.
+        block_start, block_end = block.get("start"), block.get("end")
+        return bool(
+            block_start and block_end and start < block_end and block_start < end
+            and proposal.get("clockify_project_suffix")
+            and proposal["clockify_project_suffix"] == block.get("project_id_suffix")
+            and "tag_suffixes" in block
+            and sorted(proposal.get("tag_suffixes", [])) == sorted(block["tag_suffixes"])
+            and type(block.get("billable")) is bool
+            and proposal.get("billable") is block["billable"]
+        )
+    if start != block.get("start") or end != block.get("end"):
+        return False
     project = str(proposal.get("clockify_project_suffix") or "")
     description = str(proposal.get("description") or "").strip()
     return bool(
@@ -2878,7 +2897,11 @@ def run_accounting(
             if block["kind"] == "existing_clockify"
             and _meeting_matches_existing_block(meeting, entry, start, end, block)
         ]
-        if len(matching_existing) == 1:
+        if (
+            len(matching_existing) == 1
+            and matching_existing[0]["start"] <= start
+            and end <= matching_existing[0]["end"]
+        ):
             matching_block = matching_existing[0]
             unrelated_blocks = [
                 block for block in overlapping_blocks if block is not matching_block
@@ -3190,6 +3213,64 @@ def run_accounting(
             "reason": "; ".join(failures),
             "exception_kind": "invalid_meeting_split",
             "evidence_ids": fathom_manifest[meeting_id]["source_evidence_ids"],
+        })
+
+    # Attendance is a source fact, not an inferred outcome. Preserve an eligible
+    # canonical recording when semantic extraction/review supplied no usable
+    # activity, without adding synthetic rows to the analyzer artifact. Existing
+    # quarantines and rejected multi-part splits remain exceptions.
+    for entry in eligible_recordings:
+        meeting = entry["meeting"]
+        meeting_id = meeting.canonical_id
+        if meeting_id in meeting_activities or fathom_manifest[meeting_id]["status"] != "unresolved":
+            continue
+        representative = next(
+            (event for event in entry["events"] if event.get("source_type") == "fathom"),
+            entry["events"][0],
+        )
+        title = str(meeting.title or "").strip()
+        if not title:
+            continue
+        route, route_error = resolve_route({}, entry["events"], routing)
+        warnings = [{
+            "type": "semantic_meeting_fallback",
+            "reason": "No usable semantic activity; recorded attendance only, no outcome inferred.",
+        }]
+        if route_error or route is None:
+            route, warning = _unresolved_route()
+            warnings.append(warning)
+        start, end = _canonical_meeting_span(meeting, representative)
+        proposal = _proposal(
+            {
+                "activity_id": semantic_analyzer.stable_digest("act-", {"recorded_attendance": meeting_id}),
+                "workstream_id": semantic_analyzer.stable_digest("ws-", {"recorded_meeting": meeting_id}),
+                "object": title,
+                "effort": {},
+                "timing_confidence": "high",
+                "split_rationale": "Authoritative canonical recording interval; factual attendance only.",
+            },
+            route, f"{route.get('prefix') or 'SC'} — Attended {title}",
+            start, end, entry["source_evidence_ids"], 1,
+            review_warnings=warnings,
+        )
+        proposal["provenance"] = {
+            "source_type": "recorded_meeting",
+            "source_session_id": meeting_id,
+            "source_machine": "cross-machine",
+            "burst_start": _iso(start),
+            "burst_end": _iso(end),
+            "evidence_ids": entry["source_evidence_ids"],
+            "canonical_meeting_id": meeting_id,
+            "recorded_meeting_title": title,
+            "recorded_meeting_start": _iso(start),
+            "recorded_meeting_end": _iso(end),
+            "meeting_precedence": _meeting_precedence(representative),
+            "semantic_fallback": True,
+        }
+        meeting_proposals.append(proposal)
+        fathom_manifest[meeting_id].update({
+            "status": "proposed", "activity_id": proposal["activity_id"],
+            "semantic_fallback": True,
         })
 
     for meeting_id, candidates in meeting_activities.items():

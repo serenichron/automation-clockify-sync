@@ -439,6 +439,13 @@ def _validate_review_warning(
         if suffix in projects:
             sanitized["counterpart_project"] = projects[suffix]
         return sanitized
+    elif warning_type == "semantic_meeting_fallback":
+        if warning != {
+            "type": "semantic_meeting_fallback",
+            "reason": "No usable semantic activity; recorded attendance only, no outcome inferred.",
+        }:
+            raise PublicationError("proposal semantic meeting fallback warning is invalid")
+        return dict(warning)
     elif warning_type == "estimated_session_placement":
         if set(warning) != {"type", "reason"}:
             raise PublicationError("proposal estimated placement warning has invalid fields")
