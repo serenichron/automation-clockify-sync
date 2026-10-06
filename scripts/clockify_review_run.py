@@ -858,6 +858,203 @@ def _snapshot_reconciliation_inputs(
     return targets
 
 
+def _frozen_source_inputs(
+    source: Path,
+) -> tuple[collector_receipts.FrozenSourceSnapshot, dict[str, bytes]]:
+    """Read one captured source once, checking its original semantic/cache binding."""
+    frozen = collector_receipts.verify_frozen_source(source)
+    extra: dict[str, bytes] = {}
+    for filename in (
+        *_RECONCILIATION_INPUTS.values(),
+        "semantic-analysis.json", "analyzer-cache-used.jsonl",
+        "captured-source-provenance.json", "augmentation-acceptance.json",
+    ):
+        extra[filename] = _read_snapshot_source(source / filename, label=f"frozen source {filename}")
+    for filename in ("captured-source-provenance.json", "augmentation-acceptance.json"):
+        if not isinstance(json.loads(extra[filename]), Mapping):
+            raise ReviewRunError(f"frozen source {filename} must be an object")
+    _manifest, period, _bundles, _content = _validated_period_manifest(
+        source / "period-manifest.json", allow_collecting_bootstrap=True,
+    )
+    identity = period.identity.document()
+    native = frozen.report["clockify_native_checkpoint"]
+    request = native["request"]
+    if (
+        not identity["since_utc"] <= frozen.since_utc < frozen.until_utc <= identity["until_utc"]
+        or identity["member_id"] != request["user_id"]
+        or identity["workspace_id"] != request["workspace_id"]
+    ):
+        raise ReviewRunError("frozen source period differs from its native capture")
+    analysis = json.loads(extra["semantic-analysis.json"])
+    if not isinstance(analysis, dict):
+        raise ReviewRunError("frozen source semantic analysis must be an object")
+    ledger, all_events = work_accounting_pipeline.load_ledger(source / "evidence/evidence-ledger.json")
+    member_identities = work_accounting_pipeline.meeting_reconciliation.manifest_member_identities(
+        ledger.manifest.document()
+    )
+    analysis_events, _noise = work_accounting_pipeline._analysis_events(all_events, member_identities)
+    evidence_ids = sorted(str(event["evidence_id"]) for event in analysis_events)
+    if (
+        analysis.get("ledger_event_count") != len(evidence_ids)
+        or analysis.get("ledger_evidence_digest")
+        != semantic_analyzer.stable_digest("led-", evidence_ids)
+    ):
+        raise ReviewRunError("frozen source semantic ledger binding differs")
+    cache = extra["analyzer-cache-used.jsonl"]
+    cache_summary = analysis.get("analyzer_cache")
+    snapshot = cache_summary.get("snapshot") if isinstance(cache_summary, Mapping) else None
+    records = [json.loads(line) for line in cache.splitlines() if line.strip()]
+    if (
+        not isinstance(snapshot, Mapping)
+        or set(snapshot) != {"path", "record_count", "sha256"}
+        or snapshot.get("path") != "analyzer-cache-used.jsonl"
+        or snapshot.get("record_count") != len(records)
+        or snapshot.get("sha256") != hashlib.sha256(cache).hexdigest()
+        or sorted((
+            {"cache_key": row["cache_key"], "decision_digest": row["decision_digest"]}
+            for row in records
+        ), key=lambda row: row["cache_key"]) != _analysis_cache_records(analysis)
+    ):
+        raise ReviewRunError("frozen source analyzer cache binding differs")
+    semantic_analyzer.AnalyzerResponseCache(source / "analyzer-cache-used.jsonl")
+    return frozen, extra
+
+
+def _prepare_frozen_source_run(source: Path) -> Path:
+    """Copy a verified offline capture into a write-once native review run."""
+    source = Path(source)
+    frozen, extra = _frozen_source_inputs(source)
+    original_bytes = dict(frozen.verified_artifact_bytes)
+    original_bytes.update(extra)
+    original_hashes = {
+        filename: "sha256:" + hashlib.sha256(content).hexdigest()
+        for filename, content in sorted(original_bytes.items())
+    }
+    source_name = frozen.run_dir.name
+    executor = clockify_sync_collect.collector_runtime_identity()
+    marker = {
+        "source_run_dir": str(frozen.run_dir),
+        "source_run_id": source_name,
+        "source_file_sha256": original_hashes,
+        "executor_runtime_identity": executor,
+    }
+    locator = hashlib.sha256(
+        json.dumps(marker, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    target = RUNS.resolve() / f"frozen-source-{locator}"
+    if target.is_symlink():
+        raise ReviewRunError("frozen materialization path is unsafe")
+    target.mkdir(exist_ok=True)
+    collector_receipts._safe_path(target, run_dir=RUNS)
+    for filename, content in original_bytes.items():
+        if filename in ("run-report.json", "semantic-analysis.json"):
+            continue
+        destination = collector_receipts._safe_path(target / filename, run_dir=target)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        _write_snapshot(destination, content, label=f"frozen source {filename}")
+    fixture = target / "frozen-fixture" / "semantic-analysis.json"
+    collector_receipts._safe_path(fixture, run_dir=target)
+    fixture.parent.mkdir(exist_ok=True)
+    _write_snapshot(fixture, extra["semantic-analysis.json"], label="frozen semantic fixture")
+    report = dict(frozen.report)
+    report.update({
+        "run_id": target.name,
+        "collector_runtime_identity": frozen.report["runtime_identity"],
+        "executor_runtime_identity": executor,
+        "runtime_identity": executor,
+        "frozen_source": marker,
+    })
+    paths = report.get("paths")
+    if isinstance(paths, Mapping):
+        report["paths"] = {
+            key: str(target / Path(value).relative_to(frozen.run_dir))
+            if isinstance(value, str) and Path(value).is_relative_to(frozen.run_dir)
+            else value
+            for key, value in paths.items()
+        }
+    report_bytes = (json.dumps(report, indent=2, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+    _write_snapshot(
+        collector_receipts._safe_path(target / "run-report.json", run_dir=target),
+        report_bytes, label="frozen materialization report",
+    )
+    return target
+
+
+def _verified_frozen_source_run(run_dir: Path) -> collector_receipts.FrozenSourceSnapshot:
+    """Recheck the original capture and every byte copied before completion."""
+    run_dir = _run_child(run_dir, label="frozen materialization")
+    report = _read_json(collector_receipts._safe_path(run_dir / "run-report.json", run_dir=run_dir))
+    marker = report.get("frozen_source") if isinstance(report, Mapping) else None
+    if not isinstance(marker, Mapping) or set(marker) != {
+        "source_run_dir", "source_run_id", "source_file_sha256", "executor_runtime_identity",
+    }:
+        raise ReviewRunError("frozen materialization provenance is invalid")
+    source = Path(str(marker["source_run_dir"]))
+    frozen, extra = _frozen_source_inputs(source)
+    originals = dict(frozen.verified_artifact_bytes)
+    originals.update(extra)
+    expected_hashes = {
+        filename: "sha256:" + hashlib.sha256(content).hexdigest()
+        for filename, content in sorted(originals.items())
+    }
+    if (
+        marker["source_run_id"] != frozen.run_dir.name
+        or marker["source_run_dir"] != str(frozen.run_dir)
+        or marker["source_file_sha256"] != expected_hashes
+        or report.get("collector_runtime_identity") != frozen.report.get("runtime_identity")
+        or report.get("executor_runtime_identity") != marker["executor_runtime_identity"]
+        or report.get("runtime_identity") != marker["executor_runtime_identity"]
+        or report.get("source_augmentation") != frozen.report.get("source_augmentation")
+        or report.get("run_id") != run_dir.name
+    ):
+        raise ReviewRunError("frozen materialization source binding differs")
+    for filename, content in originals.items():
+        if filename == "run-report.json":
+            continue
+        destination = (
+            run_dir / "frozen-fixture/semantic-analysis.json"
+            if filename == "semantic-analysis.json" else run_dir / filename
+        )
+        destination = collector_receipts._safe_path(destination, run_dir=run_dir)
+        if _read_snapshot_source(destination, label=f"frozen materialization {filename}") != content:
+            raise ReviewRunError(f"frozen materialization {filename} differs")
+    if collector_receipts.native_checkpoint_inventory(run_dir) != {
+        filename for filename in frozen.verified_artifact_bytes
+        if filename.startswith(collector_receipts.NATIVE_CHECKPOINT_PREFIX)
+    }:
+        raise ReviewRunError("frozen materialization native checkpoint inventory differs")
+    return frozen
+
+
+def _finalize_frozen_source_completion(
+    run_dir: Path,
+) -> collector_receipts.SliceCompletionBundle:
+    """Seal only verified captured bytes and passing downstream artifacts."""
+    frozen = _verified_frozen_source_run(run_dir)
+    quality = _read_json(run_dir / "quality_report.json")
+    if not isinstance(quality, Mapping) or quality.get("status") != "pass":
+        raise collector_receipts.CollectorReceiptError("frozen source quality has not passed")
+    slices = clockify_sync_collect.plan_slices(
+        dt.datetime.fromisoformat(frozen.since_utc.replace("Z", "+00:00")),
+        dt.datetime.fromisoformat(frozen.until_utc.replace("Z", "+00:00")),
+        zone=clockify_sync_collect.BUCHAREST,
+    )
+    if len(slices) != 1 or (
+        clockify_sync_collect.iso_utc(slices[0].since) != frozen.since_utc
+        or clockify_sync_collect.iso_utc(slices[0].until) != frozen.until_utc
+    ):
+        raise ReviewRunError("frozen source is not one bounded collector slice")
+    bundle = collector_receipts.build_completion_bundle(run_dir, slice_=slices[0])
+    path = run_dir / "completion-bundle.json"
+    if path.exists() or path.is_symlink():
+        existing = collector_receipts.load_completion_bundle(path, run_dir=run_dir)
+        if existing.bundle_digest != bundle.bundle_digest:
+            raise ReviewRunError("frozen materialization completion differs")
+    else:
+        collector_receipts.write_completion_bundle(path, bundle)
+    return collector_receipts.load_completion_bundle(path, run_dir=run_dir)
+
+
 def _prepare_collector_derivation_run(
     source: Path,
     snapshots: Mapping[str, Path],
@@ -2636,6 +2833,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Resume accounting for one existing, locally snapshotted source run.",
     )
     parser.add_argument("--repair-from", type=Path, help="Re-derive accounting in a distinct run from a completed source's exact snapshots and validated cache.")
+    parser.add_argument(
+        "--materialize-frozen-from", type=Path,
+        help="Complete a verified captured source offline in a distinct private review run.",
+    )
     parser.add_argument("--retry-failed-reviews", action="store_true", help="Re-analyze selected source-bound failed semantic reviews in one repair run.")
     parser.add_argument("--retry-review-digest", action="append", help="Exact frt- digest of one failed source evidence-ID set; repeat for multiple targets.")
     parser.add_argument(
@@ -2683,6 +2884,7 @@ def _process_run(
     replay_source = getattr(args, "_replay_source", None)
     replay_analysis_fixture = getattr(args, "_replay_analysis_fixture", None)
     repair_analysis_fixture = getattr(args, "_repair_analysis_fixture", None)
+    frozen_analysis_fixture = getattr(args, "_frozen_analysis_fixture", None)
     accounting_command = [
         sys.executable,
         str(SCRIPTS / "work_accounting_pipeline.py"),
@@ -2712,7 +2914,7 @@ def _process_run(
         for digest in args.retry_review_digest:
             accounting_command.extend(["--failed-review-retry-digest", digest])
     analysis_fixture = (
-        replay_analysis_fixture or repair_analysis_fixture or args.analysis_fixture
+        replay_analysis_fixture or repair_analysis_fixture or frozen_analysis_fixture or args.analysis_fixture
     )
     if analysis_fixture:
         accounting_command.extend(["--analysis-fixture", str(analysis_fixture)])
@@ -2812,6 +3014,7 @@ def _process_run(
     completion_error = None
     has_repair_source = (run_dir / "repair-source.json").is_file()
     has_collector_source = (run_dir / "collector-source.json").is_file()
+    has_frozen_source = isinstance(_read_json(run_dir / "run-report.json").get("frozen_source"), dict)
     has_replay_completion_source = (
         replay_source is not None
         and (replay_source / "completion-bundle.json").is_file()
@@ -2834,6 +3037,7 @@ def _process_run(
         (run_dir / "slice-finalization.json").is_file()
         or has_repair_source
         or has_collector_source
+        or has_frozen_source
     ) and snapshot is not None:
         if quality.get("status") == "pass":
             try:
@@ -2843,6 +3047,8 @@ def _process_run(
                     bundle = _finalize_repair_completion(run_dir)
                 elif has_collector_source:
                     bundle = _finalize_collector_derivation_completion(run_dir)
+                elif has_frozen_source:
+                    bundle = _finalize_frozen_source_completion(run_dir)
                 elif is_recovery_run:
                     bundle = _finalize_recovery_completion(run_dir)
                 else:
@@ -3052,6 +3258,17 @@ def _adopt_completed_recovery(source: Path) -> Path | None:
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(raw_argv)
+    if args.materialize_frozen_from is not None:
+        if (
+            not _option_was_supplied(raw_argv, "--runs-root")
+            or not _option_was_supplied(raw_argv, "--state")
+            or args.runs_root.resolve() == (ROOT / "runs").resolve()
+            or args.state.resolve() == DEFAULT_STATE.resolve()
+            or not args.state.is_absolute()
+            or args.state != args.state.resolve()
+        ):
+            print("clockify review run: frozen materialization requires explicit private --runs-root and --state paths", file=sys.stderr)
+            return 2
     try:
         args.runs_root = _configure_runs_root(args.runs_root)
     except ValueError as exc:
@@ -3073,8 +3290,8 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    if sum((args.replay_from is not None, args.resume_from is not None, args.repair_from is not None, recovery_mode)) > 1:
-        print("clockify review run: replay, resume, repair and recovery modes are mutually exclusive", file=sys.stderr)
+    if sum((args.replay_from is not None, args.resume_from is not None, args.repair_from is not None, recovery_mode, args.materialize_frozen_from is not None)) > 1:
+        print("clockify review run: replay, resume, repair, recovery and frozen materialization modes are mutually exclusive", file=sys.stderr)
         return 2
     if (
         args.retry_failed_reviews != bool(args.retry_review_digest)
@@ -3112,7 +3329,19 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    if not args.replay_from and not args.resume_from and not args.repair_from and not recovery_mode and args.period_manifest is None:
+    if args.materialize_frozen_from is not None and (
+        args.since or args.until or args.no_enrich or args.calendly_optional
+        or args.analysis_fixture or args.analyzer_cache
+        or disallowed_reconciliation_overrides
+        or args.retry_failed_reviews or args.retry_review_digest
+        or args.analyzer_target_body_bytes is not None
+        or args.analyzer_max_events_per_chunk is not None
+        or args.analyzer_workers is not None
+        or _option_was_supplied(raw_argv, "--review-mode")
+    ):
+        print("clockify review run: frozen materialization cannot override collection, reconciliation or analyzer inputs", file=sys.stderr)
+        return 2
+    if not args.replay_from and not args.resume_from and not args.repair_from and not recovery_mode and not args.materialize_frozen_from and args.period_manifest is None:
         print(
             "clockify review run: every fresh run requires --period-manifest",
             file=sys.stderr,
@@ -3120,7 +3349,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     reconciliation_contents: dict[str, bytes] | None = None
-    if not args.replay_from and not args.resume_from and not args.repair_from and not recovery_mode:
+    if not args.replay_from and not args.resume_from and not args.repair_from and not recovery_mode and not args.materialize_frozen_from:
         try:
             reconciliation_contents = {
                 filename: _read_snapshot_source(
@@ -3145,7 +3374,26 @@ def main(argv: list[str] | None = None) -> int:
 
     collector_code = 0
     collector_error = ""
-    if recovery_mode:
+    if args.materialize_frozen_from is not None:
+        try:
+            frozen = _prepare_frozen_source_run(args.materialize_frozen_from)
+            existing = _adopt_completed_resume(frozen)
+            if existing is not None:
+                _verified_frozen_source_run(frozen)
+                result = _read_json(existing)
+                bundle = collector_receipts.load_completion_bundle(
+                    frozen / "completion-bundle.json", run_dir=frozen,
+                )
+                if result.get("completion_bundle_digest") != bundle.bundle_digest:
+                    raise ReviewRunError("completed frozen materialization result differs")
+                print(existing)
+                return 0
+            run_dirs = (frozen,)
+            args._frozen_analysis_fixture = frozen / "frozen-fixture/semantic-analysis.json"
+        except (OSError, ValueError, json.JSONDecodeError, collector_receipts.CollectorReceiptError) as exc:
+            print(f"clockify review run: cannot prepare frozen materialization: {exc}", file=sys.stderr)
+            return 2
+    elif recovery_mode:
         try:
             recovered = clockify_source_debt_recover.recover(
                 args.recover_source_debt_from,
@@ -3322,7 +3570,7 @@ def main(argv: list[str] | None = None) -> int:
 
     for run_dir in run_dirs:
         run_args = argparse.Namespace(**vars(args))
-        if args.replay_from or args.repair_from:
+        if args.replay_from or args.repair_from or args.materialize_frozen_from:
             snapshots = {
                 filename: run_dir / filename for filename in _RECONCILIATION_INPUTS.values()
             }

@@ -43,6 +43,11 @@ _COLLECTOR_RAW_ARTIFACTS = {
 }
 _BUNDLE_SCHEMA_VERSION = "collector-completion-bundle/v1"
 _PERIOD_TIMEZONE = ZoneInfo("Europe/Bucharest")
+_HISTORICAL_STAGE_SHA256 = "6735619bec99effe73492ac2bde554862908e6e86cae8b0de978ae6d0978e9e1"
+_HISTORICAL_NORMALIZER_SHA256 = "2020001370f05624ef5a5f2e05123477bea68f566f0c8883bd1ef550722cbea7"
+_HISTORICAL_MATERIALIZER_SHA256 = "8bbc609fe66b925ee3b223186247c9821b266d90c9b7213de5f2d321c2d1854f"
+_HISTORICAL_AUDIT_PATH = Path("/tmp/clockify-september-normalization-audit-20261006-nSvDlL/proof.json")
+_HISTORICAL_AUDIT_SHA256 = "e147f08fd2e9f5556f50993f6803075eb6aa78d6e5acda19e0c2c60ba1f9789b"
 NATIVE_CHECKPOINT_PREFIX = "evidence/clockify-native-checkpoint/"
 
 
@@ -432,6 +437,132 @@ class CollectorSourceBundle:
     @property
     def replay(self) -> bool:
         return False
+
+
+@dataclass(frozen=True)
+class FrozenSourceSnapshot:
+    """Verified captured bytes, without claiming collector or backlog completion."""
+
+    run_dir: Path
+    report: Mapping[str, object]
+    since_utc: str
+    until_utc: str
+    verified_artifact_bytes: Mapping[str, bytes]
+    verified_artifact_digests: Mapping[str, str]
+
+
+def _historical_transport_projection(event: evidence_ledger.EvidenceEvent) -> evidence_ledger.EvidenceEvent:
+    """Reproduce the one attested pre-transport-receipt event shape, never its code."""
+    attributes = dict(event.attributes)
+    if "transport_omitted_tool_content" not in attributes:
+        return event
+    if (
+        event.source_type != "codex_sessions_event"
+        or attributes.get("role") != "tool"
+        or attributes.get("kind") != "tool_result"
+        or attributes.get("content") not in (None, "")
+    ):
+        raise CollectorReceiptError("historical transport projection is not a tool result")
+    attributes.pop("transport_omitted_tool_content")
+    return evidence_ledger.evidence_event(
+        event.source_type, event.source_ref, observed_at=event.observed_at,
+        raw_source_span=event.raw_source_span, attributes=attributes,
+        legacy_aliases=event.legacy_aliases,
+    )
+
+
+def _attested_historical_source(
+    run_dir: Path, report: Mapping, ledger_digest: str, manifest_id: str,
+    events_digest: str, verified_bytes: Mapping[str, bytes],
+) -> Mapping:
+    """Bind this exact old policy to the immutable stage receipt and read-only audit."""
+    augmentation = report.get("source_augmentation")
+    paths = report.get("paths")
+    if (
+        not isinstance(augmentation, Mapping)
+        or augmentation.get("schema_version") != "offline-captured-mac-conservative-additive-union/v1"
+        or augmentation.get("materializer_sha256") != _HISTORICAL_MATERIALIZER_SHA256
+        or not isinstance(paths, Mapping)
+        or not isinstance(paths.get("run_dir"), str)
+    ):
+        raise CollectorReceiptError("historical normalization profile is not attested")
+    stage_run = _safe_path(Path(paths["run_dir"]))
+    if stage_run.name != run_dir.name or stage_run.parent.name != "runs":
+        raise CollectorReceiptError("historical stage source identity differs")
+    stage_root = stage_run.parent.parent
+    receipt_path = _safe_path(stage_root / "allhost-stage-result.json")
+    receipt_bytes, receipt_digest = _safe_read_bytes_and_digest(receipt_path)
+    if receipt_digest != "sha256:" + _HISTORICAL_STAGE_SHA256:
+        raise CollectorReceiptError("historical stage receipt digest differs")
+    receipt = json.loads(receipt_bytes)
+    if (
+        not isinstance(receipt, Mapping)
+        or receipt.get("schema_version") != "offline-september-allhost-stage/v1"
+        or receipt.get("runs_root") != str(stage_run.parent)
+        or receipt.get("stage_only") is not True
+        or receipt.get("network") is not False
+        or receipt.get("inference") is not False
+        or receipt.get("source_host_rereads") is not False
+        or receipt.get("materializer_sha256") != _HISTORICAL_MATERIALIZER_SHA256
+    ):
+        raise CollectorReceiptError("historical stage receipt is invalid")
+    modules = receipt.get("native_module_hashes")
+    normalizers = [value for path, value in modules.items()
+                   if Path(path).name == "evidence_ledger.py"] if isinstance(modules, Mapping) else []
+    if normalizers != [_HISTORICAL_NORMALIZER_SHA256]:
+        raise CollectorReceiptError("historical normalizer version is unknown")
+    rows = receipt.get("results")
+    matches = [row for row in rows if isinstance(row, Mapping)
+               and row.get("source_run") == str(stage_run)] if isinstance(rows, list) else []
+    if len(matches) != 1:
+        raise CollectorReceiptError("historical stage source receipt is missing")
+    row = matches[0]
+    identity = row.get("ledger_identity")
+    if (
+        row.get("label") != run_dir.name.removeprefix("captured-mac-conservative-union-")
+        or row.get("stage_only") is not True
+        or row.get("completion_bundle_created") is not False
+        or row.get("native_raw_projection_exact") is not True
+        or row.get("native_checkpoint_consumer_validated") is not True
+        or row.get("all_frozen_inputs_byte_identical") is not True
+        or row.get("inference") is not False
+        or not isinstance(identity, Mapping)
+        or identity != {"file_sha256": ledger_digest, "manifest_id": manifest_id,
+                        "events_digest": events_digest}
+    ):
+        raise CollectorReceiptError("historical stage ledger identity differs")
+    audit_bytes, audit_digest = _safe_read_bytes_and_digest(_safe_path(_HISTORICAL_AUDIT_PATH))
+    if audit_digest != "sha256:" + _HISTORICAL_AUDIT_SHA256:
+        raise CollectorReceiptError("historical compatibility audit digest differs")
+    audit = json.loads(audit_bytes)
+    if (
+        not isinstance(audit, Mapping)
+        or audit.get("schema_version") != "read-only-normalization-compatibility-audit/v1"
+        or audit.get("stage_receipt_sha256") != _HISTORICAL_STAGE_SHA256
+        or audit.get("attested_historical_normalizer_sha256") != _HISTORICAL_NORMALIZER_SHA256
+        or audit.get("all_periods_pass") is not True
+    ):
+        raise CollectorReceiptError("historical compatibility audit is invalid")
+    audit_rows = audit.get("results")
+    audited = [item for item in audit_rows if isinstance(item, Mapping)
+               and item.get("period") == row["label"]] if isinstance(audit_rows, list) else []
+    if len(audited) != 1 or audited[0].get("pass") is not True:
+        raise CollectorReceiptError("historical source was not audited")
+    for name, relative in {**_COLLECTOR_RAW_ARTIFACTS,
+                           "enriched_context": "evidence/enriched-context.json"}.items():
+        if relative not in verified_bytes:
+            if name == "enriched_context":
+                continue
+            raise CollectorReceiptError("historical source raw artifact is missing")
+        content = verified_bytes[relative]
+        if (
+            audited[0].get("raw_artifacts_sha256", {}).get(name) != hashlib.sha256(content).hexdigest()
+            or _safe_read_bytes_and_digest(_safe_path(stage_run / relative, run_dir=stage_run))[0] != content
+        ):
+            raise CollectorReceiptError("historical source raw artifact differs")
+    if audited[0].get("bound_ledger_file_sha256") != ledger_digest:
+        raise CollectorReceiptError("historical source ledger differs from audit")
+    return audited[0]
 
 
 def _slice_utc(value: object, label: str) -> str:
@@ -833,4 +964,125 @@ def load_collector_source_bundle(path: Path, *, run_dir: Path) -> CollectorSourc
         source_bundle_digest=_digest(source_unsigned),
         verified_artifact_bytes=dict(verified_bytes),
         verified_artifact_digests=dict(verified_digests),
+    )
+
+
+def verify_frozen_source(run_dir: Path) -> FrozenSourceSnapshot:
+    """Prove captured raw bytes and their ledger without claiming live collection."""
+    run_dir = _safe_path(Path(run_dir))
+    if not run_dir.is_dir() or run_dir.is_symlink():
+        raise CollectorReceiptError("frozen source directory is missing or unsafe")
+    verified_bytes: dict[str, bytes] = {}
+    verified_digests: dict[str, str] = {}
+
+    def read(relative: str) -> bytes:
+        path = _safe_path(run_dir / relative, run_dir=run_dir)
+        content, digest = _safe_read_bytes_and_digest(path)
+        verified_bytes[relative] = content
+        verified_digests[relative] = digest
+        return content
+
+    try:
+        report = json.loads(read("run-report.json"))
+        ledger_document = json.loads(read("evidence/evidence-ledger.json"))
+        if not isinstance(report, dict) or not isinstance(ledger_document, dict):
+            raise ValueError("report or ledger is not an object")
+        augmentation = report.get("source_augmentation")
+        if (
+            report.get("run_id") != run_dir.name
+            or not isinstance(augmentation, Mapping)
+            or augmentation.get("original_collection_not_reperformed") is not True
+            or "clockify_native_checkpoint" not in report
+        ):
+            raise ValueError("frozen capture provenance is missing")
+        date_range = report.get("date_range")
+        if not isinstance(date_range, Mapping):
+            raise ValueError("frozen period is missing")
+        since_utc = _report_utc(date_range.get("since"))
+        until_utc = _report_utc(date_range.get("until"))
+        if since_utc >= until_utc:
+            raise ValueError("frozen period is invalid")
+        _completion_identities_from_documents(
+            report, ledger_document, since_utc=since_utc, until_utc=until_utc,
+        )
+        reported_ledger = report.get("evidence_ledger")
+        manifest_document = ledger_document.get("manifest")
+        events_document = ledger_document.get("events")
+        if (
+            not isinstance(reported_ledger, Mapping)
+            or not isinstance(manifest_document, Mapping)
+            or not isinstance(events_document, list)
+        ):
+            raise ValueError("frozen ledger shape is invalid")
+        manifest = evidence_ledger.LedgerManifest.from_document(manifest_document)
+        bound = evidence_ledger.EvidenceLedger(
+            tuple(evidence_ledger.EvidenceEvent.from_document(item) for item in events_document),
+            manifest.source_inventory, manifest.timezone, manifest.member_identities,
+        )
+        bound.validate(manifest)
+        if (
+            reported_ledger.get("manifest_id") != manifest.manifest_id
+            or reported_ledger.get("events_digest") != manifest.events_digest
+            or reported_ledger.get("event_count") != manifest.event_count
+            or reported_ledger.get("ledger_digest") != verified_digests["evidence/evidence-ledger.json"]
+        ):
+            raise ValueError("frozen run report ledger binding differs")
+        raw: dict[str, object] = {}
+        for name, relative in _COLLECTOR_RAW_ARTIFACTS.items():
+            raw[name] = json.loads(read(relative))
+        enriched = run_dir / "evidence/enriched-context.json"
+        if enriched.exists() or enriched.is_symlink():
+            raw["enriched_context"] = json.loads(read("evidence/enriched-context.json"))
+        current_events = tuple(evidence_ledger.normalize_collector_snapshot(raw))
+        reconstructed = evidence_ledger.EvidenceLedger(
+            current_events,
+            evidence_ledger.source_inventory_from_collector(raw),
+            manifest.timezone, manifest.member_identities,
+        )
+        if reconstructed.manifest.document() != manifest.document():
+            audited = _attested_historical_source(
+                run_dir, report,
+                verified_digests["evidence/evidence-ledger.json"].removeprefix("sha256:"),
+                manifest.manifest_id, manifest.events_digest, verified_bytes,
+            )
+            projected = evidence_ledger.EvidenceLedger(
+                tuple(_historical_transport_projection(event) for event in current_events),
+                evidence_ledger.source_inventory_from_collector(raw),
+                manifest.timezone, manifest.member_identities,
+            )
+            if (
+                projected.manifest.document() != manifest.document()
+                or [event.document() for event in projected.events] != events_document
+                or audited.get("bound_manifest_sha256") != evidence_ledger.sha256_hex(manifest.document())
+                or audited.get("bound_events_sha256") != evidence_ledger.sha256_hex(events_document)
+            ):
+                raise ValueError("frozen historical raw evidence does not match bound ledger")
+            try:
+                from scripts import work_accounting_pipeline
+            except ModuleNotFoundError:  # direct script execution
+                import work_accounting_pipeline  # type: ignore[no-redef]
+            old_retained, _old_noise = work_accounting_pipeline._analysis_events(
+                events_document, frozenset(manifest.member_identities),
+            )
+            new_retained, _new_noise = work_accounting_pipeline._analysis_events(
+                [event.document() for event in reconstructed.events],
+                frozenset(manifest.member_identities),
+            )
+            if (
+                old_retained != new_retained
+                or audited.get("retained_analysis_sha256") != evidence_ledger.sha256_hex(old_retained)
+            ):
+                raise ValueError("frozen historical normalization changed retained analysis")
+        native = _verified_native_checkpoint(
+            report, run_dir=run_dir, since_utc=since_utc, until_utc=until_utc,
+            clockify_evidence=verified_bytes["evidence/clockify-existing.json"],
+        )
+        for relative, content in native.items():
+            verified_bytes[relative] = content
+            verified_digests[relative] = "sha256:" + hashlib.sha256(content).hexdigest()
+        read("run-report.md")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise CollectorReceiptError("frozen source raw evidence or provenance is invalid") from exc
+    return FrozenSourceSnapshot(
+        run_dir, report, since_utc, until_utc, verified_bytes, verified_digests,
     )
