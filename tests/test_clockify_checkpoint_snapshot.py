@@ -123,6 +123,82 @@ class ClockifyCheckpointSnapshotTests(unittest.TestCase):
     def identity_directory_name(self):
         return self.store._directory_for(self.identity).name
 
+    def test_exact_precision_snapshot_retains_fractional_observation_and_native_bytes(self):
+        entry = copy.deepcopy(ENTRY)
+        entry["timeInterval"] = {"start": "2026-09-10T09:00:00.125Z", "end": "2026-09-10T09:50:38.875Z", "duration": "PT50M38.75S"}
+        observed = "2026-10-02T12:00:00.625Z"
+        evidence = copy.deepcopy(EVIDENCE)
+        evidence["entries"][0].update(start="2026-09-10T09:00:00.125000Z", end="2026-09-10T09:50:38.875000Z", duration="PT50M38.75S")
+        evidence["collection_snapshot"]["observed_at"] = "2026-10-02T12:00:00.625000Z"
+        self.source_evidence.write_text(json.dumps(evidence, indent=2) + "\n")
+        manifest = self.checkpoint([[entry]], metadata={"snapshot_at": observed})
+        native_bytes = (manifest.parent / "pages/000001.json").read_bytes()
+        evidence_bytes = self.source_evidence.read_bytes()
+        with patch.object(collector, "clockify_get", side_effect=AssertionError("network forbidden")):
+            captured = self.capture(manifest)
+            loaded = self.load(captured)
+        self.assertEqual("2026-10-02T12:00:00.625000Z", loaded.manifest["snapshot_at"])
+        self.assertEqual([entry], loaded.entries)
+        self.assertEqual(native_bytes, loaded.verified_artifact_bytes[f"checkpoint/{self.identity_directory_name()}/pages/000001.json"])
+        self.assertEqual(evidence_bytes, loaded.verified_artifact_bytes["clockify-existing.json"])
+        self.assertEqual(native_bytes, (manifest.parent / "pages/000001.json").read_bytes())
+        self.assertEqual(evidence_bytes, self.source_evidence.read_bytes())
+        proof = json.loads(loaded.verified_artifact_bytes["snapshot.json"])
+        proof["snapshot_at"] = OBSERVED
+        rounded_proof_bytes = (json.dumps(proof) + "\n").encode()
+        (self.destination / "snapshot.json").write_bytes(rounded_proof_bytes)
+        with self.assertRaisesRegex(ValueError, "observation"):
+            self.load(captured, expected_manifest_sha256=hashlib.sha256(rounded_proof_bytes).hexdigest())
+
+    def test_exact_legacy_minute_snapshot_replays_precise_native_entries_without_rewrite(self):
+        entry = copy.deepcopy(ENTRY)
+        entry["timeInterval"] = {"start": "2026-09-10T09:00:00.125Z", "end": "2026-09-10T09:50:38.875Z", "duration": "PT50M38.75S"}
+        evidence = copy.deepcopy(EVIDENCE)
+        evidence["entries"][0].update(end="2026-09-10 12:50", duration="PT50M38.75S")
+        self.source_evidence.write_text(json.dumps(evidence, indent=2) + "\n")
+        evidence_bytes = self.source_evidence.read_bytes()
+        manifest = self.checkpoint([[entry]], metadata={"snapshot_at": "2026-10-02T12:00:00.625Z"})
+        native_bytes = (manifest.parent / "pages/000001.json").read_bytes()
+        with patch.object(collector, "clockify_get", side_effect=AssertionError("network forbidden")):
+            captured = self.capture(manifest)
+            loaded = self.load(captured)
+        self.assertEqual([entry], loaded.entries)
+        self.assertEqual(3038.75, (dt.datetime.fromisoformat(loaded.entries[0]["timeInterval"]["end"])
+                                 - dt.datetime.fromisoformat(loaded.entries[0]["timeInterval"]["start"])).total_seconds())
+        self.assertEqual(evidence_bytes, loaded.verified_artifact_bytes["clockify-existing.json"])
+        self.assertEqual(native_bytes, loaded.verified_artifact_bytes[f"checkpoint/{self.identity_directory_name()}/pages/000001.json"])
+        self.assertEqual(evidence_bytes, self.source_evidence.read_bytes())
+        self.assertEqual(native_bytes, (manifest.parent / "pages/000001.json").read_bytes())
+        # A frozen historical writer also serialized proof observation to whole seconds.
+        proof = json.loads(loaded.verified_artifact_bytes["snapshot.json"])
+        proof["snapshot_at"] = OBSERVED
+        historical_proof_bytes = (json.dumps(proof) + "\n").encode()
+        (self.destination / "snapshot.json").write_bytes(historical_proof_bytes)
+        loaded = self.load(captured, expected_manifest_sha256=hashlib.sha256(historical_proof_bytes).hexdigest())
+        self.assertEqual(OBSERVED, loaded.manifest["snapshot_at"])
+        self.assertEqual(historical_proof_bytes, loaded.verified_artifact_bytes["snapshot.json"])
+        self.assertEqual(native_bytes, loaded.verified_artifact_bytes[f"checkpoint/{self.identity_directory_name()}/pages/000001.json"])
+        self.assertEqual(evidence_bytes, loaded.verified_artifact_bytes["clockify-existing.json"])
+
+    def test_hybrid_or_partially_truncated_projection_is_not_a_supported_frozen_version(self):
+        entry = copy.deepcopy(ENTRY)
+        entry["timeInterval"] = {"start": "2026-09-10T09:00:00.125Z", "end": "2026-09-10T09:50:38.875Z", "duration": "PT50M38.75S"}
+        manifest = self.checkpoint([[entry]])
+        for start, end in [
+            ("2026-09-10 12:00", "2026-09-10T09:50:38.875000Z"),
+            ("2026-09-10T09:00:00.125000Z", "2026-09-10 12:50"),
+            ("2026-09-10T09:00:00.125000Z", "2026-09-10T09:50:38Z"),
+            ("2026-09-10T09:00:00.125000Z", "2026-09-10T09:50:00Z"),
+            ("2026-09-10 12:00", "2026-09-10 12:51"),
+        ]:
+            with self.subTest(start=start, end=end):
+                evidence = copy.deepcopy(EVIDENCE)
+                evidence["entries"][0].update(start=start, end=end, duration="PT50M38.75S")
+                self.source_evidence.write_text(json.dumps(evidence))
+                with self.assertRaisesRegex(ValueError, "projection"):
+                    self.capture(manifest)
+                self.assertFalse(self.destination.exists())
+
     def test_replay_never_reopens_changed_source_cache_or_original_evidence(self):
         manifest = self.checkpoint()
         captured = self.capture(manifest)

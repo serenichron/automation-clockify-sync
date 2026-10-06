@@ -2565,6 +2565,11 @@ def _clockify_checkpoint_page(state: CheckpointState) -> int:
     return page
 
 
+def _clockify_timestamp(value: dt.datetime | None) -> str | None:
+    """Keep native Clockify instants exact; minute display formatting loses credit."""
+    return value.isoformat().replace("+00:00", "Z") if value is not None else None
+
+
 def fetch_clockify(
     cenv: dict[str, str],
     routing: dict[str, Any],
@@ -2616,7 +2621,7 @@ def fetch_clockify(
             identity = _clockify_checkpoint_identity(ws, user, since, until)
             checkpoint_state = checkpoint_store.open(
                 identity,
-                initial_metadata={"snapshot_at": iso_utc(observed_at)},
+                initial_metadata={"snapshot_at": _clockify_timestamp(observed_at.astimezone(dt.timezone.utc))},
             )
             observed_at = _clockify_checkpoint_snapshot(checkpoint_state)
             entries, seen_pages = _clockify_checkpoint_entries(
@@ -2671,8 +2676,8 @@ def fetch_clockify(
                 fixed_end = snapshot_boundary
                 running_snapshot_count += 1
                 running_snapshot = {
-                    "observed_at": iso_utc(observed_at),
-                    "boundary": iso_utc(snapshot_boundary),
+                    "observed_at": _clockify_timestamp(observed_at.astimezone(dt.timezone.utc)),
+                    "boundary": _clockify_timestamp(snapshot_boundary.astimezone(dt.timezone.utc)),
                     "basis": "collection_snapshot_boundary",
                 }
             sanitized.append({
@@ -2680,8 +2685,8 @@ def fetch_clockify(
                 "description": e.get("description", ""),
                 "project_id_suffix": (e.get("projectId") or "")[-6:],
                 "tag_id_suffixes": [(t or "")[-8:] for t in e.get("tagIds", [])],
-                "start": local_dt_string(start_dt),
-                "end": local_dt_string(fixed_end),
+                "start": _clockify_timestamp(start_dt),
+                "end": _clockify_timestamp(fixed_end),
                 "running": running,
                 "running_snapshot": running_snapshot,
                 "duration": ti.get("duration"),
@@ -2700,9 +2705,9 @@ def fetch_clockify(
             "running_entry_count": running_entry_count,
             "running_entry_snapshot_count": running_snapshot_count,
             "collection_snapshot": {
-                "observed_at": iso_utc(observed_at),
-                "boundary": iso_utc(snapshot_boundary),
-                "requested_until": iso_utc(until),
+                "observed_at": _clockify_timestamp(observed_at.astimezone(dt.timezone.utc)),
+                "boundary": _clockify_timestamp(snapshot_boundary.astimezone(dt.timezone.utc)),
+                "requested_until": _clockify_timestamp(until.astimezone(dt.timezone.utc)),
             },
             "complete": running_snapshot_count == running_entry_count,
         }

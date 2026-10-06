@@ -17,6 +17,18 @@ class DistinctMeetingOverlapTests(unittest.TestCase):
             proposal["provenance"]["canonical_meeting_id"] = meeting_id
         return proposal
 
+    def assert_reciprocal_review_warnings(self, rows):
+        self.assertEqual(2, len(rows))
+        for row, counterpart in ((rows[0], rows[1]), (rows[1], rows[0])):
+            self.assertEqual([{
+                "type": "review_proposal_overlap",
+                "counterpart_id": counterpart["candidate_key"],
+                "overlap_start": "2026-09-28T09:30:00+03:00",
+                "overlap_end": "2026-09-28T10:00:00+03:00",
+                "overlap_duration_seconds": 1800,
+                "counterpart_project_suffix": "sc0001",
+            }], row["review_warnings"])
+
     def test_distinct_overlapping_meetings_retain_ninety_minutes_with_warning(self):
         first = self.proposal("meeting-one", 0, 60, "meeting-1")
         second = self.proposal("meeting-two", 30, 30, "meeting-2")
@@ -29,10 +41,7 @@ class DistinctMeetingOverlapTests(unittest.TestCase):
             row["activity_id"]: row["duration_seconds"] for row in rows
         })
         self.assertEqual(5400, sum(row["duration_seconds"] for row in rows))
-        warnings = [warning for row in rows for warning in row["review_warnings"]]
-        self.assertEqual(1, len(warnings))
-        self.assertEqual("review_proposal_overlap", warnings[0]["type"])
-        self.assertEqual(1800, warnings[0]["overlap_duration_seconds"])
+        self.assert_reciprocal_review_warnings(rows)
 
     def test_meeting_and_unrelated_work_retain_full_duration_in_either_order(self):
         meeting = self.proposal("meeting", 0, 60, "meeting-1")
@@ -45,10 +54,7 @@ class DistinctMeetingOverlapTests(unittest.TestCase):
                 self.assertEqual({"meeting": 3600, "work": 1800}, {
                     row["activity_id"]: row["duration_seconds"] for row in rows
                 })
-                warnings = [warning for row in rows for warning in row["review_warnings"]]
-                self.assertEqual(1, len(warnings))
-                self.assertEqual("review_proposal_overlap", warnings[0]["type"])
-                self.assertEqual(1800, warnings[0]["overlap_duration_seconds"])
+                self.assert_reciprocal_review_warnings(rows)
 
     def test_same_canonical_meeting_from_two_sources_is_credited(self):
         first = self.proposal("fathom-source", 0, 60, "meeting-1")
@@ -59,6 +65,7 @@ class DistinctMeetingOverlapTests(unittest.TestCase):
 
         self.assertEqual(1, len(rows))
         self.assertEqual(3600, rows[0]["duration_seconds"])
+        self.assertEqual([], rows[0]["review_warnings"])
         self.assertEqual(1, len(skipped))
         self.assertEqual(1800, skipped[0]["credited_overlap_receipt"]["credited_seconds"])
         self.assertEqual("meeting_proposal_overlap", skipped[0]["credited_overlap_receipt"]["counterparts"][0]["type"])
@@ -73,7 +80,7 @@ class DistinctMeetingOverlapTests(unittest.TestCase):
 
         self.assertEqual([], skipped)
         self.assertEqual(5400, sum(row["duration_seconds"] for row in rows))
-        self.assertEqual(1, sum(len(row["review_warnings"]) for row in rows))
+        self.assert_reciprocal_review_warnings(rows)
 
     def test_same_nonmeeting_activity_segments_are_still_credited(self):
         first = self.proposal("same-activity", 0, 60)

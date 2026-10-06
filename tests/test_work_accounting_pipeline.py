@@ -3433,10 +3433,10 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         second = evidence_ledger.evidence_event(
             "fathom",
             {"source_type": "fathom", "source_id": "meeting-2"},
-            observed_at="2026-07-10T13:30:00+03:00",
+            observed_at="2026-07-10T13:36:00+03:00",
             raw_source_span={
-                "start": "2026-07-10T13:30:00+03:00",
-                "end": "2026-07-10T14:30:00+03:00",
+                "start": "2026-07-10T13:36:00+03:00",
+                "end": "2026-07-10T14:36:00+03:00",
             },
             attributes={
                 "title": "BNI one-to-one",
@@ -3459,16 +3459,104 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         self.assertEqual(
             [
                 ("2026-07-10T13:00:00+03:00", "2026-07-10T14:00:00+03:00"),
-                ("2026-07-10T13:30:00+03:00", "2026-07-10T14:30:00+03:00"),
+                ("2026-07-10T13:36:00+03:00", "2026-07-10T14:36:00+03:00"),
             ],
             [(row["start"], row["end"]) for row in proposals],
         )
         self.assertEqual(7200, sum(row["duration_seconds"] for row in proposals))
         self.assertTrue(all("credited_overlap_receipt" not in row["provenance"] for row in proposals))
-        warnings = [warning for row in proposals for warning in row["review_warnings"]
-                    if warning["type"] == "review_proposal_overlap"]
-        self.assertEqual(1, len(warnings))
-        self.assertEqual(1800, warnings[0]["overlap_duration_seconds"])
+        self.assertNotEqual(
+            proposals[0]["provenance"]["canonical_meeting_id"],
+            proposals[1]["provenance"]["canonical_meeting_id"],
+        )
+        for row, counterpart in ((proposals[0], proposals[1]), (proposals[1], proposals[0])):
+            warnings = [
+                warning for warning in row["review_warnings"]
+                if warning["type"] == "review_proposal_overlap"
+            ]
+            self.assertEqual(1, len(warnings))
+            self.assertEqual(counterpart["candidate_key"], warnings[0]["counterpart_id"])
+            self.assertEqual("2026-07-10T13:36:00+03:00", warnings[0]["overlap_start"])
+            self.assertEqual("2026-07-10T14:00:00+03:00", warnings[0]["overlap_end"])
+            self.assertEqual(1440, warnings[0]["overlap_duration_seconds"])
+
+    def test_same_canonical_recording_overlap_remains_credited_without_review_warning(self):
+        start = dt.datetime.fromisoformat("2026-09-29T10:00:00+03:00")
+        route = {"project_name": "Serenichron", "project_suffix": "sc0001"}
+        first = pipeline._proposal(
+            {"activity_id": "act-one", "workstream_id": "ws-one"}, route,
+            "SC — Attended recording", start, start + dt.timedelta(minutes=30),
+            ["ev-one"], 1,
+        )
+        duplicate = pipeline._proposal(
+            {"activity_id": "act-two", "workstream_id": "ws-two"}, route,
+            "SC — Attended recording", start, start + dt.timedelta(minutes=30),
+            ["ev-one"], 2,
+        )
+        for row in (first, duplicate):
+            row["provenance"]["canonical_meeting_id"] = "cm-" + "a" * 64
+        skipped: list[dict] = []
+
+        proposals = pipeline._normalize_postable_proposals([first, duplicate], [], skipped)
+
+        self.assertEqual(1, len(proposals))
+        self.assertEqual(1800, proposals[0]["duration_seconds"])
+        self.assertEqual(1, len(skipped))
+        self.assertEqual([], [
+            warning for warning in proposals[0]["review_warnings"]
+            if warning["type"] == "review_proposal_overlap"
+        ])
+
+    def test_meeting_overlap_warnings_bind_only_surviving_credited_segments(self):
+        start = dt.datetime.fromisoformat("2026-09-29T10:00:00+03:00")
+        route = {"project_name": "Serenichron", "project_suffix": "sc0001"}
+
+        def meeting(activity_id, canonical_id, begin, end, segment, rank):
+            row = pipeline._proposal(
+                {"activity_id": activity_id, "workstream_id": "ws-one"}, route,
+                "SC — Attended meeting", begin, end, ["ev-one"], segment,
+            )
+            row["provenance"]["canonical_meeting_id"] = canonical_id
+            row["provenance"]["meeting_precedence"] = {"rank": rank}
+            return row
+
+        distinct = meeting(
+            "act-distinct", "cm-" + "b" * 64,
+            start - dt.timedelta(minutes=5), start + dt.timedelta(minutes=40), 1, 1,
+        )
+        credited = meeting(
+            "act-credited", "cm-" + "a" * 64,
+            start + dt.timedelta(minutes=15), start + dt.timedelta(minutes=30), 2, 1,
+        )
+        candidate = meeting(
+            "act-candidate", "cm-" + "a" * 64,
+            start, start + dt.timedelta(minutes=40), 3, 2,
+        )
+        skipped: list[dict] = []
+
+        proposals = pipeline._normalize_postable_proposals(
+            [distinct, credited, candidate], [], skipped,
+        )
+
+        self.assertEqual([], skipped)
+        survivors = [row for row in proposals if row["activity_id"] == "act-candidate"]
+        self.assertEqual(2, len(survivors))
+        distinct_row = next(row for row in proposals if row["activity_id"] == "act-distinct")
+        warnings = sorted(
+            (
+                warning["counterpart_id"],
+                warning["overlap_start"],
+                warning["overlap_end"],
+                warning["overlap_duration_seconds"],
+            )
+            for warning in distinct_row["review_warnings"]
+            if warning["type"] == "review_proposal_overlap"
+            and warning["counterpart_id"] in {row["candidate_key"] for row in survivors}
+        )
+        self.assertEqual(sorted([
+            (survivors[0]["candidate_key"], "2026-09-29T10:00:00+03:00", "2026-09-29T10:15:00+03:00", 900),
+            (survivors[1]["candidate_key"], "2026-09-29T10:30:00+03:00", "2026-09-29T10:40:00+03:00", 600),
+        ]), warnings)
 
     def test_distinct_tst_and_sc_work_preserves_two_minute_overlap_for_review(self):
         start = dt.datetime.fromisoformat("2026-09-28T09:00:00+03:00")

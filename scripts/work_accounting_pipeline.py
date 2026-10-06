@@ -2487,6 +2487,21 @@ def _normalize_postable_proposals(
                         is not None
                     ),
                 ]
+                survivor_block = {
+                    "block_id": str(row.get("candidate_key") or ""),
+                    "start": start,
+                    "end": end,
+                    "project_id_suffix": row.get("clockify_project_suffix"),
+                }
+                for accepted_row, block in zip(accepted, blocks):
+                    if block not in distinct or not block["canonical_meeting_id"]:
+                        continue
+                    warning = _overlap_warning(
+                        block["start"], block["end"], survivor_block,
+                        "review_proposal_overlap",
+                    )
+                    if warning is not None and warning not in accepted_row["review_warnings"]:
+                        accepted_row["review_warnings"].append(warning)
         accepted.extend(survivors)
     return sorted(
         accepted,

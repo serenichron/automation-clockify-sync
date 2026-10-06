@@ -7,7 +7,8 @@ never reads them. Existing checkpoints and sanitized collector schema are unchan
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+import copy
+from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -116,6 +117,20 @@ class _CapturedStore(checkpoints.PageCheckpointStore):
         raise checkpoints.CheckpointError("snapshot replay is read-only")
 
 
+def _legacy_minute_projection(projection: dict) -> dict:
+    """Reproduce the historical writer exactly, without normalizing bound inputs."""
+    legacy = copy.deepcopy(projection)
+    for entry in legacy["entries"]:
+        for field in ("start", "end"):
+            entry[field] = collector.local_dt_string(collector.parse_dt(entry[field]))
+        if entry["running_snapshot"] is not None:
+            for field in ("observed_at", "boundary"):
+                entry["running_snapshot"][field] = collector.iso_utc(collector.parse_dt(entry["running_snapshot"][field]))
+    for field in ("observed_at", "boundary", "requested_until"):
+        legacy["collection_snapshot"][field] = collector.iso_utc(collector.parse_dt(legacy["collection_snapshot"][field]))
+    return legacy
+
+
 def _validate(directory: Path, files: dict[str, bytes], evidence: bytes, *, identity,
               request: dict, since: datetime, until: datetime):
     store = _CapturedStore(directory, files)
@@ -162,12 +177,14 @@ def _validate(directory: Path, files: dict[str, bytes], evidence: bytes, *, iden
         {"clockify_user_id": request["user_id"]}, since, until,
         snapshot_at=observed, checkpoint_store=store,
     )
-    if projection != _document(evidence):
+    bound_projection = _document(evidence)
+    legacy_match = bound_projection == _legacy_minute_projection(projection)
+    if projection != bound_projection and not legacy_match:
         raise checkpoints.CheckpointError("checkpoint projection does not match bound source-run evidence")
     # JSON round-trip converts the existing immutable checkpoint views to the
     # native JSON shape without dropping or shortening any fields.
     full_entries = [json.loads(checkpoints._canonical(_plain(entry))) for entry in entries]
-    return full_entries, collector.iso_utc(observed)
+    return full_entries, collector._clockify_timestamp(observed.astimezone(timezone.utc)), legacy_match
 
 
 def _plain(value):
@@ -208,7 +225,7 @@ def capture_checkpoint_snapshot(*, checkpoint_manifest: Path, clockify_evidence:
             raise checkpoints.CheckpointError("checkpoint page locator is invalid")
         files[relative] = _read(directory / relative)
     evidence = _read(clockify_evidence)
-    entries, observed = _validate(directory, files, evidence, identity=identity, request=request, since=since, until=until)
+    entries, observed, _ = _validate(directory, files, evidence, identity=identity, request=request, since=since, until=until)
     checkpoint_relative = f"checkpoint/{directory.name}"
     artifacts = {f"{checkpoint_relative}/{relative}": raw for relative, raw in files.items()}
     artifacts["clockify-existing.json"] = evidence
@@ -265,9 +282,12 @@ def load_checkpoint_snapshot(snapshot_dir: Path | None, *, workspace_id: str, us
         artifacts[relative] = raw
     files = {relative.removeprefix(checkpoint_relative + "/"): raw for relative, raw in artifacts.items()
              if relative.startswith(checkpoint_relative + "/")}
-    entries, observed = _validate(snapshot_dir / checkpoint_relative, files, artifacts["clockify-existing.json"],
+    entries, observed, legacy_match = _validate(snapshot_dir / checkpoint_relative, files, artifacts["clockify-existing.json"],
                                  identity=identity, request=request, since=since, until=until)
-    if proof["snapshot_at"] != observed or proof["entry_count"] != len(entries):
+    observed_matches = proof["snapshot_at"] == observed or (
+        legacy_match and proof["snapshot_at"] == collector.iso_utc(_timestamp(observed, "snapshot_at"))
+    )
+    if not observed_matches or proof["entry_count"] != len(entries):
         raise checkpoints.CheckpointError("snapshot observation or native entry count does not match")
     return ClockifyCheckpointSnapshot(entries=entries, manifest=proof, manifest_sha256=proof_hash,
                                      verified_artifact_bytes={**artifacts, "snapshot.json": proof_raw})

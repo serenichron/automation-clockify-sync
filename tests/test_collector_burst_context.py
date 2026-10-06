@@ -14,6 +14,8 @@ from pathlib import Path
 from unittest import mock
 
 from scripts import collector_checkpoints as checkpoints
+from scripts import evidence_ledger
+from scripts import work_accounting_pipeline as accounting
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "clockify_sync_collect.py"
@@ -962,6 +964,89 @@ class CollectorBurstContextTests(unittest.TestCase):
         self.assertEqual(201, len(result["entries"]))
         self.assertTrue(any("page=2&" in call for call in calls))
 
+    def test_clockify_projection_preserves_native_seconds_for_existing_overlap(self) -> None:
+        cases = [
+            ("2026-07-21T09:00:00Z", "2026-07-21T09:50:38Z", "PT50M38S", 3038, 2918),
+            ("2026-07-21T14:30:00.125+05:30", "2026-07-21T15:20:38.875+05:30", "PT50M38.75S", 3038.75, 2918.875),
+        ]
+        for raw_start, raw_end, duration, span_seconds, overlap_seconds in cases:
+            with self.subTest(raw_end=raw_end), mock.patch.object(collector, "clockify_get", return_value=[{
+                "id": "precise-entry", "description": "Synthetic completed work", "projectId": "project-id",
+                "tagIds": [], "billable": True,
+                "timeInterval": {"start": raw_start, "end": raw_end, "duration": duration},
+            }]):
+                result = collector.fetch_clockify(
+                    {"CLOCKIFY_WORKSPACE_ID": "workspace", "CLOCKIFY_API_KEY": "not-logged"},
+                    {"clockify_user_id": "user"}, SINCE, UNTIL,
+                )
+            self.assertTrue(result["complete"])
+            documents = [event.document() for event in evidence_ledger.normalize_collector_snapshot({"clockify": result})]
+            block, = accounting._existing_blocks(documents)
+            warning = accounting._overlap_warning(
+                dt.datetime(2026, 7, 21, 9, 2, tzinfo=dt.timezone.utc),
+                dt.datetime(2026, 7, 21, 10, tzinfo=dt.timezone.utc), block, "existing_clockify_overlap",
+            )
+            self.assertIsNotNone(warning)
+            self.assertEqual(overlap_seconds, (
+                min(block["end"], dt.datetime(2026, 7, 21, 10, tzinfo=dt.timezone.utc))
+                - max(block["start"], dt.datetime(2026, 7, 21, 9, 2, tzinfo=dt.timezone.utc))
+            ).total_seconds())
+            self.assertEqual(int(overlap_seconds), warning["overlap_duration_seconds"])
+            self.assertEqual(dt.datetime.fromisoformat(raw_start.replace("Z", "+00:00")), block["start"])
+            self.assertEqual(dt.datetime.fromisoformat(raw_end.replace("Z", "+00:00")), block["end"])
+            self.assertEqual(span_seconds, (block["end"] - block["start"]).total_seconds())
+            self.assertEqual(dt.datetime.fromisoformat(raw_end.replace("Z", "+00:00")).utcoffset(),
+                             dt.datetime.fromisoformat(result["entries"][0]["end"]).utcoffset())
+
+    def test_clockify_checkpoint_replay_preserves_native_subminute_intervals(self) -> None:
+        entries = [{
+            "id": "precise-checkpoint-entry",
+            "timeInterval": {"start": "2026-07-21T09:00:00.125Z", "end": "2026-07-21T09:50:38.875Z", "duration": "PT50M38.75S"},
+        }]
+        env = {"CLOCKIFY_WORKSPACE_ID": "workspace", "CLOCKIFY_API_KEY": "not-logged"}
+        routing = {"clockify_user_id": "user"}
+        with tempfile.TemporaryDirectory() as directory:
+            store = checkpoints.PageCheckpointStore(Path(directory))
+            with mock.patch.object(collector, "clockify_get", return_value=entries):
+                collected = collector.fetch_clockify(env, routing, SINCE, UNTIL, checkpoint_store=store)
+            with mock.patch.object(collector, "clockify_get", side_effect=AssertionError("completed checkpoint must not fetch")):
+                replayed = collector.fetch_clockify(env, routing, SINCE, UNTIL, checkpoint_store=store)
+            for result in (collected, replayed):
+                self.assertTrue(result["complete"])
+                documents = [event.document() for event in evidence_ledger.normalize_collector_snapshot({"clockify": result})]
+                block, = accounting._existing_blocks(documents)
+                self.assertEqual(3038.75, (block["end"] - block["start"]).total_seconds())
+                self.assertEqual(125000, block["start"].microsecond)
+                self.assertEqual(875000, block["end"].microsecond)
+            self.assertEqual(collected, replayed)
+
+    def test_running_clockify_projection_preserves_fractional_snapshot_boundary(self) -> None:
+        snapshot = dt.datetime(2026, 7, 21, 9, 50, 38, 875000, tzinfo=dt.timezone.utc)
+        for requested_until, expected_span in [
+            (UNTIL, 3038.75),
+            (dt.datetime(2026, 7, 21, 9, 40, 20, 625000, tzinfo=dt.timezone.utc), 2420.5),
+        ]:
+            with self.subTest(expected_span=expected_span), tempfile.TemporaryDirectory() as directory:
+                store = checkpoints.PageCheckpointStore(Path(directory))
+                env = {"CLOCKIFY_WORKSPACE_ID": "workspace", "CLOCKIFY_API_KEY": "not-logged"}
+                routing = {"clockify_user_id": "user"}
+                with mock.patch.object(collector, "clockify_get", return_value=[{
+                    "id": "precise-running-entry",
+                    "timeInterval": {"start": "2026-07-21T09:00:00.125Z", "end": None},
+                }]):
+                    collected = collector.fetch_clockify(
+                        env, routing, SINCE, requested_until, snapshot_at=snapshot, checkpoint_store=store,
+                    )
+                with mock.patch.object(collector, "clockify_get", side_effect=AssertionError("completed checkpoint must not fetch")):
+                    replayed = collector.fetch_clockify(env, routing, SINCE, requested_until, checkpoint_store=store)
+                for result in (collected, replayed):
+                    self.assertTrue(result["complete"])
+                    documents = [event.document() for event in evidence_ledger.normalize_collector_snapshot({"clockify": result})]
+                    block, = accounting._existing_blocks(documents)
+                    self.assertEqual(expected_span, (block["end"] - block["start"]).total_seconds())
+                    self.assertEqual(min(snapshot, requested_until), block["end"])
+                self.assertEqual(collected, replayed)
+
     def test_clockify_retry_resumes_after_persisted_page(self) -> None:
         first_page = [
             {
@@ -1239,7 +1324,7 @@ class CollectorBurstContextTests(unittest.TestCase):
         self.assertEqual(1, result["running_entry_count"])
         self.assertEqual(1, result["running_entry_snapshot_count"])
         running = next(entry for entry in result["entries"] if entry["id_suffix"] == "ng-entry")
-        self.assertEqual("2026-07-21 08:15", running["end"])
+        self.assertEqual(dt.datetime(2026, 7, 21, 8, 15, tzinfo=TZ), collector.parse_dt(running["end"]))
         self.assertTrue(running["running"])
         self.assertEqual("collection_snapshot_boundary", running["running_snapshot"]["basis"])
         self.assertEqual("2026-07-21T05:15:00Z", running["running_snapshot"]["boundary"])
@@ -1259,7 +1344,7 @@ class CollectorBurstContextTests(unittest.TestCase):
             )
 
         running = result["entries"][0]
-        self.assertEqual("2026-07-22 00:00", running["end"])
+        self.assertEqual(UNTIL, collector.parse_dt(running["end"]))
         self.assertEqual("2026-07-21T21:00:00Z", running["running_snapshot"]["boundary"])
         self.assertEqual("2026-07-21T21:00:00Z", result["collection_snapshot"]["boundary"])
 

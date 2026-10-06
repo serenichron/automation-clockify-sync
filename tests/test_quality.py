@@ -36,6 +36,43 @@ def proposal(**overrides):
     return result
 
 
+def recorded_meeting_proposal(row_id, meeting_id, start, end, evidence_id):
+    """Synthetic factual-attendance row with the current provenance shape."""
+    title = "Impromptu Google Meet Meeting"
+    description = f"SC — Attended {title}"
+    return proposal(
+        id=row_id,
+        candidate_key=f"wks-{row_id.lower()}",
+        activity_id=f"act-{row_id.lower()}",
+        workstream_id=f"wst-{row_id.lower()}",
+        review_activity_key=f"rav-{row_id.lower()}",
+        allocation_segment=1,
+        allocation_mode="non_overlapping_v1",
+        start=start,
+        end=end,
+        duration_minutes=30,
+        duration_seconds=1800,
+        source_label=title,
+        description=description,
+        rendered_description=description,
+        source=[f"evidence:{evidence_id}"],
+        review_warnings=[{
+            "type": "semantic_meeting_fallback",
+            "reason": "No usable semantic activity; recorded attendance only, no outcome inferred.",
+        }],
+        provenance={
+            "source_type": "recorded_meeting",
+            "source_session_id": f"recording-{row_id.lower()}",
+            "semantic_fallback": True,
+            "canonical_meeting_id": meeting_id,
+            "recorded_meeting_title": title,
+            "recorded_meeting_start": start,
+            "recorded_meeting_end": end,
+            "evidence_ids": [evidence_id],
+        },
+    )
+
+
 class QualityMatchingTests(unittest.TestCase):
     def test_stable_project_identity_wins_over_misleading_label_text(self):
         routes = [
@@ -627,6 +664,94 @@ class QualityCliTests(unittest.TestCase):
 
         self.assertEqual("blocked", report["status"])
         self.assertEqual(1, report["summary"]["duplicate_description_groups"])
+
+    def test_distinct_recorded_meetings_may_share_generic_attendance_description(self):
+        first = recorded_meeting_proposal(
+            "P003", "cm-" + "a" * 64,
+            "2026-09-29T10:00:00+03:00", "2026-09-29T10:30:00+03:00",
+            "ev-" + "1" * 64,
+        )
+        second = recorded_meeting_proposal(
+            "P006", "cm-" + "b" * 64,
+            "2026-09-29T11:00:00+03:00", "2026-09-29T11:30:00+03:00",
+            "ev-" + "2" * 64,
+        )
+
+        report = quality.build_report("run-meetings", [first, second], {}, [])
+
+        self.assertEqual("pass", report["status"])
+        self.assertEqual(0, report["summary"]["duplicate_description_groups"])
+        self.assertEqual(0, report["summary"]["rows_with_issues"])
+
+    def test_same_recorded_meeting_with_same_description_still_blocks(self):
+        first = recorded_meeting_proposal(
+            "P003", "cm-" + "a" * 64,
+            "2026-09-29T10:00:00+03:00", "2026-09-29T10:30:00+03:00",
+            "ev-" + "1" * 64,
+        )
+        second = recorded_meeting_proposal(
+            "P006", "cm-" + "a" * 64,
+            "2026-09-29T10:00:00+03:00", "2026-09-29T10:30:00+03:00",
+            "ev-" + "1" * 64,
+        )
+        second["activity_id"] = first["activity_id"]
+
+        report = quality.build_report("run-duplicate-meeting", [first, second], {}, [])
+
+        self.assertEqual("blocked", report["status"])
+        self.assertEqual(1, report["summary"]["duplicate_description_groups"])
+
+    def test_same_recording_same_activity_nonoverlapping_segments_remain_reviewable(self):
+        first = recorded_meeting_proposal(
+            "P003", "cm-" + "a" * 64,
+            "2026-09-29T10:00:00+03:00", "2026-09-29T10:30:00+03:00",
+            "ev-" + "1" * 64,
+        )
+        second = recorded_meeting_proposal(
+            "P006", "cm-" + "a" * 64,
+            "2026-09-29T10:30:00+03:00", "2026-09-29T11:00:00+03:00",
+            "ev-" + "1" * 64,
+        )
+        first["provenance"]["recorded_meeting_end"] = "2026-09-29T11:00:00+03:00"
+        second["provenance"]["recorded_meeting_start"] = "2026-09-29T10:00:00+03:00"
+        second["activity_id"] = first["activity_id"]
+        second["review_activity_key"] = first["review_activity_key"]
+        second["workstream_id"] = first["workstream_id"]
+        second["allocation_segment"] = 2
+
+        report = quality.build_report("run-split-meeting", [first, second], {}, [])
+
+        self.assertEqual("pass", report["status"])
+        self.assertEqual(0, report["summary"]["duplicate_description_groups"])
+
+    def test_untrusted_or_mixed_meeting_description_group_still_blocks(self):
+        first = recorded_meeting_proposal(
+            "P003", "cm-" + "a" * 64,
+            "2026-09-29T10:00:00+03:00", "2026-09-29T10:30:00+03:00",
+            "ev-" + "1" * 64,
+        )
+        second = recorded_meeting_proposal(
+            "P006", "cm-" + "b" * 64,
+            "2026-09-29T11:00:00+03:00", "2026-09-29T11:30:00+03:00",
+            "ev-" + "2" * 64,
+        )
+        missing_identity = {**second, "provenance": {
+            **second["provenance"], "canonical_meeting_id": None,
+        }}
+        mixed_source = proposal(
+            id="P006",
+            candidate_key="claude:distinct-session",
+            start="2026-09-29T11:00:00+03:00",
+            end="2026-09-29T11:30:00+03:00",
+            duration_minutes=30,
+            description=first["description"],
+        )
+
+        for row in (missing_identity, mixed_source):
+            with self.subTest(source=row["provenance"]["source_type"]):
+                report = quality.build_report("run-mixed", [first, row], {}, [])
+                self.assertEqual("blocked", report["status"])
+                self.assertEqual(1, report["summary"]["duplicate_description_groups"])
 
 
 if __name__ == "__main__":

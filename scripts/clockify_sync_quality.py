@@ -546,6 +546,34 @@ def review_proposal(
     }
 
 
+def _recorded_description_group_is_one_event(rows: list[dict[str, Any]]) -> bool:
+    if len(rows) == 1:
+        return True
+    activity_ids = {str(row.get("activity_id") or "") for row in rows}
+    review_keys = {str(row.get("review_activity_key") or "") for row in rows}
+    segments = [row.get("allocation_segment") for row in rows]
+    source_spans = {
+        (
+            parse_timestamp(_provenance(row).get("recorded_meeting_start")),
+            parse_timestamp(_provenance(row).get("recorded_meeting_end")),
+        )
+        for row in rows
+    }
+    windows = [(parse_timestamp(row.get("start")), parse_timestamp(row.get("end"))) for row in rows]
+    if (
+        len(activity_ids) != 1 or "" in activity_ids
+        or len(review_keys) != 1 or "" in review_keys
+        or any(row.get("allocation_mode") != "non_overlapping_v1" for row in rows)
+        or any(type(segment) is not int or segment < 1 for segment in segments)
+        or len(set(segments)) != len(rows)
+        or len(source_spans) != 1
+        or not all(start and end and start < end for start, end in windows)
+    ):
+        return False
+    ordered = sorted(windows)
+    return all(left[1] <= right[0] for left, right in zip(ordered, ordered[1:]))
+
+
 def find_duplicate_descriptions(proposals: list[dict[str, Any]]) -> list[dict[str, Any]]:
     descriptions: dict[str, list[dict[str, Any]]] = {}
     for proposal in proposals:
@@ -556,8 +584,19 @@ def find_duplicate_descriptions(proposals: list[dict[str, Any]]) -> list[dict[st
     for description, rows in descriptions.items():
         if len(rows) <= 1:
             continue
+        recorded_meetings = [
+            _provenance(row).get("source_type") == "recorded_meeting" for row in rows
+        ]
+        if all(recorded_meetings) and all(_recorded_attendance_contract(row) for row in rows):
+            by_meeting: dict[str, list[dict[str, Any]]] = {}
+            for row in rows:
+                by_meeting.setdefault(_provenance(row)["canonical_meeting_id"], []).append(row)
+            if all(_recorded_description_group_is_one_event(group) for group in by_meeting.values()):
+                # Generic attendance titles may describe distinct recordings;
+                # one recording may retain non-overlapping allocation segments.
+                continue
         activity_ids = {str(row.get("activity_id") or "") for row in rows}
-        if len(activity_ids) == 1 and "" not in activity_ids:
+        if len(activity_ids) == 1 and "" not in activity_ids and not any(recorded_meetings):
             # One semantic activity may need multiple non-overlapping Clockify
             # segments. Reusing its deterministic description is intentional.
             continue
