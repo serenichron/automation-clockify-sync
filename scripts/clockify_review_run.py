@@ -1298,7 +1298,7 @@ def _sealed_source_endpoint(
 
 def _preflight_replay_analyzer_cache(
     source: Path, cache_path: Path, source_analysis: dict[str, Any],
-    *, retry_origin: Path | None = None,
+    *, retry_origin: Path | None = None, inference_context: Path | None = None,
 ) -> list[dict[str, str]]:
     """Rebuild semantic requests and prove every decision is a sealed cache hit."""
     ledger, all_events = work_accounting_pipeline.load_ledger(
@@ -1310,9 +1310,10 @@ def _preflight_replay_analyzer_cache(
     events, _noise = work_accounting_pipeline._analysis_events(
         all_events, member_identities
     )
-    routing = _read_json(source / "routing.json")
+    context = inference_context or source
+    routing = _read_json(context / "routing.json")
     corrections = work_accounting_pipeline._load_corrections(
-        source / "review-corrections.jsonl"
+        context / "review-corrections.jsonl"
     )
     cache = semantic_analyzer.AnalyzerResponseCache(cache_path)
     endpoints = cache.sealed_endpoints()
@@ -1546,6 +1547,68 @@ def _verified_native_checkpoint_copy(source: Path, target: Path, provenance: Map
         raise ReviewRunError("native checkpoint copied collection basis differs") from exc
 
 
+def _verified_replay_inference_context(source: Path) -> Path:
+    """Follow unchanged sealed decisions to their original inference snapshots.
+
+    Accounting repairs may change routing without changing model decisions.
+    Those decisions must still be proven against their original request bytes.
+    Every traversed hop is verified; fresh retry decisions use the existing
+    scoped-retry validator rather than inheriting older inference inputs.
+    """
+    current = _run_child(source, label="replay inference source")
+    seen = {current}
+    while True:
+        repair = current / "repair-source.json"
+        replay = current / "replay-source.json"
+        has_repair = repair.exists() or repair.is_symlink()
+        has_replay = replay.exists() or replay.is_symlink()
+        if not has_repair and not has_replay:
+            return current
+        path = repair if has_repair else replay
+        lineage, _content, _digest = _read_snapshot_json(path, label="replay inference source lineage")
+        if not isinstance(lineage, Mapping):
+            raise ReviewRunError("replay inference source lineage is invalid")
+        parent = _run_child(RUNS / str(lineage.get("source_run_id") or ""), label="replay inference parent")
+        if parent in seen:
+            raise ReviewRunError("replay inference source lineage loops")
+        seen.add(parent)
+        if has_repair:
+            if (
+                _file_sha256(parent / "completion-bundle.json", label="inference source completion") != lineage.get("source_completion_sha256")
+            ):
+                raise ReviewRunError("replay inference source lineage differs: source completion changed")
+            bundle = collector_receipts.load_completion_bundle(parent / "completion-bundle.json", run_dir=parent)
+            if collector_receipts.completion_coverage(bundle) != lineage.get("source_coverage"):
+                raise ReviewRunError("replay inference source coverage changed")
+            if _ledger_identity(current) != lineage.get("ledger_identity") or _ledger_identity(parent) != lineage.get("ledger_identity"):
+                raise ReviewRunError("replay inference immutable evidence changed")
+            if (
+                _file_sha256(parent / "routing.json", label="inference original routing") != lineage.get("source_routing_sha256")
+                or _file_sha256(current / "routing.json", label="inference repaired routing") != lineage.get("repair_routing_sha256")
+            ):
+                raise ReviewRunError("replay inference routing provenance changed")
+            for filename in _RECONCILIATION_INPUTS.values():
+                if filename == "routing.json":
+                    continue
+                if filename == "review-corrections.jsonl" and "source_corrections_sha256" in lineage:
+                    if _validate_repair_credit_transition(parent, current / filename, runs_root=RUNS) != (lineage.get("source_corrections_sha256"), lineage.get("repair_corrections_sha256")):
+                        raise ReviewRunError("replay inference correction provenance changed")
+                elif _read_snapshot_source(parent / filename, label="inference original input") != _read_snapshot_source(current / filename, label="inference repair input"):
+                    raise ReviewRunError("replay inference reconciliation snapshot changed")
+            cache_sha = _file_sha256(current / "analyzer-cache-used.jsonl", label="inference sealed cache").removeprefix("sha256:")
+            if cache_sha != lineage.get("analyzer_cache_sha256"):
+                analysis = _read_json(current / "semantic-analysis.json")
+                if not isinstance(analysis, Mapping) or not analysis.get("failed_review_retry"):
+                    raise ReviewRunError("replay inference sealed cache provenance changed")
+                return current
+            _repair_analysis_fixture(current)
+        else:
+            _replay_analysis_fixture(parent, current)
+            if _ledger_identity(current) != _ledger_identity(parent) or _accounting_identity(parent)["file_sha256"] != lineage.get("work_accounting_result_sha256"):
+                raise ReviewRunError("replay inference parent identity changed")
+        current = parent
+
+
 def _prepare_replay_run(source: Path) -> Path:
     """Create a distinct run with immutable ledger and semantic fixture copies."""
     source = _run_child(source, label="replay source")
@@ -1685,6 +1748,7 @@ def _prepare_replay_run(source: Path) -> Path:
         if inference_backed and cache_fixture is not None:
             reused_cache_records = _preflight_replay_analyzer_cache(
                 target, cache_fixture, source_analysis, retry_origin=source,
+                inference_context=_verified_replay_inference_context(source),
             )
         report = source_report
         if not isinstance(report, dict):
