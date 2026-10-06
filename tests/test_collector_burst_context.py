@@ -246,6 +246,23 @@ class CollectorBurstContextTests(unittest.TestCase):
         self.assertEqual([], bursts)
         self.assertEqual(["metadata"], consumed)
 
+    def test_burst_assistant_context_cannot_extend_last_human_cutoff(self) -> None:
+        def row(minutes, role, content):
+            return {"timestamp": SINCE + dt.timedelta(hours=8, minutes=minutes),
+                    "role": role, "kind": "message", "content": content}
+        bursts = collector._partition_bursts([
+            row(0, "user", "Repair the client portal."),
+            row(20, "assistant", "Initial repair result."),
+            row(40, "tool", "Unattended runtime outside human cutoff."),
+            row(45, "user", "Review a different client issue."),
+            row(50, "assistant", "Different issue reviewed."),
+        ])
+        self.assertEqual(2, len(bursts))
+        self.assertEqual(["Repair the client portal.", "Initial repair result."],
+                         [row["content"] for row in bursts[0]])
+        self.assertEqual(["Review a different client issue.", "Different issue reviewed."],
+                         [row["content"] for row in bursts[1]])
+
     def test_claude_two_bursts_use_distinct_user_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp) / "projects"

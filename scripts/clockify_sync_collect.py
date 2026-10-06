@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import bisect
 import datetime as dt
 import email.utils
 import fnmatch
@@ -750,18 +751,16 @@ def _partition_bursts(events: list[dict[str, Any]]) -> list[list[dict[str, Any]]
             bursts[-1].append(user)
     # Each assistant result belongs to the current user burst only until the
     # following burst starts. It can enrich context but never merge user work.
+    starts = [burst[0]["timestamp"] for burst in bursts]
+    # Freeze HUMAN cutoffs before adding any assistant/tool messages. Appending
+    # runtime context must not slide the cutoff and bridge unattended activity.
+    cutoffs = [burst[-1]["timestamp"] + dt.timedelta(seconds=BURST_GAP_SECONDS) for burst in bursts]
     for event in events:
         if event.get("role") == "user" or not event.get("timestamp"):
             continue
-        for index, burst in enumerate(bursts):
-            start = burst[0]["timestamp"]
-            last_user = burst[-1]["timestamp"]
-            next_start = bursts[index + 1][0]["timestamp"] if index + 1 < len(bursts) else None
-            if (event["timestamp"] >= start
-                    and event["timestamp"] <= last_user + dt.timedelta(seconds=BURST_GAP_SECONDS)
-                    and (next_start is None or event["timestamp"] < next_start)):
-                burst.append(event)
-                break
+        index = bisect.bisect_right(starts, event["timestamp"]) - 1
+        if index >= 0 and event["timestamp"] <= cutoffs[index]:
+            bursts[index].append(event)
     return [sorted(burst, key=lambda event: event["timestamp"]) for burst in bursts]
 
 
@@ -1469,9 +1468,10 @@ def parse_claude(p):
 
 def _remote_codex_contract() -> str:
     """Remote Codex extraction, using the same row-local user-burst context contract."""
-    helpers = ("from typing import Any\n" + inspect.getsource(_codex_message_event)
+    helpers = ("from typing import Any\nimport bisect\n" + f"BURST_GAP_SECONDS={BURST_GAP_SECONDS}\n" + inspect.getsource(_codex_message_event)
                + "\n" + inspect.getsource(_deduplicate_codex_messages)
-               + "\n" + inspect.getsource(_codex_rollout_objects))
+               + "\n" + inspect.getsource(_codex_rollout_objects)
+               + "\n" + inspect.getsource(_partition_bursts))
     return helpers + r'''try:
     if CXBASE and Path(CXBASE).exists():
         db=Path(CXBASE)/'state_5.sqlite'
@@ -1494,19 +1494,7 @@ def _remote_codex_contract() -> str:
                         message=_codex_message_event(o)
                         if message is not None: events.append(message)
                     events=_deduplicate_codex_messages(events)
-                    users=sorted((event for event in events if event['role']=='user'), key=lambda event:event['timestamp'])
-                    if not users: continue
-                    bursts=[]
-                    for user in users:
-                        if not bursts or (user['timestamp']-bursts[-1][-1]['timestamp']).total_seconds()>1800: bursts.append([user])
-                        else: bursts[-1].append(user)
-                    for event in events:
-                        if event['role']!='assistant': continue
-                        for i,burst in enumerate(bursts):
-                            next_start=bursts[i+1][0]['timestamp'] if i+1<len(bursts) else None
-                            last_user=burst[-1]['timestamp']
-                            if event['timestamp']>=burst[0]['timestamp'] and event['timestamp']<=last_user+dt.timedelta(seconds=1800) and (next_start is None or event['timestamp']<next_start):
-                                burst.append(event); break
+                    bursts=_partition_bursts(events)
                     for burst in bursts:
                         burst.sort(key=lambda event:event['timestamp'])
                         first_user=''; last_assistant=''; user_ts=[]
