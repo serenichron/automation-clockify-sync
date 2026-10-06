@@ -31,7 +31,7 @@ class ScopedRecoveryReplayTests(unittest.TestCase):
             failure = next(row for row in source_analysis['exceptions']
                            if row['kind'] == 'analyzer_review_failure')
             digest = semantic_analyzer.stable_digest('frt-', failure['evidence_ids'], length=64)
-            original_analyze = semantic_analyzer.analyze_tiered
+            original_scoped = pipeline.run_scoped_failed_review_retry
 
             def duplicate_transport(_endpoint, body):
                 payload = json.loads(body['messages'][-1]['content'])
@@ -46,8 +46,8 @@ class ScopedRecoveryReplayTests(unittest.TestCase):
                 parent_cache.write_bytes((parent / 'analyzer-cache-used.jsonl').read_bytes())
                 with (
                     mock.patch.object(semantic_analyzer.AnalyzerEndpoint, 'from_env', side_effect=endpoint_patch),
-                    mock.patch.object(semantic_analyzer, 'analyze_tiered', side_effect=lambda events, **kw:
-                                      original_analyze(events, transport=duplicate_transport,
+                    mock.patch.object(pipeline, 'run_scoped_failed_review_retry', side_effect=lambda *args, **kw:
+                                      original_scoped(*args, transport=duplicate_transport,
                                                        private_text_approved=True, **kw)),
                 ):
                     pipeline.run_accounting(

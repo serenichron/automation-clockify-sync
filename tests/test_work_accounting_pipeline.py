@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import copy
 import datetime as dt
+import hashlib
+import io
 import json
 from pathlib import Path
 import re
@@ -16,6 +18,7 @@ from scripts import review_corrections
 from scripts import work_accounting_pipeline as pipeline
 from scripts.meeting_reconciliation import MeetingReconciliationError, reconcile_meetings
 from task3_scenario_contract import assert_scenario_contract
+from test_semantic_analyzer import event as semantic_event, provider_response, valid_response
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -338,8 +341,7 @@ class WorkAccountingPipelineTests(unittest.TestCase):
                 cache.write_bytes(b" " + cache.read_bytes()[1:])
                 pipeline._failed_review_retry_targets(source, [{"evidence_id": "ev-1"}, {"evidence_id": "ev-2"}], cache, selected)
 
-    def test_failed_review_retry_passes_bound_target_to_analyzer(self):
-        import hashlib
+    def test_failed_review_retry_passes_bound_target_to_reviewer_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             cache = root / "analyzer-cache-used.jsonl"
@@ -347,25 +349,40 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             source = root / "semantic-analysis.json"
             selected = pipeline.semantic_analyzer.stable_digest("frt-", ["ev-1"], length=64)
             write_json(source, {
+                "activities": [], "omissions": [],
                 "ledger_event_count": 1,
                 "ledger_evidence_digest": pipeline.semantic_analyzer.stable_digest("led-", ["ev-1"]),
-                "analyzer_cache": {"snapshot": {"path": "analyzer-cache-used.jsonl", "sha256": hashlib.sha256(b"").hexdigest(), "record_count": 0}},
+                "analyzer_cache": {"records": [], "snapshot": {"path": "analyzer-cache-used.jsonl", "sha256": hashlib.sha256(b"").hexdigest(), "record_count": 0}},
                 "exceptions": [{"kind": "analyzer_review_failure", "evidence_ids": ["ev-1"], "reason": "Flash reviewer exhausted bounded structural repair: contract_rejected_duplicate_evidence"}],
             })
             primary = pipeline.semantic_analyzer.AnalyzerEndpoint("primary", "http://fixture", pipeline.semantic_analyzer.CURRENT_LIVE_FLASH_ROUTE[0], revision=pipeline.semantic_analyzer.CURRENT_LIVE_FLASH_ROUTE[1])
             cache_type = pipeline.semantic_analyzer.AnalyzerResponseCache
+            payloads = []
+
+            def transport(request, **_kwargs):
+                payload = json.loads(json.loads(request.data)["messages"][1]["content"])
+                payloads.append(payload)
+                return io.BytesIO(json.dumps(provider_response(payload)).encode())
+
             with (
+                mock.patch.dict("os.environ", {"CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED": "approved"}),
                 mock.patch.object(pipeline.semantic_analyzer.AnalyzerEndpoint, "from_env", side_effect=[primary, None]),
-                mock.patch.object(pipeline.semantic_analyzer, "analyze_tiered", autospec=True, return_value={"activities": [], "exceptions": [], "omissions": []}) as analyze,
+                mock.patch.object(pipeline.semantic_analyzer, "analyze_tiered", side_effect=AssertionError("selected failure must not restart extraction")),
+                mock.patch.object(pipeline.semantic_analyzer.urllib.request, "urlopen", side_effect=transport),
                 mock.patch.object(pipeline.semantic_analyzer, "AnalyzerResponseCache", wraps=cache_type) as caches,
             ):
                 result = pipeline.analyze_ledger(
-                    [{"evidence_id": "ev-1"}], analyzer_cache_path=cache,
+                    [semantic_event("ev-1")], analyzer_cache_path=cache,
                     failed_review_retry_source=source, failed_review_retry_digest=selected,
+                    review_taxonomy=[{"project_name": "Serenichron Level 2", "prefix": "SC", "tag_names": ["Processes"]}],
                 )
             self.assertEqual(1, sum(call.kwargs.get("record_review_diagnostics") is True for call in caches.call_args_list))
             self.assertEqual(selected, result["failed_review_retry"]["target_digest"])
-            self.assertEqual({("ev-1",): "contract_rejected_duplicate_evidence"}, analyze.call_args.kwargs["failed_review_retry_targets"])
+            self.assertTrue(result["activities"], result)
+            self.assertEqual(["ev-1"], result["activities"][0]["evidence_ids"])
+            self.assertEqual(1, len(payloads))
+            self.assertEqual(selected, payloads[0]["scoped_failed_review"]["group_digest"])
+            self.assertEqual([], payloads[0]["candidate"]["activities"])
 
     def test_failed_review_retry_selects_canonical_multiple_groups(self):
         import hashlib
@@ -377,35 +394,213 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             first = pipeline.semantic_analyzer.stable_digest("frt-", ["ev-1"], length=64)
             second = pipeline.semantic_analyzer.stable_digest("frt-", ["ev-2"], length=64)
             write_json(source, {
+                "activities": [], "omissions": [],
                 "ledger_event_count": 2,
                 "ledger_evidence_digest": pipeline.semantic_analyzer.stable_digest("led-", ["ev-1", "ev-2"]),
-                "analyzer_cache": {"snapshot": {"path": "analyzer-cache-used.jsonl", "sha256": hashlib.sha256(b"").hexdigest(), "record_count": 0}},
+                "analyzer_cache": {"records": [], "snapshot": {"path": "analyzer-cache-used.jsonl", "sha256": hashlib.sha256(b"").hexdigest(), "record_count": 0}},
                 "exceptions": [
                     {"kind": "analyzer_review_failure", "evidence_ids": ["ev-1"], "reason": "Flash reviewer exhausted bounded structural repair: contract_rejected_duplicate_evidence"},
                     {"kind": "analyzer_review_failure", "evidence_ids": ["ev-2"], "reason": "Flash reviewer exhausted bounded structural repair: contract_rejected_omitted_evidence"},
                 ],
             })
             primary = pipeline.semantic_analyzer.AnalyzerEndpoint("primary", "http://fixture", pipeline.semantic_analyzer.CURRENT_LIVE_FLASH_ROUTE[0], revision=pipeline.semantic_analyzer.CURRENT_LIVE_FLASH_ROUTE[1])
+            payloads = []
+
+            def transport(request, **_kwargs):
+                payload = json.loads(json.loads(request.data)["messages"][1]["content"])
+                payloads.append(payload)
+                return io.BytesIO(json.dumps(provider_response(payload)).encode())
+
             with (
+                mock.patch.dict("os.environ", {"CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED": "approved"}),
                 mock.patch.object(pipeline.semantic_analyzer.AnalyzerEndpoint, "from_env", side_effect=[primary, None]),
-                mock.patch.object(pipeline.semantic_analyzer, "analyze_tiered", autospec=True, return_value={"activities": [], "exceptions": [], "omissions": []}) as analyze,
+                mock.patch.object(pipeline.semantic_analyzer, "analyze_tiered", side_effect=AssertionError("selected failures must not restart extraction")),
+                mock.patch.object(pipeline.semantic_analyzer.urllib.request, "urlopen", side_effect=transport),
             ):
                 result = pipeline.analyze_ledger(
-                    [{"evidence_id": "ev-1"}, {"evidence_id": "ev-2"}],
+                    [semantic_event("ev-1"), semantic_event("ev-2")],
                     analyzer_cache_path=cache, failed_review_retry_source=source,
                     failed_review_retry_digest=[second, first],
+                    review_taxonomy=[{"project_name": "Serenichron Level 2", "prefix": "SC", "tag_names": ["Processes"]}],
                 )
             self.assertEqual(sorted([first, second]), result["failed_review_retry"]["target_digests"])
-            self.assertEqual({
-                ("ev-1",): "contract_rejected_duplicate_evidence",
-                ("ev-2",): "contract_rejected_omitted_evidence",
-            }, analyze.call_args.kwargs["failed_review_retry_targets"])
+            self.assertEqual({first, second}, {payload["scoped_failed_review"]["group_digest"] for payload in payloads})
+            self.assertEqual({("ev-1",), ("ev-2",)}, {tuple(row["evidence_ids"]) for row in result["activities"]})
             for selection in ([first, first], [first, "frt-" + "0" * 64]):
                 with self.assertRaises(pipeline.WorkAccountingError):
                     pipeline._failed_review_retry_targets(
                         json.loads(source.read_text()),
                         [{"evidence_id": "ev-1"}, {"evidence_id": "ev-2"}], cache, selection,
                     )
+
+    def test_three_structural_groups_use_nine_reviews_and_preserve_sealed_source(self):
+        """Catches re-extraction, regrouping, or collateral source/cache changes."""
+        primary = pipeline.semantic_analyzer.AnalyzerEndpoint(
+            "primary", "http://fixture", pipeline.semantic_analyzer.CURRENT_LIVE_FLASH_ROUTE[0],
+            revision=pipeline.semantic_analyzer.CURRENT_LIVE_FLASH_ROUTE[1],
+        )
+        groups = [[f"ev-{group}-{member:03d}" for member in range(size)]
+                  for group, size in enumerate((132, 214, 99))]
+        selected = [pipeline.semantic_analyzer.stable_digest("frt-", ids, length=64)
+                    for ids in groups]
+        events = [semantic_event(value) for ids in groups for value in ids]
+        events += [semantic_event(value) for value in ("keep", "omit", "unselected")]
+        unchanged_activity = valid_response("keep")["activities"][0]
+        unchanged_omission = {"lifecycle": "noise", "evidence_ids": ["omit"], "reason": "existing classification"}
+        unchanged_failure = {
+            "kind": "analyzer_review_failure", "evidence_ids": ["unselected"],
+            "reason": "Flash reviewer exhausted bounded structural repair: contract_rejected_invalid_effort",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache_path = root / "analyzer-cache-used.jsonl"
+            cache = pipeline.semantic_analyzer.AnalyzerResponseCache(cache_path)
+            cache.store_rejected(primary, {"request": "sealed-source"}, failure_code="contract_rejected")
+            original_cache = cache_path.read_bytes()
+            source = {
+                "activities": [unchanged_activity], "omissions": [unchanged_omission],
+                "exceptions": [{
+                    "kind": "analyzer_review_failure", "evidence_ids": ids,
+                    "reason": "Flash reviewer exhausted bounded structural repair: contract_rejected_omitted_evidence",
+                } for ids in groups] + [unchanged_failure],
+                "ledger_event_count": len(events),
+                "ledger_evidence_digest": pipeline.semantic_analyzer.stable_digest("led-", sorted(event["evidence_id"] for event in events)),
+                "analyzer_cache": {**cache.summary(), "snapshot": {
+                    "path": "analyzer-cache-used.jsonl", "record_count": 1,
+                    "sha256": hashlib.sha256(original_cache).hexdigest(),
+                }},
+            }
+            source_path = root / "semantic-analysis.json"
+            write_json(source_path, source)
+            original_source = source_path.read_bytes()
+            payloads = []
+
+            def transport(request, **_kwargs):
+                payload = json.loads(json.loads(request.data)["messages"][1]["content"])
+                payloads.append(payload)
+                return io.BytesIO(json.dumps(provider_response(payload)).encode())
+
+            taxonomy = [{"project_name": "Serenichron Level 2", "prefix": "SC", "tag_names": ["Processes"]}]
+            with (
+                mock.patch.dict("os.environ", {"CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED": "approved"}),
+                mock.patch.object(pipeline.semantic_analyzer.AnalyzerEndpoint, "from_env", side_effect=[primary, None, primary, None]),
+                mock.patch.object(pipeline.semantic_analyzer, "analyze_tiered", side_effect=AssertionError("no re-extraction")),
+                mock.patch.object(pipeline.semantic_analyzer.urllib.request, "urlopen", side_effect=transport),
+            ):
+                result = pipeline.analyze_ledger(
+                    events, analyzer_cache_path=cache_path, review_taxonomy=taxonomy,
+                    failed_review_retry_source=source_path, failed_review_retry_digest=selected,
+                )
+                retry_cache = cache_path.read_bytes()
+                replay = pipeline.analyze_ledger(
+                    events, analyzer_cache_path=cache_path, review_taxonomy=taxonomy,
+                    failed_review_retry_source=source_path, failed_review_retry_digest=selected,
+                )
+            self.assertEqual(9, len(payloads))
+            self.assertEqual([3, 4, 2], [sum(payload["scoped_failed_review"]["group_digest"] == digest
+                                            for payload in payloads) for digest in selected])
+            for payload in payloads:
+                self.assertEqual({"activities": [], "exceptions": [], "omissions": []}, payload["candidate"])
+            self.assertEqual(unchanged_activity, result["activities"][0])
+            self.assertEqual(unchanged_omission, result["omissions"][0])
+            self.assertEqual([unchanged_failure], result["exceptions"])
+            self.assertEqual(10, len(result["activities"]))
+            for section in ("activities", "omissions", "exceptions"):
+                self.assertEqual(result[section], replay[section])
+            self.assertEqual(original_source, source_path.read_bytes())
+            self.assertTrue(retry_cache.startswith(original_cache))
+            self.assertEqual(retry_cache, cache_path.read_bytes())
+
+    def test_retry_dispatch_rejects_ledger_cache_and_target_tampering_before_transport(self):
+        """Catches review dispatch bypassing exact source bindings."""
+        primary = pipeline.semantic_analyzer.AnalyzerEndpoint(
+            "primary", "http://fixture", pipeline.semantic_analyzer.CURRENT_LIVE_FLASH_ROUTE[0],
+            revision=pipeline.semantic_analyzer.CURRENT_LIVE_FLASH_ROUTE[1],
+        )
+        selected = pipeline.semantic_analyzer.stable_digest("frt-", ["ev-1"], length=64)
+        for tamper in ("ledger", "cache", "target_digest", "cache_digest"):
+            with self.subTest(tamper=tamper), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                cache_path = root / "analyzer-cache-used.jsonl"
+                cache = pipeline.semantic_analyzer.AnalyzerResponseCache(cache_path)
+                cache.store_rejected(primary, {"request": "source"}, failure_code="contract_rejected")
+                source = {
+                    "activities": [], "omissions": [],
+                    "exceptions": [{"kind": "analyzer_review_failure", "evidence_ids": ["ev-1"],
+                                    "reason": "Flash reviewer exhausted bounded structural repair: contract_rejected_omitted_evidence"}],
+                    "ledger_event_count": 1,
+                    "ledger_evidence_digest": pipeline.semantic_analyzer.stable_digest("led-", ["ev-1"]),
+                    "analyzer_cache": {**cache.summary(), "snapshot": {
+                        "path": "analyzer-cache-used.jsonl", "record_count": 1,
+                        "sha256": hashlib.sha256(cache_path.read_bytes()).hexdigest(),
+                    }},
+                }
+                events = [semantic_event("ev-2" if tamper == "ledger" else "ev-1")]
+                selection = "frt-" + "0" * 64 if tamper == "target_digest" else selected
+                if tamper == "cache":
+                    cache_path.write_bytes(b" " + cache_path.read_bytes()[1:])
+                if tamper == "cache_digest":
+                    source["analyzer_cache"]["snapshot"]["sha256"] = "0" * 64
+                source_path = root / "semantic-analysis.json"
+                write_json(source_path, source)
+                source_bytes, cache_bytes = source_path.read_bytes(), cache_path.read_bytes()
+                with (
+                    mock.patch.object(pipeline.semantic_analyzer.AnalyzerEndpoint, "from_env", return_value=primary),
+                    mock.patch.object(pipeline.semantic_analyzer, "analyze_tiered", side_effect=AssertionError("invalid source must not extract")),
+                    mock.patch.object(pipeline.semantic_analyzer.urllib.request, "urlopen", side_effect=AssertionError("invalid source must not reach network")),
+                    self.assertRaisesRegex(pipeline.WorkAccountingError, "source ledger binding|source cache binding|target is absent"),
+                ):
+                    pipeline.analyze_ledger(
+                        events, analyzer_cache_path=cache_path,
+                        failed_review_retry_source=source_path, failed_review_retry_digest=selection,
+                    )
+                self.assertEqual(source_bytes, source_path.read_bytes())
+                self.assertEqual(cache_bytes, cache_path.read_bytes())
+
+    def test_retry_dispatch_preserves_failed_retry_scoped_and_partial_quarantine_paths(self):
+        """Catches regressing existing reviewer-only recovery modes."""
+        primary = pipeline.semantic_analyzer.AnalyzerEndpoint(
+            "primary", "http://fixture", pipeline.semantic_analyzer.CURRENT_LIVE_FLASH_ROUTE[0],
+            revision=pipeline.semantic_analyzer.CURRENT_LIVE_FLASH_ROUTE[1],
+        )
+        selected = pipeline.semantic_analyzer.stable_digest("frt-", ["ev-1"], length=64)
+        for kind, reason in (
+            ("analyzer_review_failure", "Flash reviewer exhausted bounded failed-review retry: contract_rejected_omitted_evidence"),
+            ("analyzer_review_failure", "Flash reviewer exhausted bounded scoped retry: contract_rejected_invalid_effort"),
+            ("analyzer_review_partial_quarantine", "existing partial quarantine"),
+        ):
+            with self.subTest(kind=kind, reason=reason), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                cache = root / "analyzer-cache-used.jsonl"
+                cache.write_bytes(b"")
+                source = root / "semantic-analysis.json"
+                write_json(source, {
+                    "activities": [], "omissions": [],
+                    "exceptions": [{"kind": kind, "reason": reason, "evidence_ids": ["ev-1"]}],
+                    "ledger_event_count": 1,
+                    "ledger_evidence_digest": pipeline.semantic_analyzer.stable_digest("led-", ["ev-1"]),
+                    "analyzer_cache": {"records": [], "snapshot": {"path": "analyzer-cache-used.jsonl", "record_count": 0, "sha256": hashlib.sha256(b"").hexdigest()}},
+                })
+                payloads = []
+
+                def transport(request, **_kwargs):
+                    payload = json.loads(json.loads(request.data)["messages"][1]["content"])
+                    payloads.append(payload)
+                    return io.BytesIO(json.dumps(provider_response(payload)).encode())
+
+                with (
+                    mock.patch.dict("os.environ", {"CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED": "approved"}),
+                    mock.patch.object(pipeline.semantic_analyzer.AnalyzerEndpoint, "from_env", side_effect=[primary, None]),
+                    mock.patch.object(pipeline.semantic_analyzer, "analyze_tiered", side_effect=AssertionError("no extraction")),
+                    mock.patch.object(pipeline.semantic_analyzer.urllib.request, "urlopen", side_effect=transport),
+                ):
+                    result = pipeline.analyze_ledger(
+                        [semantic_event("ev-1")], analyzer_cache_path=cache,
+                        failed_review_retry_source=source, failed_review_retry_digest=selected,
+                        review_taxonomy=[{"project_name": "Serenichron Level 2", "prefix": "SC", "tag_names": ["Processes"]}],
+                    )
+                self.assertEqual(["ev-1"], result["activities"][0]["evidence_ids"])
+                self.assertEqual(1, len(payloads))
 
     def test_analyzer_tuning_cli_options_are_explicit(self):
         args = pipeline.parse_args([

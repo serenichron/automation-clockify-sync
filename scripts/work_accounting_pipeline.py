@@ -878,6 +878,9 @@ def analyze_ledger(
         and (
             row.get("kind") == "analyzer_review_partial_quarantine"
             or str(row.get("reason") or "").startswith(
+                "Flash reviewer exhausted bounded structural repair:"
+            )
+            or str(row.get("reason") or "").startswith(
                 "Flash reviewer exhausted bounded failed-review retry:"
             )
             or str(row.get("reason") or "").startswith(

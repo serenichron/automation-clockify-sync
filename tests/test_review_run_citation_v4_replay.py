@@ -33,7 +33,6 @@ class CitationV4ReplayTests(unittest.TestCase):
                 semantic_analyzer.DEFAULT_PRIMARY_MODEL,
                 revision=semantic_analyzer.DEFAULT_PRIMARY_REVISION,
             )
-            original_analyze = semantic_analyzer.analyze_tiered
             original_scoped = work_accounting_pipeline.run_scoped_failed_review_retry
             original_provider = fixtures.analyzer_provider_response
             scoped_calls = []
@@ -55,26 +54,17 @@ class CitationV4ReplayTests(unittest.TestCase):
                 endpoint if name == "CLOCKIFY_ANALYZER_PRIMARY" else None
             )
 
-            def retry(parent: Path, target: str, *, scoped: bool, transport):
+            def retry(parent: Path, target: str, *, transport):
                 child = run._prepare_repair_run(parent)
                 cache = child / "analyzer-cache-retry.jsonl"
                 cache.write_bytes((child / "analyzer-cache-used.jsonl").read_bytes())
-                if scoped:
-                    replacement = mock.patch.object(
-                        work_accounting_pipeline, "run_scoped_failed_review_retry",
-                        side_effect=lambda *args, **kwargs: original_scoped(
-                            *args, **{**kwargs, "transport": transport,
-                                     "private_text_approved": True},
-                        ),
-                    )
-                else:
-                    replacement = mock.patch.object(
-                        semantic_analyzer, "analyze_tiered",
-                        side_effect=lambda events, **kwargs: original_analyze(
-                            events, transport=transport,
-                            private_text_approved=True, **kwargs,
-                        ),
-                    )
+                replacement = mock.patch.object(
+                    work_accounting_pipeline, "run_scoped_failed_review_retry",
+                    side_effect=lambda *args, **kwargs: original_scoped(
+                        *args, **{**kwargs, "transport": transport,
+                                 "private_text_approved": True},
+                    ),
+                )
                 with (
                     mock.patch.object(
                         semantic_analyzer.AnalyzerEndpoint, "from_env",
@@ -108,12 +98,12 @@ class CitationV4ReplayTests(unittest.TestCase):
                 structural = exception(source, "analyzer_review_failure")
                 self.assertIn("contract_rejected_duplicate_evidence", structural["reason"])
                 first, _ = retry(
-                    source, digest(structural), scoped=False,
+                    source, digest(structural),
                     transport=duplicate_transport,
                 )
                 quarantine = exception(first, "analyzer_review_partial_quarantine")
                 second, _ = retry(
-                    first, digest(quarantine), scoped=True,
+                    first, digest(quarantine),
                     transport=duplicate_transport,
                 )
                 residual = exception(second, "analyzer_review_partial_quarantine")
@@ -128,7 +118,7 @@ class CitationV4ReplayTests(unittest.TestCase):
                     ]["mode"],
                 )
                 third, bundle = retry(
-                    second, digest(residual), scoped=True,
+                    second, digest(residual),
                     transport=valid_transport,
                 )
                 recovered = json.loads((third / "semantic-analysis.json").read_text())

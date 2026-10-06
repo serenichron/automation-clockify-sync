@@ -59,7 +59,7 @@ class ChainedRepairReplayTests(unittest.TestCase):
             semantic_analyzer.DEFAULT_PRIMARY_MODEL,
             revision=semantic_analyzer.DEFAULT_PRIMARY_REVISION,
         )
-        original_analyze = semantic_analyzer.analyze_tiered
+        original_scoped = work_accounting_pipeline.run_scoped_failed_review_retry
 
         def retry_transport(_endpoint, body):
             payload = json.loads(body["messages"][-1]["content"])
@@ -80,9 +80,9 @@ class ChainedRepairReplayTests(unittest.TestCase):
                     if name == "CLOCKIFY_ANALYZER_PRIMARY" else None,
                 ),
                 mock.patch.object(
-                    semantic_analyzer, "analyze_tiered",
-                    side_effect=lambda events, **kw: original_analyze(
-                        events, transport=retry_transport,
+                    work_accounting_pipeline, "run_scoped_failed_review_retry",
+                    side_effect=lambda *args, **kw: original_scoped(
+                        *args, transport=retry_transport,
                         private_text_approved=True, **kw,
                     ),
                 ),
@@ -109,9 +109,9 @@ class ChainedRepairReplayTests(unittest.TestCase):
                     if name == "CLOCKIFY_ANALYZER_PRIMARY" else None,
                 ),
                 mock.patch.object(
-                    semantic_analyzer, "analyze_tiered",
-                    side_effect=lambda events, **kw: original_analyze(
-                        events, transport=forbidden_transport,
+                    work_accounting_pipeline, "run_scoped_failed_review_retry",
+                    side_effect=lambda *args, **kw: original_scoped(
+                        *args, transport=forbidden_transport,
                         private_text_approved=True, **kw,
                     ),
                 ),

@@ -1819,12 +1819,13 @@ class ReviewRunResultTests(unittest.TestCase):
                 "selection_guidance": ["offline"],
             }],
         )
-        cache_content = cache_path.read_bytes()
-        analysis["analyzer_cache"]["snapshot"] = {
-            "path": "analyzer-cache-used.jsonl",
-            "record_count": len(cache_content.splitlines()),
-            "sha256": hashlib.sha256(cache_content).hexdigest(),
-        }
+        with mock.patch.object(
+            semantic_analyzer.AnalyzerEndpoint, "from_env",
+            side_effect=lambda name, **_kwargs: endpoint if name == "CLOCKIFY_ANALYZER_PRIMARY" else None,
+        ):
+            analysis["analyzer_cache"]["snapshot"] = work_accounting_pipeline._seal_analyzer_cache_snapshot(
+                source, cache_path, analysis,
+            )
         fixture = root / "sealed-analysis.json"
         write_json(fixture, analysis)
         completed = subprocess.run([
@@ -1925,10 +1926,10 @@ class ReviewRunResultTests(unittest.TestCase):
                 payload = json.loads(body["messages"][-1]["content"])
                 transport_calls.append(payload)
                 return analyzer_provider_response(payload)
-            real_analyze = semantic_analyzer.analyze_tiered
+            real_scoped = work_accounting_pipeline.run_scoped_failed_review_retry
             with (
                 mock.patch.object(semantic_analyzer.AnalyzerEndpoint, "from_env", side_effect=lambda name, **_kwargs: endpoint if name == "CLOCKIFY_ANALYZER_PRIMARY" else None),
-                mock.patch.object(semantic_analyzer, "analyze_tiered", side_effect=lambda events, **kwargs: real_analyze(events, transport=transport, private_text_approved=True, **kwargs)),
+                mock.patch.object(work_accounting_pipeline, "run_scoped_failed_review_retry", side_effect=lambda *args, **kwargs: real_scoped(*args, transport=transport, private_text_approved=True, **kwargs)),
             ):
                 work_accounting_pipeline.run_accounting(
                     repair, root=ROOT, routing_path=repair / "routing.json",
@@ -1989,7 +1990,7 @@ class ReviewRunResultTests(unittest.TestCase):
                 "clockify_analyzer_primary", "https://offline.invalid/v1/chat/completions",
                 semantic_analyzer.DEFAULT_PRIMARY_MODEL, revision=semantic_analyzer.DEFAULT_PRIMARY_REVISION,
             )
-            real_analyze = semantic_analyzer.analyze_tiered
+            real_scoped = work_accounting_pipeline.run_scoped_failed_review_retry
             attempts = []
             def rejected_transport(_endpoint, body):
                 payload = json.loads(body["messages"][-1]["content"])
@@ -2007,7 +2008,7 @@ class ReviewRunResultTests(unittest.TestCase):
             }
             with (
                 mock.patch.object(semantic_analyzer.AnalyzerEndpoint, "from_env", side_effect=lambda name, **_kwargs: endpoint if name == "CLOCKIFY_ANALYZER_PRIMARY" else None),
-                mock.patch.object(semantic_analyzer, "analyze_tiered", side_effect=lambda values, **kwargs: real_analyze(values, transport=rejected_transport, private_text_approved=True, **kwargs)),
+                mock.patch.object(work_accounting_pipeline, "run_scoped_failed_review_retry", side_effect=lambda *args, **kwargs: real_scoped(*args, transport=rejected_transport, private_text_approved=True, **kwargs)),
             ):
                 first = work_accounting_pipeline.analyze_ledger(events, **retry_options)
             self.assertEqual(1, len(attempts))
@@ -2020,7 +2021,7 @@ class ReviewRunResultTests(unittest.TestCase):
                 self.fail("same-child cached rejection must not call transport")
             with (
                 mock.patch.object(semantic_analyzer.AnalyzerEndpoint, "from_env", side_effect=lambda name, **_kwargs: endpoint if name == "CLOCKIFY_ANALYZER_PRIMARY" else None),
-                mock.patch.object(semantic_analyzer, "analyze_tiered", side_effect=lambda values, **kwargs: real_analyze(values, transport=forbidden, private_text_approved=True, **kwargs)),
+                mock.patch.object(work_accounting_pipeline, "run_scoped_failed_review_retry", side_effect=lambda *args, **kwargs: real_scoped(*args, transport=forbidden, private_text_approved=True, **kwargs)),
             ):
                 second = work_accounting_pipeline.analyze_ledger(events, **retry_options)
             self.assertEqual(first["exceptions"], second["exceptions"])
@@ -2080,12 +2081,12 @@ class ReviewRunResultTests(unittest.TestCase):
                 semantic_analyzer.DEFAULT_PRIMARY_MODEL,
                 revision=semantic_analyzer.DEFAULT_PRIMARY_REVISION,
             )
-            real_analyze = semantic_analyzer.analyze_tiered
+            real_scoped = work_accounting_pipeline.run_scoped_failed_review_retry
             def transport(_endpoint, body):
                 return analyzer_provider_response(json.loads(body["messages"][-1]["content"]))
             with (
                 mock.patch.object(semantic_analyzer.AnalyzerEndpoint, "from_env", side_effect=lambda name, **_kwargs: endpoint if name == "CLOCKIFY_ANALYZER_PRIMARY" else None),
-                mock.patch.object(semantic_analyzer, "analyze_tiered", side_effect=lambda events, **kwargs: real_analyze(events, transport=transport, private_text_approved=True, **kwargs)),
+                mock.patch.object(work_accounting_pipeline, "run_scoped_failed_review_retry", side_effect=lambda *args, **kwargs: real_scoped(*args, transport=transport, private_text_approved=True, **kwargs)),
             ):
                 work_accounting_pipeline.run_accounting(
                     child, root=ROOT, routing_path=child / "routing.json",

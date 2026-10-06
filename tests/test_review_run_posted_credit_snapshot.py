@@ -269,7 +269,6 @@ class InvalidEffortV3ConsumerTests(unittest.TestCase):
                 semantic_analyzer.DEFAULT_PRIMARY_MODEL,
                 revision=semantic_analyzer.DEFAULT_PRIMARY_REVISION,
             )
-            original_analyze = semantic_analyzer.analyze_tiered
             scoped = work_accounting_pipeline.run_scoped_failed_review_retry
             calls = []
 
@@ -296,9 +295,9 @@ class InvalidEffortV3ConsumerTests(unittest.TestCase):
                         if name == "CLOCKIFY_ANALYZER_PRIMARY" else None,
                     ),
                     mock.patch.object(
-                        semantic_analyzer, "analyze_tiered",
-                        side_effect=lambda events, **kwargs: original_analyze(
-                            events, transport=still_invalid_transport,
+                        work_accounting_pipeline, "run_scoped_failed_review_retry",
+                        side_effect=lambda *args, **kwargs: scoped(
+                            *args, transport=still_invalid_transport,
                             private_text_approved=True, **kwargs,
                         ),
                     ),
@@ -318,7 +317,7 @@ class InvalidEffortV3ConsumerTests(unittest.TestCase):
                     if row["kind"] == "analyzer_review_failure"
                 )
                 self.assertIn("contract_rejected_invalid_effort", parent_failure["reason"])
-                self.assertIn("bounded failed-review retry", parent_failure["reason"])
+                self.assertIn("bounded scoped retry", parent_failure["reason"])
                 validate_repair(parent, runs, root / "parent-items.json")
                 run._finalize_repair_completion(parent)
                 target = semantic_analyzer.stable_digest(
