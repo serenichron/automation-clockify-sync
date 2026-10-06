@@ -149,6 +149,9 @@ class CollectorBurstContextTests(unittest.TestCase):
                 ("2026-07-21T04:59:00Z", "# AGENTS.md instructions\nGenerated policy"),
                 ("2026-07-21T04:59:10Z", "<environment_context>runtime metadata</environment_context>"),
                 ("2026-07-21T04:59:20Z", '<in-app-browser-context source="ambient-ui-state">generated tab</in-app-browser-context>'),
+                ("2026-07-21T04:59:30Z", '<codex_internal_context source="runtime">runtime history</codex_internal_context>'),
+                ("2026-07-21T04:59:35Z", "<codex_internal_context>historical quoted prompt\n## My request:\nRepair the historical client portal.</codex_internal_context>"),
+                ("2026-07-21T04:59:40Z", "<recommended_plugins>generated suggestions</recommended_plugins>"),
                 ("2026-07-21T05:00:13.123Z", "<in-app-browser-context>generated tab</in-app-browser-context>\n\n## My request:\nRepair the client portal."),
                 ("2026-07-21T05:05:27.456Z", "Verify the repaired client portal."),
             ]:

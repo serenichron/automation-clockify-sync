@@ -2009,15 +2009,22 @@ def _codex_message_event(obj: dict[str, Any]) -> dict[str, Any] | None:
         content = str(content or "")
     if role == "user":
         # Desktop context arrives as role=user too, but is not human attention.
+        injected_prefixes = (
+            "# agents.md instructions", "<environment_context>", "<turn_aborted>",
+            "<codex_delegation>", "<external_codex_apps_open_page>",
+            "<teammate-message", "<subagent_notification", "<codex_internal_context",
+            "<recommended_plugins",
+        )
+        # Generated history can quote old request markers; never revive those
+        # historical prompts as new attention before identifying the envelope.
+        if content.lstrip().casefold().startswith(injected_prefixes):
+            return None
         for marker in ("## My request:", "# My request:", "# My request for Codex:"):
             if marker.casefold() in content.casefold():
                 content = content[content.casefold().index(marker.casefold()) + len(marker):].strip()
                 break
-        if content.lstrip().casefold().startswith((
-            "# agents.md instructions", "<environment_context>", "<turn_aborted>",
-            "<codex_delegation>", "<external_codex_apps_open_page>",
-            "<teammate-message", "<subagent_notification>", "<in-app-browser-context",
-            "<ide_opened_file>", "<ide_selection>",
+        if content.lstrip().casefold().startswith(injected_prefixes + (
+            "<in-app-browser-context", "<ide_opened_file>", "<ide_selection>",
         )):
             return None
     return {"timestamp": timestamp.astimezone(BUCHAREST), "role": role,
