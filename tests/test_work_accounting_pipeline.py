@@ -1969,9 +1969,9 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             initial["proposals"][0],
             "modify",
             field_patch={
-                "description": {
+                "duration_seconds": {
                     "op": "replace",
-                    "value": "SC — Repaired Clockify review process for accurate automatic timesheets",
+                    "value": 60,
                 }
             },
         )
@@ -1988,6 +1988,63 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         failures = [row for row in rerun["ambiguous"] if row.get("exception_kind") == "correction_regression"]
         self.assertEqual(1, len(failures))
         self.assertEqual(activity_id, failures[0]["activity_id"])
+
+    def test_exact_wording_correction_changes_only_rendered_description_for_every_segment(self):
+        """Catches enforcing human wording as regression-only instead of applying it locally."""
+        for reviewed in (False, True):
+            with self.subTest(semantic_reviewed=reviewed):
+                first = session_event(
+                    "session-1:event:wording-first", "2026-07-10T09:00:00+03:00",
+                    span_end="2026-07-10T12:00:00+03:00",
+                )
+                last = session_event("session-1:event:wording-last", "2026-07-10T12:00:00+03:00")
+                existing = clockify_event("2026-07-10T10:00:00+03:00", "2026-07-10T10:30:00+03:00")
+                analysis = analysis_for([first.evidence_id, last.evidence_id], recommended=120)
+                if reviewed:
+                    analysis["activities"][0].update({
+                        "semantic_reviewer_model": "deepseek-v4-flash:0731-cloud",
+                        "semantic_reviewer_revision": "a" * 64,
+                        "review_prompt_version": "clockify-semantic-review-v5",
+                    })
+                run_dir, initial = self.make_run([first, last, existing], analysis)
+                self.assertEqual(2, len(initial["proposals"]))
+                initial_analysis = json.loads((run_dir / "semantic-analysis.json").read_text())
+                corrections_path = run_dir.parent.parent / "wording-corrections.jsonl"
+                replacement = "SC — Corrected human-reviewed wording without changing the work facts"
+                self.append_correction(corrections_path, initial["proposals"][0], "modify", field_patch={
+                    "description": {"op": "replace", "value": replacement},
+                })
+                rerun = pipeline.run_accounting(
+                    run_dir, root=ROOT, analysis_fixture=run_dir.parent.parent / "analysis.json",
+                    corrections_path=corrections_path,
+                )
+                self.assertEqual(2, len(rerun["proposals"]))
+                self.assertEqual({replacement}, {row["description"] for row in rerun["proposals"]})
+                self.assertEqual({replacement}, {row["rendered_description"] for row in rerun["proposals"]})
+                for before, after in zip(initial["proposals"], rerun["proposals"], strict=True):
+                    self.assertEqual(
+                        {key: value for key, value in before.items() if key not in {"description", "rendered_description"}},
+                        {key: value for key, value in after.items() if key not in {"description", "rendered_description"}},
+                    )
+                corrected_analysis = json.loads((run_dir / "semantic-analysis.json").read_text())
+                for before, after in zip(initial_analysis["activities"], corrected_analysis["activities"], strict=True):
+                    self.assertEqual({key: value for key, value in before.items() if key != "rendered_description"},
+                                     {key: value for key, value in after.items() if key != "rendered_description"})
+                self.assertEqual(1, rerun["correction_regression"]["summary"]["pass"])
+                for mismatch in ("activity", "evidence"):
+                    wrong_target = copy.deepcopy(initial["proposals"][0])
+                    if mismatch == "activity":
+                        wrong_target["activity_id"] = "unrelated-reviewed-activity"
+                    else:
+                        wrong_target["provenance"]["evidence_ids"] = [first.evidence_id]
+                    path = run_dir.parent.parent / f"wording-{mismatch}.jsonl"
+                    self.append_correction(path, wrong_target, "modify", field_patch={
+                        "description": {"op": "replace", "value": replacement},
+                    })
+                    untouched = pipeline.run_accounting(
+                        run_dir, root=ROOT, analysis_fixture=run_dir.parent.parent / "analysis.json", corrections_path=path,
+                    )
+                    self.assertEqual(initial["proposals"], untouched["proposals"])
 
     def test_matching_modify_correction_passes_and_keeps_all_segments(self):
         first = session_event(
@@ -3073,9 +3130,9 @@ class WorkAccountingPipelineTests(unittest.TestCase):
                 patch = None
                 if decision == "modify":
                     patch = {
-                        "description": {
+                        "duration_seconds": {
                             "op": "replace",
-                            "value": "SC — Defined prospect meeting outcome for corrected client planning",
+                            "value": 60,
                         }
                     }
                 self.append_correction(

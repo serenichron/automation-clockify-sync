@@ -1106,6 +1106,31 @@ def _routes_by_selection(
     return result
 
 
+def _description_from_review_correction(
+    activity: Mapping[str, Any], regression_cases: Iterable[Mapping[str, Any]],
+) -> str | None:
+    """Apply only an exact local human wording replacement, never provider hints."""
+    target = review_corrections.proposal_target(activity)
+    if target is None:
+        return None
+    replacements: set[str] = set()
+    for case in regression_cases:
+        if (str(case.get("activity_id") or ""), str(case.get("evidence_fingerprint") or "")) != target:
+            continue
+        if case.get("decision") != "modify" or "wording" not in case.get("correction_categories", ()):
+            continue
+        patch = case.get("expected_field_patch")
+        operation = patch.get("description") if isinstance(patch, Mapping) else None
+        if not isinstance(operation, Mapping) or operation.get("op") != "replace":
+            continue
+        value = operation.get("value")
+        if not isinstance(value, str) or not value.strip() or "\n" in value or "\r" in value:
+            return None
+        replacements.add(value)
+    # Conflicting exact targets stay visible to the regression gate.
+    return next(iter(replacements)) if len(replacements) == 1 else None
+
+
 def _route_from_review_correction(
     activity: Mapping[str, Any],
     regression_cases: Iterable[Mapping[str, Any]],
@@ -2962,7 +2987,10 @@ def run_accounting(
         if route_error or route is None:
             route, warning = _unresolved_route()
             routing_warnings.append(warning)
-        if activity.get("semantic_reviewer_model"):
+        corrected_description = _description_from_review_correction(activity, regression_cases)
+        if corrected_description is not None:
+            description = corrected_description
+        elif activity.get("semantic_reviewer_model"):
             # The independent Flash reviewer owns semantic clarity and useful
             # wording. Python only assembles its reviewed fields with the
             # authoritative route prefix; it does not overrule the review with
