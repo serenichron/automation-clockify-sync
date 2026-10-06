@@ -439,6 +439,10 @@ def _validate_review_warning(
         if suffix in projects:
             sanitized["counterpart_project"] = projects[suffix]
         return sanitized
+    elif warning_type == "estimated_session_placement":
+        if set(warning) != {"type", "reason"}:
+            raise PublicationError("proposal estimated placement warning has invalid fields")
+        return {"type": warning_type, "reason": _warning_text(warning.get("reason"), "reason")}
     elif warning_type == "unresolved_routing":
         if set(warning) != UNRESOLVED_ROUTING_WARNING_FIELDS:
             raise PublicationError(
