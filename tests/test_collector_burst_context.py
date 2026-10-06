@@ -39,6 +39,16 @@ class CollectorBurstContextTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
 
+    def collect_legacy_remote_codex(self, home: Path) -> dict:
+        scope = {"Path": Path, "dt": dt, "json": json, "CXBASE": str(home),
+                 "SINCE": SINCE, "UNTIL": UNTIL, "BUCHAREST": collector.BUCHAREST,
+                 "MACHINE": "remote", "parse_dt": collector.parse_dt,
+                 "local_str": collector.local_dt_string, "clean_context": collector._meaningful_context,
+                 "active_duration": lambda values: collector.compute_active_duration(values)[:2],
+                 "res": {"codex_sessions": [], "errors": []}}
+        exec(collector._remote_codex_contract(), scope)
+        return scope["res"]
+
     def test_runtime_identity_ignores_untracked_sync_and_state_artifacts(self) -> None:
         responses = [
             mock.Mock(returncode=0, stdout=str(collector.ROOT) + "\n"),
@@ -196,6 +206,109 @@ class CollectorBurstContextTests(unittest.TestCase):
         self.assertEqual(2, rows[0]["user_messages"])
         self.assertEqual("Repair the remote client portal.", rows[0]["first_user_message"])
         self.assertEqual("2026-07-21T08:00:13+03:00", rows[0]["events"][0]["timestamp"])
+
+    def test_legacy_remote_codex_recovers_modern_rollout_with_empty_db_index(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            rollout = home / "sessions" / "2026" / "07" / "21" / "rollout-unindexed.jsonl"
+            self.write_jsonl(rollout, [
+                {"type": "session_meta", "payload": {"id": "unindexed", "cwd": "/work/client"}},
+                {"timestamp": "2026-07-21T05:00:00Z", "type": "response_item", "payload": {
+                    "type": "message", "role": "user", "content": [{"type": "input_text", "text": "Repair the remote export."}]}},
+                {"timestamp": "2026-07-21T05:05:00Z", "type": "response_item", "payload": {
+                    "type": "message", "role": "user", "content": [{"type": "input_text", "text": "Verify the remote export."}]}},
+            ])
+            with contextlib.closing(sqlite3.connect(home / "state_5.sqlite")) as conn, conn:
+                conn.execute("CREATE TABLE threads (id, rollout_path, cwd, title, first_user_message, thread_source, archived, updated_at)")
+
+            result = self.collect_legacy_remote_codex(home)
+
+        self.assertEqual([], result["errors"])
+        self.assertEqual(["unindexed"], [row["session_id"] for row in result["codex_sessions"]])
+        self.assertEqual("/work/client", result["codex_sessions"][0]["cwd"])
+        self.assertEqual("Repair the remote export.", result["codex_sessions"][0]["first_user_message"])
+        self.assertEqual(2, result["codex_sessions"][0]["user_messages"])
+
+    def test_legacy_remote_codex_missing_db_is_normal_filesystem_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            rollout = home / "sessions" / "2026" / "07" / "21" / "rollout-no-db.jsonl"
+            self.write_jsonl(rollout, [
+                {"type": "session_meta", "payload": {"id": "no-db", "cwd": "/work/client"}},
+                event("2026-07-21T05:00:00Z", "user_message", "Repair the remote export."),
+                event("2026-07-21T05:05:00Z", "user_message", "Verify the remote export."),
+            ])
+
+            result = self.collect_legacy_remote_codex(home)
+
+        self.assertEqual(["no-db"], [row["session_id"] for row in result["codex_sessions"]])
+        self.assertEqual([], result["errors"])
+
+    def test_legacy_remote_codex_merges_partial_index_and_preserves_archived_bursts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            live = home / "sessions" / "2026" / "07" / "21"
+            archived = home / "archived_sessions"
+            indexed = live / "rollout-indexed.jsonl"
+            omitted = live / "rollout-omitted.jsonl"
+            stale_user = live / "rollout-stale-user.jsonl"
+            stale_subagent = live / "rollout-subagent.jsonl"
+            archive_copy = archived / "rollout-omitted.jsonl"
+            archive_unique = archived / "rollout-archived.jsonl"
+            old_archive = archived / "rollout-old.jsonl"
+            for path, sid, prompt in (
+                (indexed, "indexed", "Review the client export."),
+                (omitted, "omitted", "Repair the client export."),
+                (stale_user, "stale-user", "Verify the stale indexed export."),
+                (stale_subagent, "subagent", "Internal agent task."),
+                (archive_copy, "omitted", "Repair the client export."),
+            ):
+                self.write_jsonl(path, [
+                    {"type": "session_meta", "payload": {"id": sid, "cwd": "/work/client"}},
+                    event("2026-07-21T05:00:00Z", "user_message", prompt),
+                    event("2026-07-21T05:04:00Z", "user_message", "Verify result."),
+                ])
+            self.write_jsonl(archive_unique, [
+                {"type": "session_meta", "payload": {"id": "archived", "cwd": "/work/archive"}},
+                event("2026-07-21T05:00:00Z", "user_message", "Archive task one."),
+                event("2026-07-21T05:04:00Z", "user_message", "Verify archive task one."),
+                event("2026-07-21T06:00:00Z", "user_message", "Archive task two."),
+                event("2026-07-21T06:04:00Z", "user_message", "Verify archive task two."),
+            ])
+            self.write_jsonl(old_archive, [
+                {"type": "session_meta", "payload": {"id": "old"}},
+                event("2026-07-20T05:00:00Z", "user_message", "Old task."),
+            ])
+            old_mtime = (SINCE - dt.timedelta(days=1)).timestamp()
+            os.utime(old_archive, (old_mtime, old_mtime))
+            with contextlib.closing(sqlite3.connect(home / "state_5.sqlite")) as conn, conn:
+                conn.execute("CREATE TABLE threads (id, rollout_path, cwd, title, first_user_message, thread_source, archived, updated_at)")
+                conn.executemany("INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [
+                    ("indexed", str(indexed), "/work/indexed-db", "", "", "user", 0, int(SINCE.timestamp())),
+                    ("stale-user", str(stale_user), "/work/client", "", "", "user", 0,
+                     int((SINCE - dt.timedelta(days=2)).timestamp())),
+                    ("subagent", str(stale_subagent), "/work/client", "", "", "subagent", 0,
+                     int((SINCE - dt.timedelta(days=2)).timestamp())),
+                ])
+            original_open = Path.open
+            opened: list[Path] = []
+
+            def track_open(path: Path, *args: object, **kwargs: object):
+                opened.append(path)
+                return original_open(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "open", track_open):
+                result = self.collect_legacy_remote_codex(home)
+
+        self.assertEqual([], result["errors"])
+        self.assertNotIn(old_archive, opened)
+        rows = result["codex_sessions"]
+        self.assertEqual(["archived", "archived", "indexed", "omitted", "stale-user"],
+                         sorted(row["session_id"] for row in rows))
+        self.assertEqual("/work/indexed-db", next(row for row in rows if row["session_id"] == "indexed")["cwd"])
+        self.assertEqual(["Archive task one.", "Archive task two."],
+                         [row["first_user_message"] for row in rows if row["session_id"] == "archived"])
+        self.assertTrue(all(row["archived"] for row in rows if row["session_id"] == "archived"))
 
     def test_codex_completed_message_items_recover_camelcase_user_turns(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

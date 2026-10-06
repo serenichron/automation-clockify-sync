@@ -1472,47 +1472,73 @@ def _remote_codex_contract() -> str:
                + "\n" + inspect.getsource(_deduplicate_codex_messages)
                + "\n" + inspect.getsource(_codex_rollout_objects)
                + "\n" + inspect.getsource(_partition_bursts))
-    return helpers + r'''try:
+    return helpers + r'''def collect_codex_rollout(path, sid=None, cwd=None, archived=False):
+    try:
+        records=_codex_rollout_objects(path)
+        first=next(records)
+        if first.get('type')!='session_meta': records.close(); return
+        meta=first.get('payload',{})
+        if meta.get('thread_source')=='subagent' or (isinstance(meta.get('source'),dict) and meta['source'].get('subagent')): records.close(); return
+        sid=sid or meta.get('id') or path.stem
+        if sid in seen_sids: records.close(); return
+        cwd=cwd if cwd is not None else meta.get('cwd','')
+        before=len(res['codex_sessions'])
+        events=[]
+        for o in records:
+            message=_codex_message_event(o)
+            if message is not None: events.append(message)
+        events=_deduplicate_codex_messages(events)
+        bursts=_partition_bursts(events)
+        for burst in bursts:
+            burst.sort(key=lambda event:event['timestamp'])
+            first_user=''; last_assistant=''; user_ts=[]
+            for event in burst:
+                if event['role']=='user':
+                    user_ts.append(event['timestamp']); candidate=clean_context(event['content'])
+                    if not first_user and len(candidate)>=10: first_user=candidate
+                else:
+                    candidate=clean_context(event['content'])
+                    if candidate: last_assistant=candidate
+            if not user_ts: continue
+            bs,be=user_ts[0],user_ts[-1]; raw=max(1,int((be-bs).total_seconds()/60)); active,method=active_duration(user_ts)
+            if be<SINCE or bs>=UNTIL: continue
+            title=first_user or last_assistant or ''
+            res['codex_sessions'].append({'source':'codex','machine':MACHINE,'session_id':sid,'path':str(path),'cwd':cwd or '','title':title,'start':local_str(bs),'end':local_str(be),'duration_minutes':min(active,raw),'raw_wallclock_minutes':raw,'user_messages':len(user_ts),'first_user_message':first_user,'last_assistant_message':last_assistant,'evidence_level':method,'archived':bool(archived),'events':[{**event,'timestamp':event['timestamp'].isoformat()} for event in burst]})
+        if len(res['codex_sessions'])>before: seen_sids.add(sid)
+    except Exception: pass
+try:
     if CXBASE and Path(CXBASE).exists():
+        seen_sids=set()
+        indexed_paths=set()
         db=Path(CXBASE)/'state_5.sqlite'
         if db.exists():
             import sqlite3
             conn=sqlite3.connect('file:'+str(db)+'?mode=ro', uri=True)
             lo=int((SINCE-dt.timedelta(days=1)).timestamp())
             rows=conn.execute('SELECT id, rollout_path, cwd, title, first_user_message, thread_source, archived FROM threads WHERE updated_at >= ? ORDER BY updated_at', (lo,)).fetchall()
+            stale_subagents=conn.execute("SELECT rollout_path FROM threads WHERE thread_source = 'subagent' AND updated_at < ?", (lo,)).fetchall()
             conn.close()
+            indexed_paths.update(Path(path) for (path,) in stale_subagents if path)
             for sid, rollout_path, cwd, session_title, first_msg, thread_source, archived in rows:
+                if rollout_path: indexed_paths.add(Path(rollout_path))
                 if thread_source=='subagent' or not rollout_path or not Path(rollout_path).exists(): continue
+                collect_codex_rollout(Path(rollout_path), sid, cwd, archived)
+        sessions_dir=Path(CXBASE)/'sessions'
+        archived_dir=Path(CXBASE)/'archived_sessions'
+        if sessions_dir.exists():
+            for path in sessions_dir.rglob('rollout-*.jsonl'):
+                if path in indexed_paths: continue
                 try:
-                    records=_codex_rollout_objects(Path(rollout_path))
-                    first=next(records)
-                    if first.get('type')!='session_meta': records.close(); continue
-                    meta=first.get('payload',{})
-                    if meta.get('thread_source')=='subagent' or (isinstance(meta.get('source'),dict) and meta['source'].get('subagent')): records.close(); continue
-                    events=[]
-                    for o in records:
-                        message=_codex_message_event(o)
-                        if message is not None: events.append(message)
-                    events=_deduplicate_codex_messages(events)
-                    bursts=_partition_bursts(events)
-                    for burst in bursts:
-                        burst.sort(key=lambda event:event['timestamp'])
-                        first_user=''; last_assistant=''; user_ts=[]
-                        for event in burst:
-                            if event['role']=='user':
-                                user_ts.append(event['timestamp']); candidate=clean_context(event['content'])
-                                if not first_user and len(candidate)>=10: first_user=candidate
-                            else:
-                                candidate=clean_context(event['content'])
-                                if candidate: last_assistant=candidate
-                        if not user_ts: continue
-                        bs,be=user_ts[0],user_ts[-1]; raw=max(1,int((be-bs).total_seconds()/60)); active,method=active_duration(user_ts)
-                        if be<SINCE or bs>=UNTIL: continue
-                        title=first_user or last_assistant or ''
-                        res['codex_sessions'].append({'source':'codex','machine':MACHINE,'session_id':sid,'path':str(rollout_path),'cwd':cwd or '','title':title,'start':local_str(bs),'end':local_str(be),'duration_minutes':min(active,raw),'raw_wallclock_minutes':raw,'user_messages':len(user_ts),'first_user_message':first_user,'last_assistant_message':last_assistant,'evidence_level':method,'archived':bool(archived),'events':[{**event,'timestamp':event['timestamp'].isoformat()} for event in burst]})
+                    if dt.datetime.fromtimestamp(path.stat().st_mtime, tz=BUCHAREST)<SINCE: continue
                 except Exception: pass
-        else:
-            res['errors'].append('codex state_5.sqlite not found')
+                collect_codex_rollout(path)
+        if archived_dir.exists():
+            for path in sorted(archived_dir.glob('rollout-*.jsonl')):
+                if path in indexed_paths: continue
+                try:
+                    if dt.datetime.fromtimestamp(path.stat().st_mtime, tz=BUCHAREST)<SINCE: continue
+                except Exception: pass
+                collect_codex_rollout(path, archived=True)
     else:
         res['errors'].append('codex_home not found: '+CXBASE)
 except Exception as e: res['errors'].append('codex scan: '+str(e)[:200])
