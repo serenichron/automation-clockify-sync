@@ -1811,6 +1811,54 @@ def _activity_observed_intervals(
     ]
 
 
+def _hermes_session_timing_contexts(
+    events: Iterable[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Index bounded human pools separately from atomic outcome citations.
+
+    Pools are source-bound placement capacity, never per-outcome observed spans.
+    Mirror the collector's direct-human filter so automated user-role wrappers
+    cannot borrow a surrounding genuine-human pool.
+    """
+    groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for event in events:
+        source_type = str(event.get("source_type") or "")
+        source = event.get("source_ref") or {}
+        attrs = _attributes(event)
+        if (
+            source_type not in {"hermes_db_sessions_event", "hermes_sessions_event"}
+            or source.get("source_type") != source_type.removesuffix("_event")
+            or not source.get("machine") or not source.get("session_id")
+            or attrs.get("role") != "user"
+            or attrs.get("kind", "message") != "message" or attrs.get("tool_name")
+            or str(attrs.get("content") or "").lstrip().casefold().startswith((
+                "<task-notification", "<system-reminder", "<teammate-message",
+                "<command-message", "<local-command", "<codex_internal_context",
+                "this session is being continued from a previous conversation",
+            ))
+        ):
+            continue
+        groups.setdefault((source_type, str(source["machine"]), str(source["session_id"])), []).append(event)
+    contexts: dict[str, dict[str, Any]] = {}
+    for members in groups.values():
+        for interval in _activity_observed_intervals(members):
+            start, end = _parse_dt(interval["start"]), _parse_dt(interval["end"])
+            ids = sorted(
+                str(event["evidence_id"])
+                for event in members
+                if (point := _observed_span(event)[0]) is not None
+                and start <= point <= end
+            )
+            context = {
+                "pool_id": semantic_analyzer.stable_digest("htp-", ids),
+                "interval": interval,
+                "evidence_ids": ids,
+            }
+            for evidence_id in ids:
+                contexts[evidence_id] = context
+    return contexts
+
+
 def _interval_capacity_minutes(intervals: Iterable[Mapping[str, Any]]) -> int:
     parsed = [
         (_parse_dt(interval.get("start")), _parse_dt(interval.get("end")))
@@ -2781,6 +2829,8 @@ def run_accounting(
     workstream_envelopes = _workstream_daily_envelopes(
         analysis.get("activities", []), events_by_id
     )
+    hermes_timing_contexts = _hermes_session_timing_contexts(analysis_events)
+    shared_timing_pool_ids: set[str] = set()
     activity_context: dict[str, dict[str, Any]] = {}
     allocation_demands = []
     ambiguous: list[dict[str, Any]] = []
@@ -2930,7 +2980,19 @@ def run_accounting(
             attempt["candidate"] = True
             continue
 
+        timing_contexts = {
+            hermes_timing_contexts[evidence_id]["pool_id"]: hermes_timing_contexts[evidence_id]
+            for evidence_id in evidence_ids if evidence_id in hermes_timing_contexts
+        }
         intervals = _activity_observed_intervals(cited)
+        borrowed_timing_context = not intervals and bool(timing_contexts)
+        if borrowed_timing_context:
+            timing_ids = sorted({
+                value for context in timing_contexts.values()
+                for value in context["evidence_ids"]
+            })
+            intervals = _activity_observed_intervals([events_by_id[value] for value in timing_ids])
+            shared_timing_pool_ids.update(timing_contexts)
         if not intervals:
             ambiguous.append({"id": activity_id, "reason": "cited evidence has timestamps but no positive observed interval", "exception_kind": "timing_evidence", "evidence_ids": evidence_ids})
             if corrected_route is not None:
@@ -2942,7 +3004,9 @@ def run_accounting(
                     "provenance": {"evidence_ids": evidence_ids},
                 })
             continue
-        spans = [
+        # Shared human pool bounds must not be relabelled as observed spans of
+        # an arbitrary outcome evidence ID. Allowed intervals own placement.
+        spans = [] if borrowed_timing_context else [
             {
                 "evidence_id": evidence_ids[min(index, len(evidence_ids) - 1)],
                 "start": interval["start"],
@@ -2982,6 +3046,7 @@ def run_accounting(
             "description": description,
             "evidence_ids": evidence_ids,
             "review_warnings": review_warnings,
+            "hermes_timing_contexts": timing_contexts,
         }
 
     for meeting_id, attempts in meeting_attempts.items():
@@ -3067,24 +3132,39 @@ def run_accounting(
             "activity_ids": [str(candidate["activity"].get("activity_id") or "") for candidate in candidates],
         })
 
+    for context in activity_context.values():
+        pools = context["hermes_timing_contexts"]
+        if not shared_timing_pool_ids.intersection(pools):
+            continue
+        context["shared_timing_context"] = {
+            "timing_context_evidence_ids": sorted({
+                value for pool in pools.values() for value in pool["evidence_ids"]
+            }),
+            "timing_context_intervals": [pools[key]["interval"] for key in sorted(pools)],
+            "timing_placement": "estimated",
+        }
+        context["review_warnings"].append({
+            "type": "estimated_session_placement",
+            "reason": "Estimated effort placed within shared same-session human observations; exact outcome boundaries are not observed.",
+        })
     allocation = work_allocator.allocate_work(allocation_demands, fixed)
     proposals = list(meeting_proposals)
     activity_segment_counts: dict[str, int] = {}
     for segment in allocation.allocations:
         context = activity_context[segment.activity_id]
         activity_segment_counts[segment.activity_id] = activity_segment_counts.get(segment.activity_id, 0) + 1
-        proposals.append(
-            _proposal(
-                context["activity"],
-                context["route"],
-                context["description"],
-                segment.start,
-                segment.end,
-                context["evidence_ids"],
-                activity_segment_counts[segment.activity_id],
-                review_warnings=context["review_warnings"],
-            )
+        proposal = _proposal(
+            context["activity"],
+            context["route"],
+            context["description"],
+            segment.start,
+            segment.end,
+            context["evidence_ids"],
+            activity_segment_counts[segment.activity_id],
+            review_warnings=context["review_warnings"],
         )
+        proposal["provenance"].update(copy.deepcopy(context.get("shared_timing_context") or {}))
+        proposals.append(proposal)
 
     demands_by_activity = {
         demand.activity_id: demand for demand in allocation.evidence
@@ -3103,6 +3183,12 @@ def run_accounting(
     for conflict in allocation.contested_time:
         demand = demands_by_activity[conflict.activity_id]
         context = activity_context[conflict.activity_id]
+        if context.get("shared_timing_context"):
+            # The allocator debits the occupied union once. Recovery deliberately
+            # allows distinct observed activity overlap, but cannot re-spend a
+            # shared human pool for outcomes with unknown individual boundaries.
+            residual_conflicts.append(conflict)
+            continue
         slices = _capacity_recovery_slices(
             demand,
             allocation.allocations,
@@ -3191,15 +3277,22 @@ def run_accounting(
                 "reason": "fully_credited_existing_clockify_overlap",
             })
     for conflict in allocation.contested_time:
+        context = activity_context[conflict.activity_id]
+        shared_context = context.get("shared_timing_context") or {}
         ambiguous.append({
             "id": conflict.activity_id,
             "activity_id": conflict.activity_id,
             "workstream_id": conflict.workstream_id,
-            "reason": conflict.reason,
+            "reason": (
+                "Estimated outcomes share one observed human window; remaining effort is not separately timed."
+                if shared_context else conflict.reason
+            ),
             "exception_kind": "contested_time",
             "requested_minutes": conflict.requested_minutes,
             "allocated_minutes": conflict.allocated_minutes,
             "unallocated_minutes": conflict.unallocated_minutes,
+            **({"evidence_ids": list(context["evidence_ids"]), **copy.deepcopy(shared_context)}
+               if shared_context else {}),
         })
 
     for meeting_id, status in fathom_manifest.items():

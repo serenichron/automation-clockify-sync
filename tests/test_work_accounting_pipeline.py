@@ -2047,6 +2047,141 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         self.assertEqual("2026-09-10T12:41:00+03:00", result["proposals"][0]["end"])
         self.assertEqual(35, result["proposals"][0]["review_warnings"][0]["requested_minutes"])
 
+    def test_disjoint_hermes_outcomes_use_separate_same_session_timing_context(self):
+        """Catches outcome partitioning dropping the other genuine timing anchor."""
+        first_user = hermes_event("2026-10-03 16:06")
+        first_result = hermes_event("2026-10-03 16:15", "assistant")
+        next_user = hermes_event("2026-10-03 16:28")
+        next_result = hermes_event("2026-10-03 16:30", "assistant")
+        analysis = analysis_for(
+            [first_user.evidence_id, first_result.evidence_id], recommended=10,
+        )
+        second = analysis_for(
+            [next_user.evidence_id, next_result.evidence_id], recommended=10,
+        )["activities"][0]
+        second["action"] = "Reviewed"
+        second["object"] = "Clockify routing configuration"
+        second["outcome"] = "for correct client assignment"
+        analysis["activities"].append(second)
+
+        _, result = self.make_run(
+            [first_user, first_result, next_user, next_result], analysis,
+        )
+
+        self.assertEqual(2, len(result["proposals"]))
+        self.assertEqual(20, sum(row["duration_minutes"] for row in result["proposals"]))
+        expected_outcomes = {
+            frozenset([first_user.evidence_id, first_result.evidence_id]),
+            frozenset([next_user.evidence_id, next_result.evidence_id]),
+        }
+        self.assertEqual(expected_outcomes, {
+            frozenset(row["provenance"]["evidence_ids"])
+            for row in result["proposals"]
+        })
+        for row in result["proposals"]:
+            self.assertEqual(
+                {first_user.evidence_id, next_user.evidence_id},
+                set(row["provenance"]["timing_context_evidence_ids"]),
+            )
+            self.assertEqual("estimated", row["provenance"]["timing_placement"])
+            self.assertIn("estimated_session_placement", [
+                warning["type"] for warning in row["review_warnings"]
+            ])
+            self.assertGreaterEqual(row["start"], "2026-10-03T16:06:00+03:00")
+            self.assertLessEqual(row["end"], "2026-10-03T16:28:00+03:00")
+        self.assertTrue(all(
+            row["evidence_spans"] == []
+            for row in result["allocation"]["evidence"]
+        ))
+
+    def test_shared_hermes_capacity_cannot_be_spent_again_by_residual_recovery(self):
+        """Catches the residual recovery branch giving each outcome the whole pool."""
+        first_user = hermes_event("2026-10-03 16:06")
+        first_result = hermes_event("2026-10-03 16:15", "assistant")
+        next_user = hermes_event("2026-10-03 16:28")
+        next_result = hermes_event("2026-10-03 16:30", "assistant")
+        analysis = analysis_for(
+            [first_user.evidence_id, first_result.evidence_id], recommended=15,
+        )
+        second = analysis_for(
+            [next_user.evidence_id, next_result.evidence_id], recommended=15,
+        )["activities"][0]
+        second["object"] = "Clockify routing configuration"
+        analysis["activities"].append(second)
+
+        _, result = self.make_run(
+            [first_user, first_result, next_user, next_result], analysis,
+        )
+
+        self.assertEqual(15, sum(row["duration_minutes"] for row in result["proposals"]))
+        self.assertEqual([], result["allocation"]["capacity_recoveries"])
+        self.assertEqual(15, sum(
+            row["unallocated_minutes"] for row in result["allocation"]["contested_time"]
+        ))
+        residual = next(row for row in result["ambiguous"] if row["exception_kind"] == "contested_time")
+        self.assertEqual("estimated", residual.get("timing_placement"))
+        self.assertEqual(
+            {first_user.evidence_id, next_user.evidence_id},
+            set(residual["timing_context_evidence_ids"]),
+        )
+
+    def test_direct_hermes_demand_cannot_respend_a_pool_shared_by_another_outcome(self):
+        """Catches recovery double-spending when only one outcome needs context."""
+        first = hermes_event("2026-10-03 16:06")
+        middle = hermes_event("2026-10-03 16:16")
+        last = hermes_event("2026-10-03 16:28")
+        result_event = hermes_event("2026-10-03 16:30", "assistant")
+        analysis = analysis_for([first.evidence_id, last.evidence_id], recommended=15)
+        second = analysis_for(
+            [middle.evidence_id, result_event.evidence_id], recommended=15,
+        )["activities"][0]
+        second["object"] = "Clockify routing configuration"
+        analysis["activities"].append(second)
+
+        _, result = self.make_run([first, middle, last, result_event], analysis)
+
+        self.assertEqual(15, sum(row["duration_minutes"] for row in result["proposals"]))
+        self.assertEqual([], result["allocation"]["capacity_recoveries"])
+        self.assertEqual(15, sum(
+            row["unallocated_minutes"] for row in result["allocation"]["contested_time"]
+        ))
+
+    def test_hermes_timing_context_never_crosses_idle_day_machine_or_session(self):
+        """Catches widening a singleton with unrelated source timing or automation."""
+        anchor = hermes_event("2026-10-03 23:40")
+        assistant = hermes_event("2026-10-04 01:00", "assistant")
+        for other in (
+            hermes_event("2026-10-03 23:50", machine="other-machine"),
+            hermes_event("2026-10-03 23:50", session="other-session"),
+            hermes_event("2026-10-04 00:01"),
+            hermes_event("2026-10-03 23:09"),
+            evidence_ledger.evidence_event(
+                "hermes_db_sessions_event",
+                {"source_type": "hermes_db_sessions", "source_id": "automated",
+                 "machine": "precision", "session_id": "hermes-one"},
+                observed_at="2026-10-03T23:50:00+03:00",
+                raw_source_span={"timestamp": "2026-10-03T23:50:00+03:00"},
+                attributes={"role": "user", "kind": "message",
+                            "content": "<task-notification>Completed automatically"},
+            ),
+        ):
+            with self.subTest(source=other.source_ref):
+                analysis = analysis_for(
+                    [anchor.evidence_id, assistant.evidence_id], recommended=10,
+                )
+                analysis["omissions"] = [{
+                    "lifecycle": "noise", "evidence_ids": [other.evidence_id],
+                    "reason": "unrelated timing context only",
+                }]
+                _, result = self.make_run(
+                    [anchor, assistant, other], analysis,
+                )
+                self.assertEqual([], result["proposals"])
+                self.assertTrue(any(
+                    row.get("exception_kind") == "timing_evidence"
+                    for row in result["ambiguous"]
+                ))
+
     def test_hermes_assistant_points_cannot_bridge_idle_user_gap(self):
         points = [hermes_event("2026-09-10 09:00"), hermes_event("2026-09-10 09:02"),
                   hermes_event("2026-09-10 09:25", "assistant"),
