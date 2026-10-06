@@ -1164,6 +1164,21 @@ def _route_from_review_correction(
         # Exact corrections select a project/task, not a universal SC prefix.
         # Use its canonical configured route and refuse ambiguous native targets.
         expected_tags = tuple(sorted(str(value) for value in tag_names))
+        configured_routes = [
+            route
+            for section in ("session_routes", "meeting_routes", "evidence_routes")
+            for route in routing.get(section, [])
+            if isinstance(route, dict) and route.get("project_name")
+            and not route.get("base_prefix")
+        ]
+        # Explicit human selections may name a configured lifecycle route even
+        # when the activity does not trigger automatic lifecycle/cutover routing.
+        # Keep both declarations so ordinary/lifecycle native conflicts fail closed.
+        for rule in routing.get("client_lifecycle_routes", []):
+            activation = rule.get("activation") if isinstance(rule, Mapping) else None
+            route = activation.get("route") if isinstance(activation, Mapping) else None
+            if isinstance(route, Mapping) and route.get("project_name"):
+                configured_routes.append(dict(route))
         matches = {
             (
                 str(route.get("project_suffix") or ""),
@@ -1171,9 +1186,9 @@ def _route_from_review_correction(
                 str(route.get("prefix") or "SC"),
                 bool(route.get("billable", True)),
             ): route
-            for (name, _prefix, tags), route in _routes_by_selection(routing).items()
-            if name == project_name.casefold() and tags == expected_tags
-            and not route.get("base_prefix")
+            for route in configured_routes
+            if str(route["project_name"]).casefold() == project_name.casefold()
+            and tuple(sorted(str(value) for value in route.get("tag_names", []))) == expected_tags
         }
         return next(iter(matches.values())) if len(matches) == 1 else None
     return None
