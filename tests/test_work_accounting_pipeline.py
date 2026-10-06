@@ -1743,6 +1743,29 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             if warning.get("type") == "allocation_capacity_recovery"
         ])
 
+    def test_recovery_sums_distinct_overlap_and_verified_posted_credits(self):
+        survivor = {
+            "activity_id": "act-recovery", "candidate_key": "wks-survivor",
+            "start": "2026-07-10T10:00:00+03:00", "duration_seconds": 600,
+            "review_warnings": [], "provenance": {"allocation_capacity_recovery": True},
+        }
+        skipped = [
+            {"activity_id": "act-recovery", "credited_overlap_receipt": {"credited_seconds": 600},
+             "provenance": {"allocation_capacity_recovery": True}},
+            {"activity_id": "act-recovery", "verification_basis": "preserved_collection_snapshot",
+             "verified_posted_credit": {"covered_seconds": 600, "allocation_capacity_recovery": True}},
+        ]
+        records = [{"activity_id": "act-recovery", "requested_minutes": 30,
+                    "allocator_allocated_minutes": 0, "recovered_minutes": 30,
+                    "residual_minutes": 0}]
+
+        pipeline._refresh_capacity_recovery_warnings([survivor], skipped, records)
+
+        self.assertEqual(10, records[0]["recovered_minutes"])
+        self.assertEqual(20, records[0]["credited_minutes"])
+        self.assertEqual(0, records[0]["residual_minutes"])
+        self.assertEqual(20, survivor["review_warnings"][0]["credited_minutes"])
+
     def test_capacity_recovery_dedupes_same_activity_interval_but_keeps_distinct_work(self):
         first = session_event(
             "dedupe-recovery:event:1",

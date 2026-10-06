@@ -2053,12 +2053,20 @@ def _refresh_capacity_recovery_warnings(
             int(proposal.get("duration_seconds") or 0) // 60
             for proposal in survivors
         )
-        credited_minutes = sum(
+        overlap_credited_minutes = sum(
             int((row.get("credited_overlap_receipt") or {}).get("credited_seconds") or 0) // 60
             for row in skipped
             if row.get("activity_id") == activity_id
             and (row.get("provenance") or {}).get("allocation_capacity_recovery")
         )
+        posted_credited_minutes = sum(
+            int((row.get("verified_posted_credit") or {}).get("covered_seconds") or 0) // 60
+            for row in skipped
+            if row.get("activity_id") == activity_id
+            and row.get("verification_basis") == "preserved_collection_snapshot"
+            and (row.get("verified_posted_credit") or {}).get("allocation_capacity_recovery") is True
+        )
+        credited_minutes = overlap_credited_minutes + posted_credited_minutes
         residual_minutes = max(
             0,
             int(record["requested_minutes"])
@@ -2609,6 +2617,10 @@ def _apply_verified_posted_credits(
                                             "verification_basis": "preserved_collection_snapshot", "operation_anchor": credit["operation_anchor"],
                                             "coverage_kind": credit["coverage_kind"], "credit_digest": credit["credit_digest"],
                                             "collection_snapshot_sha256": collection_snapshot.manifest_sha256,
+                                            "verified_posted_credit": {
+                                                "covered_seconds": row["duration_seconds"],
+                                                "allocation_capacity_recovery": row["provenance"].get("allocation_capacity_recovery") is True,
+                                            },
                                             "clockify_entry_ids": [proof["clockify_entry_id"] for proof in credit["prior_proofs"]]})
         except (ValueError, TypeError, KeyError, AttributeError):
             # An invalid recurring group must never hide a reviewable proposal.
@@ -3371,6 +3383,8 @@ def run_accounting(
     )
 
     proposals = _normalize_postable_proposals(proposals, existing, skipped)
+    # Match sealed credits against the same recovery warning shape as finalized proposals.
+    _refresh_capacity_recovery_warnings(proposals, skipped, recovery_records)
     collection_snapshot = (_accounting_collection_snapshot(run_dir, all_events)
                            if any(credit.get("schema_version") == 2 for credit in verified_posted_credits) else None)
     proposals, posted_skipped = _apply_verified_posted_credits(

@@ -86,6 +86,33 @@ class RecurringNativeCreditTests(unittest.TestCase):
     def apply(self, proposals, credits, proof):
         return pipeline._apply_verified_posted_credits(proposals, [], credits, collection_snapshot=proof)
 
+    def accounting_run_fixture(self, root, proof):
+        since, until = START.replace(day=1, hour=0), START.replace(month=10, day=1, hour=0)
+        store = collector_checkpoints.PageCheckpointStore(root / "cache")
+        state = store.open(collector._clockify_checkpoint_identity("workspace-1", "user-1", since, until), initial_metadata={"snapshot_at": "2026-10-04T12:00:00Z"})
+        state = store.append_page(state, payload=proof.entries, continuation={"page": 2}, signature=collector._clockify_page_signature(proof.entries))
+        state = store.mark_complete(state)
+        source = root / "original-run/evidence/clockify-existing.json"
+        source.parent.mkdir(parents=True)
+        projection = collector.fetch_clockify({"CLOCKIFY_WORKSPACE_ID": "workspace-1"}, {"clockify_user_id": "user-1"}, since, until, checkpoint_store=store)
+        source.write_text(json.dumps(projection))
+        run_dir = root / "fresh-run"
+        destination = run_dir / "evidence/clockify-native-checkpoint"
+        captured = snapshot.capture_checkpoint_snapshot(checkpoint_manifest=state.directory / "manifest.json",
+            clockify_evidence=source, destination=destination, workspace_id="workspace-1", user_id="user-1", since=since, until=until)
+        (run_dir / "evidence/clockify-existing.json").write_bytes(source.read_bytes())
+        original = json.loads((root / "source-ledger.json").read_bytes())
+        events = [evidence_ledger.EvidenceEvent.from_document(event) for event in original["events"]]
+        events.extend(evidence_ledger.normalize_collector_snapshot({"clockify": projection}))
+        ledger = evidence_ledger.EvidenceLedger(tuple(events), {"clockify": {"status": "complete"}, "fathom": {"status": "complete"}, "multica_issues": {"status": "complete"}})
+        ledger_doc = {"schema_version": ledger.manifest.schema_version, "manifest": ledger.manifest.document(), "events": [event.document() for event in ledger.events]}
+        (run_dir / "evidence/evidence-ledger.json").write_text(json.dumps(ledger_doc))
+        report = {"date_range": {"since": since.isoformat(), "until": until.isoformat()}, "clockify_native_checkpoint": {"manifest_sha256": captured.manifest_sha256, "request": captured.manifest["request"]}}
+        (run_dir / "run-report.json").write_text(json.dumps(report))
+        analysis = root / "analysis.json"
+        analysis.write_text(json.dumps(accounting_fixtures.analysis_for([events[0].evidence_id], recommended=30)))
+        return run_dir, analysis, ledger_doc, report
+
     def test_equal_credit_uses_approved_editorial_payload_and_preserves_independent_work(self):
         with tempfile.TemporaryDirectory() as tmp:
             current, declaration, proof = self.fixture(Path(tmp))
@@ -310,6 +337,86 @@ class RecurringNativeCreditTests(unittest.TestCase):
             sealed = review_corrections.load_verified_posted_credits(path)
             self.assertEqual([], self.apply(current, sealed, proof)[0])
 
+    def test_accounting_matches_finalized_recovery_warning_before_native_credit(self):
+        """A sealed final proposal must match before the post-credit warning refresh."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _current, declaration, proof = self.fixture(root)
+            run_dir, analysis, ledger_doc, _report = self.accounting_run_fixture(root, proof)
+            with mock.patch.object(collector, "clockify_get", side_effect=AssertionError("network forbidden")):
+                baseline = pipeline.run_accounting(run_dir, root=accounting_fixtures.ROOT, analysis_fixture=analysis)
+            self.assertEqual(1, len(baseline["proposals"]))
+            final_proposal = baseline["proposals"][0]
+            warning = next(w for w in final_proposal["review_warnings"] if w["type"] == "allocation_capacity_recovery")
+            self.assertEqual(0, warning["credited_minutes"])
+            self.assertEqual(30, final_proposal["duration_minutes"])
+            declaration["current_review_ids"] = [f'{final_proposal["review_activity_key"]}-s{final_proposal["allocation_segment"]:02d}']
+            declaration["artifacts"]["current_proposals"] = adoption_fixtures.artifact(root / "final-proposals.json", [final_proposal])
+            declaration["artifacts"]["current_source_ledger"] = adoption_fixtures.artifact(root / "final-source-ledger.json", ledger_doc)
+            credit = self.seal(declaration)
+            corrections = root / "corrections.jsonl"
+            self.assertTrue(review_corrections.append_verified_posted_credit(
+                corrections, credit, runs_root=root, current_proposals=[final_proposal],
+                existing_blocks=[], collection_snapshot=proof,
+            ))
+            with mock.patch.object(collector, "clockify_get", side_effect=AssertionError("network forbidden")):
+                credited = pipeline.run_accounting(
+                    run_dir, root=accounting_fixtures.ROOT, analysis_fixture=analysis,
+                    corrections_path=corrections,
+                )
+            self.assertEqual([], credited["proposals"])
+            self.assertEqual(1, sum(row.get("verification_basis") == "preserved_collection_snapshot" for row in credited["skipped"]))
+            native_skip = next(row for row in credited["skipped"] if row.get("verification_basis") == "preserved_collection_snapshot")
+            self.assertEqual({"covered_seconds": 1800, "allocation_capacity_recovery": True}, native_skip["verified_posted_credit"])
+            self.assertNotIn("credited_overlap_receipt", native_skip)
+            self.assertEqual([{
+                "activity_id": final_proposal["activity_id"],
+                "requested_minutes": 30,
+                "allocator_allocated_minutes": 0,
+                "recovered_minutes": 0,
+                "credited_minutes": 30,
+                "residual_minutes": 0,
+            }], credited["allocation"]["capacity_recoveries"])
+
+    def test_partial_native_recovery_credit_rebinds_survivor_warning_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            current, declaration, proof = self.fixture(
+                root, prior_minutes=(15,), current_minutes=(15, 15),
+            )
+            first, remaining = current
+            remaining["start"] = first["end"]
+            remaining["end"] = (dt.datetime.fromisoformat(remaining["start"]) + dt.timedelta(minutes=15)).isoformat()
+            first["activity_id"] = remaining["activity_id"] = "act-recovery"
+            first["provenance"]["allocation_capacity_recovery"] = True
+            remaining["provenance"]["allocation_capacity_recovery"] = True
+            unrelated_warning = {"type": "routing_review", "detail": "preserve me"}
+            remaining["review_warnings"] = [unrelated_warning]
+            independent = copy.deepcopy(remaining)
+            independent.update(activity_id="act-independent", candidate_key="wks-independent")
+            independent["provenance"].pop("allocation_capacity_recovery")
+            records = [{"activity_id": "act-recovery", "requested_minutes": 30,
+                        "allocator_allocated_minutes": 0, "recovered_minutes": 30,
+                        "residual_minutes": 0}]
+            pipeline._refresh_capacity_recovery_warnings(current, [], records)
+            declaration["current_review_ids"] = [f'{first["review_activity_key"]}-s{first["allocation_segment"]:02d}']
+            declaration["artifacts"]["current_proposals"] = adoption_fixtures.artifact(root / "recovery-proposals.json", current)
+            credit = self.seal(declaration)
+
+            survivors, skipped = self.apply([*current, independent], [credit], proof)
+            self.assertEqual([remaining, independent], survivors)
+            self.assertEqual({"covered_seconds": 900, "allocation_capacity_recovery": True}, skipped[0]["verified_posted_credit"])
+            pipeline._refresh_capacity_recovery_warnings(survivors, skipped, records)
+
+            self.assertEqual({"activity_id": "act-recovery", "requested_minutes": 30,
+                              "allocator_allocated_minutes": 0, "recovered_minutes": 15,
+                              "credited_minutes": 15, "residual_minutes": 0}, records[0])
+            self.assertEqual(unrelated_warning, remaining["review_warnings"][0])
+            self.assertEqual({"type": "allocation_capacity_recovery", "requested_minutes": 30,
+                              "allocator_allocated_minutes": 0, "recovered_minutes": 15,
+                              "credited_minutes": 15, "residual_minutes": 0}, remaining["review_warnings"][1])
+            self.assertEqual([unrelated_warning], independent["review_warnings"])
+
     def test_mixed_v1_v2_log_appends_in_both_orders_without_losing_v1_checks(self):
         """Catches v1 indexing v2-only records as legacy proof fields."""
         for schemas in ((2, 1), (1, 2)):
@@ -345,30 +452,7 @@ class RecurringNativeCreditTests(unittest.TestCase):
             corrections = root / "corrections.jsonl"
             review_corrections.append_verified_posted_credit(corrections, credit, runs_root=root,
                 current_proposals=current, existing_blocks=[], collection_snapshot=proof)
-            since, until = START.replace(day=1, hour=0), START.replace(month=10, day=1, hour=0)
-            store = collector_checkpoints.PageCheckpointStore(root / "cache")
-            state = store.open(collector._clockify_checkpoint_identity("workspace-1", "user-1", since, until), initial_metadata={"snapshot_at": "2026-10-04T12:00:00Z"})
-            state = store.append_page(state, payload=proof.entries, continuation={"page": 2}, signature=collector._clockify_page_signature(proof.entries))
-            state = store.mark_complete(state)
-            source = root / "original-run/evidence/clockify-existing.json"
-            source.parent.mkdir(parents=True)
-            projection = collector.fetch_clockify({"CLOCKIFY_WORKSPACE_ID": "workspace-1"}, {"clockify_user_id": "user-1"}, since, until, checkpoint_store=store)
-            source.write_text(json.dumps(projection))
-            run_dir = root / "fresh-run"
-            destination = run_dir / "evidence/clockify-native-checkpoint"
-            captured = snapshot.capture_checkpoint_snapshot(checkpoint_manifest=state.directory / "manifest.json",
-                clockify_evidence=source, destination=destination, workspace_id="workspace-1", user_id="user-1", since=since, until=until)
-            (run_dir / "evidence/clockify-existing.json").write_bytes(source.read_bytes())
-            original = json.loads((root / "source-ledger.json").read_bytes())
-            events = [evidence_ledger.EvidenceEvent.from_document(event) for event in original["events"]]
-            events.extend(evidence_ledger.normalize_collector_snapshot({"clockify": projection}))
-            ledger = evidence_ledger.EvidenceLedger(tuple(events), {"clockify": {"status": "complete"}, "fathom": {"status": "complete"}, "multica_issues": {"status": "complete"}})
-            ledger_doc = {"schema_version": ledger.manifest.schema_version, "manifest": ledger.manifest.document(), "events": [event.document() for event in ledger.events]}
-            (run_dir / "evidence/evidence-ledger.json").write_text(json.dumps(ledger_doc))
-            report = {"date_range": {"since": since.isoformat(), "until": until.isoformat()}, "clockify_native_checkpoint": {"manifest_sha256": captured.manifest_sha256, "request": captured.manifest["request"]}}
-            (run_dir / "run-report.json").write_text(json.dumps(report))
-            analysis = root / "analysis.json"
-            analysis.write_text(json.dumps(accounting_fixtures.analysis_for([events[0].evidence_id], recommended=30)))
+            run_dir, analysis, ledger_doc, report = self.accounting_run_fixture(root, proof)
             # Control only the pure allocator/normalizer boundary. The run,
             # snapshot validation, correction transport and final outputs are real.
             with mock.patch.object(pipeline, "_normalize_postable_proposals", return_value=copy.deepcopy(current)), \
@@ -378,6 +462,7 @@ class RecurringNativeCreditTests(unittest.TestCase):
             self.assertTrue(any(row.get("verification_basis") == "preserved_collection_snapshot" for row in result["skipped"]))
             # A valid full-native proof must also bind this actual run's ledger
             # and exact sanitized collector bytes, not just exist beside them.
+            ledger = evidence_ledger.EvidenceLedger(tuple(evidence_ledger.EvidenceEvent.from_document(event) for event in ledger_doc["events"]), {"clockify": {"status": "complete"}, "fathom": {"status": "complete"}, "multica_issues": {"status": "complete"}})
             without_clockify = evidence_ledger.EvidenceLedger(tuple(event for event in ledger.events if event.source_type != "clockify"), ledger.source_inventory)
             mutations = {
                 "ledger_projection": (run_dir / "evidence/evidence-ledger.json", json.dumps({"schema_version": without_clockify.manifest.schema_version,
