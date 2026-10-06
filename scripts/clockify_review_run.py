@@ -1788,7 +1788,7 @@ def _verified_replay_inference_context(source: Path) -> Path:
                 if filename == "routing.json":
                     continue
                 if filename == "review-corrections.jsonl" and "source_corrections_sha256" in lineage:
-                    if _validate_repair_credit_transition(parent, current / filename, runs_root=RUNS) != (lineage.get("source_corrections_sha256"), lineage.get("repair_corrections_sha256")):
+                    if _validate_repair_credit_transition(parent, current / filename, runs_root=RUNS, routing_snapshot=current / "routing.json") != (lineage.get("source_corrections_sha256"), lineage.get("repair_corrections_sha256")):
                         raise ReviewRunError("replay inference correction provenance changed")
                 elif _read_snapshot_source(parent / filename, label="inference original input") != _read_snapshot_source(current / filename, label="inference repair input"):
                     raise ReviewRunError("replay inference reconciliation snapshot changed")
@@ -2030,8 +2030,9 @@ def _replay_analyzer_cache(replay: Path) -> Path | None:
 
 def _validate_repair_credit_transition(
     source: Path, proposed: Path, *, runs_root: Path,
+    routing_snapshot: Path | None = None,
 ) -> tuple[str, str]:
-    """Prove a child correction snapshot is only new, effective posted credits."""
+    """Prove append-only posted credits or exact source-bound editorial edits."""
     original = source / "review-corrections.jsonl"
     parent_bytes = _read_snapshot_source(original, label="repair parent corrections")
     child_bytes = _read_snapshot_source(proposed, label="repair proposed corrections")
@@ -2043,14 +2044,96 @@ def _validate_repair_credit_transition(
         parent_records = review_corrections._read_log(original)
         child_records = review_corrections._read_log(proposed)
         tail = child_records[len(parent_records):]
-        if not tail or any(
-            record.get("record_type") != review_corrections.VERIFIED_POSTED_CREDIT
-            for record in tail
-        ):
-            raise ReviewRunError("repair corrections may append only verified posted credits")
+        if not tail:
+            raise ReviewRunError("repair corrections must append a validated record")
         proposals = _read_json(source / "proposals.json")
         if not isinstance(proposals, list) or not all(isinstance(row, dict) for row in proposals):
             raise ReviewRunError("repair parent proposals are invalid")
+        proposal_targets = {
+            target for proposal in proposals
+            if (target := review_corrections.proposal_target(proposal)) is not None
+        }
+        prior_decision_targets = {
+            (record["activity_id"], record["evidence_fingerprint"])
+            for record in parent_records
+            if record.get("record_type") != review_corrections.VERIFIED_POSTED_CREDIT
+        }
+        appended_decision_targets: set[tuple[str, str]] = set()
+        source_activities: list[Mapping[str, Any]] | None = None
+        selected_routing: Mapping[str, Any] | None = None
+        for record in tail:
+            if record.get("record_type") == review_corrections.VERIFIED_POSTED_CREDIT:
+                continue
+            patch = record.get("field_patch")
+            description = patch.get("description") if isinstance(patch, Mapping) else None
+            value = description.get("value") if isinstance(description, Mapping) else None
+            target = (record.get("activity_id"), record.get("evidence_fingerprint"))
+            fields = set(patch) if isinstance(patch, Mapping) else set()
+            has_wording = "description" in fields
+            has_routing = "client_project" in fields or "tag_names" in fields
+            expected_fields = ({"description"} if has_wording else set()) | (
+                {"client_project", "tag_names"} if has_routing else set()
+            )
+            expected_categories = sorted(
+                (["wording"] if has_wording else []) + (["routing"] if has_routing else [])
+            )
+            if (
+                record.get("schema_version") != 1
+                or record.get("decision") != "modify"
+                or not expected_fields or fields != expected_fields
+                or record.get("correction_categories") != expected_categories
+                or (has_wording and (
+                    not isinstance(description, Mapping)
+                    or description.get("op") != "replace"
+                    or not isinstance(value, str) or not value or value != value.strip()
+                    or not value.isprintable()
+                ))
+                or target not in proposal_targets
+                or target in prior_decision_targets
+                or target in appended_decision_targets
+            ):
+                raise ReviewRunError("repair editorial decision is not exact source-bound replacement")
+            if has_routing:
+                project = patch["client_project"]["value"]
+                tags = patch["tag_names"]["value"]
+                if (
+                    not isinstance(project, str) or not project or project != project.strip()
+                    or not project.isprintable()
+                    or not isinstance(tags, list)
+                    or any(not isinstance(tag, str) or not tag or tag != tag.strip()
+                           or not tag.isprintable() for tag in tags)
+                    or len(set(tags)) != len(tags)
+                ):
+                    raise ReviewRunError("repair routing selection is invalid")
+                if source_activities is None:
+                    analysis, _content, _digest = _read_snapshot_json(
+                        source / "semantic-analysis.json", label="repair source semantic activities",
+                    )
+                    activities = analysis.get("activities") if isinstance(analysis, Mapping) else None
+                    if not isinstance(activities, list) or not all(isinstance(item, Mapping) for item in activities):
+                        raise ReviewRunError("repair source semantic activities are invalid")
+                    source_activities = activities
+                    selected_routing, _content, _digest = _read_snapshot_json(
+                        routing_snapshot or source / "routing.json", label="repair selected routing",
+                    )
+                    if not isinstance(selected_routing, Mapping):
+                        raise ReviewRunError("repair selected routing is invalid")
+                activities = [activity for activity in source_activities
+                              if review_corrections.proposal_target(activity) == target]
+                if len(activities) != 1:
+                    raise ReviewRunError("repair routing does not match one original semantic activity")
+                regression = review_corrections.derive_regression_cases([record])
+                route = work_accounting_pipeline._route_from_review_correction(
+                    activities[0], regression, selected_routing,
+                )
+                if (
+                    route is None or route.get("project_name") != project
+                    or sorted(route.get("tag_names", [])) != sorted(tags)
+                    or not route.get("project_suffix")
+                    or len(route.get("tag_suffixes", [])) != len(tags)
+                ):
+                    raise ReviewRunError("repair routing does not select one configured project and task")
+            appended_decision_targets.add(target)
         _ledger, events = work_accounting_pipeline.load_ledger(
             source / "evidence" / "evidence-ledger.json"
         )
@@ -2097,6 +2180,8 @@ def _validate_repair_credit_transition(
             )
         survivors = proposals
         for credit in tail:
+            if credit.get("record_type") != review_corrections.VERIFIED_POSTED_CREDIT:
+                continue
             if credit.get("schema_version") == 2:
                 survivors, skipped = work_accounting_pipeline._apply_verified_posted_credits(
                     survivors, blocks, [credit], collection_snapshot=collection_snapshot,
@@ -2159,6 +2244,7 @@ def _prepare_repair_run(
     if corrections_override is not None:
         parent_digest, child_digest = _validate_repair_credit_transition(
             source, corrections_override, runs_root=RUNS,
+            routing_snapshot=routing_override or source / "routing.json",
         )
         correction_provenance = {
             "source_corrections_sha256": parent_digest,
@@ -2332,6 +2418,7 @@ def _finalize_repair_completion(run_dir: Path) -> collector_receipts.SliceComple
             )
             if _validate_repair_credit_transition(
                 source, run_dir / filename, runs_root=RUNS,
+                routing_snapshot=run_dir / "routing.json",
             ) != expected:
                 raise ReviewRunError("repair posted credit provenance changed")
             continue
