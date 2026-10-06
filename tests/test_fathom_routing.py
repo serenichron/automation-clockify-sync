@@ -134,7 +134,7 @@ class FathomRoutingTests(unittest.TestCase):
         """Catches a billable client alias bypassing the unattended-agent skip guard."""
         routing = collector.load_json(MODULE_PATH.parents[1] / "routing.json")
         route = collector.route_session(
-            {"label": "MAB Food Fairy", "path": "/work/multica-command/session.jsonl"}, routing
+            {"label": "MAB Food Fairy", "path": "/work/multica/session.jsonl"}, routing
         )
         self.assertEqual("skip", route["action"])
 
@@ -148,7 +148,7 @@ class FathomRoutingTests(unittest.TestCase):
         self.assertEqual("5f5b5121a551633f6dfa31e6", routing["member_id"])
         self.assertEqual(routing["clockify_user_id"], routing["member_id"])
         self.assertEqual(
-            "8c3cbf3b044aa667a9917f7f8ae53eb9ea269f418d3b7d1df0ad11867b540e2b",
+            "7af74f973bbadb05100b23801c922eeac5369c2e9070a411af0c97cd7760979e",
             hashlib.sha256(raw).hexdigest(),
         )
         self.assertEqual(

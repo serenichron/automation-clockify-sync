@@ -1133,17 +1133,27 @@ def _route_from_review_correction(
         tag_names = tags.get("value") if isinstance(tags, Mapping) else None
         if not isinstance(project_name, str) or not isinstance(tag_names, list):
             return None
-        selection = (
-            project_name.casefold(),
-            "SC",
-            tuple(sorted(str(value) for value in tag_names)),
-        )
-        return _routes_by_selection(routing).get(selection)
+        # Exact corrections select a project/task, not a universal SC prefix.
+        # Use its canonical configured route and refuse ambiguous native targets.
+        expected_tags = tuple(sorted(str(value) for value in tag_names))
+        matches = {
+            (
+                str(route.get("project_suffix") or ""),
+                tuple(sorted(str(value) for value in route.get("tag_suffixes", []))),
+                str(route.get("prefix") or "SC"),
+                bool(route.get("billable", True)),
+            ): route
+            for (name, _prefix, tags), route in _routes_by_selection(routing).items()
+            if name == project_name.casefold() and tags == expected_tags
+            and not route.get("base_prefix")
+        }
+        return next(iter(matches.values())) if len(matches) == 1 else None
     return None
 
 
 def _route_from_client_lifecycle(
-    cited_events: list[Mapping[str, Any]], routing: Mapping[str, Any]
+    cited_events: list[Mapping[str, Any]], routing: Mapping[str, Any],
+    *, activity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Apply a configured client route only on/after its explicit cutover."""
     for rule in routing.get("client_lifecycle_routes", []):
@@ -1151,6 +1161,9 @@ def _route_from_client_lifecycle(
             continue
         pattern = str(rule.get("pattern") or "")
         if not pattern:
+            continue
+        outcome_scope = _activity_routing_text(activity)
+        if outcome_scope and re.search(pattern, outcome_scope, flags=re.IGNORECASE) is None:
             continue
         activation = rule.get("activation")
         if not isinstance(activation, Mapping):
@@ -1182,7 +1195,8 @@ def _route_from_client_lifecycle(
 
 
 def _route_from_explicit_evidence(
-    cited_events: list[Mapping[str, Any]], routing: Mapping[str, Any]
+    cited_events: list[Mapping[str, Any]], routing: Mapping[str, Any],
+    *, activity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     searchable = _substantive_evidence_text(cited_events)
     for rule in routing.get("evidence_routes", []):
@@ -1191,6 +1205,9 @@ def _route_from_explicit_evidence(
         pattern = str(rule.get("pattern") or "")
         if not pattern or re.search(pattern, searchable, flags=re.IGNORECASE) is None:
             continue
+        outcome_scope = _activity_routing_text(activity)
+        if outcome_scope and re.search(pattern, outcome_scope, flags=re.IGNORECASE) is None:
+            continue
         selection = (
             str(rule.get("project_name") or "").casefold(),
             str(rule.get("prefix") or "SC"),
@@ -1198,6 +1215,19 @@ def _route_from_explicit_evidence(
         )
         return _routes_by_selection(routing).get(selection) or dict(rule)
     return None
+
+
+def _activity_routing_text(activity: Mapping[str, Any] | None) -> str:
+    """Scope client-name rules to the actual outcome, not shared chat history."""
+    if not activity:
+        return ""
+    recommendation = activity.get("project_recommendation") or {}
+    return " ".join(
+        str(value or "") for value in (
+            activity.get("action"), activity.get("object"), activity.get("outcome"),
+            recommendation.get("name") if isinstance(recommendation, Mapping) else None,
+        )
+    ).strip()
 
 
 def _substantive_evidence_text(cited_events: Iterable[Mapping[str, Any]]) -> str:
@@ -1263,7 +1293,7 @@ def resolve_route(
     cited_events: list[dict[str, Any]],
     routing: Mapping[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
-    if lifecycle := _route_from_client_lifecycle(cited_events, routing):
+    if lifecycle := _route_from_client_lifecycle(cited_events, routing, activity=activity):
         return _apply_prefix_override(lifecycle, cited_events, routing), None
     deterministic_routes: list[dict[str, Any]] = []
     skipped_routes: list[str] = []
@@ -1312,9 +1342,13 @@ def resolve_route(
         return _apply_prefix_override(reviewed_route, cited_events, routing), None
     named = _routes_by_name(routing).get(recommended_name) if recommended_name else None
     route = deterministic or named
-    explicit = _route_from_explicit_evidence(cited_events, routing)
-    route_is_broad_sc = str((route or {}).get("project_name") or "").casefold().startswith(
-        "serenichron"
+    explicit = _route_from_explicit_evidence(cited_events, routing, activity=activity)
+    route_is_broad_sc = (
+        str((route or {}).get("project_name") or "").casefold().startswith("serenichron")
+        and (
+            str((route or {}).get("confidence") or "") != "high"
+            or not _activity_routing_text(activity)
+        )
     )
     if explicit is not None and (route is None or route_is_broad_sc):
         route = explicit

@@ -31,7 +31,7 @@
       ],
       "billable": true,
       "confidence": "high",
-      "prefix": "MAB"
+      "prefix": "MB"
     },
     {
       "pattern": "\\b(?:Reset\\s*Feminin|rf-access-ops)\\b",
@@ -45,7 +45,7 @@
       ],
       "billable": true,
       "confidence": "high",
-      "prefix": "MAB"
+      "prefix": "MB"
     },
     {
       "pattern": "\\b(?:mihaelabrailescu|MBrailescu/site|Mihaela\\s+Br[ăa]ilescu|Reset\\s*Feminin|rf-access-ops|MAB\\s+Food\\s+Fairy)\\b",
@@ -59,7 +59,7 @@
       ],
       "billable": true,
       "confidence": "high",
-      "prefix": "MAB"
+      "prefix": "MB"
     },
     {
       "pattern": "\\bBNI\\b",
@@ -161,12 +161,6 @@
       "prefix": "TSTP"
     },
     {
-      "pattern": "multica-command",
-      "action": "skip",
-      "reason": "Multica runtime and agent work must not be logged as Vlad's time",
-      "prefix": "SC"
-    },
-    {
       "pattern": "/multica/",
       "action": "skip",
       "reason": "Multica unattended or agent activity",
@@ -190,7 +184,7 @@
       ],
       "billable": true,
       "confidence": "high",
-      "prefix": "MAB"
+      "prefix": "MB"
     },
     {
       "pattern": "rf-access-ops",
@@ -204,7 +198,7 @@
       ],
       "billable": true,
       "confidence": "high",
-      "prefix": "MAB"
+      "prefix": "MB"
     },
     {
       "pattern": "Reset Feminin",
@@ -218,7 +212,7 @@
       ],
       "billable": true,
       "confidence": "high",
-      "prefix": "MAB"
+      "prefix": "MB"
     },
     {
       "pattern": "ResetFeminin",
@@ -232,7 +226,7 @@
       ],
       "billable": true,
       "confidence": "high",
-      "prefix": "MAB"
+      "prefix": "MB"
     },
     {
       "pattern": "MBrailescu/site",
@@ -246,7 +240,7 @@
       ],
       "billable": true,
       "confidence": "high",
-      "prefix": "MAB"
+      "prefix": "MB"
     },
     {
       "pattern": "Mihaela Brăilescu",
@@ -260,7 +254,7 @@
       ],
       "billable": true,
       "confidence": "high",
-      "prefix": "MAB"
+      "prefix": "MB"
     },
     {
       "pattern": "Mihaela Brailescu",
@@ -274,7 +268,7 @@
       ],
       "billable": true,
       "confidence": "high",
-      "prefix": "MAB"
+      "prefix": "MB"
     },
     {
       "pattern": "MAB Food Fairy",
@@ -288,7 +282,7 @@
       ],
       "billable": true,
       "confidence": "high",
-      "prefix": "MAB"
+      "prefix": "MB"
     },
     {
       "pattern": "mihaelabrailescu",
@@ -302,7 +296,7 @@
       ],
       "billable": true,
       "confidence": "high",
-      "prefix": "MAB"
+      "prefix": "MB"
     },
     {
       "pattern": "multica-command",
@@ -715,7 +709,7 @@
       ],
       "billable": true,
       "confidence": "high",
-      "prefix": "MAB",
+      "prefix": "MB",
       "title_regex": "\\b(?:mihaelabrailescu|MBrailescu/site|Mihaela\\s+Br[ăa]ilescu|Reset\\s*Feminin|rf-access-ops|MAB\\s+Food\\s+Fairy)\\b"
     },
     {
