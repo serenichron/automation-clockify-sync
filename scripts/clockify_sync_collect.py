@@ -2158,7 +2158,8 @@ def parse_codex_rollout_file(path: Path, machine: str, since: dt.datetime, until
     return out
 
 
-def collect_codex_sessions_from_db(codex_home: str, machine: str, since: dt.datetime, until: dt.datetime) -> list[dict[str, Any]] | None:
+def collect_codex_sessions_from_db(codex_home: str, machine: str, since: dt.datetime, until: dt.datetime,
+                                   indexed_paths: set[Path] | None = None) -> list[dict[str, Any]] | None:
     """Enumerate Codex sessions from state_5.sqlite (the authoritative thread index).
 
     The threads table carries id, rollout_path (live OR archived), cwd, title,
@@ -2181,10 +2182,20 @@ def collect_codex_sessions_from_db(codex_home: str, machine: str, since: dt.date
             "FROM threads WHERE updated_at >= ? ORDER BY updated_at",
             (lo,),
         ).fetchall()
+        # A stale DB timestamp must not turn a known subagent into human work
+        # when the filesystem pass encounters its rollout.
+        subagent_paths = conn.execute(
+            "SELECT rollout_path FROM threads WHERE thread_source = 'subagent' AND updated_at < ?",
+            (lo,),
+        ).fetchall() if indexed_paths is not None else []
         conn.close()
     except Exception:
         return None
+    if indexed_paths is not None:
+        indexed_paths.update(Path(path) for (path,) in subagent_paths if path)
     for sid, rollout_path, cwd, title, first_msg, thread_source, archived in rows:
+        if rollout_path and indexed_paths is not None:
+            indexed_paths.add(Path(rollout_path))
         if thread_source == "subagent":
             continue
         if not rollout_path or not Path(rollout_path).exists():
@@ -2202,39 +2213,49 @@ def collect_codex_sessions_from_db(codex_home: str, machine: str, since: dt.date
 
 
 def collect_codex_sessions(codex_home: str, machine: str, since: dt.datetime, until: dt.datetime) -> list[dict[str, Any]]:
-    """Collect Codex sessions, preferring state_5.sqlite, falling back to the rollout tree.
+    """Collect indexed Codex sessions and recover recent unindexed rollouts.
 
     Primary store: sessions/YYYY/MM/DD/rollout-*.jsonl (Codex Desktop/CLI). The
     threads table in state_5.sqlite indexes those with cwd/title/first_user_message,
     so it is the richest enumeration source. session_index.jsonl is only a sparse
     name cache (no cwd/duration) and is NOT used.
     """
-    db_recs = collect_codex_sessions_from_db(codex_home, machine, since, until)
-    if db_recs is not None:
-        return db_recs
-
-    # Fallback: scan the filesystem directly (DB unavailable / remote).
-    out: list[dict[str, Any]] = []
-    seen_sids: set[str] = set()
+    indexed_paths: set[Path] = set()
+    db_recs = collect_codex_sessions_from_db(codex_home, machine, since, until, indexed_paths)
+    out: list[dict[str, Any]] = list(db_recs or [])
+    seen_sids = {record["session_id"] for record in out}
+    # The index can omit live rollouts. Reuse the mtime-gated filesystem scan
+    # for those paths, keeping DB metadata authoritative for indexed paths.
     sessions_dir = Path(codex_home) / "sessions"
     archived_dir = Path(codex_home) / "archived_sessions"
     if sessions_dir.exists():
         for p in sessions_dir.rglob("rollout-*.jsonl"):
+            if p in indexed_paths:
+                continue
             try:
                 if dt.datetime.fromtimestamp(p.stat().st_mtime, tz=BUCHAREST) < since:
                     continue
             except Exception:
                 pass
             recs = parse_codex_rollout_file(p, machine, since, until)
+            if recs and recs[0]["session_id"] in seen_sids:
+                continue
             for r in recs:
                 seen_sids.add(r["session_id"])
             out.extend(recs)
     if archived_dir.exists():
         for p in sorted(archived_dir.glob("rollout-*.jsonl")):
-            recs = parse_codex_rollout_file(p, machine, since, until)
-            for r in recs:
-                if r["session_id"] in seen_sids:
+            if p in indexed_paths:
+                continue
+            try:
+                if dt.datetime.fromtimestamp(p.stat().st_mtime, tz=BUCHAREST) < since:
                     continue
+            except Exception:
+                pass
+            recs = parse_codex_rollout_file(p, machine, since, until)
+            if recs and recs[0]["session_id"] in seen_sids:
+                continue
+            for r in recs:
                 seen_sids.add(r["session_id"])
                 r["archived"] = True
                 out.append(r)

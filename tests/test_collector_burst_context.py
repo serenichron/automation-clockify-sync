@@ -6,6 +6,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -177,7 +178,7 @@ class CollectorBurstContextTests(unittest.TestCase):
                 {"timestamp": "2026-07-21T05:05:27Z", "type": "response_item", "payload": {
                     "type": "message", "role": "user", "content": [{"type": "input_text", "text": "Verify remote portal permissions."}]}},
             ])
-            with sqlite3.connect(home / "state_5.sqlite") as conn:
+            with contextlib.closing(sqlite3.connect(home / "state_5.sqlite")) as conn, conn:
                 conn.execute("CREATE TABLE threads (id, rollout_path, cwd, title, first_user_message, thread_source, archived, updated_at)")
                 conn.execute("INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                              ("modern-remote", str(rollout), "/work/client", "", "", "user", 0, int(SINCE.timestamp())))
@@ -226,6 +227,102 @@ class CollectorBurstContextTests(unittest.TestCase):
                 bursts = collector.parse_codex_rollout_file(path, "precision", SINCE, UNTIL)
         self.assertEqual(1, len(bursts))
         self.assertEqual(2, bursts[0]["user_messages"])
+
+    def test_codex_collect_recovers_scoped_rollout_when_db_index_is_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            rollout = home / "sessions" / "2026" / "07" / "21" / "rollout-unindexed.jsonl"
+            self.write_jsonl(rollout, [
+                {"type": "session_meta", "payload": {"id": "unindexed", "cwd": "/work/client"}},
+                {"timestamp": "2026-07-21T05:00:00Z", "type": "response_item", "payload": {
+                    "type": "message", "role": "user", "content": [{"type": "input_text", "text": "Repair the client export."}]}},
+                {"timestamp": "2026-07-21T05:05:00Z", "type": "response_item", "payload": {
+                    "type": "message", "role": "user", "content": [{"type": "input_text", "text": "Verify the export."}]}},
+            ])
+            with sqlite3.connect(home / "state_5.sqlite") as conn:
+                conn.execute("CREATE TABLE threads (id, rollout_path, cwd, title, first_user_message, thread_source, archived, updated_at)")
+
+            bursts = collector.collect_codex_sessions(str(home), "precision", SINCE, UNTIL)
+
+        self.assertEqual(["unindexed"], [burst["session_id"] for burst in bursts])
+        self.assertEqual("Repair the client export.", bursts[0]["first_user_message"])
+        self.assertEqual(2, bursts[0]["user_messages"])
+
+    def test_codex_collect_merges_missing_rollout_without_duplicating_indexed_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            session_dir = home / "sessions" / "2026" / "07" / "21"
+            indexed = session_dir / "rollout-indexed.jsonl"
+            omitted = session_dir / "rollout-omitted.jsonl"
+            indexed_subagent = session_dir / "rollout-subagent.jsonl"
+            for path, sid, prompt in (
+                (indexed, "indexed", "Review client export."),
+                (omitted, "omitted", "Repair client export."),
+                (indexed_subagent, "subagent", "Internal agent task."),
+            ):
+                self.write_jsonl(path, [
+                    {"type": "session_meta", "payload": {"id": sid, "cwd": "/work/client"}},
+                    event("2026-07-21T05:00:00Z", "user_message", prompt),
+                    event("2026-07-21T05:04:00Z", "user_message", "Verify result."),
+                ])
+            with contextlib.closing(sqlite3.connect(home / "state_5.sqlite")) as conn, conn:
+                conn.execute("CREATE TABLE threads (id, rollout_path, cwd, title, first_user_message, thread_source, archived, updated_at)")
+                conn.executemany("INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [
+                    ("indexed", str(indexed), "/work/indexed-db", "", "", "user", 0, int(SINCE.timestamp())),
+                    ("subagent", str(indexed_subagent), "/work/client", "", "", "subagent", 0, int((SINCE - dt.timedelta(days=2)).timestamp())),
+                ])
+
+            bursts = collector.collect_codex_sessions(str(home), "precision", SINCE, UNTIL)
+
+        self.assertEqual(["indexed", "omitted"], [burst["session_id"] for burst in bursts])
+        self.assertEqual("/work/indexed-db", bursts[0]["cwd"])
+        self.assertEqual("Repair client export.", bursts[1]["first_user_message"])
+
+    def test_codex_collect_does_not_open_archives_older_than_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            old_archive = home / "archived_sessions" / "rollout-old.jsonl"
+            self.write_jsonl(old_archive, [
+                {"type": "session_meta", "payload": {"id": "old"}},
+                event("2026-07-20T05:00:00Z", "user_message", "Old activity."),
+            ])
+            old_mtime = (SINCE - dt.timedelta(days=1)).timestamp()
+            os.utime(old_archive, (old_mtime, old_mtime))
+            with contextlib.closing(sqlite3.connect(home / "state_5.sqlite")) as conn, conn:
+                conn.execute("CREATE TABLE threads (id, rollout_path, cwd, title, first_user_message, thread_source, archived, updated_at)")
+            original_open = Path.open
+            opened: list[Path] = []
+
+            def track_open(path: Path, *args: object, **kwargs: object):
+                opened.append(path)
+                return original_open(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "open", track_open):
+                bursts = collector.collect_codex_sessions(str(home), "precision", SINCE, UNTIL)
+
+        self.assertEqual([], bursts)
+        self.assertNotIn(old_archive, opened)
+
+    def test_codex_collect_recovers_user_rollout_with_stale_db_timestamp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            rollout = home / "sessions" / "2026" / "07" / "21" / "rollout-stale-user.jsonl"
+            self.write_jsonl(rollout, [
+                {"type": "session_meta", "payload": {"id": "stale-user", "cwd": "/work/client"}},
+                event("2026-07-21T05:00:00Z", "user_message", "Repair client export."),
+                event("2026-07-21T05:04:00Z", "user_message", "Verify client export."),
+            ])
+            with contextlib.closing(sqlite3.connect(home / "state_5.sqlite")) as conn, conn:
+                conn.execute("CREATE TABLE threads (id, rollout_path, cwd, title, first_user_message, thread_source, archived, updated_at)")
+                conn.execute("INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (
+                    "stale-user", str(rollout), "/work/client", "", "", "user", 0,
+                    int((SINCE - dt.timedelta(days=2)).timestamp()),
+                ))
+
+            bursts = collector.collect_codex_sessions(str(home), "precision", SINCE, UNTIL)
+
+        self.assertEqual(["stale-user"], [burst["session_id"] for burst in bursts])
+        self.assertEqual("Repair client export.", bursts[0]["first_user_message"])
 
     def test_codex_subagent_rejection_reads_metadata_only(self) -> None:
         consumed = []

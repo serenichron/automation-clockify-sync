@@ -3601,6 +3601,23 @@ class WorkAccountingPipelineTests(unittest.TestCase):
         self.assertEqual("proposal fully credited to higher-priority review time", skipped[0]["reason"])
         self.assertEqual(120, skipped[0]["credited_overlap_receipt"]["credited_seconds"])
 
+    def test_overlap_warning_preserves_fractional_boundaries_in_credit_receipt(self):
+        start = dt.datetime.fromisoformat("2026-09-29T12:00:00.100000+03:00")
+        end = dt.datetime.fromisoformat("2026-09-29T12:01:00.900000+03:00")
+        warning = pipeline._overlap_warning(start, end, {
+            "block_id": "native-one",
+            "start": dt.datetime.fromisoformat("2026-09-29T12:00:00.900000+03:00"),
+            "end": end,
+        }, "clockify_overlap")
+
+        self.assertEqual("2026-09-29T12:00:00.900000+03:00", warning["overlap_start"])
+        self.assertEqual("2026-09-29T12:01:00.900000+03:00", warning["overlap_end"])
+        self.assertEqual(60, warning["overlap_duration_seconds"])
+        receipt = pipeline._credited_overlap_receipt(start, end, [warning])
+        self.assertEqual(60, receipt["credited_seconds"])
+        self.assertEqual("2026-09-29T12:00:00.100000+03:00", receipt["original_start"])
+        self.assertEqual("2026-09-29T12:01:00.900000+03:00", receipt["original_end"])
+
     def test_overlap_warning_retains_only_clockify_project_suffix(self):
         meeting = fathom_event(
             "2026-07-10T13:00:00+03:00",

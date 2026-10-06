@@ -2187,8 +2187,8 @@ def _overlap_warning(
     warning = {
         "type": warning_type,
         "counterpart_id": str(counterpart["block_id"]),
-        "overlap_start": _iso(overlap_start),
-        "overlap_end": _iso(overlap_end),
+        "overlap_start": overlap_start.isoformat(),
+        "overlap_end": overlap_end.isoformat(),
         "overlap_duration_seconds": int(
             (overlap_end - overlap_start).total_seconds()
         ),
@@ -2221,8 +2221,8 @@ def _credited_overlap_receipt(
             merged.append((start, end))
     return {
         "schema_version": "clockify-overlap-credit/v1",
-        "original_start": _iso(original_start),
-        "original_end": _iso(original_end),
+        "original_start": original_start.isoformat(),
+        "original_end": original_end.isoformat(),
         "credited_seconds": sum(
             int((end - start).total_seconds()) for start, end in merged
         ),
