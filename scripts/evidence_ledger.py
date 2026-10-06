@@ -824,12 +824,28 @@ def _session_event(
     session_id = str(session.get("session_id") or session.get("id") or "unknown")
     timestamp = event.get("timestamp")
     timestamp_text = str(timestamp) if timestamp not in (None, "") else None
+    omission = event.get("transport_omitted_tool_content")
+    if "transport_omitted_tool_content" in event:
+        if (
+            event.get("role") != "tool"
+            or event.get("content") != ""
+            or not isinstance(omission, Mapping)
+            or set(omission) != {"sha256", "byte_count", "reason"}
+            or not isinstance(omission.get("sha256"), str)
+            or len(omission["sha256"]) != 64
+            or any(char not in "0123456789abcdef" for char in omission["sha256"])
+            or type(omission.get("byte_count")) is not int
+            or omission["byte_count"] < 0
+            or omission.get("reason") != "native_semantic_projection_omits_tool_content"
+        ):
+            raise ValueError("Invalid omitted tool-content transport receipt")
     attributes = _compact_mapping({
         "role": event.get("role"),
         "kind": event.get("kind") or "message",
         # This is deliberately not shortened: semantic analysis needs complete context.
         "content": event.get("content"),
         "tool_name": event.get("tool_name"),
+        "transport_omitted_tool_content": omission,
     })
     return evidence_event(
         f"{session_type}_event",

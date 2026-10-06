@@ -2101,13 +2101,22 @@ def parse_codex_rollout_file(path: Path, machine: str, since: dt.datetime, until
                     }
                 )
             elif item_type in {"function_call_output", "custom_tool_call_output", "tool_result"}:
+                # Native semantic projection excludes tool bodies. Retain their
+                # identity receipt instead of serializing unbounded output over SSH.
+                content = str(item.get("output") or item.get("content") or "")
+                original_utf8 = content.encode("utf-8")
                 events.append(
                     {
                         "timestamp": t.astimezone(BUCHAREST),
                         "role": "tool",
                         "kind": "tool_result",
                         "tool_name": str(item.get("name") or item.get("call_id") or ""),
-                        "content": str(item.get("output") or item.get("content") or ""),
+                        "content": "",
+                        "transport_omitted_tool_content": {
+                            "sha256": hashlib.sha256(original_utf8).hexdigest(),
+                            "byte_count": len(original_utf8),
+                            "reason": "native_semantic_projection_omits_tool_content",
+                        },
                     }
                 )
     events = _deduplicate_codex_messages(events)
