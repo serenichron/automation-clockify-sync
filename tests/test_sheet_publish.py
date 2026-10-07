@@ -2,6 +2,7 @@ import contextlib
 import hashlib
 import io
 import json
+import math
 from pathlib import Path
 import tempfile
 import unittest
@@ -288,11 +289,11 @@ class SheetPublicationTests(unittest.TestCase):
                 1000, rows, new_ids=frozenset(row[0] for row in rows),
             )
 
-    def test_raw_readback_rejects_altered_fractional_minutes_without_tolerance(self):
+    def test_raw_readback_rejects_changes_beyond_one_ulp_transport_rounding(self):
         row = publisher.proposal_row(proposal(), "run-1")
         row[3] = 43.733333333333334
         actual = list(row)
-        actual[3] = 43.73333333333333
+        actual[3] = 43.73333333333332
         with mock.patch.object(publisher.subprocess, "run", return_value=mock.Mock(
             returncode=0, stderr="", stdout=json.dumps({
                 "values": [publisher.HEADER, actual],
@@ -1159,6 +1160,27 @@ class SheetPublicationTests(unittest.TestCase):
         )
         self.assertEqual(1, result["unchanged"])
         self.assertEqual([], gateway.updated)
+
+    def test_one_ulp_duration_transport_noise_does_not_rewrite_or_fail_readback(self):
+        row = publisher.proposal_row(proposal(), "run-1")
+        row[3] = 29.983333333333334
+        transported = list(row)
+        transported[3] = math.nextafter(row[3], math.inf)
+        gateway = StatefulGateway([publisher.HEADER, transported])
+        result = publisher.publish(gateway, spreadsheet_id="sheet", sheet_title="August 2026 review", template_title="Proposals", rows=[row])
+        self.assertEqual(1, result["unchanged"])
+        self.assertEqual([], gateway.updated)
+        self.assertEqual(0, result["appended"])
+        self.assertEqual(transported, gateway.rows[1])
+
+    def test_cell_comparison_rejects_real_numeric_changes_and_nonfinite_values(self):
+        value = 29.983333333333334
+        two_ulps = math.nextafter(math.nextafter(value, math.inf), math.inf)
+        for other in (two_ulps, value + 1 / 60, math.inf, math.nan):
+            with self.subTest(other=other):
+                self.assertFalse(publisher._same_cell(value, other))
+        self.assertFalse(publisher._same_cell(2**53, 2**53 + 1))
+        self.assertFalse(publisher._same_cell("29.983333333333334", "29.983333333333338"))
 
     def test_duplicate_stable_ids_fail_closed(self):
         gateway = FakeGateway()

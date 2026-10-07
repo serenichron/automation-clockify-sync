@@ -63,6 +63,63 @@ class MonthlyGateway:
 
 
 class MonthlyTests(unittest.TestCase):
+    def test_contested_time_uses_only_unique_exact_sealed_activity_citations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            docs = frozen_run(root, 1)
+            item = docs["ambiguous.json"][0]
+            ids = item.pop("evidence_ids")
+            item.update(exception_kind="contested_time", activity_id="exact-activity",
+                        requested_minutes=25, allocated_minutes=23, unallocated_minutes=2)
+            docs["semantic-analysis.json"]["activities"] = [{"activity_id": "exact-activity", "evidence_ids": ids}]
+            for relative in ("ambiguous.json", "work-accounting-result.json", "semantic-analysis.json"):
+                (root / relative).write_text(json.dumps(docs[relative]))
+            frozen = {relative: (root / relative).read_bytes() for relative in docs}
+            rows = monthly.project_rows(root)
+            row = next(row for row in rows if row[3] == "contested_time")
+            identity = json.dumps({"kind": "contested_time", "evidence_ids": sorted(set(ids))}, sort_keys=True, separators=(",", ":"))
+            self.assertEqual("uev-" + hashlib.sha256(identity.encode()).hexdigest()[:24], row[0])
+            self.assertEqual(sorted(ids), json.loads(row[11])["evidence_ids"])
+            self.assertIn("23 minutes already allocated", row[4])
+            self.assertIn("2 requested minutes remain unplaced", row[4])
+            self.assertIn("not zero work", row[4])
+            self.assertIn("not additional time", row[6])
+            self.assertEqual(frozen, {relative: (root / relative).read_bytes() for relative in docs})
+            for activities in ([], [{"activity_id": "wrong-activity", "evidence_ids": ids}],
+                [{"activity_id": "exact-activity", "evidence_ids": ids}] * 2,
+                [{"activity_id": "exact-activity", "evidence_ids": ["unknown-ledger-reference"]}]):
+                (root / "semantic-analysis.json").write_text(json.dumps({"activities": activities}))
+                with self.assertRaises(ValueError):
+                    monthly.project_rows(root)
+
+    def test_same_activity_unrouted_segments_share_evidence_row_without_losing_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            docs = frozen_run(root, 1)
+            first, second = docs["proposals.json"]
+            first["activity_id"] = second["activity_id"] = "same-activity"
+            second["evidence_ids"] = first["evidence_ids"]
+            second.update(start="2026-09-09T13:00:00Z", end="2026-09-09T13:05:00Z")
+            for relative in ("proposals.json", "work-accounting-result.json"):
+                (root / relative).write_text(json.dumps(docs[relative]))
+            rows = monthly.project_rows(root)
+            self.assertEqual(2, len(rows))
+            routing = next(row for row in rows if row[3] == "routing_gap")
+            for value in (first["id"], second["id"], first["start"], first["end"], second["start"], second["end"]):
+                self.assertIn(value, routing[4])
+            self.assertIn("2 distinct", routing[6])
+            second["activity_id"] = "different-activity"
+            for relative in ("proposals.json", "work-accounting-result.json"):
+                (root / relative).write_text(json.dumps(docs[relative]))
+            with self.assertRaises(ValueError):
+                monthly.project_rows(root)
+            second["activity_id"] = first["activity_id"]
+            docs["ambiguous.json"].append(dict(docs["ambiguous.json"][0]))
+            for relative in ("ambiguous.json", "proposals.json", "work-accounting-result.json"):
+                (root / relative).write_text(json.dumps(docs[relative]))
+            with self.assertRaises(ValueError):
+                monthly.project_rows(root)
+
     def test_automatic_canonical_alias_across_slices_preserves_first_row_and_k(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

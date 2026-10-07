@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -43,6 +44,36 @@ def title_for_review(sheet_title: str) -> str:
     return sheet_title[:-len(suffix)] + " unresolved evidence"
 
 
+def _routing_candidates(proposals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+    for item in proposals:
+        if item.get("routing_disposition") != "unresolved-routing":
+            continue
+        ids = item.get("evidence_ids", (item.get("provenance") or {}).get("evidence_ids"))
+        if not isinstance(ids, list) or not ids or not all(isinstance(i, str) and i for i in ids):
+            raise ValueError("monthly routing candidate lacks evidence IDs")
+        groups.setdefault(tuple(sorted(set(ids))), []).append(item)
+    candidates = []
+    for members in groups.values():
+        if len(members) == 1:
+            candidates.append(members[0])
+            continue
+        activity = members[0].get("activity_id")
+        identities = [item.get("id") for item in members]
+        if (not isinstance(activity, str) or not activity or any(item.get("activity_id") != activity for item in members)
+            or not all(isinstance(i, str) and i for i in identities) or len(set(identities)) != len(identities)):
+            raise ValueError("duplicate routing identity is not distinct segments of one exact activity")
+        def interval(item: dict[str, Any]) -> tuple[dt.datetime, dt.datetime, str]:
+            start = dt.datetime.fromisoformat(item["start"].replace("Z", "+00:00"))
+            end = dt.datetime.fromisoformat(item["end"].replace("Z", "+00:00"))
+            if start.tzinfo is None or end.tzinfo is None or end <= start:
+                raise ValueError("grouped routing segment interval is invalid")
+            return start, end, item["id"]
+        ordered = sorted(members, key=interval)
+        candidates.append({**ordered[0], "_routing_segments": ordered})
+    return candidates
+
+
 def project_rows(source_dir: Path) -> list[list[str]]:
     """Render only actual accounting ambiguities and valid unrouted proposals.
 
@@ -58,8 +89,7 @@ def project_rows(source_dir: Path) -> list[list[str]]:
     if not isinstance(ambiguities, list):
         raise ValueError("monthly accounting ambiguities are invalid")
     candidates = [(row.get("exception_kind"), row) for row in ambiguities]
-    candidates.extend(("routing_gap", row) for row in proposals
-                      if row.get("routing_disposition") == "unresolved-routing")
+    candidates.extend(("routing_gap", row) for row in _routing_candidates(proposals))
     if not candidates:
         return []
     ambiguous_artifact, ambiguous_digest = _read(root, "ambiguous.json")
@@ -100,6 +130,16 @@ def project_rows(source_dir: Path) -> list[list[str]]:
     for kind, item in candidates:
         provenance = item.get("provenance") or {}
         ids = item.get("evidence_ids", provenance.get("evidence_ids"))
+        # The allocator's contested-time record carries an exact activity ID
+        # but omits citations. Resolve only that unique sealed semantic record;
+        # never match descriptions/workstreams or silently take a duplicate.
+        if kind == "contested_time" and ids is None:
+            activity_id = item.get("activity_id")
+            matches = [activity for activity in analysis.get("activities", [])
+                       if activity.get("activity_id") == activity_id]
+            if not isinstance(activity_id, str) or not activity_id or len(matches) != 1:
+                raise ValueError("contested-time evidence lacks one exact sealed activity")
+            ids = matches[0].get("evidence_ids")
         if not isinstance(kind, str) or not kind or not isinstance(ids, list) or not ids or not all(isinstance(i, str) and i for i in ids):
             raise ValueError("monthly evidence candidate lacks kind or evidence IDs")
         ids = sorted(set(ids))
@@ -140,6 +180,17 @@ def project_rows(source_dir: Path) -> list[list[str]]:
         }.get(kind, "Cited evidence does not establish a confirmed positive work interval; accounting exception requires human review.")
         quality = "quality pass; accounting ambiguity; no confirmed interval"
         action = "Confirm activity, project and observed interval; no automatic Clockify posting or additional time claim."
+        if kind == "contested_time":
+            requested, allocated, unplaced = (item.get(field) for field in
+                ("requested_minutes", "allocated_minutes", "unallocated_minutes"))
+            if (any(type(value) not in (int, float) or not math.isfinite(value) or value < 0
+                    for value in (requested, allocated, unplaced))
+                or not math.isclose(requested, allocated + unplaced, rel_tol=1e-9, abs_tol=1e-9)):
+                raise ValueError("contested-time accounting quantities are invalid")
+            reason = f"{allocated} minutes already allocated; {unplaced} requested minutes remain unplaced out of {requested} requested. This is not zero work."
+            summary = f"Allocation capacity conflict: {unplaced} requested minutes unplaced, not additional time. Already allocated work is not erased."
+            quality = "quality pass; partial allocation; residual requested time contested"
+            action = "Review residual requested capacity; no invented interval, additional time claim or automatic Clockify posting."
         if kind == "routing_gap":
             summary = "Recorded meeting attendance; no outcome inferred. Routing and prior representation require human review."
             reason = f"Valid interval, routing unresolved; context only: {item.get('start')} to {item.get('end')}. Not additional time; prior recording credits and overlaps require review."
@@ -150,6 +201,13 @@ def project_rows(source_dir: Path) -> list[list[str]]:
                 summary = "Evidence-backed work interval; client/project routing unresolved. Prior representation requires human review."
                 reason = f"Valid interval, routing unresolved; context only: {item.get('start')} to {item.get('end')}. Not additional time; prior representation and overlaps require review."
                 action = "Resolve routing and reconcile prior representation; no additional time claim or automatic Clockify posting."
+            segments = item.get("_routing_segments")
+            if segments:
+                contexts = "; ".join(f"{segment['id']}: {segment['start']} to {segment['end']}" for segment in segments)
+                reason = f"Valid interval segments, routing unresolved; context only: {contexts}. Not additional time; prior representation and overlaps require review."
+                summary = f"{len(segments)} distinct valid proposal segments share one exact activity and cited evidence identity; routing unresolved, no additional time claim."
+                quality = "quality pass; valid segments; routing unresolved; confidence " + ", ".join(sorted({str(segment.get("confidence", "")) for segment in segments}))
+                action = "Resolve routing and reconcile prior representation for every segment; no additional time claim or automatic Clockify posting."
         lineage = json.dumps({"source_run_id": root.name, "artifacts": digests, "evidence_ids": ids},
                              sort_keys=True, separators=(",", ":"))
         sources = sorted({event["source_type"] + (" / " + str(event["source_ref"]["machine"]) if event["source_ref"].get("machine") else "") for event in evidence})

@@ -1975,6 +1975,53 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
             [(since, until) for since, until, _kind, _debt in selected],
         )
 
+    def test_max_one_cached_delivery_precedes_new_generic_inference(self):
+        """A failed publication must not strand passing source/replay behind new inference."""
+        config = {**self.config, "recovery_since": "2026-09-15",
+                  "catchup_until": "2026-09-19", "max_slices": 1}
+        commands = []
+        complete = self.child_complete(commands)
+
+        def fail_publication(command, **kwargs):
+            if "clockify_sheet_publish.py" in command[1]:
+                return ChildResult(1, "", "publication failed", False, 6.0)
+            return complete(command, **kwargs)
+
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=fail_publication):
+            result = cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 20))
+        self.assertEqual("failed", result["status"])
+        state = self.state()
+        cached = state["slices"]["2026-09-15"]
+        self.assertEqual("complete", cached["source"]["coverage"]["status"])
+        self.assertEqual([], cached["source"]["coverage"]["incomplete_sources"])
+        self.assertIn("replay", cached)
+        self.assertIsNone(state["completed_through"])
+        self.assertNotIn("delivery_receipt", cached)
+        store = source_coverage.SourceDebtStore()
+        debt = source_coverage.SourceInterval(source="runner/unclassified",
+            since_utc="2026-09-16T21:00:00Z", until_utc="2026-09-18T21:00:00Z",
+            slice_id="next-inference", compatibility_version="runner-unclassified/v1")
+        store.record_failure(debt, failure_class="child_nonzero", retryable=True,
+            resume_state_digest="sha256:next", attempted_at="2026-09-19T00:00:00Z")
+        before = json.loads(json.dumps(state))
+        selected = cycle._select_work(config, state, store, today=dt.date(2026, 9, 20))
+        self.assertEqual([("2026-09-15", "2026-09-17", "delivery", None)], selected)
+        self.assertEqual(before, state)
+        for variant in ("delivered", "delivered_with_exceptions", "incomplete", "invalid_coverage", "missing"):
+            with self.subTest(variant=variant):
+                altered = json.loads(json.dumps(state))
+                record = altered["slices"]["2026-09-15"]
+                if variant in {"delivered", "delivered_with_exceptions"}:
+                    record["status"] = variant
+                elif variant == "incomplete":
+                    record["source"]["coverage"] = {"status": "incomplete", "incomplete_sources": ["fathom"]}
+                elif variant == "invalid_coverage":
+                    record["source"]["coverage"] = []
+                else:
+                    record["source"] = None
+                selected = cycle._select_work(config, altered, store, today=dt.date(2026, 9, 20))
+                self.assertEqual([("2026-09-17", "2026-09-19", "generic")], [row[:3] for row in selected])
+
     def test_later_delivery_receipt_crash_recovers_frontier_without_republishing(self):
         """Catches receipt recovery delivering a slice but stranding its routine frontier."""
         commands: list[list[str]] = []

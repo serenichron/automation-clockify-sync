@@ -202,6 +202,8 @@ def run_scoped_failed_review_retry(
     transport: semantic_analyzer.Transport = semantic_analyzer.http_transport,
     private_text_approved: bool | None = None,
     scoped_review_mode: str = "fresh",
+    selected_evidence_ids: Sequence[str] | None = None,
+    plan_only: bool = False,
 ) -> dict[str, Any]:
     """Review only selected sealed failures, retaining every other decision."""
     if scoped_review_mode not in {
@@ -237,6 +239,27 @@ def run_scoped_failed_review_retry(
     selected = {evidence_id for key in targets for evidence_id in key}
     if sum(len(key) for key in targets) != len(selected) or not selected <= ids:
         raise WorkAccountingError("scoped failed-review targets overlap or leave source")
+    scoped_ids = selected
+    if selected_evidence_ids is not None:
+        if (
+            not isinstance(selected_evidence_ids, (list, tuple))
+            or not selected_evidence_ids
+            or any(not isinstance(value, str) or not value for value in selected_evidence_ids)
+            or len(set(selected_evidence_ids)) != len(selected_evidence_ids)
+            or not set(selected_evidence_ids) <= selected
+        ):
+            raise WorkAccountingError("scoped failed-review evidence scope is invalid")
+        scoped_ids = set(selected_evidence_ids)
+        contexts = {
+            semantic_analyzer._semantic_context_key(event)
+            for event in events if event["evidence_id"] in scoped_ids
+        }
+        if any(
+            event["evidence_id"] not in scoped_ids
+            and semantic_analyzer._semantic_context_key(event) in contexts
+            for event in events
+        ):
+            raise WorkAccountingError("scoped failed-review scope divides a source context")
     source_exceptions = source.get("exceptions")
     if not isinstance(source_exceptions, list):
         raise WorkAccountingError("scoped failed-review source exceptions are invalid")
@@ -290,15 +313,36 @@ def run_scoped_failed_review_retry(
         raise WorkAccountingError("scoped failed-review source cache binding differs")
     cache.used.update({record["cache_key"]: record["decision_digest"] for record in sealed})
     result = copy.deepcopy(dict(source))
-    result["exceptions"] = [
-        row for row in result["exceptions"]
-        if tuple(sorted(str(value) for value in row["evidence_ids"])) not in targets
-    ]
+    retained_exceptions = []
+    residual_counts = []
+    scope_digest = semantic_analyzer.stable_digest("scope-", sorted(scoped_ids), length=64)
+    for row in result["exceptions"]:
+        key = tuple(sorted(str(value) for value in row["evidence_ids"]))
+        if key not in targets:
+            retained_exceptions.append(row)
+            continue
+        residual = sorted(set(key) - scoped_ids)
+        if residual:
+            row["evidence_ids"] = residual
+            row["scoped_retry_residual"] = {
+                "original_group_digest": semantic_analyzer.stable_digest("frt-", list(key), length=64),
+                "selected_scope_digest": scope_digest,
+            }
+            retained_exceptions.append(row)
+            residual_counts.append(len(residual))
+    result["exceptions"] = retained_exceptions
     events_by_id = {str(event["evidence_id"]): event for event in events}
     jobs: list[tuple[list[dict[str, Any]], set[str], dict[str, dict[str, str]], dict[str, str]]] = []
     for key in sorted(targets):
         group_digest = semantic_analyzer.stable_digest("frt-", list(key), length=64)
-        for subset in _scoped_review_partitions([events_by_id[value] for value in key]):
+        chosen = [events_by_id[value] for value in key if value in scoped_ids]
+        groups = [chosen]
+        if selected_evidence_ids is not None:
+            by_context: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+            for event in chosen:
+                by_context.setdefault(semantic_analyzer._semantic_context_key(event), []).append(event)
+            groups = [by_context[context] for context in sorted(by_context)]
+        for subset in (partition for group in groups for partition in _scoped_review_partitions(group)):
             subset_ids = {str(event["evidence_id"]) for event in subset}
             subset_digest = semantic_analyzer.stable_digest(
                 "frt-", sorted(subset_ids), length=64
@@ -326,6 +370,26 @@ def run_scoped_failed_review_retry(
             if len(semantic_analyzer.canonical_json(body).encode("utf-8")) > semantic_analyzer.DEFAULT_MAX_BODY_BYTES:
                 raise WorkAccountingError("scoped failed-review request exceeds analyzer ceiling")
             jobs.append((subset, subset_ids, spans, marker))
+    if plan_only:
+        requests = []
+        for subset, subset_ids, _spans, marker in jobs:
+            body = semantic_analyzer._review_body(
+                subset, candidate={"activities": [], "exceptions": [], "omissions": []},
+                taxonomy=review_taxonomy, model=primary.model,
+                review_scope="failed_review_scoped_recovery", scoped_failed_review=marker,
+                local_coverage_repair=request_mode == "scoped_review_v4_citation_quarantine",
+            )
+            requests.append({
+                **marker, "event_count": len(subset_ids), "evidence_ids": sorted(subset_ids),
+                "body_bytes": len(semantic_analyzer.canonical_json(body).encode("utf-8")),
+                **semantic_analyzer.AnalyzerResponseCache._request_identity(primary, body),
+            })
+        return {
+            "schema_version": "scoped-semantic-recovery-plan/v1", "mode": request_mode,
+            "source_semantic_sha256": source_semantic_sha256, "source_cache_sha256": snapshot["sha256"],
+            "selected_scope_digest": scope_digest, "selected_event_count": len(scoped_ids),
+            "residual_event_counts": residual_counts, "requests": requests,
+        }
     for subset, subset_ids, spans, marker in jobs:
         def authorize_transport(
             endpoint: semantic_analyzer.AnalyzerEndpoint,
@@ -370,6 +434,8 @@ def run_scoped_failed_review_retry(
         "source_semantic_sha256": source_semantic_sha256,
         "source_cache_sha256": snapshot["sha256"],
     }
+    if selected_evidence_ids is not None:
+        provenance.update(selected_scope_digest=scope_digest, selected_evidence_ids=sorted(scoped_ids))
     if len(digests) == 1:
         provenance["target_digest"] = digests[0]
         provenance["failure_code"] = failure_codes[digests[0]]

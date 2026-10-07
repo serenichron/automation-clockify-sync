@@ -724,14 +724,15 @@ def _select_work(
         }:
             continue
         runner_attempt = _runner_attempt(record) if isinstance(record, Mapping) else None
-        selected_intervals.add(identity)
         if item.status == "exhausted" and (
             record.get("source") is None
             or runner_attempt is not None and runner_attempt["status"] == "pending"
         ):
+            selected_intervals.add(identity)
             recovery.append((since, until, "generic_classification", item))
             continue
         if len(ordinary) < maximum:
+            selected_intervals.add(identity)
             ordinary.append((since, until, "generic", item))
     resumable = sorted(
         (
@@ -741,13 +742,15 @@ def _select_work(
             and isinstance(raw, Mapping)
             and raw.get("status") in {"source_verified", "replay_verified", "failed"}
             and isinstance(raw.get("source"), Mapping)
+            and isinstance(raw["source"].get("coverage"), Mapping)
             and raw["source"].get("coverage", {}).get("status") == "complete"
             and raw["source"].get("coverage", {}).get("incomplete_sources") == []
         ),
         key=lambda item: item[0],
     )
+    delivery = []
     for since, record in resumable:
-        if len(ordinary) == maximum:
+        if len(delivery) == maximum:
             break
         until = record.get("until")
         if not isinstance(until, str):
@@ -756,8 +759,10 @@ def _select_work(
             continue
         if not _eligible_stored_dates(config, since, until, today=today):
             continue
-        ordinary.append((since, until, "delivery", None))
+        delivery.append((since, until, "delivery", None))
         selected_intervals.add((since, until))
+    # Finish cached work before admitting another collection/inference slice.
+    ordinary = [*delivery, *ordinary][:maximum]
     routine_state = dict(state)
     routine_state["slices"] = state.get("slices", {})
     routine_config = {**config, "max_slices": maximum - len(ordinary)}

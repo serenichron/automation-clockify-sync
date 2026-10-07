@@ -11,6 +11,7 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -808,10 +809,14 @@ def _sheet_row_count(metadata: Mapping[str, Any], title: str) -> int:
 
 
 def _same_cell(left: Any, right: Any) -> bool:
-    """Compare raw scalars exactly, allowing equivalent JSON numeric types."""
+    """Allow only one floating-point ULP of Sheets JSON transport noise."""
     if left in (None, "") and right in (None, ""):
         return True
     if type(left) in (int, float) and type(right) in (int, float):
+        if type(left) is float and type(right) is float:
+            return math.isfinite(left) and math.isfinite(right) and (
+                left == right or abs(left - right) <= max(math.ulp(left), math.ulp(right))
+            )
         return left == right
     return str(left) == str(right)
 
