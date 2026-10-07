@@ -344,13 +344,19 @@ def _aggregate_semantic_allocations(
             passthrough.extend((disposition, value) for value in ordered)
             continue
         normalized_provenance = []
+        recovery_metadata = False
+        malformed_recovery = False
         for value in ordered:
             provenance = copy.deepcopy(value.get("provenance") or {})
             if isinstance(provenance, dict):
                 provenance.pop("burst_start", None)
                 provenance.pop("burst_end", None)
+                if "allocation_capacity_recovery" in provenance:
+                    recovery_metadata = True
+                    marker = provenance.pop("allocation_capacity_recovery")
+                    malformed_recovery |= type(marker) is not bool
             normalized_provenance.append(provenance)
-        if any(
+        if malformed_recovery or any(
             _canonical(value) != _canonical(normalized_provenance[0])
             for value in normalized_provenance[1:]
         ):
@@ -368,6 +374,12 @@ def _aggregate_semantic_allocations(
             }
             if "duration_seconds" in value:
                 segment["duration_seconds"] = value["duration_seconds"]
+            if recovery_metadata and len(ordered) > 1:
+                # Placement recovery is segment-local, not source identity.
+                provenance = value.get("provenance") or {}
+                if "allocation_capacity_recovery" in provenance:
+                    segment["allocation_capacity_recovery"] = provenance["allocation_capacity_recovery"]
+                segment["review_warnings"] = copy.deepcopy(value.get("review_warnings", []))
             segments.append(segment)
         aggregate["candidate_key"] = activity_key
         aggregate["review_activity_key"] = activity_key
@@ -385,6 +397,19 @@ def _aggregate_semantic_allocations(
         if isinstance(aggregate.get("provenance"), dict):
             aggregate["provenance"]["burst_start"] = segments[0]["start"]
             aggregate["provenance"]["burst_end"] = segments[-1]["end"]
+            if recovery_metadata:
+                aggregate["provenance"]["allocation_capacity_recovery"] = any(
+                    (value.get("provenance") or {}).get("allocation_capacity_recovery") is True
+                    for value in ordered
+                )
+        if recovery_metadata and len(ordered) > 1 and any("review_warnings" in value for value in ordered):
+            warnings_by_identity = {
+                _canonical(warning): copy.deepcopy(warning)
+                for value in ordered for warning in value.get("review_warnings", [])
+            }
+            # Ordered segments make the union deterministic without reordering
+            # unchanged source warnings on historical single-segment records.
+            aggregate["review_warnings"] = list(warnings_by_identity.values())
         aggregate.pop("allocation_segment", None)
         passthrough.append((disposition, aggregate))
     return passthrough

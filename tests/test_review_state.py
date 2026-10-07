@@ -1,4 +1,5 @@
 import importlib.util
+import copy
 import json
 from pathlib import Path
 import tempfile
@@ -468,6 +469,77 @@ class ReviewStateTests(unittest.TestCase):
             [1817, 1049],
             [segment["duration_seconds"] for segment in current["allocation_segments"]],
         )
+
+    def test_recovery_segments_consolidate_without_losing_facts_or_replay_churn(self):
+        ordinary = semantic_proposal("wks-ordinary", "act-recovered", ["ev-1", "ev-2"],
+                                     end="2026-07-28T09:15:00+03:00")
+        ordinary.update(duration_minutes=15, duration_seconds=900)
+        recovery = semantic_proposal("wks-recovery", "act-recovered", ["ev-1", "ev-2"],
+                                     start="2026-07-28T09:20:00+03:00", end="2026-07-28T09:25:00+03:00")
+        recovery.update(allocation_segment=2, duration_minutes=5, duration_seconds=300)
+        recovery["provenance"]["allocation_capacity_recovery"] = True
+        overlap = {"type": "observed_overlap", "other_activity_id": "act-other", "overlap_minutes": 5}
+        capacity = {"type": "allocation_capacity_recovery", "requested_minutes": 20,
+                    "allocator_allocated_minutes": 15, "recovered_minutes": 5, "residual_minutes": 0}
+        ordinary["review_warnings"] = [overlap]
+        recovery["review_warnings"] = [capacity, overlap]
+        untouched = copy.deepcopy([ordinary, recovery])
+        # The old state held only one segment, not a silent full-duration aggregate.
+        state, _, _ = ingest(self.tmp_path, "legacy", [ordinary])
+        item_id = next(iter(state["items"]))
+        review_state.set_disposition(state, item_id, "approved", "board-review")
+        run_dir = self.tmp_path / "recovered"
+        write_json(run_dir / "proposals.json", [recovery, ordinary])
+        write_json(run_dir / "ambiguous.json", [])
+        first = review_state.ingest_run(run_dir, state)
+        self.assertEqual(0, first["summary"]["new"])
+        self.assertEqual(1, first["summary"]["changed"])
+        self.assertEqual([item_id], list(state["items"]))
+        current = state["items"][item_id]["current"]
+        self.assertEqual("approved", state["items"][item_id]["disposition"])
+        # Stable identity retains prior disposition, not financial authorization
+        # for the newly recovered time; no posting/approval receipt is invented.
+        self.assertNotIn("approval_receipt", state["items"][item_id])
+        self.assertEqual((1200, 20), (current["duration_seconds"], current["duration_minutes"]))
+        self.assertEqual(["ev-1", "ev-2"], current["provenance"]["evidence_ids"])
+        self.assertIs(True, current["provenance"]["allocation_capacity_recovery"])
+        self.assertCountEqual([capacity, overlap], current["review_warnings"])
+        self.assertEqual(["wks-ordinary", "wks-recovery"], current["proposal_candidate_keys"])
+        segments = current["allocation_segments"]
+        self.assertEqual([900, 300], [segment["duration_seconds"] for segment in segments])
+        self.assertEqual(ordinary["end"], segments[0]["end"])
+        self.assertEqual(recovery["start"], segments[1]["start"])
+        self.assertNotIn("allocation_capacity_recovery", segments[0])
+        self.assertIs(True, segments[1]["allocation_capacity_recovery"])
+        self.assertEqual([overlap], segments[0]["review_warnings"])
+        self.assertEqual([capacity, overlap], segments[1]["review_warnings"])
+        for _ in range(2):
+            replay = review_state.ingest_run(run_dir, state)
+            self.assertEqual((0, 0), (replay["summary"]["new"], replay["summary"]["changed"]))
+        self.assertEqual(untouched, [ordinary, recovery])
+
+    def test_recovery_aggregation_keeps_other_conflicts_visible(self):
+        first = semantic_proposal("wks-one", "act-recovered", ["ev-1"])
+        second = copy.deepcopy(first)
+        second["candidate_key"] = "wks-two"
+        second["provenance"]["allocation_capacity_recovery"] = True
+        for conflict in ("project", "evidence", "malformed_recovery"):
+            with self.subTest(conflict=conflict):
+                conflicting = copy.deepcopy(second)
+                if conflict == "project":
+                    conflicting["client_project"] = "different project"
+                elif conflict == "evidence":
+                    conflicting["provenance"]["source_session_id"] = "different session"
+                else:
+                    conflicting["provenance"]["allocation_capacity_recovery"] = "true"
+                records = [("pending", first), ("pending", conflicting)]
+                visible = review_state._aggregate_semantic_allocations(records)
+                self.assertEqual(2, len(visible))
+                self.assertEqual(["wks-one", "wks-two"], [row["candidate_key"] for _, row in visible])
+                self.assertTrue(all("allocation_segments" not in row for _, row in visible))
+        first["provenance"]["allocation_capacity_recovery"] = "true"
+        second["provenance"]["allocation_capacity_recovery"] = "true"
+        self.assertEqual(2, len(review_state._aggregate_semantic_allocations([("pending", first), ("pending", second)])))
 
     def test_verified_split_links_children_and_supersedes_parent_without_id_reuse(self):
         legacy = semantic_proposal("legacy-candidate", "legacy-activity", ["ev-1", "ev-2"])
