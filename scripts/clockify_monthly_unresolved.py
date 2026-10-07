@@ -168,6 +168,13 @@ def project_rows(source_dir: Path) -> list[list[str]]:
         if kind == "analyzer_review_failure":
             summary = f"{len(ids)} cited evidence records quarantined after structural semantic review; no accepted allocation."
         recommendation = activity.get("project_recommendation", "")
+        # Exact human corrections are derived accounting metadata, not a new
+        # model decision, interval, or raw private-source summary.
+        reviewed = item.get("reviewed_metadata")
+        if kind == "timing_evidence" and isinstance(reviewed, dict):
+            recommendation = reviewed.get("client_project", recommendation)
+            if reviewed.get("description"):
+                summary = reviewed["description"]
         if not isinstance(recommendation, str):
             recommendation = json.dumps(recommendation, sort_keys=True, ensure_ascii=False)
         links = sorted({event["attributes"].get("share_url", "") for event in evidence

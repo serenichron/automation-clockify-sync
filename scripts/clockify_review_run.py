@@ -2045,6 +2045,30 @@ def _replay_analyzer_cache(replay: Path) -> Path | None:
     return cache
 
 
+def _unresolved_repair_target(source: Path, target: tuple[str, str]) -> bool:
+    """Bind metadata-only edits to one sealed zero-capacity activity, not new time."""
+    analysis, _, _ = _read_snapshot_json(source / "semantic-analysis.json", label="repair unresolved analysis")
+    accounting, _, _ = _read_snapshot_json(source / "work-accounting-result.json", label="repair unresolved accounting")
+    ambiguities, _, _ = _read_snapshot_json(source / "ambiguous.json", label="repair unresolved ambiguities")
+    activities = analysis.get("activities") if isinstance(analysis, Mapping) else None
+    if (
+        not isinstance(activities, list) or not all(isinstance(row, Mapping) for row in activities)
+        or not isinstance(accounting, Mapping) or not isinstance(ambiguities, list)
+        or not all(isinstance(row, Mapping) for row in ambiguities)
+        or accounting.get("ambiguous") != ambiguities
+        or accounting.get("proposals") != _read_json(source / "proposals.json")
+    ):
+        raise ReviewRunError("repair unresolved source artifacts are invalid")
+    matches = [row for row in activities if review_corrections.proposal_target(row) == target]
+    unresolved = [row for row in ambiguities
+                  if review_corrections.proposal_target({**row, "activity_id": row.get("activity_id") or row.get("id")}) == target]
+    if len(matches) != 1 or len(unresolved) != 1 or unresolved[0].get("exception_kind") != "timing_evidence":
+        return False
+    _ledger, events = work_accounting_pipeline.load_ledger(source / "evidence/evidence-ledger.json")
+    known_ids = {event["evidence_id"] for event in events}
+    return all(identity in known_ids for identity in matches[0]["evidence_ids"])
+
+
 def _validate_repair_credit_transition(
     source: Path, proposed: Path, *, runs_root: Path,
     routing_snapshot: Path | None = None,
@@ -2119,7 +2143,9 @@ def _validate_repair_credit_transition(
                     or not isinstance(value, str) or not value or value != value.strip()
                     or not value.isprintable()
                 ))
-                or target not in proposal_targets
+                or (target not in proposal_targets and not (
+                    has_routing and _unresolved_repair_target(source, target)
+                ))
                 or target in prior_decision_targets
                 or target in appended_decision_targets
             ):

@@ -3321,7 +3321,14 @@ def run_accounting(
                 if not intervals else
                 "cited evidence has no whole-minute observed capacity"
             )
-            ambiguous.append({"id": activity_id, "reason": reason, "exception_kind": "timing_evidence", "evidence_ids": evidence_ids})
+            ambiguous.append({
+                "id": activity_id, "reason": reason, "exception_kind": "timing_evidence", "evidence_ids": evidence_ids,
+                **({"reviewed_metadata": {
+                    "client_project": route.get("project_name"),
+                    "tag_names": list(route.get("tag_names", [])),
+                    "description": corrected_description,
+                }} if corrected_route is not None else {}),
+            })
             if corrected_route is not None:
                 correction_observations.append({
                     "activity_id": activity_id,
