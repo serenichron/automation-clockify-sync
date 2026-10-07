@@ -723,6 +723,7 @@ def is_injected_session_message(content: str) -> bool:
     if text.startswith((
         "<task-notification", "<system-reminder", "<teammate-message",
         "<command-message", "<local-command", "<codex_internal_context",
+        "<codex_delegation", "<subagent_notification",
         "this session is being continued from a previous conversation",
     )):
         return True

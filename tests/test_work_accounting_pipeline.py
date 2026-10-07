@@ -2467,6 +2467,56 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             with self.subTest(content=content):
                 self.assertEqual([], pipeline._activity_observed_intervals(events))
 
+    def test_legacy_codex_delegation_cannot_extend_genuine_human_capacity(self):
+        events = [
+            session_event('human-first', '2026-10-06T11:00:00+03:00', 'Review synthetic totals.').document(),
+            session_event('human-last', '2026-10-06T11:01:00+03:00', 'Confirm synthetic totals.').document(),
+            session_event('delegation', '2026-10-06T11:05:00+03:00',
+                          '<codex_delegation>Internal synthetic task.</codex_delegation>').document(),
+        ]
+        intervals = pipeline._activity_observed_intervals(events)
+        seconds = sum((dt.datetime.fromisoformat(span['end']) -
+                       dt.datetime.fromisoformat(span['start'])).total_seconds() for span in intervals)
+        self.assertEqual(60, seconds)
+
+    def test_legacy_codex_subagent_notification_cannot_extend_genuine_human_capacity(self):
+        events = [
+            session_event('human-first', '2026-10-06T11:00:00+03:00', 'Review synthetic totals.').document(),
+            session_event('human-last', '2026-10-06T11:01:00+03:00', 'Confirm synthetic totals.').document(),
+            session_event('notification', '2026-10-06T11:05:00+03:00',
+                          '<subagent_notification>Internal synthetic completion.</subagent_notification>').document(),
+        ]
+        intervals = pipeline._activity_observed_intervals(events)
+        seconds = sum((dt.datetime.fromisoformat(span['end']) -
+                       dt.datetime.fromisoformat(span['start'])).total_seconds() for span in intervals)
+        self.assertEqual(60, seconds)
+
+    def test_legacy_codex_human_prose_quoting_wrappers_preserves_capacity(self):
+        for quoted in ('<codex_delegation>Internal task.</codex_delegation>',
+                       '<subagent_notification>Internal result.</subagent_notification>'):
+            with self.subTest(quoted=quoted):
+                events = [
+                    session_event('human-first', '2026-10-06T11:00:00+03:00', 'Review synthetic totals.').document(),
+                    session_event('human-quote', '2026-10-06T11:05:00+03:00',
+                                  'I reviewed the actual synthetic result:\n' + quoted).document(),
+                ]
+                self.assertEqual([{'start': '2026-10-06T11:00:00+03:00',
+                                   'end': '2026-10-06T11:05:00+03:00'}],
+                                 pipeline._activity_observed_intervals(events))
+
+    def test_legacy_codex_goal_and_teammate_wrappers_remain_excluded_from_capacity(self):
+        for content in ('<codex_internal_context source="goal">Continue synthetic goal.</codex_internal_context>',
+                        '<teammate-message>Synthetic agent result.</teammate-message>'):
+            with self.subTest(content=content):
+                events = [
+                    session_event('human-first', '2026-10-06T11:00:00+03:00', 'Review synthetic totals.').document(),
+                    session_event('human-last', '2026-10-06T11:01:00+03:00', 'Confirm synthetic totals.').document(),
+                    session_event('injected', '2026-10-06T11:05:00+03:00', content).document(),
+                ]
+                self.assertEqual([{'start': '2026-10-06T11:00:00+03:00',
+                                   'end': '2026-10-06T11:01:00+03:00'}],
+                                 pipeline._activity_observed_intervals(events))
+
     def test_legacy_claude_ordinary_human_and_assistant_points_are_preserved(self):
         events = [claude_event('2026-09-24T10:00:00+03:00', content='Review the synthetic artifact.').document(),
                   claude_event('2026-09-24T10:05:00+03:00', 'assistant',
