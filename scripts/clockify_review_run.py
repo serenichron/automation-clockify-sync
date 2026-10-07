@@ -3229,6 +3229,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--recover-source")
     parser.add_argument("--recover-attempt-id")
+    parser.add_argument("--recover-parent-routing-digest")
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
     parser.add_argument("--period-manifest", type=Path)
     parser.add_argument("--routing", type=Path, default=DEFAULT_ROUTING)
@@ -3675,16 +3676,22 @@ def main(argv: list[str] | None = None) -> int:
     reconciliation_options = (
         "--period-manifest", "--routing", "--corrections", "--acceptance-ledger",
     )
-    recovery_values = (
+    recovery_identity_values = (
         args.recover_source_debt_from,
         args.recover_source,
         args.recover_attempt_id,
     )
-    recovery_mode = all(value is not None for value in recovery_values)
-    if any(value is not None for value in recovery_values) and not recovery_mode:
+    recovery_mode = all(value is not None for value in recovery_identity_values)
+    if (
+        any(value is not None for value in recovery_identity_values)
+        and not recovery_mode
+    ) or (
+        args.recover_parent_routing_digest is not None and not recovery_mode
+    ):
         print(
             "clockify review run: source-debt recovery requires --recover-source-debt-from, "
-            "--recover-source and --recover-attempt-id together",
+            "--recover-source and --recover-attempt-id together; new attempts also require "
+            "--recover-parent-routing-digest",
             file=sys.stderr,
         )
         return 2
@@ -3817,6 +3824,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.recover_source_debt_from,
                 args.recover_source,
                 args.recover_attempt_id,
+                expected_parent_routing_digest=args.recover_parent_routing_digest,
             )
             snapshots = _snapshot_recovery_inputs(
                 recovered.run_dir, recovered.parent_run_dir

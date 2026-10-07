@@ -2523,9 +2523,141 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
         self.assertEqual(1, observed[0][1])
         recovery_command = commands[-1]
         self.assertEqual(
-            ["--recover-source-debt-from", "--recover-source", "--recover-attempt-id"],
+            [
+                "--recover-source-debt-from", "--recover-source",
+                "--recover-attempt-id", "--recover-parent-routing-digest",
+            ],
             [flag for flag in recovery_command if flag.startswith("--recover-")],
         )
+        stored = self.state()
+        debt = self.debts()[0]
+        parent = stored["slices"]["2026-09-07"]["recovery_parents"][debt.debt_id]
+        authority_index = recovery_command.index("--recover-parent-routing-digest") + 1
+        self.assertEqual(
+            parent["snapshot_digests"]["routing.json"],
+            recovery_command[authority_index],
+        )
+
+    def test_recovery_command_rejects_parent_without_stored_routing_binding(self):
+        """Mutable parent bytes must never manufacture a missing routing authority."""
+        parent = self.root / "runs" / "unbound-parent"
+        parent.mkdir(parents=True)
+        write_json(parent / "routing.json", {"workspace_id": "untrusted"})
+        with self.assertRaisesRegex(cycle.CycleError, "snapshot binding is missing"):
+            cycle._recovery_parent_routing_digest({"run_dir": str(parent)})
+
+    def test_base_routing_pre_pin_attempt_adopts_without_rewriting_journal(self):
+        """A base-equal historical command remains resumable under the pinned launch."""
+        interval = source_coverage.SourceInterval(
+            source="peer/macbook",
+            since_utc="2026-09-06T21:00:00Z",
+            until_utc="2026-09-08T21:00:00Z",
+            slice_id="slice-historical-command",
+            compatibility_version="collector-evidence-compatibility/v2:fixture",
+        )
+        store = source_coverage.SourceDebtStore()
+        debt = store.record_failure(
+            interval, failure_class="peer_unavailable", retryable=True,
+            resume_state_digest="sha256:" + "d" * 64,
+            attempted_at="2026-09-09T00:00:00Z",
+        )
+        parent = {
+            "run_dir": str(self.root / "runs" / "historical-parent"),
+            "bundle_digest": "sha256:" + "b" * 64,
+            "snapshot_digests": {
+                "routing.json": cycle._digest(self.root / "routing.json"),
+            },
+        }
+        attempt_id = cycle._attempt_id(debt.debt_id, 1)
+        current_command = cycle._recovery_command(
+            self.config, Path(parent["run_dir"]), interval.source, attempt_id,
+            parent["snapshot_digests"]["routing.json"],
+        )
+        pin = current_command.index("--recover-parent-routing-digest")
+        historical_command = current_command[:pin] + current_command[pin + 2:]
+        historical = {
+            "schema_version": cycle.RECOVERY_ATTEMPT_SCHEMA_VERSION,
+            "debt_id": debt.debt_id,
+            "attempt_ordinal": 1,
+            "attempt_id": attempt_id,
+            "parent_run_dir": parent["run_dir"],
+            "parent_bundle_digest": parent["bundle_digest"],
+            "command_digest": cycle._value_digest(historical_command),
+            "phase": "started",
+        }
+        record = {"recovery_attempts": {debt.debt_id: historical}}
+
+        checked, command = cycle._recovery_attempt(
+            record, debt, parent, self.config,
+        )
+
+        self.assertEqual(historical, checked)
+        self.assertEqual(historical_command, command)
+        self.assertEqual(
+            historical["command_digest"],
+            record["recovery_attempts"][debt.debt_id]["command_digest"],
+        )
+        overlay_parent = {
+            **parent,
+            "snapshot_digests": {"routing.json": "sha256:" + "a" * 64},
+        }
+        overlay_command = cycle._recovery_command(
+            self.config, Path(parent["run_dir"]), interval.source, attempt_id,
+            overlay_parent["snapshot_digests"]["routing.json"],
+        )
+        overlay_pin = overlay_command.index("--recover-parent-routing-digest")
+        unpinned_overlay = overlay_command[:overlay_pin] + overlay_command[overlay_pin + 2:]
+        overlay_record = {"recovery_attempts": {debt.debt_id: {
+            **historical,
+            "command_digest": cycle._value_digest(unpinned_overlay),
+        }}}
+        with self.assertRaisesRegex(cycle.CycleError, "command has drifted"):
+            cycle._recovery_attempt(
+                overlay_record, debt, overlay_parent, self.config,
+            )
+
+    def test_cycle_resumes_base_routing_pre_pin_attempt_with_original_argv(self):
+        """The real exact runner must execute the argv bound by a historical journal."""
+        commands: list[list[str]] = []
+        with mock.patch.object(
+            cycle, "run_child_bounded", side_effect=self.child_with_first_gap(commands)
+        ):
+            cycle.run_cycle(
+                {**self.config, "max_slices": 1}, enable_sheet_write=True,
+                today=dt.date(2026, 9, 12),
+            )
+
+        def crash(command, **_kwargs):
+            commands.append(list(command))
+            return ChildResult(None, "", "suppressed", True, 1.0)
+
+        state = self.state()
+        state["next_work_class"] = "exact"
+        write_json(self.state_dir / "review-cycle-state.json", state)
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=crash):
+            cycle.run_cycle(
+                {**self.config, "max_slices": 1}, enable_sheet_write=True,
+                today=dt.date(2026, 9, 12),
+            )
+        pinned = commands[-1]
+        pin = pinned.index("--recover-parent-routing-digest")
+        historical = pinned[:pin] + pinned[pin + 2:]
+        state = self.state()
+        debt = self.debts()[0]
+        attempt = state["slices"]["2026-09-07"]["recovery_attempts"][debt.debt_id]
+        attempt["command_digest"] = cycle._value_digest(historical)
+        state["next_work_class"] = "exact"
+        write_json(self.state_dir / "review-cycle-state.json", state)
+
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=crash):
+            cycle.run_cycle(
+                {**self.config, "max_slices": 1}, enable_sheet_write=True,
+                today=dt.date(2026, 9, 12),
+            )
+
+        self.assertEqual(historical, commands[-1])
+        resumed = self.state()["slices"]["2026-09-07"]["recovery_attempts"][debt.debt_id]
+        self.assertEqual(cycle._value_digest(historical), resumed["command_digest"])
 
     def test_recovery_budget_exhaustion_preserves_same_attempt_for_restart(self):
         """Catches a pre-spawn recovery budget stop losing its durable attempt."""

@@ -21,11 +21,13 @@ try:
     from scripts import clockify_sync_collect as collector
     from scripts import collector_receipts
     from scripts import evidence_ledger
+    from scripts import semantic_analyzer
     from scripts import source_coverage
 except ModuleNotFoundError:  # direct script execution
     import clockify_sync_collect as collector  # type: ignore[no-redef]
     import collector_receipts  # type: ignore[no-redef]
     import evidence_ledger  # type: ignore[no-redef]
+    import semantic_analyzer  # type: ignore[no-redef]
     import source_coverage  # type: ignore[no-redef]
 
 
@@ -34,6 +36,10 @@ RUNS = ROOT / "runs"
 _SCHEMA = "source-debt-recovery/v1"
 _RECEIPT_SCHEMA = "source-debt-recovery-receipt/v1"
 _ATTEMPT = re.compile(r"sha256:[0-9a-f]{64}")
+_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
+_ACTOR_BINDING_KEYS = frozenset({
+    "source_type", "server_origin", "workspace_id", "author_id",
+})
 RECONCILIATION_SNAPSHOTS = (
     "period-manifest.json",
     "routing.json",
@@ -88,6 +94,53 @@ def _read_object(path: Path, *, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise SourceDebtRecoveryError(f"{label} must be an object")
     return value
+
+
+def _collection_routing_for_parent(
+    parent: Path, snapshots: Mapping[str, str],
+    expected_parent_routing_digest: str | None,
+) -> dict[str, Any]:
+    """Authenticate a frozen semantic overlay while retaining collection identity."""
+    base_path = ROOT / "routing.json"
+    base_digest = _file_digest(base_path, label="current collection routing")
+    base = _read_object(base_path, label="current collection routing")
+    frozen = _read_object(parent / "routing.json", label="parent routing snapshot")
+    frozen_digest = snapshots["routing.json"]
+    if frozen_digest == base_digest:
+        if (
+            expected_parent_routing_digest is not None
+            and expected_parent_routing_digest != frozen_digest
+        ):
+            raise SourceDebtRecoveryError("parent routing snapshot binding differs")
+        return base
+    if (
+        not isinstance(expected_parent_routing_digest, str)
+        or _DIGEST.fullmatch(expected_parent_routing_digest) is None
+        or expected_parent_routing_digest != frozen_digest
+    ):
+        raise SourceDebtRecoveryError("parent routing snapshot binding differs")
+    collection_projection = dict(frozen)
+    actor_contract = collection_projection.pop("semantic_actor_contract", None)
+    subject_binding = collection_projection.pop("semantic_subject_binding", None)
+    if collection_projection != base:
+        raise SourceDebtRecoveryError("parent routing actor overlay changes collection policy")
+    if (
+        actor_contract != semantic_analyzer.ACTOR_CONTRACT
+        or not isinstance(subject_binding, Mapping)
+        or set(subject_binding) != _ACTOR_BINDING_KEYS
+        or subject_binding.get("source_type") != "multica"
+        or any(
+            not isinstance(subject_binding.get(key), str)
+            or not str(subject_binding[key]).strip()
+            for key in _ACTOR_BINDING_KEYS
+        )
+    ):
+        raise SourceDebtRecoveryError("parent routing actor overlay is invalid")
+    try:
+        semantic_analyzer.with_actor_context([], subject_binding=subject_binding)
+    except semantic_analyzer.AnalyzerError as exc:
+        raise SourceDebtRecoveryError("parent routing actor overlay is invalid") from exc
+    return base
 
 
 def _verified_parent_ledger(parent: Path) -> evidence_ledger.EvidenceLedger:
@@ -408,7 +461,9 @@ class _Parent:
 
 
 def _validate_parent(
-    parent_path: Path, source: str, *, _visited: frozenset[Path] | None = None,
+    parent_path: Path, source: str, *,
+    expected_parent_routing_digest: str | None = None,
+    _visited: frozenset[Path] | None = None,
 ) -> _Parent:
     parent = _direct_run(parent_path, label="recovery parent")
     current_coordinator = collector._current_coordinator_identity()
@@ -537,11 +592,10 @@ def _validate_parent(
         name: _file_digest(parent / name, label=f"parent {name}")
         for name in RECONCILIATION_SNAPSHOTS
     }
-    routing_path = ROOT / "routing.json"
-    if _file_digest(routing_path, label="current routing") != snapshots["routing.json"]:
-        raise SourceDebtRecoveryError("current routing differs from the parent snapshot")
     try:
-        routing = json.loads(routing_path.read_text(encoding="utf-8"))
+        routing = _collection_routing_for_parent(
+            parent, snapshots, expected_parent_routing_digest,
+        )
         fleet_path = ROOT / "fleet.json"
         fleet = json.loads(fleet_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -717,11 +771,17 @@ def _preserve_partial(run_dir: Path) -> None:
     _fsync_directory(run_dir.parent)
 
 
-def recover(parent_run: Path, source: str, attempt_id: str) -> RecoveryResult:
+def recover(
+    parent_run: Path, source: str, attempt_id: str, *,
+    expected_parent_routing_digest: str | None = None,
+) -> RecoveryResult:
     """Validate immutable parent lineage and collect its exact slice once per attempt."""
     if not isinstance(attempt_id, str) or _ATTEMPT.fullmatch(attempt_id) is None:
         raise SourceDebtRecoveryError("recovery attempt ID must be sha256:<64 lowercase hex>")
-    parent = _validate_parent(Path(parent_run), source)
+    parent = _validate_parent(
+        Path(parent_run), source,
+        expected_parent_routing_digest=expected_parent_routing_digest,
+    )
     transition, locator = _transition(parent, attempt_id)
     locator_digest = locator.rsplit("/", 1)[1]
     run_dir = RUNS.resolve() / f"source-debt-recovery-{locator_digest}"
@@ -852,7 +912,18 @@ def verify_recovery_run(
     if not all(isinstance(value, str) for value in (parent_id, source, attempt_id)):
         raise SourceDebtRecoveryError("recovery transition identity is invalid")
     try:
-        parent = _validate_parent(RUNS / parent_id, source, _visited=visited)
+        snapshot_digests = transition.get("snapshot_digests")
+        expected_routing = (
+            snapshot_digests.get("routing.json")
+            if isinstance(snapshot_digests, Mapping) else None
+        )
+        parent = _validate_parent(
+            RUNS / parent_id, source,
+            expected_parent_routing_digest=(
+                str(expected_routing) if isinstance(expected_routing, str) else None
+            ),
+            _visited=visited,
+        )
     except RecursionError as exc:
         raise SourceDebtRecoveryError(
             "recovery ancestry exceeds safe verification depth"
@@ -967,7 +1038,12 @@ def _recovery_receipt_document(
 ) -> dict[str, Any]:
     run_dir = verified.run_dir
     source = str(verified.transition["source"])
-    parent = _validate_parent(verified.parent_run_dir, source)
+    parent = _validate_parent(
+        verified.parent_run_dir, source,
+        expected_parent_routing_digest=str(
+            verified.transition["snapshot_digests"]["routing.json"]
+        ),
+    )
     try:
         bundle = collector_receipts.load_completion_bundle(
             run_dir / "completion-bundle.json", run_dir=run_dir
@@ -1168,6 +1244,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--recover-source-debt-from", type=Path, required=True)
     parser.add_argument("--recover-source", required=True)
     parser.add_argument("--recover-attempt-id", required=True)
+    parser.add_argument("--recover-parent-routing-digest", required=True)
     return parser.parse_args(argv)
 
 
@@ -1175,7 +1252,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         result = recover(
-            args.recover_source_debt_from, args.recover_source, args.recover_attempt_id
+            args.recover_source_debt_from, args.recover_source, args.recover_attempt_id,
+            expected_parent_routing_digest=args.recover_parent_routing_digest,
         )
     except SourceDebtRecoveryError as exc:
         print(f"clockify source debt recovery: {exc}", file=sys.stderr)

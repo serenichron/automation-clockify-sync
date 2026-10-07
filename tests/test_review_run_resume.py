@@ -511,7 +511,7 @@ class ResumeTests(unittest.TestCase):
                 self.assertEqual(0, review.main(["--resume-from", str(run)]))
             processed.assert_not_called()
 
-    def test_source_debt_recovery_requires_all_three_identity_options(self):
+    def test_source_debt_recovery_requires_core_identity_and_accepts_legacy_pin_absence(self):
         """Dropping any caller-persisted recovery identity must fail before work."""
         parent = "/tmp/source-parent"
         attempt = "sha256:" + "a" * 64
@@ -519,13 +519,17 @@ class ResumeTests(unittest.TestCase):
             "--recover-source-debt-from", parent,
             "--recover-source", "sessions/macbook",
             "--recover-attempt-id", attempt,
+            "--recover-parent-routing-digest", "sha256:" + "b" * 64,
         ]
         parsed = review.parse_args(complete)
         self.assertEqual(Path(parent), parsed.recover_source_debt_from)
         self.assertEqual("sessions/macbook", parsed.recover_source)
         self.assertEqual(attempt, parsed.recover_attempt_id)
 
-        for omitted in range(0, len(complete), 2):
+        legacy = complete[:-2]
+        self.assertIsNone(review.parse_args(legacy).recover_parent_routing_digest)
+
+        for omitted in range(0, 6, 2):
             argv = complete[:omitted] + complete[omitted + 2:]
             with self.subTest(omitted=complete[omitted]):
                 self.assertEqual(2, review.main(argv))
@@ -549,6 +553,7 @@ class ResumeTests(unittest.TestCase):
                 "--recover-source-debt-from", str(parent),
                 "--recover-source", "sessions/macbook",
                 "--recover-attempt-id", "sha256:" + "a" * 64,
+                "--recover-parent-routing-digest", "sha256:" + "b" * 64,
             ]
             with mock.patch.object(review, "RUNS", root / "runs"), \
                  mock.patch.object(review.clockify_source_debt_recover, "recover", return_value=recovery_result) as recovered, \
@@ -558,7 +563,10 @@ class ResumeTests(unittest.TestCase):
                  mock.patch.object(review, "_acceptance_gate", return_value={}), \
                  mock.patch.object(review, "_process_run", return_value=(0, result)) as processed:
                 self.assertEqual(0, review.main(argv))
-            recovered.assert_called_once_with(parent, "sessions/macbook", "sha256:" + "a" * 64)
+            recovered.assert_called_once_with(
+                parent, "sessions/macbook", "sha256:" + "a" * 64,
+                expected_parent_routing_digest="sha256:" + "b" * 64,
+            )
             args, actual_run, _gate = processed.call_args.args
             self.assertEqual(derived, actual_run)
             self.assertEqual(derived / "routing.json", args.routing)
@@ -577,6 +585,7 @@ class ResumeTests(unittest.TestCase):
                 "--recover-source-debt-from", str(parent),
                 "--recover-source", "sessions/macbook",
                 "--recover-attempt-id", "sha256:" + "b" * 64,
+                "--recover-parent-routing-digest", "sha256:" + "c" * 64,
             ]
             with mock.patch.object(review.clockify_source_debt_recover, "recover", return_value=recovery_result), \
                  mock.patch.object(review, "_snapshot_recovery_inputs", return_value={}), \
@@ -591,6 +600,7 @@ class ResumeTests(unittest.TestCase):
             "--recover-source-debt-from", "/tmp/parent",
             "--recover-source", "sessions/macbook",
             "--recover-attempt-id", "sha256:" + "c" * 64,
+            "--recover-parent-routing-digest", "sha256:" + "d" * 64,
         ]
         conflicts = (
             ["--resume-from", "/tmp/parent"], ["--replay-from", "/tmp/parent"],

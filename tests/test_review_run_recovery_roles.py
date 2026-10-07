@@ -108,6 +108,7 @@ class RecoveryRoleTests(unittest.TestCase):
                         "--recover-source-debt-from", str(runs / "parent"),
                         "--recover-source", "peer/macbook",
                         "--recover-attempt-id", "sha256:" + "a" * 64,
+                        "--recover-parent-routing-digest", "sha256:" + "b" * 64,
                     ]
                 )
                 args = review.parse_args([

@@ -1599,8 +1599,11 @@ def _review_command(
 
 def _recovery_command(
     config: Mapping[str, Any], parent_run_dir: Path, source: str, attempt_id: str,
+    parent_routing_digest: str,
 ) -> list[str]:
     root = _path(config, "root")
+    if not _valid_digest(parent_routing_digest):
+        raise CycleError("recovery parent routing digest is invalid")
     return [
         sys.executable,
         str(root / "scripts" / "clockify_review_run.py"),
@@ -1608,9 +1611,17 @@ def _recovery_command(
         "--recover-source-debt-from", str(parent_run_dir),
         "--recover-source", source,
         "--recover-attempt-id", attempt_id,
+        "--recover-parent-routing-digest", parent_routing_digest,
         "--state", str(_path(config, "state_dir") / "review-state.json"),
         "--analyzer-cache", str(_path(config, "cache")),
     ]
+
+
+def _recovery_parent_routing_digest(parent: Mapping[str, Any]) -> str:
+    snapshots = parent.get("snapshot_digests")
+    if isinstance(snapshots, Mapping) and _valid_digest(snapshots.get("routing.json")):
+        return str(snapshots["routing.json"])
+    raise CycleError("recovery parent routing snapshot binding is missing")
 
 
 def _pending_resume_command(config: Mapping[str, Any], child: Path) -> list[str]:
@@ -3993,7 +4004,9 @@ def _valid_digest(value: object) -> bool:
 
 
 def _validate_recovery_attempt(
-    raw: object, *, debt_id: str, parent: Mapping[str, Any], command: list[str] | None = None,
+    raw: object, *, debt_id: str, parent: Mapping[str, Any],
+    command: list[str] | None = None,
+    legacy_command: list[str] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(raw, Mapping):
         raise CycleError("stored recovery attempt is invalid")
@@ -4025,7 +4038,12 @@ def _validate_recovery_attempt(
         or not _valid_digest(raw.get("command_digest"))
     ):
         raise CycleError("stored recovery attempt identity is invalid")
-    if command is not None and raw.get("command_digest") != _value_digest(command):
+    accepted_command_digests = (
+        {_value_digest(command)} if command is not None else set()
+    )
+    if legacy_command is not None:
+        accepted_command_digests.add(_value_digest(legacy_command))
+    if command is not None and raw.get("command_digest") not in accepted_command_digests:
         raise CycleError("stored recovery attempt command has drifted")
     if phase != "started" and (
         not isinstance(raw.get("result_path"), str)
@@ -4039,6 +4057,23 @@ def _validate_recovery_attempt(
     ):
         raise CycleError("stored verified recovery outcome is invalid")
     return dict(raw)
+
+
+def _legacy_recovery_command_for_parent(
+    config: Mapping[str, Any], parent: Mapping[str, Any], command: list[str],
+) -> list[str] | None:
+    """Admit only pre-pin attempts whose frozen routing was the release base."""
+    if _recovery_parent_routing_digest(parent) != _digest(
+        _path(config, "root") / "routing.json"
+    ):
+        return None
+    try:
+        index = command.index("--recover-parent-routing-digest")
+    except ValueError as exc:  # pragma: no cover - command is built locally
+        raise CycleError("recovery command routing pin is missing") from exc
+    if index + 1 >= len(command):  # pragma: no cover - command is built locally
+        raise CycleError("recovery command routing pin is incomplete")
+    return command[:index] + command[index + 2:]
 
 
 def _recovery_attempt(
@@ -4062,20 +4097,33 @@ def _recovery_attempt(
             validation_parent = {
                 "run_dir": existing.get("parent_run_dir"),
                 "bundle_digest": existing.get("parent_bundle_digest"),
+                "snapshot_digests": parent.get("snapshot_digests"),
             }
         command = _recovery_command(
             config, Path(str(validation_parent["run_dir"])),
-            debt.interval.source, attempt_id
+            debt.interval.source, attempt_id,
+            _recovery_parent_routing_digest(validation_parent),
+        )
+        legacy_command = _legacy_recovery_command_for_parent(
+            config, validation_parent, command,
         )
         checked = _validate_recovery_attempt(
-            existing, debt_id=debt.debt_id, parent=validation_parent, command=command
+            existing, debt_id=debt.debt_id, parent=validation_parent,
+            command=command,
+            legacy_command=legacy_command,
         )
         if not str(checked["phase"]).startswith("finished_"):
-            return checked, command
+            return checked, (
+                legacy_command
+                if legacy_command is not None
+                and checked["command_digest"] == _value_digest(legacy_command)
+                else command
+            )
         ordinal = int(checked["attempt_ordinal"]) + 1
     attempt_id = _attempt_id(debt.debt_id, ordinal)
     command = _recovery_command(
-        config, Path(str(parent["run_dir"])), debt.interval.source, attempt_id
+        config, Path(str(parent["run_dir"])), debt.interval.source, attempt_id,
+        _recovery_parent_routing_digest(parent),
     )
     attempt = {
         "schema_version": RECOVERY_ATTEMPT_SCHEMA_VERSION,
@@ -4301,11 +4349,15 @@ def _apply_verified_recovery(
     debt_path: Path, since: str, until: str, debt: source_coverage.DebtItem,
     parent: Mapping[str, Any], attempt: Mapping[str, Any],
 ) -> tuple[dict[str, Any], str]:
+    command = _recovery_command(
+        config, Path(str(parent["run_dir"])), debt.interval.source,
+        str(attempt["attempt_id"]), _recovery_parent_routing_digest(parent),
+    )
     checked = _validate_recovery_attempt(
         attempt, debt_id=debt.debt_id, parent=parent,
-        command=_recovery_command(
-            config, Path(str(parent["run_dir"])), debt.interval.source,
-            str(attempt["attempt_id"]),
+        command=command,
+        legacy_command=_legacy_recovery_command_for_parent(
+            config, parent, command,
         ),
     )
     stage, status = _validate_recovery_stage(
@@ -4437,11 +4489,16 @@ def _reconcile_verified_attempts(
                 config, record, debt.debt_id, str(since), until,
                 attempt=attempt if isinstance(attempt, Mapping) else None,
             )
+            command = _recovery_command(
+                config, Path(str(parent["run_dir"])), debt.interval.source,
+                str(attempt.get("attempt_id")) if isinstance(attempt, Mapping) else "",
+                _recovery_parent_routing_digest(parent),
+            )
             checked = _validate_recovery_attempt(
                 attempt, debt_id=debt.debt_id, parent=parent,
-                command=_recovery_command(
-                    config, Path(str(parent["run_dir"])), debt.interval.source,
-                    str(attempt.get("attempt_id")) if isinstance(attempt, Mapping) else "",
+                command=command,
+                legacy_command=_legacy_recovery_command_for_parent(
+                    config, parent, command,
                 ),
             )
             if checked["phase"] not in {"verified_complete", "verified_incomplete"}:

@@ -297,6 +297,7 @@ class SourceDebtRecoveryTests(unittest.TestCase):
 
     def make_parent(
         self, *, enriched_context: dict[str, object] | None = None,
+        reconciliation_routing: dict[str, object] | None = None,
     ) -> Path:
         if enriched_context is not None:
             hermes_db = self.root / "hermes.db"
@@ -339,7 +340,11 @@ class SourceDebtRecoveryTests(unittest.TestCase):
         collector._write_pending_slice_finalization(parent, identity, slices[0])
         for name, content in {
             "period-manifest.json": b"{\"schema_version\":1}\n",
-            "routing.json": (self.root / "routing.json").read_bytes(),
+            "routing.json": (
+                json.dumps(reconciliation_routing, sort_keys=True).encode() + b"\n"
+                if reconciliation_routing is not None
+                else (self.root / "routing.json").read_bytes()
+            ),
             "review-corrections.jsonl": b"",
             "review-acceptance.jsonl": b"",
             "semantic-analysis.json": b"{}\n",
@@ -356,6 +361,18 @@ class SourceDebtRecoveryTests(unittest.TestCase):
             "sha256:" + hashlib.sha256(bundle_path.read_bytes()).hexdigest(),
         )
         return parent
+
+    def actor_routing(self) -> dict[str, object]:
+        return {
+            **self.routing,
+            "semantic_actor_contract": "clockify-semantic-actors/v1",
+            "semantic_subject_binding": {
+                "source_type": "multica",
+                "server_origin": "https://multica.example.invalid",
+                "workspace_id": "workspace-one",
+                "author_id": "member-one",
+            },
+        }
 
     @staticmethod
     def enriched_context() -> dict[str, object]:
@@ -393,6 +410,88 @@ class SourceDebtRecoveryTests(unittest.TestCase):
         transition = json.loads((first.run_dir / "run-report.json").read_text())["source_debt_recovery"]
         self.assertEqual(SOURCE, transition["source"])
         self.assertEqual(ATTEMPT_1, transition["attempt_id"])
+
+    def test_actor_snapshot_uses_base_collection_identity_and_exact_reconciliation(self) -> None:
+        """Actor-only reconciliation metadata must not change collector compatibility."""
+        parent = self.make_parent(reconciliation_routing=self.actor_routing())
+        expected_routing = "sha256:" + hashlib.sha256(
+            (parent / "routing.json").read_bytes()
+        ).hexdigest()
+        observed_collection_routing: list[dict[str, object]] = []
+        real_collect = collector._collect_slice
+
+        def observe_collect(args, routing, *positional, **keywords):
+            observed_collection_routing.append(json.loads(json.dumps(routing)))
+            return real_collect(args, routing, *positional, **keywords)
+
+        with mock.patch.object(
+            collector, "collect_remote_sessions", return_value=self.healthy_peer()
+        ), mock.patch.object(collector, "_collect_slice", side_effect=observe_collect):
+            recovered = recovery.recover(
+                parent, SOURCE, ATTEMPT_1,
+                expected_parent_routing_digest=expected_routing,
+            )
+
+        snapshots = review._snapshot_recovery_inputs(recovered.run_dir, parent)
+        self.assertEqual([self.routing], observed_collection_routing)
+        self.assertEqual(
+            (parent / "routing.json").read_bytes(), snapshots["routing.json"].read_bytes()
+        )
+        for name in (
+            "semantic-analysis.json", "work-accounting-result.json",
+            "review-snapshot.json",
+        ):
+            (recovered.run_dir / name).write_text("{}\n")
+        (recovered.run_dir / "quality_report.json").write_text(
+            '{"status":"pass"}\n'
+        )
+        bundle = review._finalize_recovery_completion(recovered.run_dir)
+        transition = json.loads(
+            (recovered.run_dir / "run-report.json").read_text()
+        )["source_debt_recovery"]
+        (recovered.run_dir / "autopilot-result.json").write_text(json.dumps({
+            "quality_status": "pass",
+            "completion_bundle_digest": bundle.bundle_digest,
+            "source_debt_recovery": {
+                "source": SOURCE,
+                "attempt_id": ATTEMPT_1,
+                "status": "complete",
+                "transition_digest": transition["transition_digest"],
+            },
+        }) + "\n")
+        receipt = recovery.seal_recovery_receipt(recovered.run_dir)
+        self.assertEqual(receipt, recovery.verify_recovery_receipt(recovered.run_dir))
+
+    def test_actor_snapshot_requires_exact_authority_before_transport(self) -> None:
+        """A structurally valid actor overlay is not authority for different frozen bytes."""
+        parent = self.make_parent(reconciliation_routing=self.actor_routing())
+        with mock.patch.object(collector, "collect_remote_sessions") as transport:
+            with self.assertRaisesRegex(
+                recovery.SourceDebtRecoveryError, "routing.*binding"
+            ):
+                recovery.recover(
+                    parent, SOURCE, ATTEMPT_1,
+                    expected_parent_routing_digest="sha256:" + "f" * 64,
+                )
+        transport.assert_not_called()
+
+    def test_non_actor_routing_drift_blocks_before_transport(self) -> None:
+        """A bound snapshot cannot smuggle collection-policy drift as actor metadata."""
+        drifted = self.actor_routing()
+        drifted["session_routes"] = [{"pattern": "private", "project_id": "wrong"}]
+        parent = self.make_parent(reconciliation_routing=drifted)
+        expected_routing = "sha256:" + hashlib.sha256(
+            (parent / "routing.json").read_bytes()
+        ).hexdigest()
+        with mock.patch.object(collector, "collect_remote_sessions") as transport:
+            with self.assertRaisesRegex(
+                recovery.SourceDebtRecoveryError, "routing.*overlay"
+            ):
+                recovery.recover(
+                    parent, SOURCE, ATTEMPT_1,
+                    expected_parent_routing_digest=expected_routing,
+                )
+        transport.assert_not_called()
 
     def test_recovery_accepts_raw_parent_after_only_derived_artifact_drift(self) -> None:
         """The backlog-bound raw collector source survives an old executor overwrite."""
