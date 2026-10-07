@@ -3121,7 +3121,6 @@ def run_accounting(
         analysis.get("activities", []), events_by_id
     )
     session_timing_contexts = _session_timing_contexts(analysis_events)
-    shared_timing_pool_ids: set[str] = set()
     activity_context: dict[str, dict[str, Any]] = {}
     allocation_demands = []
     ambiguous: list[dict[str, Any]] = []
@@ -3313,7 +3312,6 @@ def run_accounting(
         borrowed_timing_context = bool(timing_contexts) and (not intervals or codex_under_capacity)
         if borrowed_timing_context:
             intervals = context_intervals
-            shared_timing_pool_ids.update(timing_contexts)
         observed_capacity = _interval_capacity_minutes(intervals)
         if not intervals or observed_capacity == 0:
             reason = (
@@ -3380,6 +3378,7 @@ def run_accounting(
             "evidence_ids": evidence_ids,
             "review_warnings": review_warnings,
             "session_timing_contexts": timing_contexts,
+            "borrowed_timing_context": borrowed_timing_context,
         }
 
     for meeting_id, attempts in meeting_attempts.items():
@@ -3531,7 +3530,9 @@ def run_accounting(
 
     for context in activity_context.values():
         pools = context["session_timing_contexts"]
-        if not shared_timing_pool_ids.intersection(pools):
+        # Membership alone does not erase a demand's independently cited
+        # observed bounds. Only actual borrowers have estimated pool placement.
+        if not context["borrowed_timing_context"]:
             continue
         context["shared_timing_context"] = {
             "timing_context_evidence_ids": sorted({
