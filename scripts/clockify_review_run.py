@@ -2069,6 +2069,111 @@ def _unresolved_repair_target(source: Path, target: tuple[str, str]) -> bool:
     return all(identity in known_ids for identity in matches[0]["evidence_ids"])
 
 
+def _recorded_attendance_repair_target(
+    source: Path, target: tuple[str, str], proposals: list[dict[str, Any]], record: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Admit only a sealed, uniquely rederived full canonical Fathom attendance."""
+    matches = [row for row in proposals if review_corrections.proposal_target(row) == target]
+    if len(matches) != 1:
+        raise ReviewRunError("repair attendance does not match one original proposal")
+    proposal = matches[0]
+    provenance = proposal.get("provenance")
+    if not isinstance(provenance, Mapping) or (
+        provenance.get("source_type") != "recorded_meeting"
+        or provenance.get("semantic_fallback") is not True
+    ):
+        raise ReviewRunError("repair target is not recorded attendance")
+    try:
+        collector_receipts.load_completion_bundle(source / "completion-bundle.json", run_dir=source)
+    except collector_receipts.CollectorReceiptError as exc:
+        raise ReviewRunError("repair attendance requires a sealed source") from exc
+    result, _content, _digest = _read_snapshot_json(
+        source / "work-accounting-result.json", label="repair sealed attendance accounting",
+    )
+    if not isinstance(result, Mapping) or proposal not in result.get("proposals", []):
+        raise ReviewRunError("repair attendance proposal differs from sealed accounting")
+    snapshot, _content, _digest = _read_snapshot_json(
+        source / "review-snapshot.json", label="repair sealed attendance review item",
+    )
+    categories = snapshot.get("categories") if isinstance(snapshot, Mapping) else None
+    if not isinstance(categories, Mapping) or not all(
+        isinstance(items, list) and all(isinstance(item, Mapping) for item in items)
+        for items in categories.values()
+    ):
+        raise ReviewRunError("repair attendance review snapshot is invalid")
+    items = [item for group in categories.values() for item in group
+             if review_corrections.proposal_target(item) == target]
+    if len(items) != 1:
+        raise ReviewRunError("repair attendance does not match one sealed review item")
+    review_corrections.validate_decision(record, item={"id": items[0].get("id"), "current": proposal})
+    ledger, events = work_accounting_pipeline.load_ledger(source / "evidence/evidence-ledger.json")
+    manifest = ledger.manifest.document()
+    recordings, exceptions = work_accounting_pipeline._recording_events(events, manifest)
+    canonical_id = provenance.get("canonical_meeting_id")
+    entries = [entry for entry in recordings if entry["meeting"].canonical_id == canonical_id]
+    if len(entries) != 1 or len([
+        row for row in proposals
+        if isinstance(row.get("provenance"), Mapping)
+        and row["provenance"].get("canonical_meeting_id") == canonical_id
+    ]) != 1:
+        raise ReviewRunError("repair attendance canonical identity is not unique")
+    entry = entries[0]
+    citations = entry["source_evidence_ids"]
+    representative = next((event for event in entry["events"] if event.get("source_type") == "fathom"), None)
+    if representative is None or any(set(citations) & set(row["source_evidence_ids"]) for row in exceptions):
+        raise ReviewRunError("repair attendance lacks unambiguous Fathom evidence")
+    eligible, _reason = work_accounting_pipeline._meeting_is_eligible(
+        representative, work_accounting_pipeline.meeting_reconciliation.manifest_member_identities(manifest),
+    )
+    if not eligible or work_accounting_pipeline._attributes(representative).get("semantic_evidence_status") == "title_only":
+        raise ReviewRunError("repair attendance source is not eligible")
+    reconciliation, _content, _digest = _read_snapshot_json(
+        source / _CANONICAL_MEETING_RECONCILIATION, label="repair canonical attendance reconciliation",
+    )
+    if not isinstance(reconciliation, list) or not all(isinstance(row, Mapping) for row in reconciliation):
+        raise ReviewRunError("repair attendance reconciliation is invalid")
+    reconciled = [row for row in reconciliation if row.get("canonical_id") == canonical_id]
+    if len(reconciled) != 1 or any(reconciled[0].get(field) != value for field, value in {
+        "status": "proposed", "activity_id": target[0], "semantic_fallback": True,
+        "source_evidence_ids": citations, "evidence_id": citations[0],
+    }.items()):
+        raise ReviewRunError("repair attendance reconciliation differs from source")
+    if reconciled[0] not in result.get("fathom_reconciliation", []):
+        raise ReviewRunError("repair attendance reconciliation differs from sealed accounting")
+    meeting = entry["meeting"]
+    title = str(meeting.title or "").strip()
+    activity = {
+        "activity_id": semantic_analyzer.stable_digest("act-", {"recorded_attendance": canonical_id}),
+        "workstream_id": semantic_analyzer.stable_digest("ws-", {"recorded_meeting": canonical_id}),
+        "object": title, "effort": {}, "timing_confidence": "high",
+        "split_rationale": "Authoritative canonical recording interval; factual attendance only.",
+        "evidence_ids": citations,
+    }
+    start, end = work_accounting_pipeline._canonical_meeting_span(meeting, representative)
+    expected = work_accounting_pipeline._proposal(activity, {}, "", start, end, citations, 1)
+    expected_provenance = {
+        "source_type": "recorded_meeting", "source_session_id": canonical_id,
+        "source_machine": "cross-machine", "burst_start": expected["start"], "burst_end": expected["end"],
+        "evidence_ids": citations, "canonical_meeting_id": canonical_id,
+        "recorded_meeting_title": title, "recorded_meeting_start": expected["start"],
+        "recorded_meeting_end": expected["end"],
+        "meeting_precedence": work_accounting_pipeline._meeting_precedence(representative),
+        "semantic_fallback": True,
+    }
+    immutable_fields = (
+        "activity_id", "workstream_id", "candidate_key", "review_activity_key", "allocation_segment",
+        "start", "end", "duration_seconds", "duration_minutes", "source", "source_label", "effort",
+        "timing_confidence", "allocation_mode",
+    )
+    if (
+        not title or review_corrections.proposal_target(activity) != target
+        or provenance != expected_provenance
+        or any(proposal.get(field) != expected[field] for field in immutable_fields)
+    ):
+        raise ReviewRunError("repair attendance identity, citations or full source interval differ")
+    return activity
+
+
 def _validate_repair_credit_transition(
     source: Path, proposed: Path, *, runs_root: Path,
     routing_snapshot: Path | None = None,
@@ -2177,6 +2282,10 @@ def _validate_repair_credit_transition(
                         raise ReviewRunError("repair selected routing is invalid")
                 activities = [activity for activity in source_activities
                               if review_corrections.proposal_target(activity) == target]
+                if not activities:
+                    if has_wording:
+                        raise ReviewRunError("repair recorded attendance permits routing metadata only")
+                    activities = [_recorded_attendance_repair_target(source, target, proposals, record)]
                 if len(activities) != 1:
                     raise ReviewRunError("repair routing does not match one original semantic activity")
                 regression = review_corrections.derive_regression_cases([record])

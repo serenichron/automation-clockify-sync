@@ -199,6 +199,28 @@ class FathomRoutingTests(unittest.TestCase):
         self.assertEqual("Serenichron Level 1", route["project_name"])
         self.assertEqual(["Project Management"], route["tag_names"])
 
+    def test_source_domain_alias_routes_without_mutating_source_or_client_priority(self):
+        # Losing only_internal alias admission must leave the genuine internal call unrouted.
+        routing = collector.load_json(MODULE_PATH.parents[1] / "routing.json")
+        internal = meeting("Agency planning review")
+        for alias in ("only_internal", "internal_only"):
+            with self.subTest(alias=alias):
+                internal["calendar_invitees_domains_type"] = alias
+                before = json.dumps(internal, sort_keys=True)
+                route = collector.route_meeting(internal, routing)
+                self.assertEqual("propose", route["action"])
+                self.assertEqual("Serenichron Level 1", route["project_name"])
+                self.assertEqual(["Project Management"], route["tag_names"])
+                self.assertEqual(before, json.dumps(internal, sort_keys=True))
+        external = {**internal, "calendar_invitees_domains_type": "one_or_more_external",
+                    "calendar_invitees": [{"email": "lead@example.test", "is_external": True}]}
+        self.assertEqual("ambiguous", collector.route_meeting(external, routing)["action"])
+        contradictory = {**external, "calendar_invitees_domains_type": "only_internal"}
+        self.assertEqual("ambiguous", collector.route_meeting(contradictory, routing)["action"])
+        client = {**internal, "calendar_invitees_domains_type": "only_internal",
+                  "calendar_invitees": [{"email": "alex@lensofalex.com", "is_external": False}]}
+        self.assertEqual("Lens of Alex Retainer", collector.route_meeting(client, routing)["project_name"])
+
     def test_matched_meeting_becomes_stable_proposal(self):
         proposals, ambiguous, skipped = collector.build_proposals(
             {

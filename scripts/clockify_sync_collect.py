@@ -3617,6 +3617,8 @@ def route_meeting(meeting: dict[str, Any], routing: dict[str, Any]) -> dict[str,
         for invitee in meeting.get("calendar_invitees", [])
         if isinstance(invitee, dict)
     ]
+    if domains_type == "only_internal" and not any(invitee.get("is_external") is True for invitee in invitees):
+        domains_type = "internal_only"
     if (
         not domains_type
         and invitees
