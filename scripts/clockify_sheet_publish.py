@@ -18,6 +18,7 @@ import re
 import subprocess
 import tempfile
 from typing import Any, Mapping, Protocol, Sequence
+from zoneinfo import ZoneInfo
 
 try:
     from scripts import clockify_portfolio_replay as portfolio_replay
@@ -300,6 +301,9 @@ def _timestamp(value: Any) -> str:
         parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError as exc:
         raise PublicationError(f"invalid proposal timestamp: {text}") from exc
+    # Review cells contain Bucharest wall time; legacy naive inputs are local.
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(ZoneInfo("Europe/Bucharest"))
     return parsed.strftime("%Y-%m-%d %H:%M:%S" if parsed.second else "%Y-%m-%d %H:%M")
 
 
