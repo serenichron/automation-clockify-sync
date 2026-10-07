@@ -282,7 +282,7 @@ def load_config(path: Path) -> dict[str, Any]:
         raise CycleError("config must be valid JSON") from exc
     if not isinstance(config, dict) or not _REQUIRED.issubset(config):
         raise CycleError("config is missing required review-cycle fields")
-    if set(config) - (_REQUIRED | {"runs_dir", "catchup_until", "max_slices", "total_child_budget_seconds", "monthly_unresolved_alias_proof", "native_credit_input", "private_routing"}):
+    if set(config) - (_REQUIRED | {"runs_dir", "catchup_until", "max_slices", "total_child_budget_seconds", "monthly_unresolved_alias_proof", "meeting_publication_bindings", "native_credit_input", "private_routing"}):
         raise CycleError("config contains unsupported review-cycle fields")
     if "native_credit_input" in config:
         handle = config["native_credit_input"]
@@ -290,6 +290,8 @@ def load_config(path: Path) -> dict[str, Any]:
                 or not isinstance(handle["path"], str) or not _valid_digest(handle["sha256"])):
             raise CycleError("native credit input must be an exact hash-bound handle")
         _canonical_runtime_path(handle["path"], label="native credit input")
+    if "meeting_publication_bindings" in config:
+        _canonical_runtime_path(config["meeting_publication_bindings"], label="meeting publication bindings")
     if not isinstance(config["calendly_optional"], bool):
         raise CycleError("calendly_optional must be boolean")
     try:
@@ -1757,7 +1759,30 @@ def _publisher_command(
     ]
     if config.get("monthly_unresolved_alias_proof"):
         command.extend(["--monthly-unresolved-alias-proof", str(config["monthly_unresolved_alias_proof"])])
+    meeting_bindings = _meeting_bindings_for_target(config, sheet_title)
+    if meeting_bindings is not None:
+        command.extend(["--meeting-publication-bindings", str(meeting_bindings)])
     return command
+
+
+def _meeting_bindings_for_target(config: Mapping[str, Any], sheet_title: str) -> Path | None:
+    """A month-specific prior capture must not gate a different month's run."""
+    if not config.get("meeting_publication_bindings"):
+        return None
+    from scripts import clockify_meeting_publication_alias as meeting_alias, clockify_source_adoptions
+    path = Path(str(config["meeting_publication_bindings"]))
+    try:
+        document = json.loads(clockify_source_adoptions._capture(meeting_alias.artifact_handle(path), {}))
+        if (not isinstance(document, dict) or set(document) != {
+                "schema_version", "spreadsheet_id", "sheet_title", "bindings"}
+                or document.get("schema_version") != meeting_alias.SCHEMA
+                or document.get("spreadsheet_id") != config["spreadsheet_id"]
+                or not isinstance(document.get("sheet_title"), str)
+                or not isinstance(document.get("bindings"), list) or not document["bindings"]):
+            raise ValueError("meeting representation target binding differs")
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        raise CycleError("meeting publication binding target is invalid") from exc
+    return path if document["sheet_title"] == sheet_title else None
 
 
 def _publication_profile(config: Mapping[str, Any], profile: str | None) -> str | None:
@@ -1768,6 +1793,18 @@ def _publication_profile(config: Mapping[str, Any], profile: str | None) -> str 
 
 
 def _receipt_publication_config(config: Mapping[str, Any], document: Mapping[str, Any]) -> Mapping[str, Any]:
+    if "meeting_publication_bindings" in document:
+        from scripts import clockify_source_adoptions
+        proof = document["meeting_publication_bindings"]
+        try:
+            clockify_source_adoptions._capture(proof, {})
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise CycleError("delivery meeting binding artifact has drifted") from exc
+        config = {**config, "meeting_publication_bindings": proof["path"]}
+    elif "meeting_publication_bindings" in config:
+        # Historical no-alias receipts remain exact even after optional capture
+        # bindings are added to the current recurring configuration.
+        config = {key: value for key, value in config.items() if key != "meeting_publication_bindings"}
     if document.get("publication_profile") != clockify_monthly_unresolved.ALIAS_PROFILE:
         return config
     proof = document.get("publication_alias_proof")
@@ -1799,21 +1836,38 @@ def _expected_publication_receipts(
     publication_profile = _publication_profile(config, publication_profile)
     if publication_profile not in (None, clockify_monthly_unresolved.PROFILE, clockify_monthly_unresolved.ALIAS_PROFILE):
         raise CycleError("unknown delivery publication profile")
-    receipts = [
-        _publication_receipt(
-            spreadsheet_id=str(config["spreadsheet_id"]),
-            sheet_title=title,
-            rows=[
-                proposal_row(
-                    item, str(source["run_id"]), project_allowlist=projects,
-                )
-                for item in members
-            ],
+    partition_rows = {title: [proposal_row(item, str(source["run_id"]), project_allowlist=projects) for item in members]
+                      for title, members in partitions if members and (
+                          publication_profile is None or title != "unresolved-evidence")}
+    meeting_bindings = _meeting_bindings_for_target(config, sheet_title)
+    aliases = []
+    if meeting_bindings is not None:
+        try:
+            from scripts import clockify_meeting_publication_alias as meeting_alias
+            rows, aliases = meeting_alias.project(
+                bindings_path=meeting_bindings, source_dir=source_dir, proposals=proposals,
+                rows=[proposal_row(item, str(source["run_id"]), project_allowlist=projects) for item in proposals],
+                spreadsheet_id=str(config["spreadsheet_id"]), sheet_title=sheet_title,
+            )
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            raise CycleError("meeting representation source projection differs") from exc
+        aliased = {alias["current_review_id"] for alias in aliases}
+        partition_rows = {sheet_title: [], "unresolved-evidence": []}
+        for proposal, row in zip(proposals, rows, strict=True):
+            unresolved = proposal.get("routing_disposition") == "unresolved-routing"
+            destination = "unresolved-evidence" if unresolved and stable_review_id(proposal) not in aliased else sheet_title
+            if publication_profile is None or destination != "unresolved-evidence":
+                partition_rows[destination].append(row)
+    receipts = []
+    for title, rows in partition_rows.items():
+        if not rows:
+            continue
+        receipt = _publication_receipt(
+            spreadsheet_id=str(config["spreadsheet_id"]), sheet_title=title, rows=rows,
         )
-        for title, members in partitions if members and (
-            publication_profile is None or title != "unresolved-evidence"
-        )
-    ]
+        if aliases and title == sheet_title:
+            receipt["meeting_aliases"] = aliases
+        receipts.append(receipt)
     if publication_profile in (clockify_monthly_unresolved.PROFILE, clockify_monthly_unresolved.ALIAS_PROFILE):
         rows = clockify_monthly_unresolved.project_rows(source_dir)
         aliases = {}
@@ -1852,6 +1906,7 @@ def _validated_publication_document(
     retained = [
         {**{field: item.get(field) for field in retained_fields},
          **({"source_aliases": item["source_aliases"]} if "source_aliases" in item else {}),
+         **({"meeting_aliases": item["meeting_aliases"]} if "meeting_aliases" in item else {}),
          **({field: item.get(field) for field in ("monthly_layout", "monthly_target_readback")}
             if "monthly_layout" in item or "monthly_target_readback" in item else {})}
         for item in publications if isinstance(item, Mapping)
@@ -1981,6 +2036,10 @@ def _delivery_document(
         unsigned["source_completeness"] = dict(source["coverage"])
     if publication_profile is not None:
         unsigned["publication_profile"] = publication_profile
+    meeting_bindings = _meeting_bindings_for_target(config, sheet_title)
+    if meeting_bindings is not None:
+        from scripts import clockify_meeting_publication_alias as meeting_alias
+        unsigned["meeting_publication_bindings"] = meeting_alias.artifact_handle(meeting_bindings)
     if publication_profile == clockify_monthly_unresolved.ALIAS_PROFILE:
         path = Path(str(config["monthly_unresolved_alias_proof"]))
         unsigned["publication_alias_proof"] = {"path": str(path), "digest": _digest(path)}

@@ -16,9 +16,13 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 from typing import Any, Mapping, Protocol, Sequence
 from zoneinfo import ZoneInfo
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 try:
     from scripts import clockify_portfolio_replay as portfolio_replay
@@ -957,6 +961,7 @@ def _plan_publish(
     sheet_title: str,
     template_title: str,
     rows: Sequence[Sequence[Any]],
+    preserved_ids: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     ids = [str(row[0]) for row in rows]
     if len(ids) != len(set(ids)):
@@ -966,6 +971,8 @@ def _plan_publish(
     sheets = _sheet_map(metadata)
     created = sheet_title not in sheets
     if created:
+        if preserved_ids:
+            raise PublicationError("meeting representation target Sheet is missing")
         if template_title not in sheets:
             raise PublicationError(f"template Sheet is missing: {template_title}")
         return {
@@ -984,6 +991,17 @@ def _plan_publish(
     quoted = _a1_title(sheet_title)
     row_count = _sheet_row_count(metadata, sheet_title)
     positions, existing = _scan_rows(gateway, spreadsheet_id, quoted, row_count)
+
+    for row in rows:
+        if str(row[0]) not in preserved_ids:
+            continue
+        position = positions.get(str(row[0]))
+        if position is None:
+            raise PublicationError("meeting representation retained row is missing")
+        prior = list(existing[position])
+        prior.extend([""] * (len(HEADER) - len(prior)))
+        if any(not _same_cell(prior[i], row[i]) for i in range(len(HEADER)) if i not in HUMAN_COLUMNS):
+            raise PublicationError("meeting representation retained machine fields drifted")
 
     updates: list[Mapping[str, Any]] = []
     appends: list[Sequence[Any]] = []
@@ -1325,6 +1343,8 @@ def publish_proposal_partitions(
     monthly_rows: Sequence[Sequence[Any]] | None = None,
     monthly_aliases: Mapping[str, Any] | None = None,
     monthly_source_dir: Path | None = None,
+    meeting_bindings: Path | None = None,
+    source_dir: Path | None = None,
 ) -> dict[str, Any]:
     proposal_partitions: tuple[tuple[str, list[Mapping[str, Any]]], ...] = (
         (sheet_title, [
@@ -1347,6 +1367,30 @@ def publish_proposal_partitions(
         for destination, members in proposal_partitions
         if members and (monthly_rows is None or destination != "unresolved-evidence")
     ]
+    meeting_aliases: dict[str, list[dict[str, Any]]] = {}
+    if meeting_bindings is not None:
+        if source_dir is None or Path(source_dir).name != run_id:
+            raise PublicationError("meeting representation current source run differs")
+        try:
+            from scripts import clockify_meeting_publication_alias as meeting_alias
+            all_rows = [proposal_row(proposal, run_id, project_allowlist=project_allowlist) for proposal in proposals]
+            projected, aliases = meeting_alias.project(
+                bindings_path=meeting_bindings, source_dir=source_dir,
+                proposals=proposals, rows=all_rows,
+                spreadsheet_id=spreadsheet_id, sheet_title=sheet_title,
+            )
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            raise PublicationError("meeting representation binding is invalid") from exc
+        aliased = {alias["current_review_id"] for alias in aliases}
+        selected: dict[str, list[list[Any]]] = {sheet_title: [], "unresolved-evidence": []}
+        for proposal, row in zip(proposals, projected, strict=True):
+            unresolved = proposal.get("routing_disposition") == "unresolved-routing"
+            destination = "unresolved-evidence" if unresolved and stable_review_id(proposal) not in aliased else sheet_title
+            if monthly_rows is None or destination != "unresolved-evidence":
+                selected[destination].append(row)
+        partitions = [(title, rows) for title, rows in selected.items() if rows]
+        if aliases:
+            meeting_aliases[sheet_title] = aliases
     ids = [str(row[0]) for _destination, rows in partitions for row in rows]
     if len(ids) != len(set(ids)):
         raise PublicationError("proposal input contains duplicate stable review IDs")
@@ -1360,6 +1404,7 @@ def publish_proposal_partitions(
             sheet_title=destination,
             template_title=template_title,
             rows=rows,
+            preserved_ids=frozenset(alias["retained_review_id"] for alias in meeting_aliases.get(destination, [])),
         )
         for destination, rows in partitions
     ]
@@ -1382,6 +1427,7 @@ def publish_proposal_partitions(
                 spreadsheet_id=spreadsheet_id, sheet_title=destination, rows=rows,
             ),
             **result,
+            **({"meeting_aliases": meeting_aliases[destination]} if destination in meeting_aliases else {}),
         })
     if monthly_plan is not None:
         publications.append({
@@ -1454,11 +1500,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--enable-write", action="store_true")
     parser.add_argument("--monthly-unresolved", action="store_true")
     parser.add_argument("--monthly-unresolved-alias-proof", type=Path)
+    parser.add_argument("--meeting-publication-bindings", type=Path)
     args = parser.parse_args(argv)
 
     quality = _json(args.quality_report)
     replay = _json(args.replay_integrity)
     if args.portfolio_repair is not None:
+        if args.meeting_publication_bindings is not None:
+            parser.error("meeting publication bindings require --proposals")
         portfolio = _json(args.portfolio_repair)
         if not isinstance(portfolio, Mapping):
             raise PublicationError("portfolio repair input must be a JSON object")
@@ -1502,12 +1551,28 @@ def main(argv: list[str] | None = None) -> int:
                     monthly_aliases = monthly_unresolved.load_alias_proofs(args.monthly_unresolved_alias_proof, args.proposals.parent)
             except (OSError, KeyError, TypeError, ValueError) as exc:
                 raise PublicationError("monthly unresolved source/replay projection is invalid") from exc
+    meeting_preview_aliases = []
+    meeting_binding_handle = None
+    if args.meeting_publication_bindings is not None:
+        try:
+            from scripts import clockify_meeting_publication_alias as meeting_alias
+            if args.proposals.parent.name != args.run_id:
+                raise ValueError("meeting representation current source run differs")
+            meeting_binding_handle = meeting_alias.artifact_handle(args.meeting_publication_bindings)
+            _projected, meeting_preview_aliases = meeting_alias.project(
+                bindings_path=args.meeting_publication_bindings, source_dir=args.proposals.parent,
+                proposals=proposals, rows=rows,
+                spreadsheet_id=args.spreadsheet_id, sheet_title=args.sheet_title,
+            )
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            raise PublicationError("meeting representation binding is invalid") from exc
     if not args.enable_write:
         print(json.dumps({
             "status": "dry_run",
             "external_writes": False,
             "sheet_title": args.sheet_title,
             "rows": len(rows),
+            **({"meeting_aliases": len(meeting_preview_aliases)} if meeting_binding_handle is not None else {}),
         }, sort_keys=True))
         return 0
     gateway = GwsSheetsGateway()
@@ -1524,6 +1589,8 @@ def main(argv: list[str] | None = None) -> int:
             monthly_rows=monthly_rows,
             monthly_aliases=monthly_aliases,
             monthly_source_dir=args.proposals.parent,
+            meeting_bindings=args.meeting_publication_bindings,
+            source_dir=args.proposals.parent,
         )
     else:
         result = publish(
@@ -1534,6 +1601,8 @@ def main(argv: list[str] | None = None) -> int:
             rows=rows,
         )
     document = {"status": "published", "external_writes": True, **result}
+    if meeting_binding_handle is not None:
+        document["meeting_publication_bindings"] = meeting_binding_handle
     if args.proposals is not None and args.monthly_unresolved:
         document["publication_profile"] = monthly_unresolved.PROFILE
         if args.monthly_unresolved_alias_proof is not None:
@@ -1557,12 +1626,13 @@ def main(argv: list[str] | None = None) -> int:
                 "publications": [
                     {**{field: item[field] for field in receipt_fields},
                      **({"source_aliases": item["source_aliases"]} if "source_aliases" in item else {}),
+                     **({"meeting_aliases": item["meeting_aliases"]} if "meeting_aliases" in item else {}),
                      **({"canonical_source_aliases": item["canonical_source_aliases"]} if "canonical_source_aliases" in item else {}),
                      **({field: item[field] for field in ("monthly_layout", "monthly_target_readback")} if "monthly_layout" in item else {})}
                     for item in document["publications"]
                 ],
             }
-            for field in ("publication_profile", "publication_alias_proof"):
+            for field in ("publication_profile", "publication_alias_proof", "meeting_publication_bindings"):
                 if field in document:
                     stable_document[field] = document[field]
         _write_result(args.result_output, stable_document)
