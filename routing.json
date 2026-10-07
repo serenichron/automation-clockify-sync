@@ -714,6 +714,7 @@
     },
     {
       "email_domain": "tstprep.com",
+      "title_regex": "^\\s*TST(?:\\s+Prep\\b|\\s*[-–—:|]\\s*)",
       "prefix": "TSTP",
       "project_name": "TST Prep Level 1",
       "project_suffix": "319d88",

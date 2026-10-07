@@ -165,6 +165,11 @@ def _scoped_review_partitions(
         ordered = sorted(
             grouped[context],
             key=lambda row: (
+                # Ordinals restart for each captured burst. Keep burst bounds
+                # ahead of source order so later instructions cannot borrow
+                # an earlier burst's reply; preserve ordinal order within it.
+                str((row.get("raw_source_span") or {}).get("session_start") or "") if source_order else "",
+                str((row.get("raw_source_span") or {}).get("session_end") or "") if source_order else "",
                 row["source_ref"]["ordinal"] if source_order else 0,
                 semantic_analyzer._event_sort_key(row)[:2],
                 str(row["evidence_id"]),
@@ -1826,6 +1831,12 @@ def _activity_observed_intervals(
     hermes_groups: dict[tuple[str, str, str], list[dict[str, str]]] = {}
     for event in cited_events:
         source_type = str(event.get("source_type") or "")
+        if (
+            source_type in POINT_OBSERVATION_GAP_THRESHOLDS_SECONDS
+            and collector.is_injected_session_message(str(_attributes(event).get("content") or ""))
+        ):
+            # Legacy direct citations cannot regain timing from machine messages.
+            continue
         if source_type in {"hermes_db_sessions", "hermes_sessions"}:
             # Hermes session_start/end describe an unattended envelope. Only
             # its timestamped direct-user messages can establish capacity.
@@ -1916,11 +1927,7 @@ def _session_timing_contexts(
             or not source.get("machine") or not source.get("session_id")
             or attrs.get("role") != "user"
             or attrs.get("kind", "message") != "message" or attrs.get("tool_name")
-            or str(attrs.get("content") or "").lstrip().casefold().startswith((
-                "<task-notification", "<system-reminder", "<teammate-message",
-                "<command-message", "<local-command", "<codex_internal_context",
-                "this session is being continued from a previous conversation",
-            ))
+            or collector.is_injected_session_message(str(attrs.get("content") or ""))
         ):
             continue
         groups.setdefault((source_type, str(source["machine"]), str(source["session_id"])), []).append(event)
@@ -3246,7 +3253,20 @@ def run_accounting(
         title = str(meeting.title or "").strip()
         if not title:
             continue
-        route, route_error = resolve_route({}, entry["events"], routing)
+        attendance = {
+            "activity_id": semantic_analyzer.stable_digest("act-", {"recorded_attendance": meeting_id}),
+            "workstream_id": semantic_analyzer.stable_digest("ws-", {"recorded_meeting": meeting_id}),
+            "object": title,
+            "effort": {},
+            "timing_confidence": "high",
+            "split_rationale": "Authoritative canonical recording interval; factual attendance only.",
+            "evidence_ids": entry["source_evidence_ids"],
+        }
+        corrected_route = _route_from_review_correction(attendance, regression_cases, routing)
+        if corrected_route is not None:
+            route, route_error = _apply_prefix_override(corrected_route, entry["events"], routing), None
+        else:
+            route, route_error = resolve_route(attendance, entry["events"], routing)
         warnings = [{
             "type": "semantic_meeting_fallback",
             "reason": "No usable semantic activity; recorded attendance only, no outcome inferred.",
@@ -3256,14 +3276,7 @@ def run_accounting(
             warnings.append(warning)
         start, end = _canonical_meeting_span(meeting, representative)
         proposal = _proposal(
-            {
-                "activity_id": semantic_analyzer.stable_digest("act-", {"recorded_attendance": meeting_id}),
-                "workstream_id": semantic_analyzer.stable_digest("ws-", {"recorded_meeting": meeting_id}),
-                "object": title,
-                "effort": {},
-                "timing_confidence": "high",
-                "split_rationale": "Authoritative canonical recording interval; factual attendance only.",
-            },
+            attendance,
             route, f"{route.get('prefix') or 'SC'} — Attended {title}",
             start, end, entry["source_evidence_ids"], 1,
             review_warnings=warnings,

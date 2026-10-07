@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 from scripts import semantic_analyzer as semantic
-from test_semantic_analyzer import event, provider_response
+from test_semantic_analyzer import event, provider_members, provider_response
 
 
 class RepairContractTests(unittest.TestCase):
@@ -28,6 +28,172 @@ class RepairContractTests(unittest.TestCase):
             self.events, candidate=self.candidate, taxonomy=self.taxonomy,
             model=self.endpoint.model, **kwargs,
         )
+
+    def test_duplicate_repair_feedback_identifies_exact_alias_ranges_and_replays(self):
+        events = []
+        for bundle, count in ((1, 11), (2, 11), (3, 36)):
+            for member in range(1, count + 1):
+                value = event(f"ev-private-{bundle}-{member:02d}")
+                value["source_ref"] = {
+                    "source_type": "codex_sessions", "machine": "private-host",
+                    "session_id": f"private-session-{bundle}",
+                }
+                events.append(value)
+        spans = {value["evidence_id"]: {"start": "2026-07-10 10:00", "end": "2026-07-10 10:10"}
+                 for value in events}
+        expected = [
+            {"bundle_ref": "b-0001", "member_ranges": [[10, 11]],
+             "assigned_rows": [{"section": "activities", "row_index": 0},
+                               {"section": "activities", "row_index": 1}]},
+            {"bundle_ref": "b-0002", "member_ranges": [[10, 11]],
+             "assigned_rows": [{"section": "activities", "row_index": 2},
+                               {"section": "activities", "row_index": 3}]},
+        ]
+        def review(transport, cache):
+            return semantic._call_semantic_review(
+                self.endpoint, events, candidate=self.candidate, taxonomy=self.taxonomy,
+                tier="primary", transport=transport, known_evidence_ids=set(spans),
+                evidence_time_spans=spans, cache=cache, before_transport=None, cancelled=None,
+            )
+        calls = []
+        def fresh_transport(_endpoint, body):
+            payload = json.loads(body["messages"][1]["content"])
+            calls.append(copy.deepcopy(body))
+            members = provider_members(payload)
+            if len(calls) == 1:
+                rows = [provider_response(payload, members[start:end])["activities"][0]
+                        for start, end in ((0, 11), (9, 11), (11, 22), (20, 22))]
+                return {"activities": rows, "exceptions": [], "omissions": [{
+                    "lifecycle": "noise", "reason": "No additional supported work",
+                    "evidence_partitions": [{"bundle_ref": "b-0003", "member_ranges": [[1, 36]]}],
+                }], "private_note": "PRIVATE-REJECTED-PROSE /private/path secret=hidden"}
+            feedback = payload["repair_feedback"]
+            self.assertEqual(expected, feedback.get("citation_conflicts"))
+            self.assertEqual({"expected_members": 58, "unique_cited_members": 58,
+                              "duplicate_members": 4, "missing_members": 0},
+                             feedback.get("coverage_counts"))
+            return provider_response(payload)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "cache.jsonl"
+            first = review(fresh_transport, semantic.AnalyzerResponseCache(path, record_review_diagnostics=True))
+            self.assertEqual(2, len(calls))
+            self.assertEqual(58, len(first["activities"][0]["evidence_ids"]))
+            for forbidden in ("PRIVATE-REJECTED-PROSE", "/private/path", "secret=hidden",
+                              "ev-private-", "private-host", "private-session-"):
+                self.assertNotIn(forbidden, semantic.canonical_json(calls[1]))
+            # Reproduce a cached primary rejection, without an accepted repair.
+            second_path = Path(temporary) / "cached-rejection.jsonl"
+            second_path.write_bytes(path.read_bytes().splitlines(keepends=True)[0])
+            sidecar = path.with_name(path.name + ".review-diagnostics.jsonl")
+            second_sidecar = second_path.with_name(second_path.name + ".review-diagnostics.jsonl")
+            second_sidecar.write_bytes(sidecar.read_bytes())
+            second_sidecar.chmod(0o600)
+            cached_calls = []
+            def cached_transport(_endpoint, body):
+                cached_calls.append(copy.deepcopy(body))
+                return provider_response(json.loads(body["messages"][1]["content"]))
+            second = review(cached_transport, semantic.AnalyzerResponseCache(second_path, record_review_diagnostics=True))
+            self.assertEqual([calls[1]], cached_calls)
+            self.assertEqual(first["activities"], second["activities"])
+            sealed_cache, sealed_diagnostic = second_path.read_bytes(), second_sidecar.read_bytes()
+            replayed = review(lambda *_: self.fail("accepted diagnosed repair must replay without inference"),
+                              semantic.AnalyzerResponseCache(second_path, record_review_diagnostics=True))
+            self.assertEqual(second["activities"], replayed["activities"])
+            self.assertEqual(sealed_cache, second_path.read_bytes())
+            self.assertEqual(sealed_diagnostic, second_sidecar.read_bytes())
+
+    def test_untrusted_duplicate_diagnostics_never_enter_retry_feedback(self):
+        cases = ("body mismatch", "cache mismatch", "coverage mismatch", "coverage noninteger", "unknown alias",
+                 "out of range", "reversed range", "noninteger range", "overlapping ranges",
+                 "prose field", "conflicting records", "unsafe mode", "symlink", "malformed json")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "cache.jsonl"
+                cache = semantic.AnalyzerResponseCache(path, record_review_diagnostics=True)
+                def invalid(_endpoint, body):
+                    response = provider_response(json.loads(body["messages"][1]["content"]))
+                    response["activities"].append(copy.deepcopy(response["activities"][0]))
+                    return response
+                with self.assertRaisesRegex(semantic.AnalyzerContractError, "reassigned evidence"):
+                    semantic._call_semantic_review_once(
+                        self.endpoint, self.events, candidate=self.candidate, taxonomy=self.taxonomy,
+                        tier="primary", transport=invalid, known_evidence_ids={"ev-1"},
+                        evidence_time_spans={"ev-1": {"start": "2026-07-10 10:00", "end": "2026-07-10 10:10"}},
+                        cache=cache, before_transport=None, cancelled=None,
+                    )
+                sidecar = path.with_name(path.name + ".review-diagnostics.jsonl")
+                diagnostic = json.loads(sidecar.read_text())
+                partition = diagnostic["activities"][0]["evidence_partitions"][0]
+                original = copy.deepcopy(diagnostic)
+                if case == "body mismatch":
+                    diagnostic["body_digest"] = "f" * 64
+                elif case == "cache mismatch":
+                    diagnostic["cache_key"] = "arc-" + "f" * 64
+                elif case == "coverage mismatch":
+                    diagnostic["coverage_contract"][0]["allowed_member_range"] = [1, 2]
+                elif case == "coverage noninteger":
+                    diagnostic["coverage_contract"][0]["allowed_member_range"] = [True, 1]
+                elif case == "unknown alias":
+                    partition["bundle_ref"] = "b-9999"
+                elif case == "out of range":
+                    partition["member_ranges"] = [[1, 2]]
+                elif case == "reversed range":
+                    partition["member_ranges"] = [[1, 0]]
+                elif case == "noninteger range":
+                    partition["member_ranges"] = [[True, 1]]
+                elif case == "overlapping ranges":
+                    partition["member_ranges"] = [[1, 1], [1, 1]]
+                elif case == "prose field":
+                    diagnostic["activities"][0]["reason"] = "PRIVATE-DIAGNOSTIC-PROSE secret=hidden /private/path"
+                elif case == "conflicting records":
+                    diagnostic["activities"] = diagnostic["activities"][:1]
+                sidecar.write_text(json.dumps(diagnostic) + "\n")
+                if case == "conflicting records":
+                    with sidecar.open("a") as handle:
+                        handle.write(json.dumps(original) + "\n")
+                elif case == "unsafe mode":
+                    sidecar.chmod(0o644)
+                elif case == "symlink":
+                    target = sidecar.with_name("untrusted-diagnostic.jsonl")
+                    sidecar.rename(target)
+                    sidecar.symlink_to(target)
+                elif case == "malformed json":
+                    sidecar.write_text("PRIVATE-DIAGNOSTIC-PROSE secret=hidden /private/path\n")
+                calls = []
+                def corrected(_endpoint, body):
+                    calls.append(copy.deepcopy(body))
+                    payload = json.loads(body["messages"][1]["content"])
+                    self.assertNotIn("citation_conflicts", payload["repair_feedback"])
+                    self.assertNotIn("coverage_counts", payload["repair_feedback"])
+                    for forbidden in ("PRIVATE-DIAGNOSTIC-PROSE", "secret=hidden", "/private/path"):
+                        self.assertNotIn(forbidden, semantic.canonical_json(body))
+                    return provider_response(payload)
+                result = self.review(corrected, semantic.AnalyzerResponseCache(path, record_review_diagnostics=True))
+                self.assertEqual(["ev-1"], result["activities"][0]["evidence_ids"])
+                self.assertEqual(1, len(calls))
+
+    def test_bound_diagnostic_preserves_old_accepted_generic_repair(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "cache.jsonl"
+            cache = semantic.AnalyzerResponseCache(path, record_review_diagnostics=True)
+            def invalid(_endpoint, body):
+                response = provider_response(json.loads(body["messages"][1]["content"]))
+                response["activities"].append(copy.deepcopy(response["activities"][0]))
+                return response
+            with self.assertRaises(semantic.AnalyzerContractError):
+                semantic._call_semantic_review_once(
+                    self.endpoint, self.events, candidate=self.candidate, taxonomy=self.taxonomy,
+                    tier="primary", transport=invalid, known_evidence_ids={"ev-1"},
+                    evidence_time_spans={"ev-1": {"start": "2026-07-10 10:00", "end": "2026-07-10 10:10"}},
+                    cache=cache, before_transport=None, cancelled=None,
+                )
+            generic = self.body(repair_failure_code="contract_rejected_duplicate_evidence", repair_attempt=1)
+            cache.store_accepted(self.endpoint, generic, provider_response(json.loads(generic["messages"][1]["content"])))
+            before = path.read_bytes()
+            result = self.review(lambda *_: self.fail("historical accepted generic repair must remain authoritative"),
+                                 semantic.AnalyzerResponseCache(path, record_review_diagnostics=True))
+            self.assertEqual(["ev-1"], result["activities"][0]["evidence_ids"])
+            self.assertEqual(before, path.read_bytes())
 
     def test_repair_example_is_consumable_by_actual_provider_contract(self):
         calls = []

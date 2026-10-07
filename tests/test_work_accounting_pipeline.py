@@ -2440,6 +2440,40 @@ class WorkAccountingPipelineTests(unittest.TestCase):
                 _, result = self.make_run([first, result_event, other], analysis)
                 self.assertEqual([], result["proposals"])
 
+    def test_accounting_pool_excludes_prefixed_teammate_notifications(self):
+        wrapped = ('Another Claude session sent a message:\n'
+                   '<teammate-message teammate_id="synthetic-worker">'
+                   '{"type":"idle_notification","result":"Synthetic artifact ready"}'
+                   '</teammate-message>')
+        for content, human in ((wrapped, False), ('I reviewed the actual artifacts:\n' + wrapped, True)):
+            events = [claude_event(timestamp, content=content).document() for timestamp in
+                      ('2026-09-24T10:00:00+03:00', '2026-09-24T10:05:00+03:00')]
+            with self.subTest(human=human):
+                contexts = pipeline._session_timing_contexts(events)
+                if not human:
+                    self.assertEqual({}, contexts)
+                else:
+                    self.assertEqual({event['evidence_id'] for event in events}, set(contexts))
+                    for context in contexts.values():
+                        self.assertEqual({'start': '2026-09-24T10:00:00+03:00',
+                                          'end': '2026-09-24T10:05:00+03:00'}, context['interval'])
+
+    def test_legacy_claude_machine_citations_supply_no_observed_capacity(self):
+        wrapped = ('Another Claude session sent a message:\n'
+                   '<teammate-message teammate_id="synthetic-worker">Synthetic artifact ready</teammate-message>')
+        for content in (wrapped, '<teammate-message teammate_id="synthetic-worker">Ready</teammate-message>'):
+            events = [claude_event(timestamp, content=content).document() for timestamp in
+                      ('2026-09-24T10:00:00+03:00', '2026-09-24T10:05:00+03:00')]
+            with self.subTest(content=content):
+                self.assertEqual([], pipeline._activity_observed_intervals(events))
+
+    def test_legacy_claude_ordinary_human_and_assistant_points_are_preserved(self):
+        events = [claude_event('2026-09-24T10:00:00+03:00', content='Review the synthetic artifact.').document(),
+                  claude_event('2026-09-24T10:05:00+03:00', 'assistant',
+                               content='Synthetic artifact reviewed.').document()]
+        self.assertEqual([{'start': '2026-09-24T10:00:00+03:00',
+                           'end': '2026-09-24T10:05:00+03:00'}], pipeline._activity_observed_intervals(events))
+
     def test_disjoint_hermes_outcomes_use_separate_same_session_timing_context(self):
         """Catches outcome partitioning dropping the other genuine timing anchor."""
         first_user = hermes_event("2026-10-03 16:06")

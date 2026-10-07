@@ -18,6 +18,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import sys
 from typing import Any, Mapping, Sequence
 import urllib.parse
@@ -78,7 +79,8 @@ def _cell_value(cell: Mapping[str, Any]) -> Any:
     return ""
 
 
-def _sheet_rows(document: Mapping[str, Any]) -> tuple[str, str, list[tuple[int, dict[str, Any]]]]:
+def _sheet_rows(document: Mapping[str, Any], *, pending_only: bool = True
+                ) -> tuple[str, str, list[tuple[int, dict[str, Any]]]]:
     structured = document.get("structuredContent")
     if not isinstance(structured, Mapping):
         raise NativePostError("native Sheet capture lacks structuredContent")
@@ -111,7 +113,8 @@ def _sheet_rows(document: Mapping[str, Any]) -> tuple[str, str, list[tuple[int, 
     for row_number, raw in enumerate(raw_rows[1:], 2):
         values = [_cell_value(cell) for cell in raw.get("values", [])]
         values += [""] * (len(expected) - len(values))
-        if str(values[9]).strip().lower() != "pending" or str(values[13]).strip().lower() != "unposted":
+        if pending_only and (str(values[9]).strip().lower() != "pending"
+                             or str(values[13]).strip().lower() != "unposted"):
             continue
         rows.append((row_number, dict(zip(expected, values))))
     if not rows:
@@ -236,12 +239,146 @@ def _overlap(payload: Mapping[str, Any], entry: Mapping[str, Any]) -> dict[str, 
             "overlap_seconds": seconds}
 
 
+def _row_interval(row: Mapping[str, Any], timezone: str) -> tuple[dt.datetime, dt.datetime, int]:
+    start = _parse_sheet_time(row["Start"], timezone)
+    end = _parse_sheet_time(row["End"], timezone)
+    minutes = row["Duration (min)"]
+    seconds = int((end - start).total_seconds())
+    # Only tolerate float-display roundoff; timestamps remain the exact authority.
+    if (isinstance(minutes, bool) or not isinstance(minutes, (int, float))
+            or not math.isfinite(minutes) or seconds <= 0
+            or not math.isclose(minutes * 60, seconds, rel_tol=0, abs_tol=1e-9)):
+        raise NativePostError(f"Sheet posting duration is inconsistent for {row['Review ID']}")
+    return start, end, seconds
+
+
+def _row_payload(row: Mapping[str, Any], routes: Mapping[Any, Any], timezone: str
+                 ) -> tuple[dict[str, Any], int]:
+    start, end, seconds = _row_interval(row, timezone)
+    tag_names = tuple(value.strip() for value in str(row["Tags"]).split(",") if value.strip())
+    key = (str(row["Project"]).strip(), tag_names)
+    route = routes.get(key)
+    if route is None:
+        raise NativePostError(f"Clockify route is missing for {key[0]} / {', '.join(tag_names)}")
+    return {"start": _utc(start), "end": _utc(end),
+            "description": str(row["Description"]).strip(), **route}, seconds
+
+
+def _same_interval_route(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    return all(left[key] == right[key] for key in ("start", "end", "projectId", "taskId", "tagIds", "billable"))
+
+
+def _posted_source_credit(item: Mapping[str, Any], source: str,
+                          rows: Sequence[tuple[int, Mapping[str, Any]]], routes: Mapping[Any, Any],
+                          timezone: str, live_entries: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
+    if not re.fullmatch(r"act-[0-9a-f]{24}", source):
+        return None
+    candidates = []
+    for row_number, row in rows:
+        if (str(row["Source"]).strip() != source or not str(row["Review ID"]).strip()
+                or str(row["Disposition"]).strip().lower() != "approved"
+                or str(row["Review Status"]).strip().lower() != "posted"):
+            continue
+        try:
+            payload, _ = _row_payload(row, routes, timezone)
+        except NativePostError:
+            continue  # Unverified historical rows are not authority to suppress a POST.
+        if _same_interval_route(payload, item["payload"]):
+            candidates.append((row_number, row, payload))
+    matches = [(row_number, row, payload, entry)
+               for row_number, row, payload in candidates for entry in live_entries
+               if _payload_matches(payload, entry) and str(entry.get("id") or "")]
+    native_ids = {str(entry["id"]) for _, _, _, entry in matches}
+    if len(native_ids) > 1:
+        raise NativePostError("canonical Sheet source identity is ambiguous; audit prior native entries before posting")
+    if not matches:
+        return None
+    # Previously credited aliases can carry renamed descriptions. Retain the
+    # first captured fact that exactly proves the one distinct native identity.
+    row_number, row, payload, entry = matches[0]
+    credit = {"source": source, "current_review_id": item["review_id"],
+              "current_payload_digest": item["payload_digest"],
+              "prior_row_number": row_number, "prior_row": dict(row), "payload": payload,
+              "clockify_entry_id": str(entry["id"]), "readback_digest": _live_digest([entry])}
+    credit["credit_digest"] = _digest(credit)
+    return credit
+
+
+def _validate_sheet_source_credit(item: Mapping[str, Any], timezone: str) -> None:
+    try:
+        credit = item["sheet_source_credit"]
+        row = credit["prior_row"]
+        start, end, _ = _row_interval(row, timezone)
+        if (set(credit) != {"source", "current_review_id", "current_payload_digest", "prior_row_number",
+                           "prior_row", "payload", "clockify_entry_id", "readback_digest", "credit_digest"}
+                or credit["credit_digest"] != _document_digest(credit, "credit_digest")
+                or "prior_entry_credit" in item
+                or not re.fullmatch(r"act-[0-9a-f]{24}", credit["source"])
+                or credit["source"] != item["source"] or credit["source"] != str(row["Source"]).strip()
+                or credit["current_review_id"] != item["review_id"]
+                or credit["current_payload_digest"] != item["payload_digest"]
+                or item["payload_digest"] != _digest(item["payload"])
+                or not str(row["Review ID"]).strip()
+                or type(credit["prior_row_number"]) is not int or credit["prior_row_number"] < 2
+                or str(row["Disposition"]).strip().lower() != "approved"
+                or str(row["Review Status"]).strip().lower() != "posted"
+                or credit["payload"]["start"] != _utc(start) or credit["payload"]["end"] != _utc(end)
+                or credit["payload"]["description"] != str(row["Description"]).strip()
+                or not _same_interval_route(credit["payload"], item["payload"])
+                or not isinstance(credit["clockify_entry_id"], str) or not credit["clockify_entry_id"]
+                or not re.fullmatch(r"[0-9a-f]{64}", credit["readback_digest"])):
+            raise NativePostError("sealed Sheet source credit binding differs")
+    except (ValueError, TypeError, KeyError, AttributeError) as error:
+        raise NativePostError("sealed Sheet source credit is invalid") from error
+
+
+def _batch_alias_leaders(entries: Sequence[Mapping[str, Any]]) -> dict[str, str]:
+    leaders: dict[str, str] = {}
+    aliases: dict[str, str] = {}
+    for item in entries:
+        if "prior_entry_credit" in item or "sheet_source_credit" in item:
+            continue
+        key = _canonical(item["payload"])
+        if key in leaders:
+            aliases[item["review_id"]] = leaders[key]
+        else:
+            leaders[key] = item["review_id"]
+    return aliases
+
+
+def _check_unique_native_ids(entries: Sequence[Mapping[str, Any]], entry_ids: Sequence[str],
+                             confirmed: Mapping[str, Mapping[str, Any]] | None = None) -> None:
+    by_id: dict[str, Mapping[str, Any]] = {}
+    for item, entry_id in zip(entries, entry_ids):
+        prior = by_id.get(entry_id)
+        if not entry_id:
+            raise NativePostError("each review row must bind one unique Clockify entry")
+        if prior is not None:
+            aliases = _batch_alias_leaders(entries)
+            event = (confirmed or {}).get(item["review_id"], {})
+            leader = (confirmed or {}).get(prior["review_id"], {})
+            if (aliases.get(item["review_id"]) == prior["review_id"]
+                    and event.get("disposition") == "same_batch_payload_credit"
+                    and event.get("alias_of_review_id") == prior["review_id"]
+                    and leader.get("clockify_entry_id") == entry_id
+                    and item["payload"] == prior["payload"]):
+                continue
+            left, right = prior.get("sheet_source_credit"), item.get("sheet_source_credit")
+            # Only exact aliases of the same sealed prior Sheet fact can share credit.
+            keys = ("source", "prior_row_number", "prior_row", "payload", "clockify_entry_id", "readback_digest")
+            if (left is None or right is None or left["clockify_entry_id"] != entry_id
+                    or any(left[key] != right[key] for key in keys)):
+                raise NativePostError("each review row must bind one unique Clockify entry")
+        by_id[entry_id] = item
+
+
 def build_plan(document: Mapping[str, Any], *, capture_sha256: str, routing: Mapping[str, Any],
                routing_sha256: str, timezone: str, workspace_id: str, member_id: str,
                projects: Sequence[Mapping[str, Any]], tags: Sequence[Mapping[str, Any]],
                live_entries: Sequence[Mapping[str, Any]],
                source_adoptions: Mapping[str, Any] | None = None) -> dict[str, Any]:
     spreadsheet_id, sheet_title, rows = _sheet_rows(document)
+    _, _, captured_rows = _sheet_rows(document, pending_only=False)
     routes = _resolve_routes(routing, projects, tags)
     entries: list[dict[str, Any]] = []
     total_seconds = 0
@@ -251,23 +388,8 @@ def build_plan(document: Mapping[str, Any], *, capture_sha256: str, routing: Map
         if not review_id or review_id in seen:
             raise NativePostError("Sheet posting review IDs are missing or duplicated")
         seen.add(review_id)
-        start = _parse_sheet_time(row["Start"], timezone)
-        end = _parse_sheet_time(row["End"], timezone)
-        minutes = row["Duration (min)"]
-        seconds = int((end - start).total_seconds())
-        # Only tolerate float-display roundoff; timestamps remain the exact authority.
-        if (isinstance(minutes, bool) or not isinstance(minutes, (int, float))
-                or not math.isfinite(minutes) or seconds <= 0
-                or not math.isclose(minutes * 60, seconds, rel_tol=0, abs_tol=1e-9)):
-            raise NativePostError(f"Sheet posting duration is inconsistent for {review_id}")
+        payload, seconds = _row_payload(row, routes, timezone)
         total_seconds += seconds
-        tag_names = tuple(value.strip() for value in str(row["Tags"]).split(",") if value.strip())
-        key = (str(row["Project"]).strip(), tag_names)
-        route = routes.get(key)
-        if route is None:
-            raise NativePostError(f"Clockify route is missing for {key[0]} / {', '.join(tag_names)}")
-        payload = {"start": _utc(start), "end": _utc(end),
-                   "description": str(row["Description"]).strip(), **route}
         overlaps = [value for item in live_entries if (value := _overlap(payload, item)) is not None]
         entries.append({"review_id": review_id, "row_number": row_number,
                         "duration_minutes": seconds // 60 if seconds % 60 == 0 else seconds / 60,
@@ -295,6 +417,13 @@ def build_plan(document: Mapping[str, Any], *, capture_sha256: str, routing: Map
         result["source_adoptions_sha256"] = _digest(sorted(
             source_adoptions["declarations"], key=lambda value: value["current_review_id"],
         ))
+    for item, (_, row) in zip(entries, rows):
+        if "prior_entry_credit" in item:
+            continue  # Explicit audited adoptions keep their existing contract.
+        source = str(row["Source"]).strip()
+        credit = _posted_source_credit(item, source, captured_rows, routes, timezone, live_entries)
+        if credit is not None:
+            item.update(source=source, sheet_source_credit=credit)
     result["plan_digest"] = _document_digest(result, "plan_digest")
     return result
 
@@ -329,6 +458,8 @@ def _validate_approval(plan: Mapping[str, Any], approval: Mapping[str, Any], now
     approval_id = str(approval.get("approval_id") or "")
     if not approval_id or not str(approval.get("approver") or ""):
         raise NativePostError("approval identity is missing")
+    if any(item["payload_digest"] != _digest(item["payload"]) for item in plan["entries"]):
+        raise NativePostError("approved row payload digest differs from its exact payload")
     return _digest(approval)
 
 
@@ -421,9 +552,20 @@ def execute_plan(plan: Mapping[str, Any], approval: Mapping[str, Any], events_pa
 
 
 def _item_matches(item: Mapping[str, Any], entry: Mapping[str, Any]) -> bool:
+    sheet_credit = item.get("sheet_source_credit")
+    if sheet_credit is not None:
+        return (str(entry.get("id") or "") == sheet_credit["clockify_entry_id"]
+                and _payload_matches(sheet_credit["payload"], entry)
+                and _live_digest([entry]) == sheet_credit["readback_digest"])
     credit = item.get("prior_entry_credit")
     if credit is None:
         return _payload_matches(item["payload"], entry)
+    if credit.get("verification_basis") == "audited_manual_meeting":
+        return (clockify_source_adoptions.current_live_matches(
+            credit["payload"], entry, workspace_id=credit["workspace_id"],
+            member_id=credit["member_id"], entry_id=credit["clockify_entry_id"],
+        ) and _digest(entry) == credit["retained_entry_digest"]
+                and _live_digest([entry]) == credit["readback_digest"])
     if credit.get("verification_basis") == "current_live_snapshot":
         binding = credit["confirmed_binding"]
         if not clockify_source_adoptions.current_live_matches(
@@ -446,6 +588,29 @@ def _execute_plan_locked(plan: Mapping[str, Any], approval: Mapping[str, Any], e
     period_end = max(item["payload"]["end"] for item in entries)
     records = _events(events_path)
     intents, responses, confirmed = _confirmed_by_review(records, approval_digest, plan_digest)
+    aliases = _batch_alias_leaders(entries)
+    by_review = {item["review_id"]: item for item in entries}
+    for record in records:
+        item = by_review.get(record.get("review_id"))
+        if item is None or record.get("payload_digest") != _digest(item["payload"]):
+            raise NativePostError("post event payload differs from approved row")
+        if "alias_of_review_id" in record:
+            if (record["alias_of_review_id"] != aliases.get(item["review_id"])
+                    or record["event_type"] == "created_response"
+                    or (record["event_type"] == "confirmed"
+                        and record.get("disposition") != "same_batch_payload_credit")):
+                raise NativePostError("post event alias binding differs from approved batch")
+    for review_id, leader_id in aliases.items():
+        intent = intents.get(review_id)
+        if intent is not None and review_id not in confirmed and intent.get("alias_of_review_id") != leader_id:
+            raise NativePostError("unmarked historical alias intent may already have posted")
+        terminal = confirmed.get(review_id)
+        if terminal is not None and terminal.get("disposition") == "same_batch_payload_credit":
+            leader = confirmed.get(leader_id)
+            if (intent is None or intent.get("alias_of_review_id") != leader_id
+                    or terminal.get("alias_of_review_id") != leader_id or leader is None
+                    or terminal.get("clockify_entry_id") != leader.get("clockify_entry_id")):
+                raise NativePostError("post event alias lacks confirmed leader binding")
     current = gateway.period_entries(period_start, period_end)
     if not records and _live_digest(current) != plan["live_snapshot_sha256"]:
         raise NativePostError("live Clockify snapshot drifted after approval")
@@ -472,6 +637,33 @@ def _execute_plan_locked(plan: Mapping[str, Any], approval: Mapping[str, Any], e
             credited_readbacks[item["review_id"]] = readback
 
     for item in entries:
+        if "sheet_source_credit" not in item:
+            continue
+        _validate_sheet_source_credit(item, str(plan["timezone"]))
+        readback = gateway.entry_by_id(item["sheet_source_credit"]["clockify_entry_id"])
+        if not isinstance(readback, Mapping) or not _item_matches(item, readback):
+            raise NativePostError("Sheet source credit prior entry failed exact direct GET readback")
+        credited_readbacks[item["review_id"]] = readback
+    credited_items = [item for item in entries if item["review_id"] in credited_readbacks]
+    _check_unique_native_ids(credited_items, [str(credited_readbacks[item["review_id"]]["id"])
+                                            for item in credited_items])
+
+    # An unbound exact match is not proof of source credit, but it is also
+    # not permission to create another identical native entry. Check the
+    # whole batch before any new intent or POST; distinct overlaps stay valid.
+    for item in entries:
+        review_id = item["review_id"]
+        if (review_id in confirmed or review_id in intents or review_id in responses
+                or review_id in aliases or review_id in credited_readbacks):
+            continue
+        exact_ids = sorted(str(entry["id"]) for entry in current
+                           if entry.get("id") and _payload_matches(item["payload"], entry))
+        if exact_ids:
+            raise NativePostError(
+                f"existing exact payload for {review_id}; verify source identity before posting: "
+                + ", ".join(exact_ids))
+
+    for item in entries:
         review_id = item["review_id"]
         payload = item["payload"]
         terminal = confirmed.get(review_id)
@@ -482,18 +674,39 @@ def _execute_plan_locked(plan: Mapping[str, Any], approval: Mapping[str, Any], e
             continue
         intent = intents.get(review_id)
         response = responses.get(review_id)
-        if "prior_entry_credit" in item:
+        alias_of = aliases.get(review_id)
+        if alias_of is not None:
+            leader = confirmed.get(alias_of)
+            if leader is None or response is not None:
+                raise NativePostError("batch payload alias lacks confirmed leader")
+            entry_id = str(leader["clockify_entry_id"])
+            proof_entry = gateway.entry_by_id(entry_id)
+            if not isinstance(proof_entry, Mapping) or not _payload_matches(payload, proof_entry):
+                raise NativePostError("batch payload alias failed exact direct GET readback")
+            if intent is None:
+                _append_event(events_path, {"event_type": "intent", "approval_digest": approval_digest,
+                              "plan_digest": plan_digest, "review_id": review_id,
+                              "payload_digest": item["payload_digest"], "alias_of_review_id": alias_of,
+                              "before_entry_ids": sorted(str(entry["id"]) for entry in current if entry.get("id")),
+                              "recorded_at": _utc(now)})
+            disposition = "same_batch_payload_credit"
+        elif "prior_entry_credit" in item or "sheet_source_credit" in item:
             if response is not None:
-                raise NativePostError("source adoption row unexpectedly has a create response")
+                raise NativePostError("existing credit row unexpectedly has a create response")
             if intent is None:
                 _append_event(events_path, {"event_type": "intent", "approval_digest": approval_digest,
                               "plan_digest": plan_digest, "review_id": review_id,
                               "payload_digest": item["payload_digest"],
                               "before_entry_ids": sorted(str(entry["id"]) for entry in current if entry.get("id")),
                               "recorded_at": _utc(now)})
-            entry_id = item["prior_entry_credit"]["clockify_entry_id"]
+            credit = item.get("sheet_source_credit", item.get("prior_entry_credit"))
+            entry_id = credit["clockify_entry_id"]
             proof_entry = credited_readbacks[review_id]
-            disposition = "credited_prior_source"
+            disposition = (
+                "existing_credit" if "sheet_source_credit" in item else
+                "credited_manual_meeting" if credit.get("verification_basis") == "audited_manual_meeting" else
+                "credited_prior_source"
+            )
         elif response is not None:
             entry_id = str(response["clockify_entry_id"])
             recovered = gateway.entry_by_id(entry_id)
@@ -549,6 +762,7 @@ def _execute_plan_locked(plan: Mapping[str, Any], approval: Mapping[str, Any], e
                       "plan_digest": plan_digest, "review_id": review_id,
                       "payload_digest": item["payload_digest"], "clockify_entry_id": entry_id,
                       "disposition": disposition, "readback_digest": _live_digest([proof_entry]),
+                      **({"alias_of_review_id": alias_of} if disposition == "same_batch_payload_credit" else {}),
                       "recorded_at": _utc(now)})
         records = _events(events_path)
         intents, responses, confirmed = _confirmed_by_review(records, approval_digest, plan_digest)
@@ -558,9 +772,8 @@ def _execute_plan_locked(plan: Mapping[str, Any], approval: Mapping[str, Any], e
     _, _, confirmed = _confirmed_by_review(records, approval_digest, plan_digest)
     if len(confirmed) != len(entries):
         raise NativePostError("post event ledger does not cover every approved row")
-    confirmed_ids = [str(event.get("clockify_entry_id") or "") for event in confirmed.values()]
-    if not all(confirmed_ids) or len(set(confirmed_ids)) != len(confirmed_ids):
-        raise NativePostError("each review row must bind one unique Clockify entry")
+    _check_unique_native_ids(entries, [str(confirmed[item["review_id"]].get("clockify_entry_id") or "")
+                                      for item in entries], confirmed)
     receipt_entries = []
     for item in entries:
         event = confirmed[item["review_id"]]
@@ -572,13 +785,34 @@ def _execute_plan_locked(plan: Mapping[str, Any], approval: Mapping[str, Any], e
                                 "clockify_entry_id": event["clockify_entry_id"],
                                 "disposition": event["disposition"],
                                 "live_overlaps": item["live_overlaps"]}
+        if event["disposition"] == "same_batch_payload_credit":
+            receipt_entry.update(alias_of_review_id=event["alias_of_review_id"],
+                                 posting_semantics="same_batch_identical_payload_not_posted")
         if "prior_entry_credit" in item:
             credit = item["prior_entry_credit"]
+            if credit.get("verification_basis") == "audited_manual_meeting":
+                receipt_entry.update(
+                    posting_semantics="manual_native_entry_retained_current_payload_not_posted",
+                    retained_native_payload=credit["payload"], retained_entry_digest=credit["retained_entry_digest"],
+                    approved_current_seconds=credit["approved_current_seconds"],
+                    retained_native_seconds=credit["retained_native_seconds"], posted_seconds=0,
+                    adoption_declaration_digest=credit["declaration_digest"],
+                    adoption_verification_basis="audited_manual_meeting",
+                )
+            else:
+                receipt_entry.update(
+                    posting_semantics="prior_accomplishment_retained_current_payload_not_posted",
+                    prior_approved_payload=credit["payload"], prior_payload_digest=_digest(credit["payload"]),
+                    adoption_declaration_digest=credit["declaration_digest"],
+                    adoption_verification_basis=credit.get("verification_basis", "historical_native_readback"),
+                )
+        if "sheet_source_credit" in item:
+            credit = item["sheet_source_credit"]
             receipt_entry.update(
-                posting_semantics="prior_accomplishment_retained_current_payload_not_posted",
+                posting_semantics="existing_source_retained_current_payload_not_posted",
                 prior_approved_payload=credit["payload"], prior_payload_digest=_digest(credit["payload"]),
-                adoption_declaration_digest=credit["declaration_digest"],
-                adoption_verification_basis=credit.get("verification_basis", "historical_native_readback"),
+                source=credit["source"], prior_review_id=credit["prior_row"]["Review ID"],
+                prior_row_number=credit["prior_row_number"], source_credit_digest=credit["credit_digest"],
             )
         receipt_entries.append(receipt_entry)
     receipt = {"schema_version": RECEIPT_SCHEMA, "status": "complete",
@@ -587,6 +821,43 @@ def _execute_plan_locked(plan: Mapping[str, Any], approval: Mapping[str, Any], e
                "total_minutes": plan["total_minutes"], "entries": receipt_entries,
                "final_live_snapshot_sha256": _live_digest(final_live),
                "event_ledger_sha256": hashlib.sha256(events_path.read_bytes()).hexdigest()}
+    if any("sheet_source_credit" in item for item in entries):
+        # Approval totals count visible rows; credit totals count retained native
+        # entries once, even when multiple current rows are exact source aliases.
+        credited_ids: set[str] = set()
+        credited_seconds = posted_seconds = 0
+        for item in entries:
+            event = confirmed[item["review_id"]]
+            if event["disposition"] in {"existing_credit", "credited_prior_source", "credited_manual_meeting"}:
+                if event["clockify_entry_id"] not in credited_ids:
+                    credited_ids.add(event["clockify_entry_id"])
+                    retained = item["prior_entry_credit"]["payload"] if event["disposition"] == "credited_manual_meeting" else item["payload"]
+                    credited_seconds += int((legacy._parse(retained["end"])
+                                             - legacy._parse(retained["start"])).total_seconds())
+            else:
+                posted_seconds += int((legacy._parse(item["payload"]["end"])
+                                       - legacy._parse(item["payload"]["start"])).total_seconds())
+        receipt.update(posted_minutes=posted_seconds / 60, existing_credit_minutes=credited_seconds / 60)
+    manual_credits = [item["prior_entry_credit"] for item in entries
+                      if item.get("prior_entry_credit", {}).get("verification_basis") == "audited_manual_meeting"]
+    if manual_credits:
+        receipt.update(
+            approved_current_seconds=sum(clockify_source_adoptions._seconds(item["payload"]) for item in entries),
+            retained_native_seconds=sum(credit["retained_native_seconds"] for credit in manual_credits),
+            posted_seconds=sum(clockify_source_adoptions._seconds(item["payload"]) for item in entries
+                               if confirmed[item["review_id"]]["disposition"] in {"created", "recovered_after_ambiguous_response"}),
+        )
+    if any(event["disposition"] == "same_batch_payload_credit" for event in confirmed.values()):
+        posted_seconds = alias_seconds = 0
+        for item in entries:
+            seconds = int((legacy._parse(item["payload"]["end"])
+                           - legacy._parse(item["payload"]["start"])).total_seconds())
+            disposition = confirmed[item["review_id"]]["disposition"]
+            if disposition == "same_batch_payload_credit":
+                alias_seconds += seconds
+            elif disposition not in {"existing_credit", "credited_prior_source", "credited_manual_meeting"}:
+                posted_seconds += seconds
+        receipt.update(posted_minutes=posted_seconds / 60, same_batch_alias_minutes=alias_seconds / 60)
     _atomic_write(receipt_path, receipt)
     return receipt
 

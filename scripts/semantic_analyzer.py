@@ -775,6 +775,12 @@ def _semantic_context_key(event: Mapping[str, Any]) -> tuple[str, ...]:
             str(attributes.get("repository_root") or source_ref.get("source_id") or "unknown"),
         )
     if source_type == "multica":
+        if attributes.get("activity_kind") == "comment" and source_ref.get("issue_id"):
+            return (
+                "multica",
+                str(attributes.get("project_id") or "unknown"),
+                str(source_ref["issue_id"]),
+            )
         return (
             "multica",
             str(attributes.get("project_id") or "unknown"),
@@ -975,6 +981,56 @@ def _restore_extraction_partitions(
                 raise AnalyzerError("provider record repeats expanded evidence members")
             record["evidence_ids"] = expanded
     return restored
+
+
+def _review_citation_conflicts(
+    diagnostic: Mapping[str, Any], *, events: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Derive numeric conflicts only from a complete, valid citation ledger."""
+    sections = ("activities", "exceptions", "omissions")
+    try:
+        # Reuse the native range validator, including bounds and within-row
+        # disjointness. No semantic/prose field is needed or copied out.
+        for section in sections:
+            if not isinstance(diagnostic[section], list) or any(
+                not isinstance(row, dict) or set(row) != {"evidence_partitions"}
+                for row in diagnostic[section]
+            ):
+                return None
+        _restore_extraction_partitions(diagnostic, events=events)
+        _, manifest = _semantic_evidence_bundles(events)
+        expected = {(bundle["bundle_ref"], member)
+                    for bundle in manifest for member in range(1, bundle["member_count"] + 1)}
+        assigned: dict[tuple[str, int], list[tuple[str, int]]] = {}
+        for section in sections:
+            for row_index, row in enumerate(diagnostic[section]):
+                for partition in row["evidence_partitions"]:
+                    for start, end in partition["member_ranges"]:
+                        for member in range(start, end + 1):
+                            assigned.setdefault((partition["bundle_ref"], member), []).append((section, row_index))
+        conflicts: dict[tuple[str, tuple[tuple[str, int], ...]], list[list[int]]] = {}
+        for (bundle_ref, member), rows in sorted(assigned.items()):
+            if len(rows) < 2:
+                continue
+            ranges = conflicts.setdefault((bundle_ref, tuple(rows)), [])
+            if ranges and member == ranges[-1][1] + 1:
+                ranges[-1][1] = member
+            else:
+                ranges.append([member, member])
+        if not conflicts:
+            return None
+        return {
+            "citation_conflicts": [
+                {"bundle_ref": ref, "member_ranges": ranges,
+                 "assigned_rows": [{"section": section, "row_index": index} for section, index in rows]}
+                for (ref, rows), ranges in sorted(conflicts.items())
+            ],
+            "coverage_counts": {"expected_members": len(expected), "unique_cited_members": len(assigned),
+                                "duplicate_members": sum(len(rows) > 1 for rows in assigned.values()),
+                                "missing_members": len(expected - set(assigned))},
+        }
+    except (AnalyzerError, KeyError, TypeError, ValueError):
+        return None
 
 
 def _quarantine_review_citation_conflicts(
@@ -3311,6 +3367,64 @@ class AnalyzerResponseCache:
             # Diagnostics must not change the accounting decision or retry budget.
             return
 
+    def review_duplicate_feedback(
+        self, endpoint: AnalyzerEndpoint, source_body: Mapping[str, Any],
+        current_body: Mapping[str, Any], *, events: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Read existing opt-in diagnostics bound to this exact rejected call.
+
+        The cache rejection remains authoritative and unchanged. Untrusted or
+        unavailable diagnostics retain historical category-only repair bodies.
+        """
+        if not self.record_review_diagnostics:
+            return None
+        try:
+            identity = self._request_identity(endpoint, source_body)
+            record = self._records.get(identity["cache_key"])
+            if (record is None or record["status"] != "rejected"
+                    or record["failure_code"] != "contract_rejected_duplicate_evidence"
+                    or record["body_digest"] != identity["body_digest"]):
+                return None
+            source = json.loads(source_body["messages"][1]["content"])
+            current = json.loads(current_body["messages"][1]["content"])
+            if (source.get("mode") != "review" or current.get("mode") != "review"
+                    or any(source.get(key) != current.get(key) for key in (
+                        "bundles", "coverage_contract", "candidate", "clockify_taxonomy", "review_scope",
+                    ))):
+                return None
+            _, manifest = _semantic_evidence_bundles(events)
+            coverage = [{"bundle_ref": bundle["bundle_ref"], "allowed_member_range": [1, bundle["member_count"]]}
+                        for bundle in manifest]
+            if canonical_json(source.get("coverage_contract")) != canonical_json(coverage):
+                return None
+            sidecar = self.path.with_name(self.path.name + ".review-diagnostics.jsonl")
+            descriptor = os.open(sidecar, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+                metadata = os.fstat(handle.fileno())
+                if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+                        or metadata.st_mode & 0o777 != 0o600):
+                    return None
+                fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+                try:
+                    diagnostics = [json.loads(line) for line in handle.read().splitlines()]
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            matching = [value for value in diagnostics if isinstance(value, dict)
+                        and value.get("cache_key") == identity["cache_key"]]
+            if not matching or any(canonical_json(value) != canonical_json(matching[0]) for value in matching):
+                return None
+            diagnostic = matching[0]
+            if (set(diagnostic) != {"cache_key", "body_digest", "failure_code", "review_scope",
+                                   "coverage_contract", "activities", "exceptions", "omissions"}
+                    or diagnostic["body_digest"] != identity["body_digest"]
+                    or diagnostic["failure_code"] != record["failure_code"]
+                    or diagnostic["review_scope"] != source.get("review_scope", "extraction")
+                    or canonical_json(diagnostic["coverage_contract"]) != canonical_json(coverage)):
+                return None
+            return _review_citation_conflicts(diagnostic, events=events)
+        except (AnalyzerError, KeyError, IndexError, TypeError, ValueError, OSError):
+            return None
+
     def sealed_endpoints(self) -> tuple[AnalyzerEndpoint, ...]:
         """Return credential-free routes sealed into cache records."""
         routes = {
@@ -3564,6 +3678,7 @@ def _call_semantic_review_once(
     failed_review_retry_code: str | None = None,
     local_coverage_repair: bool = False,
     scoped_failed_review: Mapping[str, str] | None = None,
+    repair_source_body: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     request_options = dict(
         candidate=candidate,
@@ -3580,20 +3695,38 @@ def _call_semantic_review_once(
         scoped_failed_review=scoped_failed_review,
     )
     body = _review_body(events, **request_options)
+    generic_body = body
+    if (cache is not None and repair_source_body is not None
+            and repair_failure_code == "contract_rejected_duplicate_evidence"):
+        feedback = cache.review_duplicate_feedback(endpoint, repair_source_body, body, events=events)
+        if feedback is not None:
+            body = copy.deepcopy(body)
+            payload = json.loads(body["messages"][1]["content"])
+            payload["repair_feedback"].update(feedback)
+            body["messages"][1]["content"] = canonical_json(payload)
     if len(canonical_json(body).encode("utf-8")) > DEFAULT_MAX_BODY_BYTES:
         raise AnalyzerError("semantic review body exceeds configured request ceiling")
     _raise_if_cancelled(cancelled)
-    response = cache.lookup(endpoint, body) if cache is not None else None
+    try:
+        response = cache.lookup(endpoint, body) if cache is not None else None
+    except AnalyzerContractError as error:
+        error.review_rejection_body = body
+        raise
     if response is None and cache is not None and repair_failure_code is not None:
         # Preserve accepted repairs sealed before the explicit response contract.
         # A prior rejection is not a valid response and may receive the current
         # attempt from the bounded two-repair budget; cache corruption and
         # identity errors still fail.
-        legacy_body = _review_body(events, **request_options, include_repair_contract=False)
-        try:
-            response = cache.lookup(endpoint, legacy_body)
-        except (AnalyzerContractError, AnalyzerTimeoutError, AnalyzerTransportError):
-            response = None
+        legacy_bodies = [_review_body(events, **request_options, include_repair_contract=False)]
+        if generic_body is not body:
+            legacy_bodies.insert(0, generic_body)
+        for legacy_body in legacy_bodies:
+            try:
+                response = cache.lookup(endpoint, legacy_body)
+            except (AnalyzerContractError, AnalyzerTimeoutError, AnalyzerTransportError):
+                response = None
+            if response is not None:
+                break
     cache_miss = response is None
     if response is None:
         if before_transport is not None:
@@ -3720,7 +3853,9 @@ def _call_semantic_review_once(
                 endpoint, body, failure_code=_contract_failure_code(exc),
                 review_scope=review_scope, response=response,
             )
-        raise AnalyzerContractError(str(exc)) from exc
+        error = AnalyzerContractError(str(exc))
+        error.review_rejection_body = body
+        raise error from exc
     _raise_if_cancelled(cancelled)
     if cache is not None and cache_miss:
         cache.store_accepted(endpoint, body, response)
@@ -3837,6 +3972,7 @@ def _call_semantic_review(
                         review_scope=review_scope,
                         review_prompt_version=review_prompt_version,
                         extractor_model=extractor_model,
+                        repair_source_body=getattr(repair_error, "review_rejection_body", None),
                     )
                 except AnalyzerContractError as error:
                     repair_error = error

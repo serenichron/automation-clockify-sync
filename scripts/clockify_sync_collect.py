@@ -717,11 +717,34 @@ def _message_evidence(content: Any, role: str) -> list[dict[str, Any]]:
     return events
 
 
+def is_injected_session_message(content: str) -> bool:
+    """Recognize leading machine envelopes, not human prose quoting them."""
+    text = content.lstrip().casefold()
+    if text.startswith((
+        "<task-notification", "<system-reminder", "<teammate-message",
+        "<command-message", "<local-command", "<codex_internal_context",
+        "this session is being continued from a previous conversation",
+    )):
+        return True
+    prefix = "another claude session sent a message:"
+    if not text.startswith(prefix):
+        return False
+    remainder = text[len(prefix):]
+    if not remainder or not remainder[0].isspace():
+        return False
+    tag = remainder.lstrip()
+    opening = "<teammate-message"
+    if not tag.startswith(opening):
+        return False
+    suffix = tag[len(opening):]
+    return bool(suffix and (suffix[0].isspace() or suffix[0] == ">") and ">" in suffix)
+
+
 def _serialized_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Preserve complete normalized message evidence without display truncation."""
     return [
         {
-            "timestamp": local_dt_string(event.get("timestamp")),
+            "timestamp": event["timestamp"].isoformat() if event.get("timestamp") else None,
             "role": str(event.get("role") or "unknown"),
             "kind": str(event.get("kind") or "message"),
             "content": str(event.get("content") or ""),
@@ -738,7 +761,8 @@ def _serialized_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _partition_bursts(events: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     """Group on direct user activity, then attach assistant context without bridging gaps."""
     users = sorted(
-        (event for event in events if event.get("timestamp") and event.get("role") == "user"),
+        (event for event in events if event.get("timestamp") and event.get("role") == "user"
+         and not is_injected_session_message(str(event.get("content") or ""))),
         key=lambda event: event["timestamp"],
     )
     if not users:
@@ -771,6 +795,8 @@ def _burst_context(events: list[dict[str, Any]]) -> tuple[str, str, list[dt.date
     user_timestamps: list[dt.datetime] = []
     for event in events:
         if event["role"] == "user":
+            if is_injected_session_message(str(event.get("content") or "")):
+                continue
             user_timestamps.append(event["timestamp"])
             if not first_user:
                 candidate = _meaningful_context(event.get("content", ""))
@@ -1384,7 +1410,7 @@ def collect_local_sessions(machine: dict[str, Any], since: dt.datetime, until: d
 
 def _remote_claude_contract() -> str:
     """Remote stdlib-only Claude parser, kept behaviorally aligned with local bursts."""
-    return r'''def skip_path(p):
+    return inspect.getsource(is_injected_session_message) + '\n' + r'''def skip_path(p):
     return any(f in str(p) for f in ['/subagents/','/multica/','multica-runtime','claude-mem-observer','multica-command'])
 def one_line(v, limit=320):
     v=' '.join(str(v or '').split())
@@ -1431,7 +1457,7 @@ def parse_claude(p):
             if not t or role not in ('user','assistant'): continue
             events.append({'timestamp':t.astimezone(BUCHAREST),'role':role,'content':message_text(o.get('message',{}).get('content',''))})
     except Exception: return []
-    users=sorted((event for event in events if event['role']=='user'), key=lambda event:event['timestamp'])
+    users=sorted((event for event in events if event['role']=='user' and not is_injected_session_message(event['content'])), key=lambda event:event['timestamp'])
     if not users: return []
     bursts=[]
     for user in users:
@@ -1468,7 +1494,8 @@ def parse_claude(p):
 
 def _remote_codex_contract() -> str:
     """Remote Codex extraction, using the same row-local user-burst context contract."""
-    helpers = ("from typing import Any\nimport bisect\n" + f"BURST_GAP_SECONDS={BURST_GAP_SECONDS}\n" + inspect.getsource(_codex_message_event)
+    helpers = ("from typing import Any\nimport bisect\n" + f"BURST_GAP_SECONDS={BURST_GAP_SECONDS}\n"
+               + inspect.getsource(is_injected_session_message) + "\n" + inspect.getsource(_codex_message_event)
                + "\n" + inspect.getsource(_deduplicate_codex_messages)
                + "\n" + inspect.getsource(_codex_rollout_objects)
                + "\n" + inspect.getsource(_partition_bursts))
@@ -1550,6 +1577,7 @@ def _remote_hermes_contract() -> str:
     helpers = (
         "from typing import Any, Mapping\n"
         f"BURST_GAP_SECONDS={BURST_GAP_SECONDS}\n"
+        + inspect.getsource(is_injected_session_message) + "\n"
         + inspect.getsource(hermes_user_observed_intervals)
     )
     return helpers + r'''try:
@@ -1859,11 +1887,7 @@ def hermes_user_observed_intervals(events: list[Mapping[str, Any]]) -> list[dict
         and event.get("kind", "message") == "message" and not event.get("tool_name")
         # These wrappers are machine-injected continuations/check-ins despite
         # transport role=user. They supply context, not human attention.
-        and not str(event.get("content") or "").lstrip().casefold().startswith((
-            "<task-notification", "<system-reminder", "<teammate-message",
-            "<command-message", "<local-command", "<codex_internal_context",
-            "this session is being continued from a previous conversation",
-        ))
+        and not is_injected_session_message(str(event.get("content") or ""))
     })
     intervals: list[dict[str, str]] = []
     cluster: list[dt.datetime] = []
@@ -3232,8 +3256,15 @@ def _multica_result(
     pages: int,
     since: dt.datetime | None,
     until: dt.datetime | None,
+    *,
+    config: Mapping[str, Any],
+    checkpoint_store: PageCheckpointStore | None = None,
 ) -> dict[str, Any]:
-    return {
+    comments, errors = (
+        _multica_comment_history(rows, config, since, until, checkpoint_store)
+        if since is not None and until is not None else ([], [])
+    )
+    result = {
         "status": "ok",
         "issues": _multica_sanitized_issues(rows, since, until),
         "pages_fetched": pages,
@@ -3244,6 +3275,172 @@ def _multica_result(
             else None
         ),
     }
+    if since is not None and until is not None:
+        # Enumerate history before excluding current-state issue snapshots.
+        # An issue updated after this window can still contain dated work in it.
+        result.update(
+            source_version="multica-issues-with-comment-history/v1",
+            comments=comments,
+            comment_history={"complete": not errors, "errors": errors},
+            complete=not errors,
+            status="partial" if errors else "ok",
+        )
+    return result
+
+
+def _multica_cli_identity_matches(config: Mapping[str, Any]) -> bool:
+    """Do not silently read history using a CLI identity unlike the issue API."""
+    try:
+        # Only the CLI's current home profile counts, not a fallback OS home.
+        profile = json.loads((Path.home() / ".multica" / "profiles" /
+                              MULTICA_PROFILE / "config.json").read_text())
+        def identity(value: Mapping[str, Any]) -> tuple[Any, Any, Any]:
+            return (
+                value.get("token") or value.get("access_token") or value.get("auth_token"),
+                str(value.get("server_url") or value.get("serverUrl") or value.get("base_url") or "").rstrip("/"),
+                value.get("workspace_id") or value.get("workspaceId"),
+            )
+        expected = identity(config)
+        if not all(expected) or expected != identity(profile):
+            return False
+        # Partial override sets do not select the API config above, but may be
+        # interpreted by the CLI. Reject mismatches rather than assume precedence.
+        for name, value in zip(
+            ("MULTICA_TOKEN", "MULTICA_SERVER_URL", "MULTICA_WORKSPACE_ID"), expected
+        ):
+            override = os.environ.get(name)
+            if override is not None and (override.rstrip("/") if name == "MULTICA_SERVER_URL" else override) != value:
+                return False
+        return True
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+
+
+def _multica_comment_rows(
+    payload: Any, issue_id: str, since: dt.datetime, until: dt.datetime,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Validate the proven CLI array contract, retaining valid partial evidence."""
+    if not isinstance(payload, list):
+        return [], False
+    comments: dict[str, dict[str, Any]] = {}
+    complete = True
+    for row in payload:
+        try:
+            if not isinstance(row, Mapping):
+                raise ValueError("comment is not an object")
+            comment_id = row.get("id")
+            if not isinstance(comment_id, str) or not comment_id or row.get("issue_id") != issue_id:
+                raise ValueError("comment identity is invalid")
+            if not isinstance(row.get("content"), str):
+                raise ValueError("comment content is invalid")
+            created = dt.datetime.fromisoformat(str(row.get("created_at") or "").replace("Z", "+00:00"))
+            if created.tzinfo is None:
+                raise ValueError("comment creation requires a timezone")
+            comment = {key: row.get(key) for key in (
+                "id", "issue_id", "parent_id", "content", "created_at", "updated_at",
+                "author_id", "author_type", "type", "source_task_id", "revision",
+            )}
+            # Canonical instants keep timezone-equivalent observations stable.
+            comment["created_at"] = created.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+            if not since <= created < until:
+                continue
+            previous = comments.get(comment_id)
+            if previous is not None and previous != comment:
+                complete = False
+                continue
+            comments[comment_id] = comment
+        except (ValueError, TypeError):
+            complete = False
+    return [comments[key] for key in sorted(comments)], complete
+
+
+def _multica_comment_checkpoint_identity(
+    origin: str, workspace_id: str, issue_id: str, since: dt.datetime, until: dt.datetime,
+) -> CheckpointIdentity:
+    since_utc = since.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    until_utc = until.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    contract = {"server_origin": origin, "workspace_id": workspace_id, "issue_id": issue_id,
+                "since": since_utc, "until": until_utc,
+                "query_since": iso_utc(since - dt.timedelta(microseconds=1)),
+                "api_contract": "multica-cli-unfolded-comments-since/v1"}
+    return CheckpointIdentity(
+        source="multica_comments", since_utc=since_utc, until_utc=until_utc,
+        request_fingerprint="sha256:" + hashlib.sha256(
+            json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+        compatibility_version="multica-comment-history/v1",
+    )
+
+
+def _multica_comment_history(
+    rows: list[Mapping[str, Any]], config: Mapping[str, Any],
+    since: dt.datetime, until: dt.datetime, checkpoint_store: PageCheckpointStore | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    comments: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    if since.tzinfo is None or until.tzinfo is None or since >= until:
+        return [], [{"reason": "comment history requires a valid timezone-aware window"}]
+    if not rows:
+        return [], []
+    if not _multica_cli_identity_matches(config):
+        return [], [{"reason": "comment CLI profile identity could not be verified"}]
+    origin = _multica_server_origin(str(config.get("server_url") or config.get("serverUrl") or config.get("base_url")))
+    workspace_id = str(config.get("workspace_id") or config.get("workspaceId"))
+    seen_issues: set[str] = set()
+    for issue in rows:
+        issue_id = issue.get("id")
+        if not isinstance(issue_id, str) or not issue_id:
+            errors.append({"reason": "issue has no usable comment-history identity"})
+            continue
+        if issue_id in seen_issues:
+            continue
+        seen_issues.add(issue_id)
+        try:
+            state = None
+            if checkpoint_store is not None:
+                state = checkpoint_store.open(
+                    _multica_comment_checkpoint_identity(origin, workspace_id, issue_id, since, until))
+            if state is not None and state.pages:
+                saved = list(checkpoint_store.iter_pages(state))
+                if len(saved) != 1 or saved[0]["continuation"] or saved[0]["metadata"]:
+                    raise CheckpointError("comment history checkpoint shape differs")
+                # PageCheckpointStore exposes immutable tuples/mappings.
+                payload = [dict(row) for row in saved[0]["payload"]]
+                signature = _multica_page_signature(payload)
+                if saved[0]["signature"] != signature:
+                    raise CheckpointError("comment history checkpoint signature differs")
+                transport_complete = True
+            else:
+                if state is not None and state.complete:
+                    raise CheckpointError("completed comment history checkpoint has no response")
+                process = subprocess.run(
+                    ["multica", "--profile", MULTICA_PROFILE, "--workspace-id", workspace_id,
+                     # CLI --since is exclusive; overfetch by at most one
+                     # second, then enforce the inclusive local lower bound.
+                     "issue", "comment", "list", issue_id, "--since",
+                     iso_utc(since - dt.timedelta(microseconds=1)), "--output", "json"],
+                    capture_output=True, text=True, timeout=60, check=False,
+                )
+                payload = json.loads(process.stdout)
+                # Cursor/truncation markers cannot silently pass as complete.
+                # Unknown diagnostics also require review rather than guessing.
+                transport_complete = process.returncode == 0 and not process.stderr.strip()
+            valid, records_complete = _multica_comment_rows(payload, issue_id, since, until)
+            complete = transport_complete and records_complete
+            snapshot = _multica_sanitized_issues([issue], None, None)[0]
+            comments.extend({**comment, "server_origin": origin, "workspace_id": workspace_id,
+                             "issue_snapshot": snapshot} for comment in valid)
+            if not complete:
+                errors.append({"issue_id": issue_id, "reason": "comment history response incomplete or malformed"})
+                continue
+            if state is not None and not state.complete:
+                if not state.pages:
+                    signature = _multica_page_signature(valid)
+                    state = checkpoint_store.append_page(state, payload=valid, continuation={}, signature=signature)
+                checkpoint_store.mark_complete(state)
+        except Exception:
+            # Never expose CLI diagnostics or credentials in source debt.
+            errors.append({"issue_id": issue_id, "reason": "comment history collection or checkpoint failed"})
+    return comments, errors
 
 
 def _multica_failure() -> dict[str, Any]:
@@ -3331,7 +3528,7 @@ def fetch_multica_issues(
                         if len(page_rows) < MULTICA_PAGE_SIZE:
                             checkpoint_state = checkpoint_store.mark_complete(checkpoint_state)
                             break
-                    return _multica_result(rows, pages, since, until)
+                    return _multica_result(rows, pages, since, until, config=cfg, checkpoint_store=checkpoint_store)
                 except CheckpointError:
                     raise
                 except Exception:
@@ -3368,7 +3565,7 @@ def fetch_multica_issues(
                 offset += len(page)
                 if pages >= 100:
                     raise ValueError("Multica issues pagination exceeded safety limit")
-            return _multica_result(rows, pages, since, until)
+            return _multica_result(rows, pages, since, until, config=cfg)
         except Exception:
             continue
     return _multica_failure()

@@ -108,14 +108,15 @@ class DelayedDirectGetGateway(FakeGateway):
 
 
 class NativeSheetPostTests(unittest.TestCase):
-    def _plan(self, document, routing=None, existing=None):
+    def _plan(self, document, routing=None, existing=None, projects=None, tags=None):
         raw = json.dumps(document, sort_keys=True).encode()
         routing = routing or route()
         return native.build_plan(
             document, capture_sha256=hashlib.sha256(raw).hexdigest(), routing=routing,
             routing_sha256="a" * 64, timezone="Europe/Bucharest",
             workspace_id="workspace-1", member_id="user-1",
-            projects=[{"id": "project-123456"}], tags=[{"id": "tag-654321"}],
+            projects=projects or [{"id": "project-123456"}],
+            tags=tags or [{"id": "tag-654321"}],
             live_entries=existing or [],
         )
 
@@ -124,6 +125,251 @@ class NativeSheetPostTests(unittest.TestCase):
             plan, approval_id="approval-1", approver="human board user",
             approved_at="2026-10-04T10:00:00Z", expires_at="2026-10-05T10:00:00Z",
         )
+
+    def test_posted_canonical_source_credits_renamed_review_without_native_write(self):
+        prior = row("review-old", "2026-09-07 12:00", "2026-09-07 12:30", 30)
+        prior[6], prior[9], prior[13] = "act-0123456789abcdef01234567", "Approved", "posted"
+        current = row("review-new", "2026-09-07 12:00", "2026-09-07 12:30", 30)
+        current[6], current[8] = "act-0123456789abcdef01234567", "Renamed client accomplishment"
+        existing = live("prior-native", "2026-09-07T09:00:00Z", "2026-09-07T09:30:00Z")
+        plan = self._plan(capture(prior, current), existing=[existing])
+        gateway = FakeGateway([existing])
+        with tempfile.TemporaryDirectory() as directory:
+            events, receipt_path = Path(directory) / "events.jsonl", Path(directory) / "receipt.json"
+            receipt = native.execute_plan(plan, self._approval(plan), events, receipt_path, gateway,
+                                          now=dt.datetime(2026, 10, 4, 11, tzinfo=dt.timezone.utc))
+            original_bytes = receipt_path.read_bytes()
+            rerun = native.execute_plan(plan, self._approval(plan), events, receipt_path, gateway,
+                                        now=dt.datetime(2026, 10, 4, 11, 1, tzinfo=dt.timezone.utc))
+            self.assertEqual(receipt, rerun)
+            self.assertEqual(original_bytes, receipt_path.read_bytes())
+        self.assertEqual([], gateway.posts)
+        self.assertEqual(1, plan["row_count"])
+        self.assertEqual(30, plan["total_minutes"])
+        self.assertEqual("Renamed client accomplishment", plan["entries"][0]["payload"]["description"])
+        credit = plan["entries"][0]["sheet_source_credit"]
+        self.assertEqual("act-0123456789abcdef01234567", credit["source"])
+        self.assertEqual("review-old", credit["prior_row"]["Review ID"])
+        self.assertEqual(2, credit["prior_row_number"])
+        self.assertEqual("Approved work", credit["payload"]["description"])
+        result = receipt["entries"][0]
+        self.assertEqual("prior-native", result["clockify_entry_id"])
+        self.assertEqual("existing_credit", result["disposition"])
+        self.assertEqual("existing_source_retained_current_payload_not_posted", result["posting_semantics"])
+        self.assertEqual(0, receipt["posted_minutes"])
+        self.assertEqual(30, receipt["existing_credit_minutes"])
+        self.assertEqual("Approved work", gateway.entries[0]["description"])
+
+    def test_posted_source_credit_requires_exact_verified_identity_not_overlap(self):
+        cases = [
+            ("different source", 6, "act-ffffffffffffffffffffffff"),
+            ("blank source", 6, ""),
+            ("noncanonical source", 6, "activity"),
+            ("source suffix", 6, "act-0123456789abcdef01234567-s00"),
+            ("different start", 1, "2026-09-07 12:10"),
+            ("different end", 2, "2026-09-07 12:20"),
+            ("unapproved", 9, "pending"),
+            ("unposted", 13, "unposted"),
+            ("invalid prior duration", 3, 29),
+        ]
+        for label, index, value in cases:
+            with self.subTest(case=label):
+                prior = row("review-old", "2026-09-07 12:00", "2026-09-07 12:30", 30)
+                prior[6], prior[9], prior[13] = "act-0123456789abcdef01234567", "Approved", "posted"
+                prior[index] = value
+                if index in (1, 2):
+                    prior[3] = 20
+                current = row("review-new", "2026-09-07 12:00", "2026-09-07 12:30", 30)
+                current[6], current[8] = "act-0123456789abcdef01234567", "Renamed work"
+                if label in {"blank source", "noncanonical source", "source suffix"}:
+                    current[6] = value  # Equal unsupported strings must not become identity.
+                existing = live("prior-native", "2026-09-07T09:00:00Z", "2026-09-07T09:30:00Z")
+                plan = self._plan(capture(prior, current), existing=[existing])
+                gateway = FakeGateway([existing])
+                with tempfile.TemporaryDirectory() as directory:
+                    receipt = native.execute_plan(plan, self._approval(plan), Path(directory) / "events.jsonl",
+                                                  Path(directory) / "receipt.json", gateway,
+                                                  now=dt.datetime(2026, 10, 4, 11, tzinfo=dt.timezone.utc))
+                self.assertEqual(1, len(gateway.posts))
+                self.assertEqual("created", receipt["entries"][0]["disposition"])
+
+    def test_same_source_changed_resolved_route_is_not_credited(self):
+        for field, value in (("project_suffix", "999999"), ("task_id", "different-task"),
+                             ("tag_suffixes", ["888888"]), ("billable", False)):
+            with self.subTest(field=field):
+                prior = row("review-old", "2026-09-07 12:00", "2026-09-07 12:30", 30)
+                prior[6], prior[9], prior[13] = "act-0123456789abcdef01234567", "Approved", "posted"
+                current = row("review-new", "2026-09-07 12:00", "2026-09-07 12:30", 30, project="Changed")
+                current[6], current[8] = "act-0123456789abcdef01234567", "Renamed work"
+                routing = route()
+                changed = copy.deepcopy(routing["session_routes"][0])
+                changed["project_name"], changed[field] = "Changed", value
+                routing["session_routes"].append(changed)
+                existing = live("prior-native", "2026-09-07T09:00:00Z", "2026-09-07T09:30:00Z")
+                plan = self._plan(capture(prior, current), routing, [existing],
+                                  projects=[{"id": "project-123456"}, {"id": "project-999999"}],
+                                  tags=[{"id": "tag-654321"}, {"id": "tag-888888"}])
+                gateway = FakeGateway([existing])
+                with tempfile.TemporaryDirectory() as directory:
+                    receipt = native.execute_plan(plan, self._approval(plan), Path(directory) / "events.jsonl",
+                                                  Path(directory) / "receipt.json", gateway,
+                                                  now=dt.datetime(2026, 10, 4, 11, tzinfo=dt.timezone.utc))
+                self.assertEqual(1, len(gateway.posts))
+                self.assertEqual("created", receipt["entries"][0]["disposition"])
+
+    def test_unverified_posted_identity_does_not_invent_credit(self):
+        for case in ("missing", "description mismatch", "task mismatch"):
+            with self.subTest(case=case):
+                prior = row("review-old", "2026-09-07 12:00", "2026-09-07 12:30", 30)
+                prior[6], prior[9], prior[13] = "act-0123456789abcdef01234567", "Approved", "posted"
+                current = row("review-new", "2026-09-07 12:00", "2026-09-07 12:30", 30)
+                current[6], current[8] = "act-0123456789abcdef01234567", "Renamed work"
+                existing = [live("prior-native", "2026-09-07T09:00:00Z", "2026-09-07T09:30:00Z")]
+                priors = [prior]
+                if case == "missing":
+                    existing = []
+                elif case == "description mismatch":
+                    existing[0]["description"] = "Unrelated accomplishment"
+                elif case == "task mismatch":
+                    existing[0]["taskId"] = "wrong-task"
+                plan = self._plan(capture(*priors, current), existing=existing)
+                gateway = FakeGateway(existing)
+                with tempfile.TemporaryDirectory() as directory:
+                    receipt = native.execute_plan(plan, self._approval(plan), Path(directory) / "events.jsonl",
+                                                  Path(directory) / "receipt.json", gateway,
+                                                  now=dt.datetime(2026, 10, 4, 11, tzinfo=dt.timezone.utc))
+                self.assertEqual(1, len(gateway.posts))
+                self.assertEqual("created", receipt["entries"][0]["disposition"])
+
+    def test_successive_posted_source_aliases_credit_one_verified_native_identity(self):
+        for alias_description in ("Approved work", "Previously renamed work"):
+            with self.subTest(description=alias_description):
+                prior = row("review-old", "2026-09-07 12:00", "2026-09-07 12:30", 30)
+                prior[6], prior[9], prior[13] = "act-0123456789abcdef01234567", "Approved", "posted"
+                alias = ["review-old-alias", *prior[1:]]
+                alias[8] = alias_description
+                current = row("review-latest", "2026-09-07 12:00", "2026-09-07 12:30", 30)
+                current[6], current[8] = "act-0123456789abcdef01234567", "Newest client wording"
+                existing = live("prior-native", "2026-09-07T09:00:00Z", "2026-09-07T09:30:00Z")
+                plan = self._plan(capture(prior, alias, current), existing=[existing])
+                gateway = FakeGateway([existing])
+                with tempfile.TemporaryDirectory() as directory:
+                    events, receipt_path = Path(directory) / "events.jsonl", Path(directory) / "receipt.json"
+                    receipt = native.execute_plan(plan, self._approval(plan), events, receipt_path, gateway,
+                                                  now=dt.datetime(2026, 10, 4, 11, tzinfo=dt.timezone.utc))
+                    rerun = native.execute_plan(plan, self._approval(plan), events, receipt_path, gateway,
+                                                now=dt.datetime(2026, 10, 4, 11, 1, tzinfo=dt.timezone.utc))
+                    self.assertEqual(receipt, rerun)
+                self.assertEqual([], gateway.posts)
+                self.assertEqual("prior-native", receipt["entries"][0]["clockify_entry_id"])
+                self.assertEqual("existing_credit", receipt["entries"][0]["disposition"])
+
+    def test_multiple_verified_native_matches_for_same_source_fail_closed(self):
+        prior = row("review-old", "2026-09-07 12:00", "2026-09-07 12:30", 30)
+        prior[6], prior[9], prior[13] = "act-0123456789abcdef01234567", "Approved", "posted"
+        current = row("review-new", "2026-09-07 12:00", "2026-09-07 12:30", 30)
+        current[6], current[8] = "act-0123456789abcdef01234567", "Renamed work"
+        existing = [live("prior-native-a", "2026-09-07T09:00:00Z", "2026-09-07T09:30:00Z"),
+                    live("prior-native-b", "2026-09-07T09:00:00Z", "2026-09-07T09:30:00Z")]
+        with self.assertRaisesRegex(native.NativePostError, "source.*ambiguous"):
+            self._plan(capture(prior, current), existing=existing)
+
+    def test_source_credit_requires_untampered_source_and_fresh_direct_get_on_resume(self):
+        prior = row("review-old", "2026-09-07 12:00", "2026-09-07 12:30", 30)
+        prior[6], prior[9], prior[13] = "act-0123456789abcdef01234567", "Approved", "posted"
+        current = row("review-new", "2026-09-07 12:00", "2026-09-07 12:30", 30)
+        current[6], current[8] = "act-0123456789abcdef01234567", "Renamed work"
+        existing = live("prior-native", "2026-09-07T09:00:00Z", "2026-09-07T09:30:00Z")
+        plan = self._plan(capture(prior, current), existing=[existing])
+        # An internally inconsistent credit remains invalid even if reapproved.
+        tampered = copy.deepcopy(plan)
+        self.assertIn("sheet_source_credit", tampered["entries"][0])
+        credit = tampered["entries"][0]["sheet_source_credit"]
+        credit["source"] = "act-ffffffffffffffffffffffff"
+        credit["credit_digest"] = native._document_digest(credit, "credit_digest")
+        tampered["plan_digest"] = native._document_digest(tampered, "plan_digest")
+        with tempfile.TemporaryDirectory() as directory:
+            gateway = FakeGateway([existing])
+            with self.assertRaisesRegex(native.NativePostError, "source credit"):
+                native.execute_plan(tampered, self._approval(tampered), Path(directory) / "tampered.jsonl",
+                                    Path(directory) / "tampered.json", gateway,
+                                    now=dt.datetime(2026, 10, 4, 11, tzinfo=dt.timezone.utc))
+            self.assertEqual([], gateway.posts)
+
+            events, receipt_path = Path(directory) / "events.jsonl", Path(directory) / "receipt.json"
+            approval = self._approval(plan)
+            with mock.patch.object(gateway, "entry_by_id", return_value=None):
+                with self.assertRaisesRegex(native.NativePostError, "direct GET readback"):
+                    native.execute_plan(plan, approval, events, receipt_path, gateway,
+                                        now=dt.datetime(2026, 10, 4, 11, tzinfo=dt.timezone.utc))
+            self.assertFalse(events.exists())
+            self.assertEqual([], gateway.posts)
+            # A crash after durable credit intent must resume via the sealed ID,
+            # never through ambiguous-create recovery or a fresh POST.
+            append_event = native._append_event
+            def interrupt_after_intent(path, event):
+                append_event(path, event)
+                raise KeyboardInterrupt("credit intent persisted")
+            with mock.patch.object(native, "_append_event", side_effect=interrupt_after_intent):
+                with self.assertRaises(KeyboardInterrupt):
+                    native.execute_plan(plan, approval, events, receipt_path, gateway,
+                                        now=dt.datetime(2026, 10, 4, 11, tzinfo=dt.timezone.utc))
+            self.assertEqual(["intent"], [event["event_type"] for event in native._events(events)])
+            native.execute_plan(plan, approval, events, receipt_path, gateway,
+                                now=dt.datetime(2026, 10, 4, 11, tzinfo=dt.timezone.utc))
+            original_bytes = receipt_path.read_bytes()
+            for field, value in (("taskId", "wrong-task"), ("description", "Changed native entry")):
+                gateway.entries = [{**existing, field: value}]
+                with self.subTest(field=field), self.assertRaisesRegex(native.NativePostError, "direct GET readback"):
+                    native.execute_plan(plan, approval, events, receipt_path, gateway,
+                                        now=dt.datetime(2026, 10, 4, 11, 1, tzinfo=dt.timezone.utc))
+                self.assertEqual(original_bytes, receipt_path.read_bytes())
+            self.assertEqual([], gateway.posts)
+
+    def test_two_exact_pending_source_aliases_share_existing_credit_without_post(self):
+        prior = row("review-old", "2026-09-07 12:00", "2026-09-07 12:30", 30)
+        prior[6], prior[9], prior[13] = "act-0123456789abcdef01234567", "Approved", "posted"
+        aliases = []
+        for review_id, description in (("review-new-a", "Renamed work A"), ("review-new-b", "Renamed work B")):
+            current = row(review_id, "2026-09-07 12:00", "2026-09-07 12:30", 30)
+            current[6], current[8] = "act-0123456789abcdef01234567", description
+            aliases.append(current)
+        existing = live("prior-native", "2026-09-07T09:00:00Z", "2026-09-07T09:30:00Z")
+        plan = self._plan(capture(prior, *aliases), existing=[existing])
+        gateway = FakeGateway([existing])
+        with tempfile.TemporaryDirectory() as directory:
+            events, receipt_path = Path(directory) / "events.jsonl", Path(directory) / "receipt.json"
+            receipt = native.execute_plan(plan, self._approval(plan), events, receipt_path, gateway,
+                                          now=dt.datetime(2026, 10, 4, 11, tzinfo=dt.timezone.utc))
+            original_bytes = receipt_path.read_bytes()
+            rerun = native.execute_plan(plan, self._approval(plan), events, receipt_path, gateway,
+                                        now=dt.datetime(2026, 10, 4, 11, 1, tzinfo=dt.timezone.utc))
+            self.assertEqual(receipt, rerun)
+            self.assertEqual(original_bytes, receipt_path.read_bytes())
+        self.assertEqual([], gateway.posts)
+        self.assertEqual(["prior-native", "prior-native"], [item["clockify_entry_id"] for item in receipt["entries"]])
+        self.assertEqual(["existing_credit", "existing_credit"], [item["disposition"] for item in receipt["entries"]])
+        self.assertEqual(60, receipt["total_minutes"])
+        self.assertEqual(0, receipt["posted_minutes"])
+        self.assertEqual(30, receipt["existing_credit_minutes"])
+
+    def test_different_canonical_sources_cannot_share_one_native_credit(self):
+        rows = []
+        for number, source in enumerate(("act-0123456789abcdef01234567", "act-ffffffffffffffffffffffff")):
+            prior = row(f"review-old-{number}", "2026-09-07 12:00", "2026-09-07 12:30", 30)
+            prior[6], prior[9], prior[13] = source, "Approved", "posted"
+            current = row(f"review-new-{number}", "2026-09-07 12:00", "2026-09-07 12:30", 30)
+            current[6], current[8] = source, "Renamed work"
+            rows.extend((prior, current))
+        existing = live("prior-native", "2026-09-07T09:00:00Z", "2026-09-07T09:30:00Z")
+        plan = self._plan(capture(*rows), existing=[existing])
+        gateway = FakeGateway([existing])
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(native.NativePostError, "unique Clockify entry"):
+                native.execute_plan(plan, self._approval(plan), Path(directory) / "events.jsonl",
+                                    Path(directory) / "receipt.json", gateway,
+                                    now=dt.datetime(2026, 10, 4, 11, tzinfo=dt.timezone.utc))
+        self.assertEqual([], gateway.posts)
 
     def test_second_precision_rows_preserve_exact_approved_payloads_and_totals(self):
         cases = [
@@ -274,6 +520,21 @@ class NativeSheetPostTests(unittest.TestCase):
                                     now=dt.datetime(2026, 10, 4, 11, tzinfo=dt.timezone.utc))
         self.assertEqual([], gateway.posts)
 
+    def test_resealed_plan_with_inconsistent_row_payload_digest_blocks_every_post(self):
+        plan = self._plan(capture(
+            row("review-a", "2026-09-07 12:00", "2026-09-07 12:30", 30),
+            row("review-b", "2026-09-07 13:00", "2026-09-07 13:30", 30),
+        ))
+        plan["entries"][1]["payload_digest"] = "0" * 64
+        plan["plan_digest"] = native._document_digest(plan, "plan_digest")
+        gateway = FakeGateway()
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(native.NativePostError, "payload digest"):
+                native.execute_plan(plan, self._approval(plan), Path(directory) / "events.jsonl",
+                                    Path(directory) / "receipt.json", gateway,
+                                    now=dt.datetime(2026, 10, 4, 11, tzinfo=dt.timezone.utc))
+        self.assertEqual([], gateway.posts)
+
     def test_live_overlap_posts_full_approved_interval_and_records_overlap(self):
         existing = [live("existing", "2026-09-07T09:10:00Z", "2026-09-07T09:20:00Z",
                          project="other", description="Other activity")]
@@ -291,16 +552,32 @@ class NativeSheetPostTests(unittest.TestCase):
         self.assertEqual(600, plan["entries"][0]["live_overlaps"][0]["overlap_seconds"])
         self.assertEqual("complete", receipt["status"])
 
-    def test_preexisting_semantic_equal_entry_is_not_credited_without_receipt_identity(self):
+    def test_preexisting_exact_entry_without_identity_never_creates_another_copy(self):
         exact = live("unrelated-exact", "2026-09-07T09:00:00Z", "2026-09-07T09:30:00Z")
         plan = self._plan(capture(row("review-a", "2026-09-07 12:00", "2026-09-07 12:30", 30)),
                           existing=[exact])
         gateway = FakeGateway([exact])
         with tempfile.TemporaryDirectory() as directory:
-            native.execute_plan(plan, self._approval(plan), Path(directory) / "events.jsonl",
-                                Path(directory) / "receipt.json", gateway,
-                                now=dt.datetime(2026, 10, 4, 11, tzinfo=dt.timezone.utc))
-        self.assertEqual(1, len(gateway.posts))
+            with self.assertRaisesRegex(native.NativePostError, "existing exact payload"):
+                native.execute_plan(plan, self._approval(plan), Path(directory) / "events.jsonl",
+                                    Path(directory) / "receipt.json", gateway,
+                                    now=dt.datetime(2026, 10, 4, 11, tzinfo=dt.timezone.utc))
+            self.assertFalse((Path(directory) / "events.jsonl").exists())
+        self.assertEqual([], gateway.posts)
+
+    def test_unbound_exact_match_in_later_row_prevents_partial_batch_posting(self):
+        exact = live("existing-exact", "2026-09-07T09:00:00Z", "2026-09-07T09:30:00Z")
+        plan = self._plan(capture(
+            row("new-work", "2026-09-07 11:00", "2026-09-07 11:10", 10),
+            row("duplicate-work", "2026-09-07 12:00", "2026-09-07 12:30", 30),
+        ), existing=[exact])
+        gateway = FakeGateway([exact])
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(native.NativePostError, "duplicate-work"):
+                native.execute_plan(plan, self._approval(plan), Path(directory) / "events.jsonl",
+                                    Path(directory) / "receipt.json", gateway,
+                                    now=dt.datetime(2026, 10, 4, 11, tzinfo=dt.timezone.utc))
+        self.assertEqual([], gateway.posts)
 
     def test_ambiguous_create_is_reconciled_by_unique_new_exact_id(self):
         plan = self._plan(capture(row("review-a", "2026-09-07 12:00", "2026-09-07 12:30", 30)))
@@ -324,6 +601,103 @@ class NativeSheetPostTests(unittest.TestCase):
             native.execute_plan(plan, approval, events, receipt, gateway,
                                 now=dt.datetime(2026, 10, 4, 11, 1, tzinfo=dt.timezone.utc))
         self.assertEqual(1, len(gateway.posts))
+
+    def test_identical_batch_payloads_create_once_and_receipt_preserves_all_reviews(self):
+        # Missing within-batch equivalence must produce two POSTs and fail this test.
+        plan = self._plan(capture(
+            row("review-a", "2026-09-07 12:00", "2026-09-07 12:30", 30),
+            row("review-b", "2026-09-07 12:00", "2026-09-07 12:30", 30),
+        ))
+        gateway = FakeGateway()
+        with tempfile.TemporaryDirectory() as directory:
+            result = native.execute_plan(plan, self._approval(plan), Path(directory) / "events.jsonl",
+                                         Path(directory) / "receipt.json", gateway,
+                                         now=dt.datetime(2026, 10, 4, 11, tzinfo=dt.timezone.utc))
+        self.assertEqual(1, len(gateway.posts))
+        self.assertEqual(["review-a", "review-b"], [item["review_id"] for item in result["entries"]])
+        self.assertEqual(["created-1", "created-1"], [item["clockify_entry_id"] for item in result["entries"]])
+        self.assertEqual("same_batch_payload_credit", result["entries"][1]["disposition"])
+        self.assertEqual("review-a", result["entries"][1]["alias_of_review_id"])
+        self.assertEqual(30, result["posted_minutes"])
+        self.assertEqual(30, result["same_batch_alias_minutes"])
+        self.assertEqual(60, result["total_minutes"])
+
+    def test_identical_batch_payload_alias_resumes_after_leader_crash_without_repost(self):
+        # A restart that resumes by review ID alone would post the alias again.
+        plan = self._plan(capture(
+            row("review-a", "2026-09-07 12:00", "2026-09-07 12:30", 30),
+            row("review-b", "2026-09-07 12:00", "2026-09-07 12:30", 30),
+        ))
+        gateway = CrashAfterCreateGateway()
+        with tempfile.TemporaryDirectory() as directory:
+            events, receipt = Path(directory) / "events.jsonl", Path(directory) / "receipt.json"
+            approval = self._approval(plan)
+            with self.assertRaises(KeyboardInterrupt):
+                native.execute_plan(plan, approval, events, receipt, gateway,
+                                    now=dt.datetime(2026, 10, 4, 11, tzinfo=dt.timezone.utc))
+            gateway.create = FakeGateway.create.__get__(gateway)
+            result = native.execute_plan(plan, approval, events, receipt, gateway,
+                                         now=dt.datetime(2026, 10, 4, 11, 1, tzinfo=dt.timezone.utc))
+            native.execute_plan(plan, approval, events, receipt, gateway,
+                                now=dt.datetime(2026, 10, 4, 11, 2, tzinfo=dt.timezone.utc))
+        self.assertEqual(1, len(gateway.posts))
+        self.assertEqual("same_batch_payload_credit", result["entries"][1]["disposition"])
+
+    def test_batch_alias_marked_intent_resumes_after_confirmation_interruption(self):
+        plan = self._plan(capture(
+            row("review-a", "2026-09-07 12:00", "2026-09-07 12:30", 30),
+            row("review-b", "2026-09-07 12:00", "2026-09-07 12:30", 30),
+        ))
+        gateway = FakeGateway()
+        append = native._append_event
+
+        def crash_before_alias_confirm(path, event):
+            if event.get("disposition") == "same_batch_payload_credit":
+                raise KeyboardInterrupt("crash after durable alias intent")
+            append(path, event)
+
+        with tempfile.TemporaryDirectory() as directory:
+            events, receipt = Path(directory) / "events.jsonl", Path(directory) / "receipt.json"
+            with mock.patch.object(native, "_append_event", side_effect=crash_before_alias_confirm):
+                with self.assertRaises(KeyboardInterrupt):
+                    native.execute_plan(plan, self._approval(plan), events, receipt, gateway,
+                                        now=dt.datetime(2026, 10, 4, 11, tzinfo=dt.timezone.utc))
+            result = native.execute_plan(plan, self._approval(plan), events, receipt, gateway,
+                                         now=dt.datetime(2026, 10, 4, 11, 1, tzinfo=dt.timezone.utc))
+        self.assertEqual(1, len(gateway.posts))
+        self.assertEqual("review-a", result["entries"][1]["alias_of_review_id"])
+
+    def test_batch_alias_cannot_reinterpret_an_old_unmarked_intent(self):
+        plan = self._plan(capture(
+            row("review-a", "2026-09-07 12:00", "2026-09-07 12:30", 30),
+            row("review-b", "2026-09-07 12:00", "2026-09-07 12:30", 30),
+        ))
+        approval = self._approval(plan)
+        gateway = FakeGateway()
+        with tempfile.TemporaryDirectory() as directory:
+            events = Path(directory) / "events.jsonl"
+            item = plan["entries"][1]
+            native._append_event(events, {"event_type": "intent", "approval_digest": native._digest(approval),
+                                "plan_digest": plan["plan_digest"], "review_id": item["review_id"],
+                                "payload_digest": item["payload_digest"], "before_entry_ids": [],
+                                "recorded_at": "2026-10-04T11:00:00Z"})
+            with self.assertRaisesRegex(native.NativePostError, "historical alias intent"):
+                native.execute_plan(plan, approval, events, Path(directory) / "receipt.json", gateway,
+                                    now=dt.datetime(2026, 10, 4, 11, 1, tzinfo=dt.timezone.utc))
+        self.assertEqual([], gateway.posts)
+
+    def test_batch_alias_changed_description_remains_a_separate_approved_entry(self):
+        first = row("review-a", "2026-09-07 12:00", "2026-09-07 12:30", 30)
+        second = row("review-b", "2026-09-07 12:00", "2026-09-07 12:30", 30)
+        second[8] = "Different approved work"
+        plan = self._plan(capture(first, second))
+        gateway = FakeGateway()
+        with tempfile.TemporaryDirectory() as directory:
+            result = native.execute_plan(plan, self._approval(plan), Path(directory) / "events.jsonl",
+                                         Path(directory) / "receipt.json", gateway,
+                                         now=dt.datetime(2026, 10, 4, 11, tzinfo=dt.timezone.utc))
+        self.assertEqual(2, len(gateway.posts))
+        self.assertEqual(["created-1", "created-2"], [item["clockify_entry_id"] for item in result["entries"]])
 
     def test_restart_recovers_persisted_intent_without_second_post(self):
         plan = self._plan(capture(row("review-a", "2026-09-07 12:00", "2026-09-07 12:30", 30)))

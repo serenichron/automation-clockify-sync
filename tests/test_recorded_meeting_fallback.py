@@ -137,6 +137,54 @@ class RecordedMeetingFallbackTests(unittest.TestCase):
         self.assertEqual("", row["client_project"])
         self.assertIn("unresolved_routing", {w["type"] for w in row["review_warnings"]})
 
+    def test_exact_review_route_applies_to_recorded_attendance_without_changing_time(self):
+        """Catches attendance fallback ignoring an evidence-bound routing decision."""
+        meeting = self.recording("route-reviewed", "2026-07-10T13:00:11+03:00",
+                                 "2026-07-10T14:00:29+03:00")
+        analysis = self.empty_analysis([meeting])
+        run, before = self.make_run([meeting], analysis)
+        original = before["proposals"][0]
+        path = run.parent.parent / "review-corrections.jsonl"
+        fixtures.WorkAccountingPipelineTests.append_correction(
+            self, path, original, "modify", categories=["routing"], field_patch={
+                "client_project": {"op": "replace", "value": "TST Prep Level 2"},
+                "tag_names": {"op": "replace", "value": ["Technical development"]},
+            })
+        after = pipeline.run_accounting(
+            run, root=fixtures.ROOT, analysis_fixture=run.parent.parent / "analysis.json",
+            corrections_path=path,
+        )
+        self.assertEqual(1, len(after["proposals"]))
+        row = after["proposals"][0]
+        self.assertEqual("TST Prep Level 2", row["client_project"])
+        self.assertEqual(["Technical development"], row["tag_names"])
+        self.assertEqual("TSTP — Attended Discovery call", row["description"])
+        for key in ("activity_id", "start", "end", "duration_seconds", "provenance"):
+            self.assertEqual(original[key], row[key])
+        self.assertIn("semantic_meeting_fallback", {w["type"] for w in row["review_warnings"]})
+        self.assertNotIn("unresolved_routing", {w["type"] for w in row["review_warnings"]})
+        self.assertEqual(0, after["correction_regression"]["summary"]["fail"])
+
+    def test_attendance_route_correction_does_not_apply_to_other_evidence(self):
+        """Catches widening a reviewed meeting route to a different source target."""
+        meeting = self.recording("route-unreviewed", "2026-07-10T13:00:00+03:00",
+                                 "2026-07-10T14:00:00+03:00")
+        run, before = self.make_run([meeting], self.empty_analysis([meeting]))
+        original = before["proposals"][0]
+        other = copy.deepcopy(original)
+        other["provenance"]["evidence_ids"] = ["ev-" + "f" * 64]
+        path = run.parent.parent / "other-source-corrections.jsonl"
+        fixtures.WorkAccountingPipelineTests.append_correction(
+            self, path, other, "modify", categories=["routing"], field_patch={
+                "client_project": {"op": "replace", "value": "TST Prep Level 2"},
+                "tag_names": {"op": "replace", "value": ["Technical development"]},
+            })
+        after = pipeline.run_accounting(
+            run, root=fixtures.ROOT, analysis_fixture=run.parent.parent / "analysis.json",
+            corrections_path=path,
+        )
+        self.assertEqual(before["proposals"], after["proposals"])
+
     def test_source_quarantines_remain_explicit(self):
         for status, seconds, expected in (("title_only", 3600, "title_only"), ("available", 18, "short_recording_without_transcript")):
             with self.subTest(reason=expected):
@@ -256,6 +304,53 @@ class RecordedMeetingFallbackTests(unittest.TestCase):
         import json
         self.assertEqual([], json.loads((run_dir / "semantic-analysis.json").read_text())["activities"])
         fixtures.assert_schema_valid(json.loads((fixtures.ROOT / "schemas" / "work-accounting-result-v1.json").read_text()), result)
+
+    def test_tst_fallback_title_route_survives_incidental_active_client_content(self):
+        """Catches another client's name hijacking recorded attendance routing."""
+        title = "TST - Vlad & Alex - AI Model Testing UI"
+        base = self.recording(
+            "tst-model-review", "2026-09-25T13:00:00+03:00",
+            "2026-09-25T14:00:00+03:00", title,
+        )
+        content = "Reviewed the TST testing UI; mentioned Mazilu & Partners as an example."
+        meeting = fixtures.evidence_ledger.evidence_event(
+            "fathom", dict(base.source_ref), observed_at=base.observed_at,
+            raw_source_span=dict(base.raw_source_span),
+            attributes={**base.attributes, "content": content,
+                        "transcript": [{"text": content}]},
+        )
+
+        _, result = self.make_run([meeting], self.empty_analysis([meeting]))
+
+        self.assertEqual(1, len(result["proposals"]))
+        row = result["proposals"][0]
+        self.assertEqual("TST Prep Level 1", row["client_project"])
+        self.assertEqual("319d88", row["clockify_project_suffix"])
+        self.assertEqual(["Project Management"], row["tag_names"])
+        self.assertEqual(f"TSTP — Attended {title}", row["description"])
+        self.assertEqual(3600, row["duration_seconds"])
+        self.assertTrue(row["provenance"]["semantic_fallback"])
+
+    def test_mazilu_fallback_title_respects_client_activation_cutover(self):
+        """Catches title scoping losing real client activation or pre-contract SC."""
+        for day, project, prefix in (
+            ("2026-09-23", "Serenichron Level 2", "SC"),
+            ("2026-09-25", "Mazilu & Partners — Retainer", "M&P"),
+        ):
+            with self.subTest(day=day):
+                meeting = self.recording(
+                    f"mazilu-working-session-{day}", f"{day}T13:00:00+03:00",
+                    f"{day}T14:00:00+03:00", "Mazilu & Partners proposal review",
+                )
+
+                _, result = self.make_run([meeting], self.empty_analysis([meeting]))
+
+                self.assertEqual(1, len(result["proposals"]))
+                row = result["proposals"][0]
+                self.assertEqual(project, row["client_project"])
+                self.assertEqual(f"{prefix} — Attended Mazilu & Partners proposal review",
+                                 row["description"])
+                self.assertEqual(3600, row["duration_seconds"])
 
     def test_native_quality_accepts_factual_attendance_without_a_fabricated_outcome(self):
         from scripts import clockify_sync_quality as quality

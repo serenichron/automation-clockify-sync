@@ -635,6 +635,13 @@ def _runtime_transition_unlocks_generic(
         return False
     record = state.get("slices", {}).get(dates[0], {})
     source = record.get("source") if isinstance(record, Mapping) else None
+    runner_attempt = _runner_attempt(record) if isinstance(record, Mapping) else None
+    if runner_attempt is not None and runner_attempt["status"] == "pending":
+        return True
+    if source is None and isinstance(record, Mapping):
+        return runner_attempt is None or (
+            runner_attempt["runtime_identity_digest"] != _value_digest(dict(runtime))
+        )
     return (
         isinstance(source, Mapping)
         and isinstance(source.get("runtime_identity_digest"), str)
@@ -646,12 +653,12 @@ def _select_work(
     config: Mapping[str, Any], state: Mapping[str, Any],
     store: source_coverage.SourceDebtStore, *, today: dt.date,
 ) -> list[tuple[str, str, str, source_coverage.DebtItem | None]]:
-    """Select bounded exact and ordinary work with deterministic fairness."""
+    """Select bounded recovery and ordinary work with deterministic fairness."""
     maximum = int(config.get("max_slices", 1))
     now = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
     active = store.active()
     ordinarily_eligible = {item.debt_id for item in store.eligible(now)}
-    exact: list[tuple[str, str, str, source_coverage.DebtItem | None]] = []
+    recovery: list[tuple[str, str, str, source_coverage.DebtItem | None]] = []
     exact_intervals: set[tuple[str, str]] = set()
     for item in sorted(
         (
@@ -673,7 +680,7 @@ def _select_work(
         record = state.get("slices", {}).get(since, {})
         if not isinstance(record, Mapping) or not isinstance(record.get("source"), Mapping):
             continue
-        exact.append((since, until, "exact", item))
+        recovery.append((since, until, "exact", item))
         exact_intervals.add(dates)
     eligible = sorted(
         (
@@ -713,10 +720,16 @@ def _select_work(
             "delivered", "delivered_with_exceptions",
         }:
             continue
-        ordinary.append((since, until, "generic", item))
+        runner_attempt = _runner_attempt(record) if isinstance(record, Mapping) else None
         selected_intervals.add(identity)
-        if len(ordinary) == maximum:
-            break
+        if item.status == "exhausted" and (
+            record.get("source") is None
+            or runner_attempt is not None and runner_attempt["status"] == "pending"
+        ):
+            recovery.append((since, until, "generic_classification", item))
+            continue
+        if len(ordinary) < maximum:
+            ordinary.append((since, until, "generic", item))
     resumable = sorted(
         (
             (since, raw)
@@ -755,15 +768,15 @@ def _select_work(
             continue
         ordinary.append((since, until, "routine", None))
         selected_intervals.add((since, until))
-    if not exact:
+    if not recovery:
         return ordinary[:maximum]
     if not ordinary:
-        return exact[:maximum]
+        return recovery[:maximum]
     if maximum == 1:
-        return exact[:1] if state.get("next_work_class", "routine") == "exact" else ordinary[:1]
-    selected = [exact[0], ordinary[0]]
+        return recovery[:1] if state.get("next_work_class", "routine") == "exact" else ordinary[:1]
+    selected = [recovery[0], ordinary[0]]
     occupied = {(item[0], item[1]) for item in selected}
-    for item in [*exact[1:], *ordinary[1:]]:
+    for item in [*recovery[1:], *ordinary[1:]]:
         if len(selected) == maximum:
             break
         identity = (item[0], item[1])
@@ -2484,6 +2497,7 @@ def _record_generic_failure(
     store: source_coverage.SourceDebtStore,
     interval: source_coverage.SourceInterval,
     *, failure_class: str, resume_state_digest: str,
+    classification: bool = False,
 ) -> source_coverage.DebtItem:
     if _same_active_failure(
         store, interval, failure_class=failure_class,
@@ -2494,9 +2508,45 @@ def _record_generic_failure(
         interval, failure_class=failure_class, retryable=True,
         resume_state_digest=resume_state_digest, attempted_at=_attempted_at(),
     )
-    if item.retry_count >= GENERIC_RETRY_LIMIT:
+    if classification or item.retry_count >= GENERIC_RETRY_LIMIT:
         item = store.exhaust(item.debt_id, terminal_reason="retry_limit")
     return item
+
+
+def _runner_attempt(record: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """Validate the runtime binding without changing the source-attempt contract."""
+    if "runner_attempt" not in record:
+        return None
+    raw = record["runner_attempt"]
+    source = record.get("source_attempt")
+    if (
+        not isinstance(raw, Mapping)
+        or set(raw) != {"runtime_identity_digest", "source_attempt_ordinal", "status"}
+        or raw.get("status") not in {"pending", "finished"}
+        or not _valid_digest(raw.get("runtime_identity_digest"))
+        or isinstance(raw.get("source_attempt_ordinal"), bool)
+        or not isinstance(raw.get("source_attempt_ordinal"), int)
+        or raw["source_attempt_ordinal"] < 1
+        or not isinstance(source, Mapping)
+        or set(source) != {
+            "ordinal", "command_digest", "resume_state_digest", "status",
+            "advance_frontier",
+        }
+        or isinstance(source.get("ordinal"), bool)
+        or not isinstance(source.get("ordinal"), int)
+        or source.get("ordinal") != raw["source_attempt_ordinal"]
+        or source.get("status") not in {"started", "finished"}
+        or raw["status"] == "finished" and source.get("status") != "finished"
+        or (
+            raw["status"] == "pending" and source.get("status") == "finished"
+            and not isinstance(record.get("source"), Mapping)
+        )
+        or not _valid_digest(source.get("command_digest"))
+        or not _valid_digest(source.get("resume_state_digest"))
+        or not isinstance(source.get("advance_frontier"), bool)
+    ):
+        raise CycleError("stored runner attempt is invalid")
+    return raw
 
 
 def _source_attempt(
@@ -2545,8 +2595,17 @@ def _attempt_failure_exists(
     )
 
 
-def _finish_attempt(record: dict[str, Any], attempt: Mapping[str, Any]) -> None:
+def _finish_attempt(
+    record: dict[str, Any], attempt: Mapping[str, Any], *, finish_runner: bool = True,
+) -> None:
     record["source_attempt"] = {**dict(attempt), "status": "finished"}
+    if finish_runner:
+        _finish_runner_attempt(record)
+
+
+def _finish_runner_attempt(record: dict[str, Any]) -> None:
+    if "runner_attempt" in record:
+        record["runner_attempt"] = {**record["runner_attempt"], "status": "finished"}
 
 
 def _record_advances_frontier(
@@ -3339,6 +3398,7 @@ def _run_slice(
     if not isinstance(record_raw, Mapping):
         raise CycleError("stored slice state is invalid")
     record: dict[str, Any] = dict(record_raw)
+    runner_attempt = _runner_attempt(record)
     bind_inputs = "expected_snapshot_digests" not in record
     manifest_path = _ensure_period(
         config, state_dir, since, until, bind_inputs=bind_inputs
@@ -3353,6 +3413,13 @@ def _run_slice(
 
     source: dict[str, Any] | None
     stored_source = record.get("source")
+    classification = (
+        generic is not None and generic.status == "exhausted"
+        and (
+            stored_source is None
+            or runner_attempt is not None and runner_attempt["status"] == "pending"
+        )
+    )
     historical_generic_gate = (
         generic is not None
         and generic.status == "exhausted"
@@ -3389,9 +3456,28 @@ def _run_slice(
         interval = generic.interval if generic is not None else _generic_interval(
             config, since, until
         )
+        previous = record.get("source_attempt")
+        runtime = config.get("_runtime_identity")
+        if (
+            classification
+            and (
+                runner_attempt is None
+                or isinstance(runtime, Mapping)
+                and runner_attempt["runtime_identity_digest"] != _value_digest(dict(runtime))
+            )
+            and isinstance(previous, Mapping) and previous.get("status") == "started"
+            and _attempt_failure_exists(debt_store, interval, previous)
+        ):
+            _finish_attempt(record, previous)
         attempt = _source_attempt(
             record, review_command, interval, advance_frontier=advance_frontier
         )
+        if isinstance(runtime, Mapping):
+            record["runner_attempt"] = {
+                "runtime_identity_digest": _value_digest(dict(runtime)),
+                "source_attempt_ordinal": attempt["ordinal"],
+                "status": "pending",
+            }
         _persist_state(state_path, state, since, record)
         if _attempt_failure_exists(debt_store, interval, attempt):
             _finish_attempt(record, attempt)
@@ -3412,34 +3498,40 @@ def _run_slice(
             record["status"] = "incomplete"
             _persist_state(state_path, state, since, record)
             return {"status": "incomplete", "reason": "total_child_budget_exhausted", "slice": {"since": since, "until": until}, "advance_frontier": False}
-        if not child.timed_out:
-            try:
-                result_path = _result(child.stdout, _runs_dir(config))
-            except CycleError:
-                result_path = None
-            if result_path is not None:
+        source_error: CycleError | None = None
+        try:
+            if not child.timed_out:
                 try:
-                    source = _validate_stage(
-                        config, result_path, since, until, replay=False,
-                        expected_snapshot_digests=expected_snapshots,
-                    )
-                except _QualityBlocked:
-                    if (result_path.parent / "collector-source.json").exists():
-                        collector_source = _validate_collector_source_stage(
-                            config, result_path, since, until,
-                            expected_snapshot_digests=expected_snapshots,
-                        )
-                    else:
-                        raise
-                except CycleError as exc:
-                    if "runtime identity" in str(exc):
+                    result_path = _result(child.stdout, _runs_dir(config))
+                except CycleError:
+                    result_path = None
+                if result_path is not None:
+                    try:
                         source = _validate_stage(
                             config, result_path, since, until, replay=False,
                             expected_snapshot_digests=expected_snapshots,
-                            allow_historical_runtime=True,
                         )
-                    else:
-                        raise
+                    except _QualityBlocked:
+                        if (result_path.parent / "collector-source.json").exists():
+                            collector_source = _validate_collector_source_stage(
+                                config, result_path, since, until,
+                                expected_snapshot_digests=expected_snapshots,
+                            )
+                        else:
+                            raise
+                    except CycleError as exc:
+                        if "runtime identity" in str(exc):
+                            source = _validate_stage(
+                                config, result_path, since, until, replay=False,
+                                expected_snapshot_digests=expected_snapshots,
+                                allow_historical_runtime=True,
+                            )
+                        else:
+                            raise
+        except CycleError as exc:
+            if not classification:
+                raise
+            source_error = exc
         if source is None and collector_source is not None:
             record.update({
                 "source_parent": collector_source,
@@ -3471,17 +3563,20 @@ def _run_slice(
             _record_generic_failure(
                 debt_store, interval, failure_class=failure_class,
                 resume_state_digest=str(attempt["resume_state_digest"]),
+                classification=classification,
             )
             source_coverage.write(debt_path, debt_store.document())
             _finish_attempt(record, attempt)
             record["status"] = "incomplete"
             _persist_state(state_path, state, since, record)
+            if source_error is not None:
+                raise source_error
             return {
                 "status": "incomplete",
                 "slice": {"since": since, "until": until},
                 "advance_frontier": bool(attempt["advance_frontier"]),
             }
-        _finish_attempt(record, attempt)
+        _finish_attempt(record, attempt, finish_runner=not classification)
         record.update({
             "status": "source_verified", "source": source,
             "source_completeness": source["coverage"],
@@ -3506,10 +3601,12 @@ def _run_slice(
             _record_generic_failure(
                 debt_store, interval, failure_class="coverage_unclassified",
                 resume_state_digest=resume_digest,
+                classification=classification,
             )
-        elif generic is not None and historical_generic_gate:
+        elif generic is not None and (historical_generic_gate or classification):
             _resolve_generic(debt_store, generic, source)
         source_coverage.write(debt_path, debt_store.document())
+        _finish_runner_attempt(record)
         record["status"] = "recovery_blocked"
         _persist_state(state_path, state, since, record)
         return {
@@ -3520,6 +3617,8 @@ def _run_slice(
 
     _resolve_generic(debt_store, generic, source)
     source_coverage.write(debt_path, debt_store.document())
+    _finish_runner_attempt(record)
+    _persist_state(state_path, state, since, record)
 
     replay = _stage_from_state(
         config, record, "replay", since, until, replay=True,
@@ -3872,17 +3971,17 @@ def run_cycle(config: Mapping[str, Any], *, enable_sheet_write: bool, today: dt.
                 config, {**state, "next_work_class": "routine"}, debt_store,
                 today=today or dt.datetime.now(ZoneInfo(str(config["timezone"]))).date(),
             )
-            exact_pick = _select_work(
+            recovery_pick = _select_work(
                 config, {**state, "next_work_class": "exact"}, debt_store,
                 today=today or dt.datetime.now(ZoneInfo(str(config["timezone"]))).date(),
             )
             if (
-                routine_pick and exact_pick
-                and routine_pick[0][2] != "exact"
-                and exact_pick[0][2] == "exact"
+                routine_pick and recovery_pick
+                and routine_pick[0][2] not in {"exact", "generic_classification"}
+                and recovery_pick[0][2] in {"exact", "generic_classification"}
             ):
                 state["next_work_class"] = (
-                    "routine" if selected[0][2] == "exact" else "exact"
+                    "routine" if selected[0][2] in {"exact", "generic_classification"} else "exact"
                 )
                 _atomic(state_path, state)
         attempted: list[dict[str, Any]] = []

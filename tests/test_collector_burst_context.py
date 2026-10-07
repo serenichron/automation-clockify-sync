@@ -29,12 +29,140 @@ TZ = dt.timezone(dt.timedelta(hours=3))
 SINCE = dt.datetime(2026, 7, 21, tzinfo=TZ)
 UNTIL = dt.datetime(2026, 7, 22, tzinfo=TZ)
 
+WRAPPED = ('Another Claude session sent a message:\n'
+           '<teammate-message teammate_id="synthetic-worker">'
+           '{"type":"idle_notification","result":"Synthetic artifact ready"}'
+           '</teammate-message>')
+HUMAN_QUOTE = 'I reviewed this report and need to compare the actual artifacts:\n' + WRAPPED
+
 
 def event(timestamp: str, event_type: str, message: str) -> dict:
     return {"timestamp": timestamp, "type": "event_msg", "payload": {"type": event_type, "message": message}}
 
 
 class CollectorBurstContextTests(unittest.TestCase):
+    def test_prefixed_teammate_notifications_supply_no_human_capacity(self) -> None:
+        for content in (WRAPPED, ' \n' + WRAPPED.upper(),
+                        '<teammate-message teammate_id="synthetic-worker">Ready</teammate-message>'):
+            with self.subTest(content=content):
+                self.assertEqual([], collector.hermes_user_observed_intervals([
+                    {"role": "user", "kind": "message", "content": content, "timestamp": timestamp}
+                    for timestamp in ('2026-09-24T10:00:00+03:00', '2026-09-24T10:05:00+03:00')
+                ]))
+
+    def test_human_quoted_teammate_report_remains_an_attention_anchor(self) -> None:
+        for content in (HUMAN_QUOTE, '```text\n' + WRAPPED + '\n```',
+                        'Another Claude session sent a message:',
+                        'Another Claude session sent a message: <teammate-message-example>quoted phrase',
+                        'Please inspect the phrase "Another Claude session sent a message:" and the quoted <teammate-message> report.'):
+            with self.subTest(content=content):
+                self.assertEqual([{'start': '2026-09-24T10:00:00+03:00',
+                                   'end': '2026-09-24T10:05:00+03:00'}],
+                                 collector.hermes_user_observed_intervals([
+                    {"role": "user", "kind": "message", "content": content, "timestamp": timestamp}
+                    for timestamp in ('2026-09-24T10:00:00+03:00', '2026-09-24T10:05:00+03:00')
+                ]))
+
+    def test_machine_envelope_does_not_create_or_extend_a_human_burst(self) -> None:
+        def native(timestamp: str, role: str, content: str) -> dict:
+            return {'timestamp': dt.datetime.fromisoformat(timestamp), 'role': role,
+                    'kind': 'message', 'content': content}
+        first = native('2026-09-24T10:00:00+03:00', 'user', 'Review the synthetic artifact.')
+        last = native('2026-09-24T10:05:00+03:00', 'user', 'Compare the synthetic artifact.')
+        injected = native('2026-09-24T10:20:00+03:00', 'user', WRAPPED)
+        late = native('2026-09-24T10:40:00+03:00', 'assistant', 'Late synthetic result.')
+        bursts = collector._partition_bursts([first, last, injected, late])
+        self.assertEqual([first['timestamp'], last['timestamp']], collector._burst_context(bursts[0])[2])
+        self.assertNotIn(late, bursts[0])
+        self.assertEqual([], collector._partition_bursts([injected, late]))
+        # Even if a caller retains the envelope as context, it cannot add a human anchor.
+        self.assertEqual(('Review the synthetic artifact.', '', [first['timestamp']]),
+                         collector._burst_context([injected, first]))
+        quoted = {**injected, 'content': HUMAN_QUOTE}
+        self.assertEqual([first['timestamp'], last['timestamp'], quoted['timestamp']],
+                         collector._burst_context(collector._partition_bursts([first, last, quoted])[0])[2])
+
+    def test_claude_evidence_serializer_preserves_seconds_and_microseconds(self) -> None:
+        rows = [{'timestamp': dt.datetime.fromisoformat(timestamp), 'role': 'user',
+                 'kind': 'message', 'content': 'Synthetic human work', 'tool_name': 'synthetic-tool'}
+                for timestamp in ('2026-09-24T10:00:01.125000+03:00', '2026-09-24T10:00:43.125000+03:00')]
+        serialized = collector._serialized_events(rows)
+        self.assertEqual(['2026-09-24T10:00:01.125000+03:00', '2026-09-24T10:00:43.125000+03:00'],
+                         [row['timestamp'] for row in serialized])
+        for row in serialized:
+            self.assertEqual({'role': 'user', 'kind': 'message', 'content': 'Synthetic human work',
+                              'tool_name': 'synthetic-tool'}, {key: value for key, value in row.items() if key != 'timestamp'})
+        self.assertIsNone(collector._serialized_events([{'timestamp': None}])[0]['timestamp'])
+        self.assertEqual('2026-09-24 10:00', collector.local_dt_string(rows[0]['timestamp']))
+
+    def test_native_claude_jsonl_preserves_evidence_timestamp_precision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / 'projects'
+            path = base / 'synthetic-project' / 'synthetic-session.jsonl'
+            self.write_jsonl(path, [
+                {'timestamp': '2026-09-24T10:00:01.125000+03:00', 'type': 'user',
+                 'message': {'content': 'Review the synthetic artifact.'}},
+                {'timestamp': '2026-09-24T10:00:43.125000+03:00', 'type': 'user',
+                 'message': {'content': 'Compare the synthetic artifact.'}},
+                {'timestamp': '2026-09-24T10:00:44.125000+03:00', 'type': 'assistant',
+                 'message': {'content': 'Synthetic comparison complete.'}},
+            ])
+            bursts = collector.parse_claude_jsonl_file(path, str(base),
+                dt.datetime(2026, 9, 24, tzinfo=TZ), dt.datetime(2026, 9, 25, tzinfo=TZ), 'synthetic-machine')
+            evidence = evidence_ledger.normalize_collector_snapshot({'sessions': [
+                {'machine': 'synthetic-machine', 'claude_bursts': bursts}]})
+        users = sorted((row.document() for row in evidence if row.attributes.get('role') == 'user'),
+                       key=lambda row: row['source_ref']['ordinal'])
+        self.assertEqual(['2026-09-24T10:00:01.125000+03:00', '2026-09-24T10:00:43.125000+03:00'],
+                         [row['observed_at'] for row in users])
+        self.assertEqual(['2026-09-24T10:00:01.125000+03:00', '2026-09-24T10:00:43.125000+03:00'],
+                         [row['raw_source_span']['timestamp'] for row in users])
+        intervals = collector.hermes_user_observed_intervals(bursts[0]['events'])
+        self.assertEqual([{'start': '2026-09-24T10:00:01.125000+03:00',
+                           'end': '2026-09-24T10:00:43.125000+03:00'}], intervals)
+        self.assertEqual(0, accounting._interval_capacity_minutes(intervals))
+
+    def test_generated_remote_codex_excludes_envelopes_and_retains_human_quotes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            for session, content in (('machine', WRAPPED), ('human', HUMAN_QUOTE)):
+                self.write_jsonl(home / 'sessions' / ('rollout-' + session + '.jsonl'), [
+                    {'type': 'session_meta', 'payload': {'id': session}},
+                    event('2026-07-21T05:00:00Z', 'user_message', content),
+                    event('2026-07-21T05:05:00Z', 'user_message', content),
+                ])
+            result = self.collect_legacy_remote_codex(home)
+        self.assertEqual(['human'], [row['session_id'] for row in result['codex_sessions']])
+        self.assertEqual(2, result['codex_sessions'][0]['user_messages'])
+
+    def test_legacy_remote_claude_excludes_envelopes_and_retains_human_quotes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            scope = {'Path': Path, 'dt': dt, 'json': json, 'BUCHAREST': collector.BUCHAREST,
+                     'SINCE': SINCE, 'UNTIL': UNTIL, 'CBASE': str(base), 'MACHINE': 'synthetic-machine',
+                     'parse_dt': collector.parse_dt, 'local_str': collector.local_dt_string,
+                     'label': lambda path, base: 'Synthetic project'}
+            exec(collector._remote_claude_contract(), scope)
+            for session, content, expected in (('machine', WRAPPED, 0), ('human', HUMAN_QUOTE, 1)):
+                path = base / (session + '.jsonl')
+                self.write_jsonl(path, [
+                    {'timestamp': '2026-07-21T05:00:00Z', 'type': 'user', 'message': {'content': content}},
+                    {'timestamp': '2026-07-21T05:05:00Z', 'type': 'user', 'message': {'content': content}},
+                ])
+                with self.subTest(session=session):
+                    self.assertEqual(expected, len(scope['parse_claude'](path)))
+
+    def test_generated_remote_hermes_includes_injected_filter_dependency(self) -> None:
+        scope = {'Path': Path, 'dt': dt, 'BUCHAREST': collector.BUCHAREST,
+                 'parse_dt': collector.parse_dt, 'HDB': '', 'res': {'errors': []}}
+        exec(collector._remote_hermes_contract(), scope)
+        for content, expected in ((WRAPPED, []), (HUMAN_QUOTE, [
+            {'start': '2026-09-24T10:00:00+03:00', 'end': '2026-09-24T10:05:00+03:00'}])):
+            with self.subTest(content=content):
+                self.assertEqual(expected, scope['hermes_user_observed_intervals']([
+                    {'role': 'user', 'kind': 'message', 'content': content, 'timestamp': timestamp}
+                    for timestamp in ('2026-09-24T10:00:00+03:00', '2026-09-24T10:05:00+03:00')]))
+
     def write_jsonl(self, path: Path, rows: list[dict]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("\n".join(json.dumps(row) for row in rows) + "\n")

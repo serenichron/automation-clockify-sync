@@ -31,6 +31,233 @@ class UniqueGateway(fixtures.FakeGateway):
         return entry
 
 
+class ManualMeetingCreditTests(unittest.TestCase):
+    _plan = fixtures.NativeSheetPostTests._plan
+    _approval = fixtures.NativeSheetPostTests._approval
+    adopted_plan = lambda self, document, gateway, snapshot: SourceAdoptionTests.adopted_plan(self, document, gateway, snapshot)
+    execute = lambda self, root, plan, gateway: SourceAdoptionTests.execute(self, root, plan, gateway)
+
+    def proof(self, root, *, independent=False):
+        from scripts import clockify_source_adoptions as adoptions, work_accounting_pipeline as pipeline, review_corrections
+        event = evidence_ledger.evidence_event(
+            "fathom", {"source_type": "fathom", "source_id": "example-recording-1"},
+            observed_at="2026-09-29T10:32:00Z",
+            raw_source_span={"start": "2026-09-29T10:32:00Z", "end": "2026-09-29T11:30:00Z"},
+            attributes={"title": "Example meeting", "recorded_by_email": "member@example.invalid",
+                        "calendar_invitees": [{"email": "member@example.invalid"}]},
+        )
+        ledger = evidence_ledger.EvidenceLedger((event,), member_identities=("member@example.invalid",))
+        ledger_document = {"schema_version": ledger.manifest.schema_version,
+                           "manifest": ledger.manifest.document(), "events": [event.document()]}
+        meetings, errors = pipeline._recording_events(ledger_document["events"], ledger_document["manifest"])
+        self.assertEqual([], errors)
+        meeting_id = meetings[0]["meeting"].canonical_id
+        proposal = {"activity_id": "act-0123456789abcdef01234567", "candidate_key": "candidate-meeting",
+                    "review_activity_key": "wka-manual", "allocation_segment": 1,
+                    "duration_seconds": 3480, "start": "2026-09-29T10:32:00Z", "end": "2026-09-29T11:30:00Z",
+                    "clockify_project_suffix": "123456", "tag_suffixes": ["654321"], "billable": True,
+                    "provenance": {"evidence_ids": [event.evidence_id], "canonical_meeting_id": meeting_id}}
+        current = fixtures.row("wka-manual-s01", "2026-09-29 13:32:00", "2026-09-29 14:30:00", 58)
+        current[6], current[8] = proposal["activity_id"], "Example recorded outcome"
+        rows = [current]
+        if independent:
+            rows.insert(0, fixtures.row("independent", "2026-09-29 15:00", "2026-09-29 15:05", 5))
+        document = fixtures.capture(*rows)
+        manual = fixtures.live("manual-1", "2026-09-29T10:31:07Z", "2026-09-29T11:30:20Z", description="Example manual meeting")
+        manual.update(workspaceId="workspace-1", userId="user-1")
+        manual["timeInterval"]["duration"] = "PT59M13S"
+        gateway = UniqueGateway([manual])
+        raw_plan = self._plan(document, existing=gateway.entries)
+        item = next(value for value in raw_plan["entries"] if value["review_id"] == "wka-manual-s01")
+        declaration = {"adoption_kind": "manual_meeting", "operation_anchor": "human-confirmed/example-meeting",
+                       "same_meeting_confirmed": True, "canonical_meeting_id": meeting_id,
+                       "current_review_id": item["review_id"], "current_payload_digest": item["payload_digest"],
+                       "current_proposal_digest": adoptions.recurring_proposal_digest(proposal),
+                       "source_fingerprint": review_corrections.evidence_fingerprint([event.evidence_id]),
+                       "clockify_entry_id": "manual-1", "retained_entry_digest": native._digest(manual),
+                       "artifacts": {"current_proposals": artifact(root/"current-proposals.json", [proposal]),
+                                     "current_source_ledger": artifact(root/"current-ledger.json", ledger_document),
+                                     "retained_entry_snapshot": artifact(root/"manual-entry.json", manual)}}
+        return document, gateway, {"schema_version": "clockify-source-accounted-adoptions/v3", "declarations": [declaration]}
+
+    def supported_plan(self, document, gateway, snapshot):
+        try:
+            return self.adopted_plan(document, gateway, snapshot)
+        except native.NativePostError as error:
+            self.fail(f"explicit audited manual meeting must be credited: {error}")
+
+    def test_manual_58_minutes_credit_retains_59_minutes_13_seconds_without_post(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            doc, gateway, snapshot = self.proof(root)
+            original = copy.deepcopy(gateway.entries)
+            plan = self.supported_plan(doc, gateway, snapshot)
+            receipt = self.execute(root, plan, gateway)
+            self.assertEqual([], gateway.posts)
+            self.assertEqual(original, gateway.entries)
+            entry = receipt["entries"][0]
+            self.assertEqual("credited_manual_meeting", entry["disposition"])
+            self.assertEqual(3480, entry["approved_current_seconds"])
+            self.assertEqual(3553, entry["retained_native_seconds"])
+            self.assertEqual(0, entry["posted_seconds"])
+            self.assertEqual(0, receipt["posted_seconds"])
+            self.assertEqual(3553, receipt["retained_native_seconds"])
+            self.assertEqual(receipt, self.execute(root, plan, gateway))
+
+    def test_manual_credit_and_batch_alias_report_only_actual_new_native_time(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            doc, gateway, snapshot = self.proof(root, independent=True)
+            rows = doc["structuredContent"]["sheets"][0]["data"][0]["rowData"]
+            alias = copy.deepcopy(rows[1])
+            alias["values"][0] = fixtures.cell("independent-alias")
+            rows.append(alias)
+            plan = self.supported_plan(doc, gateway, snapshot)
+            receipt = self.execute(root, plan, gateway)
+            self.assertEqual(1, len(gateway.posts))
+            self.assertEqual(5, receipt["posted_minutes"])
+            self.assertEqual(5, receipt["same_batch_alias_minutes"])
+            self.assertEqual(300, receipt["posted_seconds"])
+            self.assertEqual(3553, receipt["retained_native_seconds"])
+            self.assertEqual(receipt, self.execute(root, plan, gateway))
+
+    def test_manual_missing_authority_or_wrong_canonical_source_is_rejected(self):
+        for field, wrong in (("same_meeting_confirmed", False), ("same_meeting_confirmed", "true"),
+                             ("operation_anchor", ""), ("canonical_meeting_id", "cm-other"),
+                             ("source_fingerprint", "different"), ("current_proposal_digest", "0"*64),
+                             ("current_payload_digest", "0"*64), ("clockify_entry_id", "other")):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                doc, gateway, snapshot = self.proof(Path(directory))
+                snapshot["declarations"][0][field] = wrong
+                with self.assertRaisesRegex(native.NativePostError, "manual meeting"):
+                    self.adopted_plan(doc, gateway, snapshot)
+                self.assertEqual([], gateway.posts)
+
+    def test_manual_route_target_and_partial_interval_mismatch_are_rejected(self):
+        mutations = {"projectId": "other", "tagIds": [], "taskId": "other-task", "billable": False,
+                     "userId": "other", "workspaceId": "other", "start": "2026-09-29T10:33:00Z"}
+        for field, wrong in mutations.items():
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                doc, gateway, snapshot = self.proof(root)
+                target = gateway.entries[0]["timeInterval"] if field == "start" else gateway.entries[0]
+                target[field] = wrong
+                if field == "start":
+                    gateway.entries[0]["timeInterval"]["duration"] = "PT57M20S"
+                declaration = snapshot["declarations"][0]
+                declaration["retained_entry_digest"] = native._digest(gateway.entries[0])
+                declaration["artifacts"]["retained_entry_snapshot"] = artifact(root/"manual-entry.json", gateway.entries[0])
+                expected = "route or full interval coverage" if field == "start" else "manual meeting"
+                with self.assertRaisesRegex(native.NativePostError, expected):
+                    self.adopted_plan(doc, gateway, snapshot)
+
+    def test_manual_snapshot_drift_duplicate_id_and_source_bytes_drift_reject(self):
+        for mutation in ("description", "duplicate", "retained_entry_snapshot", "current_proposals", "current_source_ledger"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                doc, gateway, snapshot = self.proof(Path(directory))
+                if mutation == "description": gateway.entries[0]["description"] += " changed"
+                elif mutation == "duplicate": gateway.entries.append(copy.deepcopy(gateway.entries[0]))
+                else: Path(snapshot["declarations"][0]["artifacts"][mutation]["path"]).write_text("{}\n")
+                with self.assertRaises(native.NativePostError): self.adopted_plan(doc, gateway, snapshot)
+
+    def test_manual_fresh_direct_get_drift_blocks_all_creates_even_unrelated_first_row(self):
+        for field in ("description", "userId", "workspaceId", "id", "taskId", "billable"):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                doc, gateway, snapshot = self.proof(root, independent=True)
+                plan = self.supported_plan(doc, gateway, snapshot)
+                direct_get = gateway.entry_by_id
+                def drift(entry_id):
+                    entry = direct_get(entry_id)
+                    entry[field] = False if field == "billable" else "changed"
+                    return entry
+                gateway.entry_by_id = drift
+                with self.assertRaisesRegex(native.NativePostError, "exact direct GET"):
+                    self.execute(root, plan, gateway)
+                self.assertEqual([], gateway.posts)
+
+    def test_manual_sealed_credit_preserves_source_binding_without_artifact_io(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            doc, gateway, snapshot = self.proof(root, independent=True)
+            plan = self.supported_plan(doc, gateway, snapshot)
+            for handle in snapshot["declarations"][0]["artifacts"].values(): Path(handle["path"]).unlink()
+            receipt = self.execute(root, plan, gateway)
+            self.assertEqual(["created", "credited_manual_meeting"], [value["disposition"] for value in receipt["entries"]])
+            self.assertEqual(1, len(gateway.posts))
+            self.assertEqual(300, receipt["posted_seconds"])
+            self.assertEqual(receipt, self.execute(root, plan, gateway))
+
+    def test_manual_tampered_sealed_source_rejects_even_resealed_plan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            doc, gateway, snapshot = self.proof(root, independent=True)
+            plan = self.supported_plan(doc, gateway, snapshot)
+            item = next(value for value in plan["entries"] if value["review_id"] == "wka-manual-s01")
+            credit = item["prior_entry_credit"]
+            credit["source_events"][0]["attributes"]["title"] = "Different meeting"
+            credit["credit_digest"] = native._document_digest(credit, "credit_digest")
+            plan["plan_digest"] = native._document_digest(plan, "plan_digest")
+            with self.assertRaises(native.NativePostError): self.execute(root, plan, gateway)
+            self.assertEqual([], gateway.posts)
+
+    def test_manual_one_entry_cannot_credit_another_review_even_same_generic_title(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            doc, gateway, snapshot = self.proof(root)
+            from scripts import clockify_source_adoptions as adoptions
+            declaration = snapshot["declarations"][0]
+            original = json.loads((root/"current-proposals.json").read_text())[0]
+            alias = {**original, "review_activity_key": "wka-alias"}
+            declaration["artifacts"]["current_proposals"] = artifact(root/"current-proposals.json", [original, alias])
+            alias_row = fixtures.row("wka-alias-s01", "2026-09-29 13:32:00", "2026-09-29 14:30:00", 58)
+            alias_row[6], alias_row[8] = original["activity_id"], "Example recorded outcome"
+            current_row = fixtures.row("wka-manual-s01", "2026-09-29 13:32:00", "2026-09-29 14:30:00", 58)
+            current_row[6], current_row[8] = original["activity_id"], "Example recorded outcome"
+            doc = fixtures.capture(current_row, alias_row)
+            second = copy.deepcopy(snapshot["declarations"][0])
+            raw = self._plan(doc, existing=gateway.entries)
+            second.update(current_review_id="wka-alias-s01", current_payload_digest=raw["entries"][1]["payload_digest"],
+                          current_proposal_digest=adoptions.recurring_proposal_digest(alias))
+            snapshot["declarations"].append(second)
+            with self.assertRaisesRegex(native.NativePostError, "reuses one prior entry"):
+                self.adopted_plan(doc, gateway, snapshot)
+
+    def test_manual_different_recording_with_same_title_time_route_is_not_equivalent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            doc, gateway, snapshot = self.proof(root)
+            from scripts import clockify_source_adoptions as adoptions, review_corrections
+            ledger_document = json.loads((root/"current-ledger.json").read_text())
+            prior = ledger_document["events"][0]
+            other = evidence_ledger.evidence_event(
+                "fathom", {"source_type": "fathom", "source_id": "different-recording"},
+                observed_at=prior["observed_at"], raw_source_span=prior["raw_source_span"], attributes=prior["attributes"],
+            )
+            ledger = evidence_ledger.EvidenceLedger((other,), member_identities=("member@example.invalid",))
+            ledger_document = {"schema_version": ledger.manifest.schema_version, "manifest": ledger.manifest.document(),
+                               "events": [other.document()]}
+            proposal = json.loads((root/"current-proposals.json").read_text())[0]
+            proposal["provenance"]["evidence_ids"] = [other.evidence_id]
+            declaration = snapshot["declarations"][0]
+            declaration["artifacts"]["current_source_ledger"] = artifact(root/"current-ledger.json", ledger_document)
+            declaration["artifacts"]["current_proposals"] = artifact(root/"current-proposals.json", [proposal])
+            declaration["current_proposal_digest"] = adoptions.recurring_proposal_digest(proposal)
+            declaration["source_fingerprint"] = review_corrections.evidence_fingerprint([other.evidence_id])
+            with self.assertRaisesRegex(native.NativePostError, "canonical recording source"):
+                self.adopted_plan(doc, gateway, snapshot)
+
+    def test_manual_without_declaration_keeps_overlap_warning_and_normal_posting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            doc, gateway, _ = self.proof(root)
+            plan = self._plan(doc, existing=gateway.entries)
+            self.assertEqual(3480, plan["entries"][0]["live_overlaps"][0]["overlap_seconds"])
+            receipt = self.execute(root, plan, gateway)
+            self.assertEqual("created", receipt["entries"][0]["disposition"])
+            self.assertEqual(1, len(gateway.posts))
+
+
 class SourceAdoptionTests(unittest.TestCase):
     _plan = fixtures.NativeSheetPostTests._plan
     _approval = fixtures.NativeSheetPostTests._approval

@@ -18,6 +18,12 @@ from scripts import evidence_ledger, review_corrections
 
 SCHEMA = "clockify-source-accounted-adoptions/v1"
 CURRENT_LIVE_SCHEMA = "clockify-source-accounted-adoptions/v2"
+MANUAL_MEETING_SCHEMA = "clockify-source-accounted-adoptions/v3"
+MANUAL_FIELDS = frozenset({
+    "adoption_kind", "operation_anchor", "same_meeting_confirmed", "canonical_meeting_id",
+    "current_review_id", "current_payload_digest", "current_proposal_digest", "source_fingerprint",
+    "clockify_entry_id", "retained_entry_digest", "artifacts",
+})
 ARTIFACTS = frozenset({
     "prior_proposals", "source_ledger", "current_proposals", "current_source_ledger",
     "native_plan", "native_approval", "native_events",
@@ -186,6 +192,118 @@ def verify_prior_native_proof(artifact_handles: Mapping[str, Any], prior_review_
     proof["proof_digest"] = native._digest(proof)
     validate_prior_native_proof(proof)
     return copy.deepcopy(proof)
+
+
+def validate_manual_meeting_credit(value: Mapping[str, Any], item: Mapping[str, Any], *,
+                                   workspace_id: str, member_id: str) -> Mapping[str, Any]:
+    """Recheck explicit equivalence and sealed source/native facts, without IO."""
+    from scripts import clockify_native_sheet_post as native, work_accounting_pipeline as pipeline
+    fields = {"verification_basis", "declaration", "declaration_digest", "clockify_entry_id", "payload",
+              "readback_digest", "retained_entry", "retained_entry_digest", "current_proposal",
+              "source_events", "source_manifest", "workspace_id", "member_id", "approved_current_seconds",
+              "retained_native_seconds", "credit_digest"}
+    try:
+        if (not isinstance(value, Mapping) or set(value) != fields
+                or value["verification_basis"] != "audited_manual_meeting"
+                or value["credit_digest"] != native._document_digest(value, "credit_digest")):
+            raise AdoptionError("manual meeting sealed credit integrity differs")
+        declaration = value["declaration"]
+        if not isinstance(declaration, Mapping) or set(declaration) != MANUAL_FIELDS:
+            raise AdoptionError("manual meeting declaration proof shape differs")
+        anchor = declaration["operation_anchor"]
+        if (declaration["adoption_kind"] != "manual_meeting"
+                or declaration["same_meeting_confirmed"] is not True
+                or not isinstance(anchor, str) or not anchor.strip() or len(anchor) > 512 or not anchor.isprintable()
+                or value["declaration_digest"] != native._digest(declaration)):
+            raise AdoptionError("manual meeting requires explicit audited same-meeting authority")
+        if (declaration["current_review_id"] != item["review_id"]
+                or declaration["current_payload_digest"] != item["payload_digest"]
+                or item["payload_digest"] != native._digest(item["payload"])
+                or value["workspace_id"] != workspace_id or value["member_id"] != member_id
+                or not workspace_id or not member_id
+                or declaration["clockify_entry_id"] != value["clockify_entry_id"]
+                or declaration["retained_entry_digest"] != value["retained_entry_digest"]
+                or value["retained_entry_digest"] != native._digest(value["retained_entry"])):
+            raise AdoptionError("manual meeting current review or native identity binding differs")
+        retained = value["retained_entry"]
+        if (not current_live_matches(value["payload"], retained, workspace_id=workspace_id,
+                                     member_id=member_id, entry_id=value["clockify_entry_id"])
+                or not value["clockify_entry_id"]
+                or native._live_digest([retained]) != value["readback_digest"]):
+            raise AdoptionError("manual meeting retained entry or target differs")
+        current, payload = item["payload"], value["payload"]
+        if (any(current[key] != payload[key] for key in ("projectId", "taskId", "billable"))
+                or sorted(current["tagIds"]) != sorted(payload["tagIds"])
+                or type(current["billable"]) is not bool
+                or not (native.legacy._parse(payload["start"]) <= native.legacy._parse(current["start"])
+                        < native.legacy._parse(current["end"]) <= native.legacy._parse(payload["end"]))):
+            raise AdoptionError("manual meeting route or full interval coverage differs")
+        proposal = value["current_proposal"]
+        _validate_source_target(proposal, value["source_events"], item["review_id"])
+        fingerprint = review_corrections.evidence_fingerprint(proposal["provenance"]["evidence_ids"])
+        if (declaration["source_fingerprint"] != fingerprint
+                or declaration["current_proposal_digest"] != recurring_proposal_digest(proposal)
+                or proposal["duration_seconds"] != _seconds(current)
+                or value["approved_current_seconds"] != _seconds(current)
+                or value["retained_native_seconds"] != _seconds(payload)
+                or native.legacy._utc(proposal["start"]) != current["start"]
+                or native.legacy._utc(proposal["end"]) != current["end"]
+                or not proposal.get("clockify_project_suffix")
+                or not current["projectId"].endswith(proposal["clockify_project_suffix"])
+                or len(current["tagIds"]) != len(proposal["tag_suffixes"])
+                or len(set(proposal["tag_suffixes"])) != len(proposal["tag_suffixes"])
+                or not all(suffix and sum(tag.endswith(suffix) for tag in current["tagIds"]) == 1
+                           for suffix in proposal["tag_suffixes"])
+                or proposal["billable"] is not current["billable"]):
+            raise AdoptionError("manual meeting reviewed proposal or source fingerprint differs")
+        recordings, errors = pipeline._recording_events(value["source_events"], value["source_manifest"])
+        if (errors or len(recordings) != 1
+                or recordings[0]["meeting"].canonical_id != declaration["canonical_meeting_id"]
+                or proposal["provenance"].get("canonical_meeting_id") != declaration["canonical_meeting_id"]
+                or set(recordings[0]["source_evidence_ids"]) != set(proposal["provenance"]["evidence_ids"])):
+            raise AdoptionError("manual meeting canonical recording source differs")
+        representative = next((event for event in recordings[0]["events"] if event["source_type"] == "fathom"), recordings[0]["events"][0])
+        start, end = pipeline._canonical_meeting_span(recordings[0]["meeting"], representative)
+        if not (start <= native.legacy._parse(current["start"]) < native.legacy._parse(current["end"]) <= end):
+            raise AdoptionError("manual meeting approved interval exceeds recording source")
+        return value
+    except (ValueError, TypeError, KeyError, AttributeError, IndexError) as error:
+        if isinstance(error, AdoptionError):
+            raise
+        raise AdoptionError("manual meeting sealed proof is invalid") from error
+
+
+def _manual_meeting_credit(declaration: Mapping[str, Any], current: Mapping[str, Any], *,
+                           workspace_id: str, member_id: str, capture_cache: dict[tuple[str, str], bytes],
+                           live_entries: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    from scripts import clockify_native_sheet_post as native
+    if not isinstance(declaration, Mapping) or set(declaration) != MANUAL_FIELDS:
+        raise AdoptionError("manual meeting declaration proof shape differs")
+    handles = declaration["artifacts"]
+    if not isinstance(handles, Mapping) or set(handles) != {"current_proposals", "current_source_ledger", "retained_entry_snapshot"}:
+        raise AdoptionError("manual meeting original source or retained snapshot is missing")
+    documents = {key: json.loads(_capture(handle, capture_cache)) for key, handle in handles.items()}
+    proposal = _source(documents["current_proposals"], documents["current_source_ledger"], current["review_id"])
+    retained = documents["retained_entry_snapshot"]
+    matches = [entry for entry in live_entries if entry.get("id") == declaration["clockify_entry_id"]]
+    if len(matches) != 1 or native._digest(matches[0]) != native._digest(retained):
+        raise AdoptionError("manual meeting fresh snapshot is missing, duplicated or drifted")
+    normalized = native._normalized_live(retained)
+    if normalized is None:
+        raise AdoptionError("manual meeting retained native interval is invalid")
+    payload = {key: normalized[key] for key in ("start", "end", "projectId", "tagIds", "taskId", "billable")}
+    payload["description"] = retained.get("description")
+    value = dict(verification_basis="audited_manual_meeting", declaration=dict(declaration),
+                 declaration_digest=native._digest(declaration), clockify_entry_id=declaration["clockify_entry_id"],
+                 payload=payload, readback_digest=native._live_digest([retained]), retained_entry=copy.deepcopy(retained),
+                 retained_entry_digest=native._digest(retained), current_proposal=copy.deepcopy(proposal),
+                 source_events=_source_events(proposal, documents["current_source_ledger"]),
+                 source_manifest=copy.deepcopy(documents["current_source_ledger"]["manifest"]),
+                 workspace_id=workspace_id, member_id=member_id,
+                 approved_current_seconds=_seconds(current["payload"]), retained_native_seconds=_seconds(payload))
+    value["credit_digest"] = native._digest(value)
+    validate_manual_meeting_credit(value, current, workspace_id=workspace_id, member_id=member_id)
+    return value
 
 
 def _credit(declaration: Mapping[str, Any], current: Mapping[str, Any], *,
@@ -378,7 +496,7 @@ def credits(snapshot: Mapping[str, Any], entries: Sequence[Mapping[str, Any]], *
             live_entries: Sequence[Mapping[str, Any]] = ()) -> dict[str, dict[str, Any]]:
     """Validate every explicitly declared adoption; invalid proof never credits."""
     if (not isinstance(snapshot, Mapping) or set(snapshot) != {"schema_version", "declarations"}
-            or snapshot.get("schema_version") not in {SCHEMA, CURRENT_LIVE_SCHEMA}
+            or snapshot.get("schema_version") not in {SCHEMA, CURRENT_LIVE_SCHEMA, MANUAL_MEETING_SCHEMA}
             or not isinstance(snapshot["declarations"], list)):
         raise AdoptionError("source adoption snapshot schema is invalid")
     by_review = {entry["review_id"]: entry for entry in entries}
@@ -390,10 +508,14 @@ def credits(snapshot: Mapping[str, Any], entries: Sequence[Mapping[str, Any]], *
             review_id = declaration["current_review_id"]
             if review_id not in by_review or review_id in result:
                 raise AdoptionError("source adoption current review identity is absent or repeated")
-            value = _credit(declaration, by_review[review_id], workspace_id=workspace_id,
-                            member_id=member_id, capture_cache=capture_cache,
-                            current_live=snapshot["schema_version"] == CURRENT_LIVE_SCHEMA,
-                            live_entries=live_entries)
+            if snapshot["schema_version"] == MANUAL_MEETING_SCHEMA:
+                value = _manual_meeting_credit(declaration, by_review[review_id], workspace_id=workspace_id,
+                                              member_id=member_id, capture_cache=capture_cache, live_entries=live_entries)
+            else:
+                value = _credit(declaration, by_review[review_id], workspace_id=workspace_id,
+                                member_id=member_id, capture_cache=capture_cache,
+                                current_live=snapshot["schema_version"] == CURRENT_LIVE_SCHEMA,
+                                live_entries=live_entries)
             if value["clockify_entry_id"] in used_ids:
                 raise AdoptionError("source adoption reuses one prior entry for different current rows")
             used_ids.add(value["clockify_entry_id"])
@@ -420,6 +542,13 @@ bindings that the plan-time artifact consumer sealed, without replaying IO.
             if "prior_entry_credit" not in item:
                 continue
             value = item["prior_entry_credit"]
+            if isinstance(value, Mapping) and value.get("verification_basis") == "audited_manual_meeting":
+                validate_manual_meeting_credit(value, item, workspace_id=workspace_id, member_id=member_id)
+                if value["clockify_entry_id"] in used_ids or item["review_id"] in result:
+                    raise AdoptionError("manual meeting credit repeats a review or retained native entry")
+                used_ids.add(value["clockify_entry_id"])
+                result[item["review_id"]] = value
+                continue
             expected_fields = {
                 "declaration", "declaration_digest", "clockify_entry_id", "payload", "readback_digest",
                 "prior_source_fingerprint", "current_source_fingerprint", "confirmed_binding", "credit_digest",

@@ -813,6 +813,30 @@ def _records(value: Any) -> list[Mapping[str, Any]]:
     return []
 
 
+def _multica_comment_event(record: Mapping[str, Any]) -> EvidenceEvent:
+    """A dated comment is a point, not the issue's current completion state."""
+    return evidence_event(
+        "multica",
+        _compact_mapping({
+            "source_type": "multica", "source_id": f"comment:{record['id']}",
+            "issue_id": record["issue_id"], "workspace_id": record.get("workspace_id"),
+            "server_origin": record.get("server_origin"),
+        }),
+        observed_at=record["created_at"],
+        raw_source_span={"timestamp": record["created_at"]},
+        attributes=_compact_mapping({
+            "activity_kind": "comment",
+            # Only verified author types identify a role; do not infer a human
+            # from an unfamiliar label or from authored comment content.
+            "role": {"agent": "assistant", "member": "user"}.get(str(record.get("author_type") or ""), "source"),
+            **{key: record.get(key) for key in (
+                "content", "parent_id", "author_id", "author_type", "type", "source_task_id", "revision",
+            )},
+        }),
+        legacy_aliases={"multica_comment_id": record["id"]},
+    )
+
+
 def _session_event(
     session_type: str,
     session: Mapping[str, Any],
@@ -894,6 +918,9 @@ def normalize_collector_snapshot(snapshot: Mapping[str, Any]) -> list[EvidenceEv
                     events.append(_snapshot_event(source_type, record, index))
             continue
         events.extend(_snapshot_event(source_type, record, index) for index, record in enumerate(records, 1))
+    multica = snapshot.get("multica_issues")
+    if isinstance(multica, Mapping) and multica.get("source_version") == "multica-issues-with-comment-history/v1":
+        events.extend(_multica_comment_event(record) for record in _records(multica.get("comments", [])))
     if isinstance(enriched, Mapping):
         for context_type, records in enriched.items():
             for index, record in enumerate(_records(records), 1):

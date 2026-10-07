@@ -1501,6 +1501,244 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
         self.assertEqual(1, debt.retry_count)
         self.assertEqual("active", debt.status)
 
+    def seed_source_less_exhausted(self):
+        """Create legacy exhausted state using real bounded failures, not receipts."""
+        config = {**self.config, "catchup_until": "2026-09-09", "max_slices": 1}
+        with mock.patch.object(
+            cycle, "run_child_bounded",
+            return_value=ChildResult(None, "", "", True, 0.1),
+        ):
+            for _ in range(2):
+                cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 12))
+        return {**config, "_runtime_identity": {"git_sha": "fixture-sha"}}
+
+    def test_source_less_legacy_classification_is_fair_and_plan_is_immutable(self):
+        """Catches absent-source debt starvation or planning consuming its runtime pass."""
+        config = {**self.seed_source_less_exhausted(), "catchup_until": "2026-09-11"}
+        paths = [self.state_dir / name for name in (
+            "review-cycle-state.json", "source-coverage.json",
+        )]
+        before = [path.read_bytes() for path in paths]
+        store = source_coverage.SourceDebtStore.from_document(source_coverage.read(paths[1]))
+        state = self.state()
+        recovery = cycle._select_work(
+            config, {**state, "next_work_class": "exact"}, store,
+            today=dt.date(2026, 9, 12),
+        )
+        self.assertEqual([("2026-09-07", "generic_classification")], [
+            (item[0], item[2]) for item in recovery
+        ])
+        paired = cycle._select_work(
+            {**config, "max_slices": 2}, state, store, today=dt.date(2026, 9, 12),
+        )
+        self.assertEqual(["generic_classification", "routine"], [item[2] for item in paired])
+        with mock.patch.object(cycle, "run_child_bounded") as child:
+            plan = cycle.run_cycle(config, enable_sheet_write=False, today=dt.date(2026, 9, 12))
+        self.assertEqual([{"since": "2026-09-09", "until": "2026-09-11"}], plan["slices"])
+        child.assert_not_called()
+        self.assertEqual(before, [path.read_bytes() for path in paths])
+
+    def test_source_less_classification_failure_is_once_per_runtime(self):
+        """Catches record_failure reopening exhausted debt for a second same-runtime run."""
+        config = self.seed_source_less_exhausted()
+        commands = []
+
+        def child(command, **_kwargs):
+            commands.append(command)
+            record = self.state()["slices"]["2026-09-07"]
+            self.assertEqual("started", record["source_attempt"]["status"])
+            self.assertEqual(3 if len(commands) == 1 else 4, record["runner_attempt"]["source_attempt_ordinal"])
+            return ChildResult(None, "", "", True, 0.1)
+
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=child):
+            first = cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 12))
+            second = cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 12))
+            changed = {**config, "_runtime_identity": {"git_sha": "next-fixture"}}
+            third = cycle.run_cycle(changed, enable_sheet_write=True, today=dt.date(2026, 9, 12))
+            fourth = cycle.run_cycle(changed, enable_sheet_write=True, today=dt.date(2026, 9, 12))
+        self.assertEqual(["incomplete", "idle", "incomplete", "idle"], [
+            result["status"] for result in (first, second, third, fourth)
+        ])
+        self.assertEqual(2, len(commands))
+        self.assertEqual("exhausted", self.debts()[0].status)
+        self.assertEqual("retry_limit", self.debts()[0].terminal_reason)
+        events = source_coverage.read(self.state_dir / "source-coverage.json")["events"]
+        self.assertEqual(["failure", "failure", "exhausted", "failure", "exhausted", "failure", "exhausted"], [
+            event["event"] for event in events
+        ])
+        self.assertEqual({"ordinal", "command_digest", "resume_state_digest", "status", "advance_frontier"},
+                         set(self.state()["slices"]["2026-09-07"]["source_attempt"]))
+
+    def test_current_runtime_routine_exhaustion_does_not_get_extra_classification(self):
+        """Catches treating a known same-runtime failure as unclassified legacy history."""
+        config = {**self.config, "catchup_until": "2026-09-09", "max_slices": 1,
+                  "_runtime_identity": {"git_sha": "fixture"}}
+        with mock.patch.object(cycle, "run_child_bounded", return_value=ChildResult(None, "", "", True, 0.1)) as child:
+            for _ in range(2):
+                cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 12))
+            result = cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 12))
+        self.assertEqual(2, child.call_count)
+        self.assertEqual("idle", result["status"])
+        self.assertEqual(2, self.state()["slices"]["2026-09-07"]["runner_attempt"]["source_attempt_ordinal"])
+
+    def test_source_less_classification_creates_verified_exact_debt(self):
+        """Catches resolving generic debt without real evidence or blocking exact promotion."""
+        config = self.seed_source_less_exhausted()
+        generic_id = self.debts()[0].debt_id
+        commands = []
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=self.child_with_first_gap(commands)):
+            result = cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 12))
+        self.assertEqual("recovery_blocked", result["status"])
+        self.assertEqual(["peer/macbook"], [item.interval.source for item in self.debts()])
+        store = source_coverage.SourceDebtStore.from_document(source_coverage.read(self.state_dir / "source-coverage.json"))
+        self.assertEqual("resolved", store.get(generic_id).status)
+        selected = cycle._select_work(config, self.state(), store, today=dt.date(2026, 9, 12))
+        self.assertEqual(["exact"], [item[2] for item in selected])
+        self.assertEqual(1, len(commands))
+        self.assertEqual("2026-09-09", self.state()["scheduled_through"])
+        self.assertIsNone(self.state()["completed_through"])
+
+    def test_source_less_classification_budget_and_pre_spawn_crash_keep_same_attempt(self):
+        """Catches consuming a runtime opportunity without spawning the collector."""
+        config = self.seed_source_less_exhausted()
+        with mock.patch.object(cycle, "run_child_bounded") as child:
+            for _ in range(2):
+                result = cycle.run_cycle({**config, "total_child_budget_seconds": 30},
+                                         enable_sheet_write=True, today=dt.date(2026, 9, 12))
+                self.assertEqual("total_child_budget_exhausted", result["reason"])
+        child.assert_not_called()
+        pending = self.state()["slices"]["2026-09-07"]
+        self.assertEqual(3, pending["source_attempt"]["ordinal"])
+        self.assertEqual("started", pending["source_attempt"]["status"])
+        real_persist = cycle._persist_state
+
+        def interrupt(path, state, since, record):
+            real_persist(path, state, since, record)
+            if "runner_attempt" in record:
+                raise RuntimeError("before spawn")
+
+        with mock.patch.object(cycle, "_persist_state", side_effect=interrupt), \
+             mock.patch.object(cycle, "run_child_bounded") as child:
+            with self.assertRaisesRegex(RuntimeError, "before spawn"):
+                cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 12))
+        child.assert_not_called()
+        with mock.patch.object(cycle, "run_child_bounded", return_value=ChildResult(None, "", "", True, 0.1)) as child:
+            cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 12))
+            result = cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 12))
+        self.assertEqual(1, child.call_count)
+        self.assertEqual("idle", result["status"])
+        self.assertEqual(3, self.state()["slices"]["2026-09-07"]["source_attempt"]["ordinal"])
+
+    def test_source_less_classification_debt_write_crash_finishes_without_respawn(self):
+        """Catches a durable classification failure getting rerun before its journal finishes."""
+        config = self.seed_source_less_exhausted()
+        real_write = source_coverage.write
+
+        def interrupt(path, document):
+            real_write(path, document)
+            raise RuntimeError("after classification debt write")
+
+        with mock.patch.object(cycle, "run_child_bounded", return_value=ChildResult(None, "", "", True, 0.1)) as child:
+            with mock.patch.object(cycle.source_coverage, "write", side_effect=interrupt):
+                with self.assertRaisesRegex(RuntimeError, "after classification debt write"):
+                    cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 12))
+            cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 12))
+            result = cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 12))
+        self.assertEqual(1, child.call_count)
+        self.assertEqual("idle", result["status"])
+        self.assertEqual("finished", self.state()["slices"]["2026-09-07"]["source_attempt"]["status"])
+        self.assertEqual("exhausted", self.debts()[0].status)
+
+    def test_source_less_classification_changed_runtime_after_debt_crash_runs_new_attempt(self):
+        """Catches rebinding a completed old failure instead of using the new runtime pass."""
+        config = self.seed_source_less_exhausted()
+        real_write = source_coverage.write
+
+        def interrupt(path, document):
+            real_write(path, document)
+            raise RuntimeError("after old runtime failure")
+
+        with mock.patch.object(cycle, "run_child_bounded", return_value=ChildResult(None, "", "", True, 0.1)) as child:
+            with mock.patch.object(cycle.source_coverage, "write", side_effect=interrupt):
+                with self.assertRaisesRegex(RuntimeError, "after old runtime failure"):
+                    cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 12))
+            changed = {**config, "_runtime_identity": {"git_sha": "changed-after-crash"}}
+            cycle.run_cycle(changed, enable_sheet_write=True, today=dt.date(2026, 9, 12))
+            result = cycle.run_cycle(changed, enable_sheet_write=True, today=dt.date(2026, 9, 12))
+        self.assertEqual(2, child.call_count)
+        self.assertEqual("idle", result["status"])
+        self.assertEqual(4, self.state()["slices"]["2026-09-07"]["source_attempt"]["ordinal"])
+
+    def test_source_less_classification_invalid_runner_metadata_fails_closed(self):
+        """Catches malformed metadata granting a fresh same-runtime classification pass."""
+        config = self.seed_source_less_exhausted()
+        state = self.state()
+        store = source_coverage.SourceDebtStore.from_document(source_coverage.read(self.state_dir / "source-coverage.json"))
+        for metadata in (None, {}, {"runtime_identity_digest": "bad", "source_attempt_ordinal": 2, "status": "finished"},
+                         {"runtime_identity_digest": "sha256:" + "a" * 64, "source_attempt_ordinal": True, "status": "finished"},
+                         {"runtime_identity_digest": "sha256:" + "a" * 64, "source_attempt_ordinal": 1, "status": "finished"},
+                         {"runtime_identity_digest": "sha256:" + "a" * 64, "source_attempt_ordinal": 2, "status": "invalid"},
+                         {"runtime_identity_digest": "sha256:" + "a" * 64, "source_attempt_ordinal": 2, "status": "pending"}):
+            with self.subTest(metadata=metadata):
+                state["slices"]["2026-09-07"]["runner_attempt"] = metadata
+                with self.assertRaisesRegex(cycle.CycleError, "runner attempt"):
+                    cycle._select_work(config, state, store, today=dt.date(2026, 9, 12))
+
+    def test_source_less_classification_source_state_crash_resumes_exact_promotion(self):
+        """Catches a verified partial source stranded before its exact debts are durable."""
+        config = self.seed_source_less_exhausted()
+        real_persist = cycle._persist_state
+
+        def interrupt(path, state, since, record):
+            real_persist(path, state, since, record)
+            if record.get("status") == "source_verified":
+                raise RuntimeError("after classification source state")
+
+        commands = []
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=self.child_with_first_gap(commands)):
+            with mock.patch.object(cycle, "_persist_state", side_effect=interrupt):
+                with self.assertRaisesRegex(RuntimeError, "after classification source state"):
+                    cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 12))
+            result = cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 12))
+        self.assertEqual("recovery_blocked", result["status"])
+        self.assertEqual(1, len(commands))
+        self.assertEqual(["peer/macbook"], [item.interval.source for item in self.debts()])
+        self.assertEqual("finished", self.state()["slices"]["2026-09-07"]["runner_attempt"]["status"])
+
+    def test_source_less_classification_does_not_duplicate_routine_interval(self):
+        """Catches selecting one recovery interval twice when the frontier still overlaps."""
+        config = self.seed_source_less_exhausted()
+        state = self.state()
+        state["scheduled_through"] = "2026-09-07"
+        store = source_coverage.SourceDebtStore.from_document(source_coverage.read(self.state_dir / "source-coverage.json"))
+        selected = cycle._select_work(
+            {**config, "max_slices": 2}, state, store, today=dt.date(2026, 9, 12),
+        )
+        self.assertEqual([("2026-09-07", "generic_classification")], [
+            (item[0], item[2]) for item in selected
+        ])
+
+    def test_source_less_classification_invalid_stage_fails_closed_once(self):
+        """Catches invalid returned evidence leaving the runtime pass infinitely pending."""
+        config = self.seed_source_less_exhausted()
+
+        def invalid_source(_command, **_kwargs):
+            result = make_run(self.root, "invalid-classification", replay=False,
+                              since=dt.date(2026, 9, 7), until=dt.date(2026, 9, 9))
+            document = json.loads(result.read_text())
+            document["run_id"] = "wrong-run"
+            write_json(result, document)
+            return ChildResult(0, str(result) + "\n", "", False, 0.1)
+
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=invalid_source) as child:
+            with self.assertRaises(cycle.CycleError):
+                cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 12))
+            result = cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 12))
+        self.assertEqual(1, child.call_count)
+        self.assertEqual("idle", result["status"])
+        self.assertEqual("exhausted", self.debts()[0].status)
+        self.assertNotIn("source", self.state()["slices"]["2026-09-07"])
+
     def test_exact_debt_preserves_verified_opaque_collector_compatibility(self):
         """Catches replacing the parent backlog lineage with a guessed constant."""
         commands: list[list[str]] = []

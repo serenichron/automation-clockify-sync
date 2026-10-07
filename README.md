@@ -13,6 +13,19 @@ a compatibility wrapper.
 The source audit and process-level failure inventory are recorded in
 `clockify-description-failure-taxonomy.md`.
 
+## Standing authorization: collect, analyze, prepare review
+
+Vlad authorized the recurring reconciliation workflow without additional
+per-run approval prompts. Collect relevant private work evidence, analyze it
+through the approved `deepseek-v4.1-flash:cloud` route, reconcile against
+Clockify read-only, and publish missing proposals as pending/unposted in the
+existing monthly review tabs. This includes recovery runs and newly recovered
+evidence, not only unchanged cache hits. See the
+[standing authorization](docs/operations/standing-reconciliation-authorization.md).
+
+Do not interpret this as approval to post time to Clockify, change inference
+destinations, or deploy code. Those actions retain their separate boundaries.
+
 ## Safe local workflow
 
 ```bash
