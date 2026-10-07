@@ -1851,11 +1851,43 @@ def _validated_publication_document(
     )
     retained = [
         {**{field: item.get(field) for field in retained_fields},
-         **({"source_aliases": item["source_aliases"]} if "source_aliases" in item else {})}
+         **({"source_aliases": item["source_aliases"]} if "source_aliases" in item else {}),
+         **({field: item.get(field) for field in ("monthly_layout", "monthly_target_readback")}
+            if "monthly_layout" in item or "monthly_target_readback" in item else {})}
         for item in publications if isinstance(item, Mapping)
     ]
     base_expected = [{key: value for key, value in item.items() if key != "canonical_source_aliases"} for item in expected]
-    if len(retained) != len(publications) or retained != base_expected:
+    legacy_rows = {}
+    if len(retained) != len(publications) or len(publications) != len(expected):
+        raise CycleError("publisher result destinations or readbacks differ")
+    for index, item in enumerate(publications):
+        if "monthly_layout" not in item and "monthly_target_readback" not in item:
+            continue
+        if item.get("monthly_layout") != clockify_monthly_unresolved.LEGACY_LAYOUT or source_dir is None:
+            raise CycleError("publisher monthly legacy layout or source context differs")
+        try:
+            canonical_rows = clockify_monthly_unresolved.project_rows(source_dir)
+            # The marker may adapt only the expected monthly evidence receipt,
+            # never primary proposals or a different destination/source set.
+            canonical_receipt = _publication_receipt(
+                spreadsheet_id=expected[index]["spreadsheet_id"],
+                sheet_title=expected[index]["sheet_title"], rows=canonical_rows,
+            )
+            if (not expected[index]["sheet_title"].endswith(" unresolved evidence")
+                or any(expected[index].get(field) != value for field, value in canonical_receipt.items())):
+                raise ValueError("legacy marker does not bind expected monthly source")
+            rows = clockify_monthly_unresolved.rows_for_layout(canonical_rows, item["monthly_layout"])
+            legacy_rows[index] = rows
+            base_expected[index] = {
+                **_publication_receipt(spreadsheet_id=canonical_receipt["spreadsheet_id"],
+                    sheet_title=canonical_receipt["sheet_title"], rows=rows),
+                **({"source_aliases": expected[index]["source_aliases"]} if "source_aliases" in expected[index] else {}),
+                "monthly_layout": item["monthly_layout"],
+                "monthly_target_readback": item.get("monthly_target_readback"),
+            }
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            raise CycleError("publisher monthly legacy source projection differs") from exc
+    if retained != base_expected:
         raise CycleError("publisher result destinations or readbacks differ")
     for index, item in enumerate(publications):
         if "canonical_source_aliases" not in item:
@@ -1866,7 +1898,8 @@ def _validated_publication_document(
             raise CycleError("publisher canonical alias source context is missing")
         try:
             aliases = clockify_monthly_unresolved.validate_canonical_aliases(
-                source_dir, clockify_monthly_unresolved.project_rows(source_dir), item["canonical_source_aliases"],
+                source_dir, legacy_rows.get(index, clockify_monthly_unresolved.project_rows(source_dir)),
+                item["canonical_source_aliases"], layout=item.get("monthly_layout"),
             )
         except (OSError, KeyError, TypeError, ValueError) as exc:
             raise CycleError("publisher canonical alias proof differs") from exc
@@ -1877,6 +1910,16 @@ def _validated_publication_document(
         ):
             raise CycleError("publisher canonical alias destination or identities differ")
         retained[index]["canonical_source_aliases"] = aliases
+    for index, rows in legacy_rows.items():
+        item = retained[index]
+        try:
+            clockify_monthly_unresolved.validate_target_readback(
+                item["monthly_target_readback"], spreadsheet_id=item["spreadsheet_id"],
+                sheet_title=item["sheet_title"], rows=rows,
+                aliases=[*item.get("source_aliases", []), *item.get("canonical_source_aliases", [])],
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise CycleError("publisher monthly legacy target readback differs") from exc
     return retained
 
 

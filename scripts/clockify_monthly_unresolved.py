@@ -27,6 +27,63 @@ HEADER = [
     "Confidence / Quality State", "Recommended Human Action", "Disposition",
     "Provenance / Artifact Digest",
 ]
+LEGACY_LAYOUT = "visible-monthly-unresolved-legacy-duration/v1"
+LEGACY_HEADER = [
+    "Evidence ID", "Local day", "Source / machine", "Exception kind",
+    "Precise reason", "Route recommendation", "Sanitized accomplishment",
+    "Duration", "Timing status", "Next step", "Disposition", "Evidence digest",
+]
+
+
+def rows_for_layout(rows: list[list[Any]], layout: str | None = None) -> list[list[Any]]:
+    """Adapt presentation only; unresolved evidence is not a duration claim."""
+    if layout not in (None, LEGACY_LAYOUT):
+        raise ValueError("unknown monthly unresolved layout")
+    projected = [list(row) for row in rows]
+    if layout == LEGACY_LAYOUT:
+        for row in projected:
+            # Canonical H is meeting linkage, whereas legacy H is duration.
+            # Preserve the link as review context in J, never as claimed time.
+            if row[7]:
+                row[9] += "; Meeting linkage: " + str(row[7])
+            row[7] = ""
+    return projected
+
+
+def target_readback_digest(evidence: dict[str, Any]) -> str:
+    return "sha256:" + hashlib.sha256(json.dumps(
+        {key: value for key, value in evidence.items() if key != "sha256"},
+        sort_keys=True, separators=(",", ":"),
+    ).encode()).hexdigest()
+
+
+def validate_target_readback(
+    evidence: Any, *, spreadsheet_id: str, sheet_title: str,
+    rows: list[list[Any]], aliases: list[dict[str, Any]],
+) -> None:
+    """Validate writer-reported machine cells, not independent live freshness.
+
+    K is deliberately absent from this machine-cell snapshot: human decisions
+    must not invalidate a frozen retry or become publisher-owned data.
+    """
+    if (not isinstance(evidence, dict) or set(evidence) != {
+        "schema_version", "spreadsheet_id", "sheet_title", "sheet_id", "header", "machine_rows", "sha256",
+    } or evidence.get("schema_version") != "monthly-unresolved-target-readback/v1"
+        or evidence.get("spreadsheet_id") != spreadsheet_id or evidence.get("sheet_title") != sheet_title
+        or type(evidence.get("sheet_id")) is not int or evidence["sheet_id"] < 0
+        or evidence.get("header") != LEGACY_HEADER
+        or evidence.get("sha256") != target_readback_digest(evidence)):
+        raise ValueError("monthly legacy target readback contract differs")
+    observed = evidence["machine_rows"]
+    if (not isinstance(observed, list) or len(observed) != len(rows)
+        or any(not isinstance(row, list) or len(row) != 12 or row[10] != "" for row in observed)
+        or [row[0] for row in observed] != [row[0] for row in rows]):
+        raise ValueError("monthly legacy target readback shape or identities differ")
+    alias_digests = {alias["stable_evidence_id"]: alias["preserved_machine_digest"] for alias in aliases}
+    for requested, actual in zip(rows, observed, strict=True):
+        expected = alias_digests.get(requested[0], machine_digest(requested))
+        if machine_digest(actual) != expected:
+            raise ValueError("monthly legacy target readback machine cells differ")
 
 
 def _read(root: Path, relative: str) -> tuple[Any, str]:
@@ -367,7 +424,7 @@ def alias_metadata(rows: list[list[Any]], aliases: dict[str, Any]) -> list[dict[
             for row in rows if row[0] in aliases]
 
 
-def canonical_source_alias(source_dir: Path, requested: list[Any], existing: list[Any]) -> dict[str, Any]:
+def canonical_source_alias(source_dir: Path, requested: list[Any], existing: list[Any], *, layout: str | None = None) -> dict[str, Any]:
     """Recognize only a rederivable canonical row from one pinned sibling run."""
     provenance = json.loads(existing[11])
     if not isinstance(provenance, dict) or set(provenance) != {"source_run_id", "artifacts", "evidence_ids"}:
@@ -382,7 +439,7 @@ def canonical_source_alias(source_dir: Path, requested: list[Any], existing: lis
         _, digest = _read(historical, relative)
         if digest != expected:
             raise ValueError("canonical alias historical artifact digest differs")
-    historical_rows = {row[0]: row for row in project_rows(historical)}
+    historical_rows = {row[0]: row for row in rows_for_layout(project_rows(historical), layout)}
     old = historical_rows.get(requested[0])
     current_provenance = json.loads(requested[11])
     if (old is None or old[3] != requested[3] or provenance["evidence_ids"] != current_provenance["evidence_ids"]
@@ -397,7 +454,7 @@ def canonical_source_alias(source_dir: Path, requested: list[Any], existing: lis
             "historical_ledger_digest": ledger_digest}
 
 
-def validate_canonical_aliases(source_dir: Path, rows: list[list[Any]], aliases: Any) -> list[dict[str, Any]]:
+def validate_canonical_aliases(source_dir: Path, rows: list[list[Any]], aliases: Any, *, layout: str | None = None) -> list[dict[str, Any]]:
     """Independently reconstruct publisher-reported aliases, without Sheets."""
     if not isinstance(aliases, list) or not aliases:
         raise ValueError("canonical source aliases must be a nonempty list")
@@ -417,11 +474,11 @@ def validate_canonical_aliases(source_dir: Path, rows: list[list[Any]], aliases:
         historical = source_dir.parent / name
         if historical.is_symlink() or not historical.is_dir() or historical.resolve().parent != source_dir.parent.resolve():
             raise ValueError("canonical alias historical source is unsafe")
-        old_rows = project_rows(historical)
+        old_rows = rows_for_layout(project_rows(historical), layout)
         old = next((row for row in old_rows if row[0] == identity), None)
         if old is None:
             raise ValueError("canonical alias historical identity is absent")
-        proof = canonical_source_alias(source_dir, requested[identity], old)
+        proof = canonical_source_alias(source_dir, requested[identity], old, layout=layout)
         if proof != alias:
             raise ValueError("canonical source alias metadata differs from its frozen source")
         validated.append(proof)

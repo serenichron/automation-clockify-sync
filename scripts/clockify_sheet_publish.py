@@ -1217,12 +1217,18 @@ def _plan_monthly_unresolved(
         raise PublicationError("monthly unresolved tab grid is invalid")
     range_name = f"{_a1_title(sheet_title)}!A1:L{grid['rowCount']}"
     existing = gateway.values(spreadsheet_id, range_name)
-    if not existing or existing[0] != monthly_unresolved.HEADER:
+    if not existing or existing[0] not in (monthly_unresolved.HEADER, monthly_unresolved.LEGACY_HEADER):
         raise PublicationError("monthly unresolved header differs")
+    layout = monthly_unresolved.LEGACY_LAYOUT if existing[0] == monthly_unresolved.LEGACY_HEADER else None
+    rows = monthly_unresolved.rows_for_layout([list(row) for row in rows], layout)
+    if type(prop.get("sheetId")) is not int or prop["sheetId"] < 0:
+        raise PublicationError("monthly unresolved sheet identity is invalid")
     by_id = {}
     for raw in existing[1:]:
         if not any(value != "" for value in raw):
             continue
+        if len(raw) > 12:
+            raise PublicationError("monthly unresolved existing row width differs")
         prior = list(raw) + [""] * (12 - len(raw))
         identity = str(prior[0])
         if not identity or identity in by_id:
@@ -1246,14 +1252,14 @@ def _plan_monthly_unresolved(
             if source_dir is None:
                 raise PublicationError(f"monthly machine-field conflict: {row[0]}")
             try:
-                canonical_aliases.append(monthly_unresolved.canonical_source_alias(source_dir, list(row), prior))
+                canonical_aliases.append(monthly_unresolved.canonical_source_alias(source_dir, list(row), prior, layout=layout))
             except (OSError, KeyError, TypeError, ValueError) as exc:
                 raise PublicationError(f"monthly canonical machine-field conflict: {row[0]}") from exc
     if appends and len(existing) < 2:
         raise PublicationError("monthly unresolved tab lacks a native data-row exemplar")
     return {"sheet_title": sheet_title, "sheet_id": prop["sheetId"], "grid_rows": grid["rowCount"],
             "existing": existing, "appends": appends, "rows": [list(row) for row in rows], "aliases": aliases,
-            "canonical_aliases": canonical_aliases}
+            "canonical_aliases": canonical_aliases, "layout": layout}
 
 
 def _apply_monthly_unresolved(
@@ -1279,6 +1285,16 @@ def _apply_monthly_unresolved(
         result["source_aliases"] = monthly_unresolved.alias_metadata(plan["rows"], plan["aliases"])
     if plan["canonical_aliases"]:
         result["canonical_source_aliases"] = plan["canonical_aliases"]
+    if plan["layout"] is not None:
+        by_id = {row[0]: padded(row) for row in observed[1:] if row}
+        evidence = {
+            "schema_version": "monthly-unresolved-target-readback/v1",
+            "spreadsheet_id": spreadsheet_id, "sheet_title": title, "sheet_id": plan["sheet_id"],
+            "header": observed[0],
+            "machine_rows": [[*by_id[row[0]][:10], "", by_id[row[0]][11]] for row in plan["rows"]],
+        }
+        result["monthly_layout"] = plan["layout"]
+        result["monthly_target_readback"] = {**evidence, "sha256": monthly_unresolved.target_readback_digest(evidence)}
     return result
 
 
@@ -1537,7 +1553,8 @@ def main(argv: list[str] | None = None) -> int:
                 "publications": [
                     {**{field: item[field] for field in receipt_fields},
                      **({"source_aliases": item["source_aliases"]} if "source_aliases" in item else {}),
-                     **({"canonical_source_aliases": item["canonical_source_aliases"]} if "canonical_source_aliases" in item else {})}
+                     **({"canonical_source_aliases": item["canonical_source_aliases"]} if "canonical_source_aliases" in item else {}),
+                     **({field: item[field] for field in ("monthly_layout", "monthly_target_readback")} if "monthly_layout" in item else {})}
                     for item in document["publications"]
                 ],
             }
