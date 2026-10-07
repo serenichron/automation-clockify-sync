@@ -1461,8 +1461,6 @@ def resolve_route(
     cited_events: list[dict[str, Any]],
     routing: Mapping[str, Any],
 ) -> tuple[dict[str, Any] | None, str | None]:
-    if lifecycle := _route_from_client_lifecycle(cited_events, routing, activity=activity):
-        return _apply_prefix_override(lifecycle, cited_events, routing), None
     deterministic_routes: list[dict[str, Any]] = []
     skipped_routes: list[str] = []
     for event in cited_events:
@@ -1486,6 +1484,27 @@ def resolve_route(
         )
         for route in deterministic_routes
     }
+    recommended = activity.get("project_recommendation") or {}
+    # Canonical meeting accounting has already validated the recording. When
+    # its deterministic route and independent review both select Daily/SC,
+    # incidental client discussion must not turn the whole recording into a
+    # client lifecycle session. Exact human corrections are applied by callers
+    # before autorouting; other lifecycle precedence remains unchanged.
+    if (
+        activity.get("lifecycle") == "meeting"
+        and activity.get("semantic_reviewer_model")
+        and cited_events
+        and all(event.get("source_type") in {"fathom", "calendly"} for event in cited_events)
+        and len(deterministic_routes) == len(cited_events)
+        and len(route_identities) == 1
+        and str(deterministic_routes[0].get("project_name") or "").casefold() == "daily meetings"
+        and deterministic_routes[0].get("prefix") == recommended.get("prefix") == "SC"
+        and str(recommended.get("name") or "").casefold() == "daily meetings"
+        and sorted(deterministic_routes[0].get("tag_names", [])) == sorted(recommended.get("tag_names", []))
+    ):
+        return _apply_prefix_override(deterministic_routes[0], cited_events, routing), None
+    if lifecycle := _route_from_client_lifecycle(cited_events, routing, activity=activity):
+        return _apply_prefix_override(lifecycle, cited_events, routing), None
     if skipped_routes and deterministic_routes:
         return None, "cited evidence mixes excluded and billable sources; semantic split required"
     if skipped_routes and not deterministic_routes:
@@ -1495,7 +1514,6 @@ def resolve_route(
         return None, f"cited evidence spans multiple deterministic routes; semantic split required: {', '.join(names)}"
     deterministic = deterministic_routes[0] if deterministic_routes else None
 
-    recommended = activity.get("project_recommendation") or {}
     recommended_name = str(recommended.get("name") or "").casefold()
     recommended_tags = tuple(
         sorted(str(value) for value in recommended.get("tag_names", []))
