@@ -1624,7 +1624,13 @@ def _preflight_replay_analyzer_cache(
         "scoped_review_v4_citation_quarantine",
     ):
         raise ValueError("replay failed-review retry mode is unsupported")
-    hinted_events = work_accounting_pipeline._with_semantic_route_hints(events, routing)
+    actor_contract = (retry_provenance.get("actor_contract") if retry_provenance is not None
+                      else source_analysis.get("actor_contract"))
+    if actor_contract not in {None, semantic_analyzer.ACTOR_CONTRACT}:
+        raise ValueError("replay semantic actor contract is unsupported")
+    hinted_events = work_accounting_pipeline._with_semantic_route_hints(
+        events, routing, normalize_meeting_domains_type=actor_contract is not None,
+    )
     taxonomy = work_accounting_pipeline._semantic_review_taxonomy(routing)
     if retry_mode in {
         "scoped_review_v1", "scoped_review_v2", "scoped_review_v3_invalid_effort",
@@ -1645,9 +1651,15 @@ def _preflight_replay_analyzer_cache(
             primary=primary, cache=cache, review_taxonomy=taxonomy,
             targets=retry_targets, transport=_sealed_replay_transport,
             selected_evidence_ids=selected_scope,
+            actor_contract=actor_contract,
+            actor_subject_binding=routing.get("semantic_subject_binding") if actor_contract is not None else None,
             **({"private_text_approved": True} if selected_scope is not None else {}),
         )
     else:
+        if actor_contract is not None:
+            hinted_events = semantic_analyzer.with_actor_context(
+                hinted_events, subject_binding=routing.get("semantic_subject_binding"),
+            )
         replayed = semantic_analyzer.analyze_tiered(
             hinted_events,
             primary=primary,
@@ -1672,7 +1684,7 @@ def _preflight_replay_analyzer_cache(
     if replayed_activities != source_activities:
         raise ValueError("replay analyzer cache output differs for activities")
     for key in (
-        "schema_version", "prompt_version", "review_prompt_version",
+        "schema_version", "prompt_version", "review_prompt_version", "actor_contract",
         "evidence_bundle_schema_version", "evidence_bundle_manifest",
         "ledger_event_count", "ledger_evidence_digest",
         "exceptions", "omissions", "analysis_chunks",

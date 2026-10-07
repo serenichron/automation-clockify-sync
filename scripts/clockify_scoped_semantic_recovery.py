@@ -125,11 +125,18 @@ def validate_cached_recovery(source_dir, recovery_dir, failed_review_digests):
     members = pipeline.meeting_reconciliation.manifest_member_identities(ledger.manifest.document())
     events, _noise = pipeline._analysis_events(all_events, members)
     routing = pipeline._read_json(source_dir / "routing.json")
-    events = pipeline._with_semantic_route_hints(events, routing)
+    actor_contract = provenance.get("actor_contract")
+    if actor_contract not in {None, semantic.ACTOR_CONTRACT}:
+        raise pipeline.WorkAccountingError("cached semantic actor contract is invalid")
+    events = pipeline._with_semantic_route_hints(
+        events, routing, normalize_meeting_domains_type=actor_contract is not None,
+    )
     targets = pipeline._failed_review_retry_targets(source, events, cache.path, digests)
     options = dict(primary=primary, cache=cache, review_taxonomy=pipeline._semantic_review_taxonomy(routing),
                    targets=targets, source_semantic_sha256=source_sha, selected_evidence_ids=selected,
-                   scoped_review_mode=provenance.get("mode"), private_text_approved=True)
+                   scoped_review_mode=provenance.get("mode"), private_text_approved=True,
+                   actor_contract=actor_contract,
+                   actor_subject_binding=routing.get("semantic_subject_binding") if actor_contract else None)
     plan = pipeline.run_scoped_failed_review_retry(source, events, plan_only=True, **options)
     captured_plan = json.loads(files["recovery-plan.json"])
     if not isinstance(captured_plan, dict):
@@ -173,7 +180,12 @@ def run(args):
     members = pipeline.meeting_reconciliation.manifest_member_identities(ledger.manifest.document())
     events, _noise = pipeline._analysis_events(all_events, members)
     routing = pipeline._read_json(source_dir / "routing.json")
-    events = pipeline._with_semantic_route_hints(events, routing)
+    actor_contract = routing.get("semantic_actor_contract")
+    if actor_contract not in {None, semantic.ACTOR_CONTRACT}:
+        raise pipeline.WorkAccountingError("semantic actor contract is invalid")
+    events = pipeline._with_semantic_route_hints(
+        events, routing, normalize_meeting_domains_type=actor_contract is not None,
+    )
     scope_bytes = args.scope_file.read_bytes()
     selected = json.loads(scope_bytes)
     scope_sha256 = hashlib.sha256(scope_bytes).hexdigest()
@@ -188,7 +200,9 @@ def run(args):
     seed = (args.cache_seed or (source_dir / "analyzer-cache-used.jsonl")).resolve()
     targets = pipeline._failed_review_retry_targets(source, events, seed, args.failed_review_digest)
     cache = semantic.AnalyzerResponseCache(seed, record_review_diagnostics=True)
-    options = dict(primary=primary, cache=cache, review_taxonomy=pipeline._semantic_review_taxonomy(routing), targets=targets, source_semantic_sha256=source_sha256, selected_evidence_ids=selected)
+    options = dict(primary=primary, cache=cache, review_taxonomy=pipeline._semantic_review_taxonomy(routing), targets=targets, source_semantic_sha256=source_sha256, selected_evidence_ids=selected,
+                   actor_contract=actor_contract,
+                   actor_subject_binding=routing.get("semantic_subject_binding") if actor_contract else None)
     plan = pipeline.run_scoped_failed_review_retry(source, events, plan_only=True, **options)
     plan.update(scope_file_sha256=scope_sha256, scope_key=args.scope_key)
     if args.plan:

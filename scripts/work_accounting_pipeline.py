@@ -209,8 +209,16 @@ def run_scoped_failed_review_retry(
     scoped_review_mode: str = "fresh",
     selected_evidence_ids: Sequence[str] | None = None,
     plan_only: bool = False,
+    actor_contract: str | None = None,
+    actor_subject_binding: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Review only selected sealed failures, retaining every other decision."""
+    if actor_contract not in {None, semantic_analyzer.ACTOR_CONTRACT}:
+        raise WorkAccountingError("scoped semantic actor contract is invalid")
+    if actor_contract is not None:
+        events = semantic_analyzer.with_actor_context(events, subject_binding=actor_subject_binding)
+    elif actor_subject_binding is not None or semantic_analyzer._actor_aware(events):
+        raise WorkAccountingError("scoped semantic actor contract must be explicit")
     if scoped_review_mode not in {
         "fresh", "scoped_review_v1", "scoped_review_v2",
         "scoped_review_v3_invalid_effort", "scoped_review_v4_citation_quarantine",
@@ -391,6 +399,7 @@ def run_scoped_failed_review_retry(
             })
         return {
             "schema_version": "scoped-semantic-recovery-plan/v1", "mode": request_mode,
+            **({"actor_contract": actor_contract} if actor_contract is not None else {}),
             "source_semantic_sha256": source_semantic_sha256, "source_cache_sha256": snapshot["sha256"],
             "selected_scope_digest": scope_digest, "selected_event_count": len(scoped_ids),
             "residual_event_counts": residual_counts, "requests": requests,
@@ -436,6 +445,7 @@ def run_scoped_failed_review_retry(
     digests = sorted(failure_codes)
     provenance: dict[str, Any] = {
         "mode": request_mode,
+        **({"actor_contract": actor_contract} if actor_contract is not None else {}),
         "source_semantic_sha256": source_semantic_sha256,
         "source_cache_sha256": snapshot["sha256"],
     }
@@ -825,6 +835,7 @@ def analyze_ledger(
     failed_review_retry_selected_evidence_ids: Sequence[str] | None = None,
     failed_review_retry_cache_only: bool = False,
     failed_review_retry_scoped_mode: str = "fresh",
+    failed_review_retry_actor_contract: str | None = None,
 ) -> dict[str, Any]:
     known = {str(event.get("evidence_id")) for event in events}
     if (failed_review_retry_source is None) != (failed_review_retry_digest is None):
@@ -878,7 +889,8 @@ def analyze_ledger(
                         "semantic_reviewer_model",
                         "semantic_reviewer_revision",
                         "review_prompt_version",
-                    )
+                    ) + (("prompt_version", "actor_contract")
+                         if activity.get("actor_contract") == semantic_analyzer.ACTOR_CONTRACT else ())
                     if key != "extractor_model" or key in activity
                 }
                 for activity in raw_activities
@@ -891,6 +903,7 @@ def analyze_ledger(
         # its replay identity metadata after revalidating the semantic rows;
         # validate_result intentionally returns only the provider contract.
         for key in (
+            "actor_contract",
             "review_prompt_version",
             "evidence_bundle_schema_version",
             "evidence_bundle_manifest",
@@ -902,6 +915,8 @@ def analyze_ledger(
         ):
             if key in fixture:
                 result[key] = copy.deepcopy(fixture[key])
+        if fixture.get("actor_contract") == semantic_analyzer.ACTOR_CONTRACT:
+            result["prompt_version"] = fixture["prompt_version"]
         return result
     sealed_cache = None
     if failed_review_retry_cache_only:
@@ -961,7 +976,14 @@ def analyze_ledger(
                     "tag_names": choice.get("tag_names", []),
                     "confidence": "medium",
                 })
-    hinted_events = _with_semantic_route_hints(events, routing)
+    actor_contract = (failed_review_retry_actor_contract if failed_review_retry_cache_only
+                      else failed_review_retry_actor_contract or routing.get("semantic_actor_contract"))
+    if actor_contract not in {None, semantic_analyzer.ACTOR_CONTRACT}:
+        raise WorkAccountingError("semantic actor contract is invalid")
+    actor_binding = routing.get("semantic_subject_binding") if actor_contract is not None else None
+    hinted_events = _with_semantic_route_hints(
+        events, routing, normalize_meeting_domains_type=actor_contract is not None,
+    )
     scoped_retry = retry_targets is not None and (failed_review_retry_selected_evidence_ids is not None or any(
         isinstance(row, Mapping)
         and tuple(sorted(str(value) for value in row.get("evidence_ids", []))) in retry_targets
@@ -990,9 +1012,13 @@ def analyze_ledger(
             ).hexdigest(),
             selected_evidence_ids=failed_review_retry_selected_evidence_ids,
             scoped_review_mode=failed_review_retry_scoped_mode,
+            actor_contract=actor_contract,
+            actor_subject_binding=actor_binding,
             **({"transport": cache_only_transport, "private_text_approved": True} if failed_review_retry_cache_only else {}),
         )
     else:
+        if actor_contract is not None:
+            hinted_events = semantic_analyzer.with_actor_context(hinted_events, subject_binding=actor_binding)
         result = semantic_analyzer.analyze_tiered(
             hinted_events,
             primary=primary,

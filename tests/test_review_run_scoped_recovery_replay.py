@@ -16,11 +16,17 @@ review = fixtures.review_run
 
 class ScopedRecoveryReplayTests(unittest.TestCase):
     def test_recovered_quarantine_replays_with_no_network_and_unchanged_parent(self):
+        self.assert_recovered_quarantine_replay(actor_contract=False)
+
+    def test_actor_recovered_quarantine_replays_through_native_entrypoint(self):
+        self.assert_recovered_quarantine_replay(actor_contract=True)
+
+    def assert_recovered_quarantine_replay(self, *, actor_contract):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             runs = root / 'runs'
             original = fixtures.ReviewRunResultTests._write_real_offline_replay_source(
-                runs, root, failed_review=True,
+                runs, root, failed_review=True, actor_contract=actor_contract,
             )
             endpoint = semantic_analyzer.AnalyzerEndpoint(
                 'clockify_analyzer_primary', 'https://offline.invalid/v1/chat/completions',
@@ -91,6 +97,8 @@ class ScopedRecoveryReplayTests(unittest.TestCase):
                 self.assertEqual(1, len(calls))
                 recovered = json.loads((child / 'semantic-analysis.json').read_text())
                 self.assertEqual('scoped_review_v4_citation_quarantine', recovered['failed_review_retry']['mode'])
+                if actor_contract:
+                    self.assertEqual(semantic_analyzer.ACTOR_CONTRACT, recovered['failed_review_retry']['actor_contract'])
                 self.assertTrue(recovered['activities'])
                 self.assertFalse(any(row['kind'] == 'analyzer_review_partial_quarantine'
                                      for row in recovered['exceptions']))

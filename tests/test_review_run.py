@@ -1674,6 +1674,7 @@ class ReviewRunResultTests(unittest.TestCase):
     def _write_real_offline_replay_source(
         runs: Path, root: Path, *, mixed_evidence: bool = False,
         failed_review: bool = False,
+        actor_contract: bool = False, actor_subject_binding: dict | None = None,
     ) -> Path:
         source = runs / "source-run"
         source.mkdir(parents=True)
@@ -1748,6 +1749,17 @@ class ReviewRunResultTests(unittest.TestCase):
                     attributes={"role": "user", "kind": "message", "content": "Complete independent offline review"},
                 ),)
             member_identities = ()
+        if actor_contract:
+            binding = actor_subject_binding or {"source_type": "multica", "server_origin": "https://offline.invalid", "workspace_id": "fixture-workspace", "author_id": "fixture-subject"}
+            events += (evidence_ledger.evidence_event(
+                "multica", {"source_type": "multica", "source_id": "actor-comment", "issue_id": "fixture-issue",
+                            "server_origin": binding["server_origin"], "workspace_id": binding["workspace_id"]},
+                observed_at="2026-08-01T10:05:00Z", raw_source_span={"timestamp": "2026-08-01T10:05:00Z"},
+                attributes={"activity_kind": "comment", "role": "user", "author_type": "member", "author_id": binding["author_id"], "content": "Requested verification"}),
+                evidence_ledger.evidence_event(
+                    "fathom", {"source_type": "fathom", "source_id": "actor-meeting"},
+                    observed_at="2026-08-01T12:00:00Z", raw_source_span={"start": "2026-08-01T12:00:00Z", "end": "2026-08-01T12:10:00Z"},
+                    attributes={"title": "Agency review", "calendar_invitees_domains_type": "only_internal", "semantic_evidence_status": "transcript", "transcript": [{"text": "Reviewed agency planning"}]}))
         ledger = evidence_ledger.EvidenceLedger(
             events, inventory, member_identities=member_identities,
         )
@@ -1775,6 +1787,9 @@ class ReviewRunResultTests(unittest.TestCase):
             }],
             "meeting_routes": [],
         }
+        if actor_contract:
+            routing.update(semantic_actor_contract=semantic_analyzer.ACTOR_CONTRACT, semantic_subject_binding=binding)
+            routing["meeting_routes"] = [{"domains_type": "internal_only", "project_name": "Serenichron Level 2", "prefix": "SC", "tag_names": ["Processes"], "billable": True}]
         write_json(source / "routing.json", routing)
         (source / "review-corrections.jsonl").write_text("")
         (source / "review-acceptance.jsonl").write_text("")
@@ -1809,8 +1824,11 @@ class ReviewRunResultTests(unittest.TestCase):
         analysis_events, _noise = work_accounting_pipeline._analysis_events(
             [event.document() for event in ledger.events], member_identity_set
         )
+        hinted = work_accounting_pipeline._with_semantic_route_hints(analysis_events, routing, normalize_meeting_domains_type=actor_contract)
+        if actor_contract:
+            hinted = semantic_analyzer.with_actor_context(hinted, subject_binding=binding)
         analysis = semantic_analyzer.analyze_tiered(
-            work_accounting_pipeline._with_semantic_route_hints(analysis_events, routing),
+            hinted,
             primary=endpoint, transport=transport,
             private_text_approved=True, cache=cache, max_workers=1,
             review_taxonomy=[{

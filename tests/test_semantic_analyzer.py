@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
+import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -99,6 +101,227 @@ def provider_response(payload: dict, members: list[dict] | None = None) -> dict:
     activity["evidence_partitions"] = provider_partitions(selected)
     activity["evidence_spans"] = [member["time_span"] for member in selected]
     return response
+
+
+class ActorAwareRequestTests(unittest.TestCase):
+    # Catches attribution loss, identity namespace confusion and legacy replay drift.
+    binding = {"source_type": "multica", "server_origin": "https://source.example",
+               "workspace_id": "private-workspace", "author_id": "private-subject"}
+
+    def comments(self):
+        rows = []
+        for index, (author, kind) in enumerate((("private-subject", "member"),
+                                               ("private-other", "member"),
+                                               ("private-other", "member"),
+                                               ("private-agent", "agent"))):
+            row = event(f"ev-{index}", content="Completed implementation")
+            row.update(source_type="multica", source_ref={
+                "source_type": "multica", "server_origin": "https://source.example",
+                "workspace_id": "private-workspace", "issue_id": "private-issue"},
+                attributes={"activity_kind": "comment", "role": "user" if kind == "member" else "assistant",
+                            "author_id": author, "author_type": kind})
+            rows.append(row)
+        return rows
+
+    def annotate(self, rows, binding=None):
+        self.assertTrue(callable(getattr(semantic, "with_actor_context", None)),
+                        "Actor-aware request boundary is missing")
+        return semantic.with_actor_context(rows, subject_binding=binding)
+
+    def body(self, rows, review=False):
+        if review:
+            return semantic._review_body(rows, candidate={"activities": [], "exceptions": [], "omissions": []},
+                                         taxonomy=[], model="fixture")
+        return semantic._body_for(rows, model="fixture", mode="extract", private_text_approved=True)
+
+    def test_actor_kind_subject_and_distinct_authors_survive_both_request_passes(self):
+        rows = self.annotate(self.comments(), self.binding)
+        for review in (False, True):
+            with self.subTest(review=review):
+                body = self.body(rows, review)
+                payload = json.loads(body["messages"][1]["content"])
+                actors = [m["actor"] for m in provider_members(payload)]
+                self.assertEqual(["human_member", "human_member", "human_member", "agent"], [a["kind"] for a in actors])
+                self.assertEqual(["subject", "other", "other", "other"], [a["subject_relation"] for a in actors])
+                self.assertNotEqual(actors[0]["actor_ref"], actors[1]["actor_ref"])
+                self.assertEqual(actors[1]["actor_ref"], actors[2]["actor_ref"])
+                self.assertIn("reconciliation subject", body["messages"][0]["content"])
+                self.assertIn("not proof", body["messages"][0]["content"])
+                self.assertEqual("clockify-semantic-actors/v1", payload["actor_contract"])
+
+    def test_missing_or_mismatched_namespace_never_guesses_subject_and_keeps_session_kind(self):
+        for binding in (None, {**self.binding, "workspace_id": "other-workspace"},
+                        {**self.binding, "server_origin": "https://different.example"}):
+            with self.subTest(binding=binding):
+                rows = self.annotate(self.comments(), binding)
+                actors = [m["actor"] for m in provider_members(json.loads(self.body(rows)["messages"][1]["content"]))]
+                self.assertEqual(["unknown"] * 4, [a["subject_relation"] for a in actors])
+        rows = [event("ev-session-user"), event("ev-session-assistant")]
+        for row, role in zip(rows, ("user", "assistant")):
+            row.update(source_ref={"source_type": "codex_sessions", "machine": "private-host", "session_id": "private-session"}, role=role)
+        actors = [m["actor"] for m in provider_members(json.loads(self.body(self.annotate(rows))["messages"][1]["content"]))]
+        self.assertEqual(["session_assistant", "session_user"], [a["kind"] for a in actors])
+        self.assertEqual(["unknown", "unknown"], [a["subject_relation"] for a in actors])
+
+    def test_actor_projection_is_private_reversible_permutation_stable_and_source_immutable(self):
+        original = self.comments()
+        saved = copy.deepcopy(original)
+        annotated = self.annotate(original, self.binding)
+        body = self.body(annotated)
+        encoded = semantic.canonical_json(body)
+        for private in ("private-subject", "private-other", "private-agent", "private-workspace", "private-issue", "source.example"):
+            self.assertNotIn(private, encoded)
+        self.assertEqual(body, self.body(self.annotate(list(reversed(original)), self.binding)))
+        payload = json.loads(body["messages"][1]["content"])
+        restored = semantic._restore_extraction_partitions(provider_response(payload), events=annotated)
+        self.assertEqual(["ev-0", "ev-1", "ev-2", "ev-3"], restored["activities"][0]["evidence_ids"])
+        self.assertEqual(saved, original)
+
+    def test_legacy_bytes_bundle_manifest_and_cache_keys_are_unchanged(self):
+        rows = [event("ev-a")]
+        endpoint = semantic.AnalyzerEndpoint("primary", "http://fixture", semantic.CURRENT_LIVE_FLASH_ROUTE[0], revision=semantic.CURRENT_LIVE_FLASH_ROUTE[1])
+        bodies = [semantic._body_for(rows, model=endpoint.model, mode="extract", private_text_approved=True),
+                  semantic._review_body(rows, candidate={"activities": [], "exceptions": [], "omissions": []}, taxonomy=[], model=endpoint.model)]
+        expected = [("fc2751ad215bf07c5ee925d1a93e23cf267a1631b6e5f159b5e4988e28b5a514", "arc-ada6fe3776b9accbc2eeb30bf56c6fa155b20f603d9baa9dc233ff3d14073787"),
+                    ("3b4c401ca47c50bc41264a83c3d1e17db362a8bcb026d5018b3bc74fefd0c1bf", "arc-d813d7f60f5502fb126e9701e4482f96aa9b3946520964d3e1a889a825e1688c")]
+        for body, (digest, key) in zip(bodies, expected):
+            identity = semantic.AnalyzerResponseCache._request_identity(endpoint, body)
+            self.assertEqual(digest, identity["body_digest"])
+            self.assertEqual(key, identity["cache_key"])
+        self.assertEqual("684229cfd180feb2975c08b13fa51d87954b65d6563d35ade8ce7dce5ecff49a", hashlib.sha256(semantic.canonical_json(semantic._semantic_evidence_bundles(rows)).encode()).hexdigest())
+
+    def test_new_contract_has_separate_cache_identity_and_replays_without_transport(self):
+        rows = self.annotate(self.comments(), self.binding)
+        endpoint = semantic.AnalyzerEndpoint("primary", "http://fixture", "fixture")
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = semantic.AnalyzerResponseCache(Path(temporary) / "cache.jsonl")
+            for review in (False, True):
+                body = self.body(rows, review)
+                old = self.body(self.comments(), review)
+                payload = json.loads(body["messages"][1]["content"])
+                response = provider_response(payload)
+                cache.store_accepted(endpoint, body, response)
+                self.assertIsNone(cache.lookup(endpoint, old))
+                self.assertEqual(response, cache.lookup(endpoint, body))
+                self.assertNotEqual(semantic.AnalyzerResponseCache._request_identity(endpoint, old), semantic.AnalyzerResponseCache._request_identity(endpoint, body))
+            stored = cache.path.read_bytes()
+            self.assertNotIn(b"private-subject", stored)
+            self.assertEqual(["clockify-semantic-v18"] * 2, [json.loads(line)["prompt_version"] for line in stored.splitlines()])
+            replay = semantic.AnalyzerResponseCache(cache.path)
+            self.assertEqual(response, replay.lookup(endpoint, body))
+
+    def test_invalid_actor_binding_fails_closed(self):
+        for binding in ({"author_id": "private-subject"}, {**self.binding, "source_type": "clockify"}):
+            with self.subTest(binding=binding):
+                self.assertTrue(callable(getattr(semantic, "with_actor_context", None)), "Actor-aware request boundary is missing")
+                with self.assertRaisesRegex(semantic.AnalyzerError, "binding"):
+                    semantic.with_actor_context(self.comments(), subject_binding=binding)
+
+    def test_full_actor_analysis_preserves_contract_metadata_and_independent_cache_replay(self):
+        rows = self.annotate(self.comments(), self.binding)
+        taxonomy = [{"project_name": "Serenichron Level 2", "prefix": "SC", "tag_names": ["Processes"]}]
+        endpoint = semantic.AnalyzerEndpoint("primary", "http://fixture", "fixture")
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][1]["content"])
+            return {"probe": "ok"} if payload.get("probe") else provider_response(payload)
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = semantic.AnalyzerResponseCache(Path(temporary) / "cache.jsonl")
+            result = semantic.analyze_tiered(rows, primary=endpoint, transport=transport,
+                                           review_taxonomy=taxonomy, cache=cache, private_text_approved=True)
+            self.assertEqual("clockify-semantic-v18", result["prompt_version"])
+            self.assertEqual("clockify-semantic-review-v7", result["review_prompt_version"])
+            self.assertEqual("clockify-semantic-evidence-bundle/v2", result["evidence_bundle_schema_version"])
+            self.assertEqual("clockify-semantic-actors/v1", result["actor_contract"])
+            self.assertEqual("clockify-semantic-v18", result["activities"][0]["prompt_version"])
+            self.assertEqual("clockify-semantic-review-v7", result["activities"][0]["review_prompt_version"])
+            replay = semantic.analyze_tiered(rows, primary=endpoint, transport=lambda *_: self.fail("Actor replay inferred"),
+                                           review_taxonomy=taxonomy, cache=semantic.AnalyzerResponseCache(cache.path), private_text_approved=True)
+            self.assertEqual(result["activities"], replay["activities"])
+
+    def test_actor_synthesis_identity_does_not_reuse_legacy_semantics(self):
+        activity = valid_response("ev-a")["activities"][0]
+        activity.update(activity_id="act-example", workstream="Clockify descriptions", prompt_version="clockify-semantic-v18", actor_contract="clockify-semantic-actors/v1")
+        messages = semantic._synthesis_messages([activity], workstream_id="ws-example")
+        payload = json.loads(messages[1]["content"])
+        self.assertEqual("clockify-semantic-v18", payload["prompt_version"])
+        self.assertEqual("clockify-semantic-actors/v1", payload["actor_contract"])
+        self.assertIn("reconciliation subject", messages[0]["content"])
+        endpoint = semantic.AnalyzerEndpoint("primary", "http://fixture", "fixture")
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][1]["content"])
+            return valid_response(payload["provisional_activities"][0]["evidence_ids"][0])
+        result = semantic._call_synthesis_validated(endpoint, [activity], workstream_id="ws-example", tier="primary", transport=transport,
+                                                    known_evidence_ids={"ev-a"}, evidence_time_spans={"ev-a": activity["evidence_spans"][0]})
+        self.assertEqual("clockify-semantic-v18", result["activities"][0]["prompt_version"])
+
+    def test_actor_timeout_manifest_does_not_claim_legacy_bundle_schema(self):
+        rows = []
+        for index in range(24):
+            row = event(f"ev-timeout-{index:02d}")
+            row.update(role="user", source_ref={"source_type": "codex_sessions", "machine": "host", "session_id": "timeout"})
+            rows.append(row)
+        rows = self.annotate(rows)
+        endpoint = semantic.AnalyzerEndpoint("primary", "http://fixture", "fixture")
+        def timeout(_endpoint, body):
+            payload = json.loads(body["messages"][1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            raise semantic.AnalyzerTimeoutError("bounded fixture timeout")
+        result = semantic.analyze_tiered(rows, primary=endpoint, transport=timeout, private_text_approved=True)
+        self.assertEqual("clockify-semantic-evidence-bundle/v2", result["analysis_chunks"][0]["evidence_bundle_schema_version"])
+
+    def test_mixed_or_unsafe_actor_request_context_fails_before_projection(self):
+        rows = self.annotate(self.comments(), self.binding)
+        for invalid in ([rows[0], self.comments()[1]],
+                        [{**rows[0], "semantic_actor_context": {"kind": "private-subject", "subject_relation": "subject"}}]):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(semantic.AnalyzerError, "actor"):
+                self.body(invalid)
+
+    def test_pipeline_uses_explicit_config_binding_and_preserves_new_fixture_provenance(self):
+        semantic_analyze = semantic.analyze_tiered
+        taxonomy = [{"project_name": "Serenichron Level 2", "prefix": "SC", "tag_names": ["Processes"]}]
+        routing = {"semantic_actor_contract": "clockify-semantic-actors/v1", "semantic_subject_binding": self.binding,
+                   "session_routes": [], "meeting_routes": []}
+        endpoint = semantic.AnalyzerEndpoint("primary", "http://fixture", "fixture")
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            if payload.get("mode") == "extract":
+                self.assertIn("actor", provider_members(payload)[0], "Configured actor contract was not projected")
+                self.assertEqual("subject", provider_members(payload)[0]["actor"]["subject_relation"])
+            return provider_response(payload)
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(semantic.AnalyzerEndpoint, "from_env", side_effect=[endpoint, None]), mock.patch.dict(os.environ, {"CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED": "approved"}):
+            # analyze_tiered's bound transport default is replaced at the true external boundary.
+            with mock.patch.object(semantic, "analyze_tiered", wraps=lambda rows, **options: semantic_analyze(rows, transport=transport, **options)):
+                result = work_accounting_pipeline.analyze_ledger(self.comments(), review_routing=routing, review_taxonomy=taxonomy)
+            self.assertEqual("clockify-semantic-actors/v1", result.get("actor_contract"))
+            fixture = Path(temporary) / "semantic.json"
+            fixture.write_text(json.dumps(result))
+            replay = work_accounting_pipeline.analyze_ledger(self.comments(), analysis_fixture=fixture, review_taxonomy=taxonomy)
+            self.assertEqual("clockify-semantic-actors/v1", replay.get("actor_contract"))
+            self.assertEqual("clockify-semantic-v18", replay["prompt_version"])
+            self.assertEqual(result["activities"], replay["activities"])
+
+    def test_new_actor_pipeline_explicitly_uses_corrected_meeting_hints(self):
+        # Catches inheriting frozen v17 hints in new actor-aware requests.
+        semantic_analyze = semantic.analyze_tiered
+        row = event("ev-meeting", content="Reviewed agency planning")
+        row.update(source_type="fathom", source_ref={"source_type": "fathom", "source_id": "private-recording"},
+                   attributes={"calendar_invitees_domains_type": "only_internal"})
+        route = {"domains_type": "internal_only", "project_name": "Serenichron Level 2", "prefix": "SC", "tag_names": ["Processes"]}
+        routing = {"semantic_actor_contract": "clockify-semantic-actors/v1", "meeting_routes": [route], "session_routes": []}
+        endpoint = semantic.AnalyzerEndpoint("primary", "http://fixture", "fixture")
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            if payload.get("mode") == "review":
+                self.assertIn("route_hint", provider_members(payload)[0], "New request used a frozen meeting hint")
+                self.assertEqual("Serenichron Level 2", provider_members(payload)[0]["route_hint"]["project_name"])
+            return provider_response(payload)
+        with mock.patch.object(semantic.AnalyzerEndpoint, "from_env", side_effect=[endpoint, None]), mock.patch.dict(os.environ, {"CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED": "approved"}), mock.patch.object(semantic, "analyze_tiered", wraps=lambda rows, **options: semantic_analyze(rows, transport=transport, **options)):
+            work_accounting_pipeline.analyze_ledger([row], review_routing=routing, review_taxonomy=[route])
 
 
 @mock.patch.dict(

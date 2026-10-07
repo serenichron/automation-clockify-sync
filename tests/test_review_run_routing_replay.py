@@ -1,5 +1,6 @@
 """Real sealed-cache replay across an accounting-only routing repair."""
 import json
+import socket
 from pathlib import Path
 import tempfile
 import unittest
@@ -8,6 +9,7 @@ from unittest import mock
 import test_review_run as fixtures
 from test_review_run_chained_repair_replay import validate_repair
 from scripts import work_accounting_pipeline as accounting
+from scripts import semantic_analyzer as semantic
 
 
 review = fixtures.review_run
@@ -116,6 +118,41 @@ class RoutingRepairReplayTests(unittest.TestCase):
                 (source / name).symlink_to(source / "missing-lineage.json")
                 with mock.patch.object(review, "RUNS", self.runs), self.assertRaises(ValueError):
                     review._verified_replay_inference_context(source)
+
+
+class ActorContractReplayTests(unittest.TestCase):
+    def test_native_entrypoint_replays_sealed_actor_binding_and_corrected_hints_without_transport(self):
+        # Catches reconstruction silently using v17 projection or frozen hints.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runs = root / "runs"
+            binding = {"source_type": "multica", "server_origin": "https://offline.invalid", "workspace_id": "private-workspace", "author_id": "private-subject"}
+            source = fixtures.ReviewRunResultTests._write_real_offline_replay_source(runs, root, actor_contract=True, actor_subject_binding=binding)
+            source_analysis = json.loads((source / "semantic-analysis.json").read_bytes())
+            self.assertEqual("clockify-semantic-actors/v1", source_analysis["actor_contract"])
+            before = fixtures.run_tree_snapshot(source)
+            sealed_transport = review._sealed_replay_transport
+            def refuse_provider(endpoint, body):
+                if json.loads(body["messages"][-1]["content"]) == {"probe": semantic.PROMPT_VERSION}:
+                    return sealed_transport(endpoint, body)
+                self.fail("Actor replay inference forbidden")
+            with mock.patch.object(review, "RUNS", runs), mock.patch.object(review, "_sealed_replay_transport", side_effect=refuse_provider), mock.patch.object(socket.socket, "connect", side_effect=AssertionError("Actor replay network forbidden")):
+                replay = review._prepare_replay_run(source)
+                accounting.run_accounting(replay, root=fixtures.ROOT, routing_path=replay / "routing.json", corrections_path=replay / "review-corrections.jsonl", analysis_fixture=review._replay_analysis_fixture(source, replay), analyzer_cache_path=review._replay_analyzer_cache(replay))
+                self.assertEqual("pass", review._verify_replay_integrity(source, replay)["status"])
+            self.assertEqual(before, fixtures.run_tree_snapshot(source))
+            self.assertEqual((source / "proposals.json").read_bytes(), (replay / "proposals.json").read_bytes())
+            self.assertEqual((source / "work-accounting-result.json").read_bytes(), (replay / "work-accounting-result.json").read_bytes())
+
+    def test_native_entrypoint_rejects_unsupported_actor_contract_before_transport(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runs = root / "runs"
+            source = fixtures.ReviewRunResultTests._write_real_offline_replay_source(runs, root)
+            analysis = json.loads((source / "semantic-analysis.json").read_bytes())
+            analysis["actor_contract"] = "unsupported"
+            with mock.patch.object(review, "RUNS", runs), mock.patch.object(review, "_sealed_replay_transport", side_effect=AssertionError("Unsupported contract inferred")), self.assertRaisesRegex(ValueError, "actor contract"):
+                review._preflight_replay_analyzer_cache(source, source / "analyzer-cache-used.jsonl", analysis)
 
 
 if __name__ == "__main__":

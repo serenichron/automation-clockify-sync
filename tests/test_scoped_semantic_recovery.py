@@ -121,6 +121,92 @@ class ScopedSemanticRecoveryTests(unittest.TestCase):
             self.assertEqual([4, 5, 9, 18, 20, 34], sorted(row["event_count"] for row in plan["requests"]))
             self.assertEqual([13, 47], sorted(plan["residual_event_counts"]))
             self.assertEqual(before, cache.path.read_bytes())
+            self.assertEqual("47927851505b9213851d60fdcc3d54433673e19b1522578ce3b17ddc4a2d1557",
+                             hashlib.sha256(semantic.canonical_json(plan).encode()).hexdigest())
+
+    def test_actor_contract_is_orthogonal_to_scoped_repair_modes_and_replays(self):
+        # Catches actor awareness replacing the established effort/citation repair.
+        for mode in ("scoped_review_v2", "scoped_review_v3_invalid_effort", "scoped_review_v4_citation_quarantine"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                primary, source, events, cache, contexts, _, targets = fixture(Path(temporary))
+                if mode == "scoped_review_v3_invalid_effort":
+                    targets = {key: "contract_rejected_invalid_effort" for key in targets}
+                elif mode == "scoped_review_v4_citation_quarantine":
+                    targets = {key: "contract_rejected_duplicate_evidence" for key in targets}
+                self.assertIn("actor_contract", __import__("inspect").signature(pipeline.run_scoped_failed_review_retry).parameters,
+                              "Scoped actor-contract boundary is missing")
+                options = {"scoped_review_mode": mode, "actor_contract": "clockify-semantic-actors/v1"}
+                before = cache.path.read_bytes()
+                plan = self.run_scoped(source, events, primary, cache, targets, sum(contexts, []), lambda *_: self.fail("Plan inferred"), plan_only=True, **options)
+                self.assertEqual(mode, plan["mode"])
+                self.assertEqual("clockify-semantic-actors/v1", plan["actor_contract"])
+                self.assertEqual(before, cache.path.read_bytes())
+                payloads = []
+                def transport(_endpoint, body):
+                    payload = json.loads(body["messages"][1]["content"])
+                    payloads.append(payload)
+                    return provider_response(payload)
+                result = self.run_scoped(source, events, primary, cache, targets, sum(contexts, []), transport, **options)
+                self.assertEqual(mode, result["failed_review_retry"]["mode"])
+                self.assertEqual("clockify-semantic-actors/v1", result["failed_review_retry"]["actor_contract"])
+                self.assertEqual(source["activities"], result["activities"][:5])
+                self.assertTrue(all(p["scoped_failed_review"]["mode"] == mode for p in payloads))
+                self.assertTrue(all(p["review_prompt_version"] == "clockify-semantic-review-v7" for p in payloads))
+                after = cache.path.read_bytes()
+                replay = self.run_scoped(source, events, primary, cache, targets, sum(contexts, []), lambda *_: self.fail("Replay inferred"), **options)
+                self.assertEqual(result["activities"], replay["activities"])
+                self.assertEqual(after, cache.path.read_bytes())
+
+    def test_unknown_actor_contract_fails_before_scoped_cache_or_transport(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            primary, source, events, cache, contexts, _, targets = fixture(Path(temporary))
+            self.assertIn("actor_contract", __import__("inspect").signature(pipeline.run_scoped_failed_review_retry).parameters,
+                          "Scoped actor-contract boundary is missing")
+            before = cache.path.read_bytes()
+            with self.assertRaisesRegex(pipeline.WorkAccountingError, "actor contract"):
+                self.run_scoped(source, events, primary, cache, targets, sum(contexts, []), lambda *_: self.fail("Unknown contract inferred"), actor_contract="unsupported")
+            self.assertEqual(before, cache.path.read_bytes())
+
+    def test_command_forwards_new_actor_contract_and_reconstructs_sealed_cache(self):
+        # Catches standalone recovery dropping the actor contract during replay.
+        command = importlib.import_module("scripts.clockify_scoped_semantic_recovery")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_dir = root / "source"
+            source_dir.mkdir()
+            primary, source, events, cache, contexts, _, targets = fixture(source_dir)
+            ledger = evidence_ledger.EvidenceLedger(tuple(evidence_ledger.EvidenceEvent.from_document(row) for row in events),
+                                                   timezone="Europe/Bucharest", member_identities=("member@example.com",))
+            (source_dir / "evidence").mkdir()
+            files = {"evidence/evidence-ledger.json": {"schema_version": evidence_ledger.SCHEMA_VERSION, "events": events, "manifest": ledger.manifest.document()},
+                     "semantic-analysis.json": source,
+                     "proposals.json": [],
+                     "routing.json": {"semantic_actor_contract": "clockify-semantic-actors/v1",
+                                      "session_routes": [{"pattern": "fixture", "project_name": "Serenichron Level 2", "prefix": "SC", "tag_names": ["Processes"]}], "meeting_routes": []}}
+            for name, value in files.items():
+                (source_dir / name).write_text(json.dumps(value))
+            scope = root / "scope.json"
+            scope.write_text(json.dumps({"evidence_ids": sum(contexts, [])}))
+            argv = [str(source_dir), "--scope-file", str(scope), "--output-dir", str(root / "output")]
+            digests = [semantic.stable_digest("frt-", list(key), length=64) for key in targets]
+            for digest in digests:
+                argv += ["--failed-review-digest", digest]
+            before = {path: path.read_bytes() for path in source_dir.rglob("*") if path.is_file()}
+            def transport(_endpoint, body):
+                payload = json.loads(body["messages"][1]["content"])
+                self.assertEqual("clockify-semantic-actors/v1", payload.get("actor_contract"))
+                return provider_response(payload)
+            with mock.patch.object(semantic.AnalyzerEndpoint, "from_env", return_value=primary), mock.patch.object(semantic, "http_transport", side_effect=transport), mock.patch.dict("os.environ", {"CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED": "approved"}):
+                plan = command.run(command.parse_args(argv + ["--plan"]))
+                self.assertEqual("clockify-semantic-actors/v1", plan.get("actor_contract"))
+                command.run(command.parse_args(argv))
+            sealed = {path: path.read_bytes() for path in (root / "output").rglob("*") if path.is_file()}
+            with mock.patch.object(semantic, "http_transport", side_effect=AssertionError("Sealed recovery inferred")):
+                replay = command.validate_cached_recovery(source_dir, root / "output", digests)
+            self.assertEqual(source["activities"], replay["analysis"]["activities"][:5])
+            self.assertEqual("clockify-semantic-actors/v1", replay["analysis"]["failed_review_retry"]["actor_contract"])
+            self.assertEqual(before, {path: path.read_bytes() for path in source_dir.rglob("*") if path.is_file()})
+            self.assertEqual(sealed, {path: path.read_bytes() for path in (root / "output").rglob("*") if path.is_file()})
 
     def test_semantic_only_command_preserves_meetings_and_never_emits_proposals(self):
         # Catches routing through accounting/allocation or modifying source proposals.

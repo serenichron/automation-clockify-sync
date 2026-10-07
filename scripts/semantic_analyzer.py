@@ -41,6 +41,26 @@ PORTFOLIO_REVIEW_PROMPT_VERSION = "clockify-portfolio-review-v2"
 PORTFOLIO_VALIDATION_PROMPT_VERSION = "clockify-portfolio-validation-v1"
 ANALYZER_CACHE_SCHEMA_VERSION = "clockify-analyzer-cache/v2"
 EVIDENCE_BUNDLE_SCHEMA_VERSION = "clockify-semantic-evidence-bundle/v1"
+ACTOR_CONTRACT = "clockify-semantic-actors/v1"
+ACTOR_PROMPT_VERSION = "clockify-semantic-v18"
+ACTOR_REVIEW_PROMPT_VERSION = "clockify-semantic-review-v7"
+ACTOR_BUNDLE_SCHEMA_VERSION = "clockify-semantic-evidence-bundle/v2"
+ACTOR_INSTRUCTIONS = """
+
+ACTOR ATTRIBUTION: Account only for the configured reconciliation subject.
+An evidence author's kind, generic conversation role, and outcome performer are
+different facts. A teammate/member/agent outcome report is context, not proof that
+the subject implemented that outcome. Never transfer another actor's implementation,
+milestones, artifacts or diagnoses to the subject. The subject's own supported
+instruction, review, verification, diagnosis or coordination can support its own
+distinct activity; describe that activity rather than the teammate's implementation.
+A resulting assistant/tool response in the same supported interactive context can
+corroborate human-directed work. Session-user kind alone does not establish subject
+identity. Unknown subject_relation remains unknown: use supported context or an
+exception when attribution is material and unresolved, never guess identity.
+Preserve and classify every evidence member; do not discard member/agent reports
+wholesale. actor_ref is an opaque request-local author alias, not a global identity.
+"""
 DEFAULT_PRIMARY_MODEL = "deepseek-v4.1-flash:cloud"
 DEFAULT_PRIMARY_REVISION = "e04da138d31e0c9468e982e1ae9503d06cb7e170caa16a90c17d931c4aa140f8"
 CURRENT_LIVE_FLASH_ROUTE = (DEFAULT_PRIMARY_MODEL, DEFAULT_PRIMARY_REVISION)
@@ -169,7 +189,7 @@ SAFE_ENTITY_TOKENS = {
 }
 PROJECTED_EVENT_FIELDS = {
     "evidence_id", "source_category", "time_span", "role", "content",
-    "project_context", "meeting_context",
+    "project_context", "meeting_context", "actor",
 }
 PROVIDER_ACTIVITY_FIELDS = {
     "lifecycle", "workstream", "action", "object", "outcome",
@@ -599,6 +619,77 @@ def _tool_payload(event: dict[str, Any], attributes: dict[str, Any]) -> bool:
     return any(str(value or "").casefold() in TOOL_KINDS for value in values)
 
 
+def with_actor_context(
+    events: Iterable[dict[str, Any]], *, subject_binding: Mapping[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Opt in NEW requests with local-only, source-namespaced actor provenance.
+
+    The caller supplies an independently verified binding. Clockify user IDs,
+    names, prose and generic user roles never establish Multica membership.
+    Source ledger events are not changed; raw actor keys never leave this stage.
+    """
+    binding_keys = {"source_type", "server_origin", "workspace_id", "author_id"}
+    if subject_binding is not None and (
+        not isinstance(subject_binding, Mapping) or set(subject_binding) != binding_keys
+        or any(not isinstance(value, str) or not value.strip() for value in subject_binding.values())
+        or subject_binding.get("source_type") != "multica"
+    ):
+        raise AnalyzerError("semantic subject binding requires one complete Multica namespace")
+    output = []
+    for event in events:
+        copied = dict(event)
+        source = event.get("source_ref") if isinstance(event.get("source_ref"), Mapping) else {}
+        attributes = event.get("attributes") if isinstance(event.get("attributes"), Mapping) else {}
+        source_type = str(event.get("source_type") or "")
+        kind, relation, actor_key = "unknown", "unknown", None
+        author_type = str(attributes.get("author_type") or "")
+        author_id = str(attributes.get("author_id") or "")
+        if source_type == "multica" and attributes.get("activity_kind") == "comment":
+            kind = {"member": "human_member", "agent": "agent"}.get(author_type, "unknown")
+            namespace = (source_type, str(source.get("server_origin") or ""), str(source.get("workspace_id") or ""))
+            if author_id:
+                actor_key = (*namespace, author_type, author_id)
+            if subject_binding is not None and author_id and kind != "unknown" and namespace == (
+                subject_binding["source_type"], subject_binding["server_origin"], subject_binding["workspace_id"],
+            ):
+                relation = "subject" if kind == "human_member" and author_id == subject_binding["author_id"] else "other"
+        elif source.get("session_id"):
+            role = str(event.get("role") or attributes.get("role") or "").casefold()
+            kind = {"user": "session_user", "assistant": "session_assistant"}.get(role, "unknown")
+            if kind != "unknown":
+                actor_key = (source_type, str(source.get("machine") or ""), str(source["session_id"]), role)
+        copied["semantic_actor_contract"] = ACTOR_CONTRACT
+        copied["semantic_actor_context"] = {"kind": kind, "subject_relation": relation}
+        if actor_key is not None:
+            copied["semantic_actor_key"] = actor_key
+        else:
+            copied.pop("semantic_actor_key", None)
+        output.append(copied)
+    return output
+
+
+def _actor_aware(events: Iterable[dict[str, Any]]) -> bool:
+    contracts = {event.get("semantic_actor_contract") for event in events}
+    if contracts - {None, ACTOR_CONTRACT} or len(contracts) > 1:
+        raise AnalyzerError("semantic actor request contracts differ")
+    return contracts == {ACTOR_CONTRACT}
+
+
+def _prompt_version(events: Iterable[dict[str, Any]]) -> str:
+    return ACTOR_PROMPT_VERSION if _actor_aware(events) else PROMPT_VERSION
+
+
+def _bundle_schema_version(events: Iterable[dict[str, Any]]) -> str:
+    return ACTOR_BUNDLE_SCHEMA_VERSION if _actor_aware(events) else EVIDENCE_BUNDLE_SCHEMA_VERSION
+
+
+def _mark_actor_result(result: dict[str, Any], actor_aware: bool) -> None:
+    if actor_aware:
+        result.update(prompt_version=ACTOR_PROMPT_VERSION, actor_contract=ACTOR_CONTRACT)
+        for activity in result["activities"]:
+            activity.update(prompt_version=ACTOR_PROMPT_VERSION, actor_contract=ACTOR_CONTRACT)
+
+
 def project_event(event: dict[str, Any]) -> dict[str, Any]:
     """Create the sole, privacy-safe event shape permitted to leave the machine."""
     if not isinstance(event, dict):
@@ -637,6 +728,13 @@ def project_event(event: dict[str, Any]) -> dict[str, Any]:
         "role": role,
         "content": content,
     }
+    if _actor_aware([event]):
+        actor = event.get("semantic_actor_context")
+        if (not isinstance(actor, Mapping) or set(actor) != {"kind", "subject_relation"}
+                or actor.get("kind") not in {"human_member", "agent", "session_user", "session_assistant", "unknown"}
+                or actor.get("subject_relation") not in {"subject", "other", "unknown"}):
+            raise AnalyzerError("semantic actor projection is unsafe")
+        projected["actor"] = dict(actor)
     if time_span := _safe_time_span(event):
         projected["time_span"] = time_span
     if project_name:
@@ -827,7 +925,15 @@ def _semantic_evidence_bundles(
     evidence, session, repository, issue, meeting, and machine identifiers stay
     in the local manifest.
     """
+    events = list(events)
+    actor_aware = _actor_aware(events)
+    actor_keys = sorted({tuple(event["semantic_actor_key"]) for event in events
+                         if actor_aware and event.get("semantic_actor_key")})
+    actor_refs = {key: f"a-{index:04d}" for index, key in enumerate(actor_keys, 1)}
     contextual = _contextual_events(events)
+    for _day, _context, raw, projected in contextual:
+        if actor_aware and (actor_key := raw.get("semantic_actor_key")):
+            projected["actor"]["actor_ref"] = actor_refs[tuple(actor_key)]
     # Context-local order is deliberate.  Another machine or session may be
     # interleaved on the wall clock, but it must not fragment the source
     # conversation needed for semantic reconstruction.  Member ranges are
@@ -872,7 +978,7 @@ def _semantic_evidence_bundles(
         bundle_id = stable_digest(
             "seb-",
             {
-                "schema_version": EVIDENCE_BUNDLE_SCHEMA_VERSION,
+                "schema_version": _bundle_schema_version(events),
                 "context_digest": context_digest,
                 "projected_digest": projected_digest,
                 "evidence_ids": original_ids,
@@ -1286,11 +1392,14 @@ Output object:
     payload = {
         "mode": mode,
         "schema_version": SCHEMA_VERSION,
-        "prompt_version": PROMPT_VERSION,
-        "evidence_bundle_schema_version": EVIDENCE_BUNDLE_SCHEMA_VERSION,
+        "prompt_version": _prompt_version(events),
+        "evidence_bundle_schema_version": _bundle_schema_version(events),
         "bundles": model_bundles,
         "review_corrections": _project_corrections(corrections),
     }
+    if _actor_aware(events):
+        system += ACTOR_INSTRUCTIONS
+        payload["actor_contract"] = ACTOR_CONTRACT
     if repair_failure_code is not None:
         payload["repair_feedback"] = {
             "failure_code": repair_failure_code,
@@ -1435,6 +1544,8 @@ def _review_messages(
     scoped_failed_review: Mapping[str, str] | None = None,
 ) -> list[dict[str, str]]:
     """Build an independent semantic-review request for one extraction."""
+    if _actor_aware(events) and review_prompt_version == REVIEW_PROMPT_VERSION:
+        review_prompt_version = ACTOR_REVIEW_PROMPT_VERSION
     scoped_v2 = (
         scoped_failed_review is not None
         and scoped_failed_review.get("mode") == "scoped_review_v2"
@@ -1656,7 +1767,7 @@ Do not infer duration from a session envelope or reuse a prior disputed citation
     payload = {
         "mode": "review",
         "schema_version": SCHEMA_VERSION,
-        "extractor_prompt_version": PROMPT_VERSION,
+        "extractor_prompt_version": _prompt_version(events),
         "review_prompt_version": review_prompt_version,
         "bundles": model_bundles,
         "coverage_contract": [
@@ -1669,6 +1780,9 @@ Do not infer duration from a session envelope or reuse a prior disputed citation
         "candidate": _semantic_review_candidate(candidate),
         "clockify_taxonomy": copy.deepcopy(taxonomy),
     }
+    if _actor_aware(events):
+        system += ACTOR_INSTRUCTIONS
+        payload["actor_contract"] = ACTOR_CONTRACT
     if review_scope != "extraction":
         payload["review_scope"] = review_scope
     if repair_failure_code is not None:
@@ -1942,6 +2056,10 @@ def _synthesis_messages(
     transport_recovery_attempt: int | None = None,
 ) -> list[dict[str, str]]:
     """Build a privacy-safe request to reconcile one repeated workstream."""
+    contracts = {activity.get("actor_contract") for activity in activities}
+    if contracts - {None, ACTOR_CONTRACT} or len(contracts) > 1:
+        raise AnalyzerError("synthesis actor request contracts differ")
+    actor_aware = contracts == {ACTOR_CONTRACT}
     if not SAFE_EVIDENCE_ID_RE.fullmatch(workstream_id):
         raise AnalyzerError("synthesis workstream ID is unsafe")
     provisional = sorted(
@@ -2001,10 +2119,13 @@ or status prose in descriptive fields."""
     payload = {
         "mode": "synthesize",
         "schema_version": SCHEMA_VERSION,
-        "prompt_version": PROMPT_VERSION,
+        "prompt_version": ACTOR_PROMPT_VERSION if actor_aware else PROMPT_VERSION,
         "workstream_id": workstream_id,
         "provisional_activities": model_provisional,
     }
+    if actor_aware:
+        system += ACTOR_INSTRUCTIONS
+        payload["actor_contract"] = ACTOR_CONTRACT
     if repair_failure_code is not None:
         payload["repair_feedback"] = {
             "failure_code": repair_failure_code,
@@ -2897,6 +3018,20 @@ class AnalyzerResponseCache:
         return AnalyzerResponseCache._request_identity_for_route(route, body)
 
     @staticmethod
+    def _body_prompt_version(body: Mapping[str, Any]) -> str:
+        """Select the explicit new contract; all historical bodies keep v17 keys."""
+        try:
+            payload = json.loads(body["messages"][1]["content"])
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+            return PROMPT_VERSION
+        if not isinstance(payload, dict) or "actor_contract" not in payload:
+            return PROMPT_VERSION
+        if (payload.get("actor_contract") != ACTOR_CONTRACT
+                or payload.get("extractor_prompt_version", payload.get("prompt_version")) != ACTOR_PROMPT_VERSION):
+            raise AnalyzerError("semantic actor cache contract is invalid")
+        return ACTOR_PROMPT_VERSION
+
+    @staticmethod
     def _request_identity_for_route(
         route: Mapping[str, str], body: Mapping[str, Any]
     ) -> dict[str, str]:
@@ -2908,7 +3043,7 @@ class AnalyzerResponseCache:
             "arc-",
             {
                 "schema_version": ANALYZER_CACHE_SCHEMA_VERSION,
-                "prompt_version": PROMPT_VERSION,
+                "prompt_version": AnalyzerResponseCache._body_prompt_version(body),
                 "semantic_schema_version": SCHEMA_VERSION,
                 "route_digest": route_digest,
                 "body_digest": body_digest,
@@ -3200,7 +3335,7 @@ class AnalyzerResponseCache:
             "schema_version": ANALYZER_CACHE_SCHEMA_VERSION,
             **identity,
             "model": endpoint.model,
-            "prompt_version": PROMPT_VERSION,
+            "prompt_version": self._body_prompt_version(body),
             "semantic_schema_version": SCHEMA_VERSION,
             "status": "accepted",
             "decision_digest": self._decision_digest(decision),
@@ -3225,7 +3360,7 @@ class AnalyzerResponseCache:
                 "schema_version": ANALYZER_CACHE_SCHEMA_VERSION,
                 **identity,
                 "model": endpoint.model,
-                "prompt_version": PROMPT_VERSION,
+                "prompt_version": self._body_prompt_version(body),
                 "semantic_schema_version": SCHEMA_VERSION,
                 "status": "rejected",
                 "decision_digest": self._decision_digest(decision),
@@ -3680,6 +3815,8 @@ def _call_semantic_review_once(
     scoped_failed_review: Mapping[str, str] | None = None,
     repair_source_body: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if _actor_aware(events) and review_prompt_version == REVIEW_PROMPT_VERSION:
+        review_prompt_version = ACTOR_REVIEW_PROMPT_VERSION
     request_options = dict(
         candidate=candidate,
         taxonomy=taxonomy,
@@ -3864,6 +4001,7 @@ def _call_semantic_review_once(
         activity["semantic_reviewer_model"] = reviewer_model
         activity["semantic_reviewer_revision"] = reviewer_revision
         activity["review_prompt_version"] = review_prompt_version
+    _mark_actor_result(result, _actor_aware(events))
     return result
 
 
@@ -4149,6 +4287,7 @@ def _call_validated(
     _raise_if_cancelled(cancelled)
     if cache is not None and cache_miss:
         cache.store_accepted(endpoint, body, response)
+    _mark_actor_result(result, _actor_aware(events))
     return _ValidatedAnalysis(
         result,
         low_timing_evidence_ids=_low_model_timing_evidence_ids(restored_response),
@@ -4270,6 +4409,7 @@ def _call_synthesis_validated(
         raise AnalyzerContractError(str(exc)) from exc
     if cache is not None and cache_miss:
         cache.store_accepted(endpoint, body, response)
+    _mark_actor_result(result, all(activity.get("actor_contract") == ACTOR_CONTRACT for activity in activities))
     return _ValidatedAnalysis(
         result,
         low_timing_evidence_ids=_low_model_timing_evidence_ids(restored_response),
@@ -4538,7 +4678,7 @@ def analyze_tiered(
             )
             return {
                 "schema_version": SCHEMA_VERSION,
-                "prompt_version": PROMPT_VERSION,
+                "prompt_version": _prompt_version(chunk),
                 "activities": recovered_activities,
                 "exceptions": [
                     item
@@ -4563,7 +4703,7 @@ def analyze_tiered(
                     "recovered_by_partition" if not unresolved else "partition_exception"
                 ),
                 "repair_status": "partitioned",
-                "evidence_bundle_schema_version": EVIDENCE_BUNDLE_SCHEMA_VERSION,
+                "evidence_bundle_schema_version": _bundle_schema_version(chunk),
                 "bundle_count": len(chunk_bundle_manifest),
                 "bundle_manifest_digest": stable_digest(
                     "sebm-", chunk_bundle_manifest, length=64
@@ -4987,7 +5127,7 @@ def analyze_tiered(
             "repair_status": repair_status,
             "timeout_recovery_status": timeout_recovery_status,
             "connection_recovery_status": connection_recovery_status,
-            "evidence_bundle_schema_version": EVIDENCE_BUNDLE_SCHEMA_VERSION,
+            "evidence_bundle_schema_version": _bundle_schema_version(chunk),
             "bundle_count": len(chunk_bundle_manifest),
             "bundle_manifest_digest": stable_digest(
                 "sebm-", chunk_bundle_manifest, length=64
@@ -5381,15 +5521,20 @@ def analyze_tiered(
     exceptions.extend(synthesis_exceptions)
     omissions = [value for result in results for value in result["omissions"]]
     omissions.extend(synthesis_omissions)
+    if _actor_aware(original_events):
+        for activity in activities_by_id.values():
+            activity.update(prompt_version=ACTOR_PROMPT_VERSION, actor_contract=ACTOR_CONTRACT)
     return {
         "schema_version": SCHEMA_VERSION,
-        "prompt_version": PROMPT_VERSION,
+        "prompt_version": _prompt_version(original_events),
+        **({"actor_contract": ACTOR_CONTRACT} if _actor_aware(original_events) else {}),
         "review_prompt_version": (
-            REVIEW_PROMPT_VERSION if review_taxonomy is not None else None
+            (ACTOR_REVIEW_PROMPT_VERSION if _actor_aware(original_events) else REVIEW_PROMPT_VERSION)
+            if review_taxonomy is not None else None
         ),
-        "evidence_bundle_schema_version": EVIDENCE_BUNDLE_SCHEMA_VERSION,
+        "evidence_bundle_schema_version": _bundle_schema_version(original_events),
         "evidence_bundle_manifest": {
-            "schema_version": EVIDENCE_BUNDLE_SCHEMA_VERSION,
+            "schema_version": _bundle_schema_version(original_events),
             "digest": stable_digest("sebm-", bundle_manifest, length=64),
             "bundles": bundle_manifest,
         },
