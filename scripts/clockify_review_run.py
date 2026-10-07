@@ -24,13 +24,20 @@ import sys
 import tempfile
 from typing import Any, Mapping
 
+# Standalone service children need the release package root independently of
+# their parent process's sys.path and working directory.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 try:
     from scripts import clockify_sync_collect, review_acceptance, semantic_analyzer
     from scripts import clockify_source_debt_recover
+    from scripts import clockify_scoped_semantic_recovery
     from scripts import collector_receipts, reconciliation_manifest, review_corrections, work_accounting_pipeline
 except ModuleNotFoundError:  # direct script execution
     import clockify_sync_collect  # type: ignore[no-redef]
     import clockify_source_debt_recover  # type: ignore[no-redef]
+    import clockify_scoped_semantic_recovery  # type: ignore[no-redef]
     import review_acceptance  # type: ignore[no-redef]
     import semantic_analyzer  # type: ignore[no-redef]
     import collector_receipts  # type: ignore[no-redef]
@@ -1623,12 +1630,22 @@ def _preflight_replay_analyzer_cache(
         "scoped_review_v1", "scoped_review_v2", "scoped_review_v3_invalid_effort",
         "scoped_review_v4_citation_quarantine",
     }:
+        selected_scope = retry_provenance.get("selected_evidence_ids")
+        scope_digest = retry_provenance.get("selected_scope_digest")
+        if selected_scope is not None or scope_digest is not None:
+            if (not isinstance(selected_scope, list) or not selected_scope
+                or any(not isinstance(value, str) or not value for value in selected_scope)
+                or selected_scope != sorted(set(selected_scope))
+                or semantic_analyzer.stable_digest("scope-", selected_scope, length=64) != scope_digest):
+                raise ValueError("replay failed-review selected scope digest differs")
         replayed = work_accounting_pipeline.run_scoped_failed_review_retry(
             _read_json(original_semantic), hinted_events,
             source_semantic_sha256=semantic_sha256,
             scoped_review_mode=retry_mode,
             primary=primary, cache=cache, review_taxonomy=taxonomy,
             targets=retry_targets, transport=_sealed_replay_transport,
+            selected_evidence_ids=selected_scope,
+            **({"private_text_approved": True} if selected_scope is not None else {}),
         )
     else:
         replayed = semantic_analyzer.analyze_tiered(
@@ -2248,6 +2265,7 @@ def _validate_repair_credit_transition(
 def _prepare_repair_run(
     source: Path, *, routing_override: Path | None = None,
     corrections_override: Path | None = None,
+    scoped_recovery: Mapping[str, Any] | None = None,
 ) -> Path:
     """Derive a new accounting run without recollection or changing its source."""
     source, snapshots = _resume_source(source)
@@ -2340,6 +2358,16 @@ def _prepare_repair_run(
             "analyzer_cache_path": "analyzer-cache-used.jsonl",
             "analyzer_cache_sha256": cache_digest,
         }
+        if scoped_recovery is not None:
+            _write_snapshot(target / "repair-fixture/analyzer-cache-used.jsonl", cache_content,
+                            label="immutable scoped retry source cache")
+    if scoped_recovery is not None:
+        (target / "scoped-recovery").mkdir()
+        for name, content in scoped_recovery["files"].items():
+            _write_snapshot(target / "scoped-recovery" / name, content, label="scoped retry immutable input")
+        cache_provenance["scoped_recovery_artifacts"] = {
+            name: hashlib.sha256(content).hexdigest() for name, content in scoped_recovery["files"].items()
+        }
     report = dict(source_report)
     report.update(run_id=target.name, repair_of_run_id=source.name)
     _write_json(target / "run-report.json", report)
@@ -2395,7 +2423,7 @@ def _repair_analysis_fixture(repair: Path) -> Path:
             raise ReviewRunError("repair analyzer cache path differs")
         cache_expected = str(lineage.get("analyzer_cache_sha256") or "")
         source_cache = source / cache_relative
-        repair_cache = repair / cache_relative
+        repair_cache = repair / ("repair-fixture/analyzer-cache-used.jsonl" if lineage.get("scoped_recovery_artifacts") is not None else cache_relative)
         if (
             len(cache_expected) != 64
             or not repair_cache.is_file()
@@ -2406,9 +2434,50 @@ def _repair_analysis_fixture(repair: Path) -> Path:
     return fixture
 
 
+def _scoped_repair_inputs(repair: Path, *, source_dir: Path | None = None) -> dict[str, Any] | None:
+    """Revalidate immutable copied inputs; resume never depends on external recovery."""
+    lineage = _read_json(repair / "repair-source.json")
+    bindings = lineage.get("scoped_recovery_artifacts")
+    if bindings is None:
+        if (repair / "scoped-recovery").exists():
+            raise ReviewRunError("scoped retry immutable input binding is missing")
+        return None
+    if not isinstance(bindings, dict) or set(bindings) != set(clockify_scoped_semantic_recovery.RECOVERY_INPUT_FILES):
+        raise ReviewRunError("scoped retry immutable input bindings differ")
+    for name, expected in bindings.items():
+        if _file_sha256(repair / "scoped-recovery" / name, label="scoped retry input").removeprefix("sha256:") != expected:
+            raise ReviewRunError("scoped retry immutable input changed")
+    source = (source_dir if source_dir is not None else
+              _run_child(RUNS / str(lineage.get("source_run_id", "")), label="scoped retry source"))
+    if source.name != lineage.get("source_run_id"):
+        raise ReviewRunError("scoped retry source identity differs")
+    analysis = _read_json(repair / "scoped-recovery/semantic-analysis.json")
+    targets = _retry_provenance_digests(analysis["failed_review_retry"])
+    verified = clockify_scoped_semantic_recovery.validate_cached_recovery(source, repair / "scoped-recovery", targets)
+    retry_cache = repair / "analyzer-cache-retry.jsonl"
+    if retry_cache.exists() and _read_snapshot_source(retry_cache, label="scoped retry copied seed") != verified["files"]["analyzer-response-cache.jsonl"]:
+        raise ReviewRunError("scoped retry cache seed changed")
+    return verified
+
+
+def _configure_scoped_retry(args: argparse.Namespace, verified: Mapping[str, Any]) -> None:
+    if args.retry_review_digest is not None and tuple(args.retry_review_digest) != tuple(verified["target_digests"]):
+        raise ReviewRunError("scoped retry selected failed groups differ")
+    args.retry_failed_reviews = True
+    args.retry_review_digest = tuple(verified["target_digests"])
+    args._scoped_retry_selected_ids = verified["selected_evidence_ids"]
+    args._scoped_retry_mode = verified["mode"]
+
+
 def _finalize_repair_completion(run_dir: Path) -> collector_receipts.SliceCompletionBundle:
     """Seal derived output without replacing any collector/backlog receipt."""
     lineage = _read_json(run_dir / "repair-source.json")
+    scoped_inputs = _scoped_repair_inputs(run_dir)
+    if scoped_inputs is not None:
+        provenance = _read_json(run_dir / "semantic-analysis.json").get("failed_review_retry", {})
+        if (provenance.get("selected_evidence_ids") != scoped_inputs["selected_evidence_ids"]
+            or provenance.get("selected_scope_digest") != scoped_inputs["selected_scope_digest"]):
+            raise ReviewRunError("scoped retry derived selected scope differs")
     if not isinstance(lineage, Mapping) or (
         ("source_corrections_sha256" in lineage)
         != ("repair_corrections_sha256" in lineage)
@@ -2948,6 +3017,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--retry-failed-reviews", action="store_true", help="Re-analyze selected source-bound failed semantic reviews in one repair run.")
     parser.add_argument("--retry-review-digest", action="append", help="Exact frt- digest of one failed source evidence-ID set; repeat for multiple targets.")
+    parser.add_argument("--scoped-recovery-from", type=Path, help="Rebuild one verified semantic-only recovery in a repair using sealed cache only; never infer.")
     parser.add_argument(
         "--recover-source-debt-from", type=Path,
         help="Recollect one exact incomplete source from a verified immutable parent run.",
@@ -3022,6 +3092,11 @@ def _process_run(
         accounting_command.extend(["--failed-review-retry-source", str(retry_source)])
         for digest in args.retry_review_digest:
             accounting_command.extend(["--failed-review-retry-digest", digest])
+        selected_ids = getattr(args, "_scoped_retry_selected_ids", None)
+        if selected_ids is not None:
+            accounting_command.extend(["--failed-review-retry-cache-only", "--failed-review-retry-scoped-mode", args._scoped_retry_mode])
+            for evidence_id in selected_ids:
+                accounting_command.extend(["--failed-review-retry-selected-evidence-id", evidence_id])
     analysis_fixture = (
         replay_analysis_fixture or repair_analysis_fixture or frozen_analysis_fixture or args.analysis_fixture
     )
@@ -3416,6 +3491,9 @@ def main(argv: list[str] | None = None) -> int:
         except work_accounting_pipeline.WorkAccountingError as exc:
             print(f"clockify review run: {exc}", file=sys.stderr)
             return 2
+    if args.scoped_recovery_from is not None and (not args.retry_failed_reviews or args.repair_from is None):
+        print("clockify review run: scoped recovery requires --repair-from and exact failed-review retry targets", file=sys.stderr)
+        return 2
     supplied_reconciliation_overrides = {
         option for option in reconciliation_options
         if _option_was_supplied(raw_argv, option)
@@ -3526,6 +3604,12 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     elif args.repair_from:
         try:
+            scoped_recovery = None
+            if args.scoped_recovery_from is not None:
+                if supplied_reconciliation_overrides:
+                    raise ReviewRunError("scoped cached retry cannot override reconciliation inputs")
+                scoped_recovery = clockify_scoped_semantic_recovery.validate_cached_recovery(
+                    args.repair_from, args.scoped_recovery_from, args.retry_review_digest)
             repair = _prepare_repair_run(
                 args.repair_from,
                 routing_override=(
@@ -3538,6 +3622,7 @@ def main(argv: list[str] | None = None) -> int:
                     if "--corrections" in supplied_reconciliation_overrides
                     else None
                 ),
+                scoped_recovery=scoped_recovery,
             )
             run_dirs = (repair,)
             source_fixture = _repair_analysis_fixture(repair)
@@ -3547,7 +3632,7 @@ def main(argv: list[str] | None = None) -> int:
                 retry_cache = repair / "analyzer-cache-retry.jsonl"
                 _write_snapshot(
                     retry_cache,
-                    _read_snapshot_source(
+                    scoped_recovery["files"]["analyzer-response-cache.jsonl"] if scoped_recovery is not None else _read_snapshot_source(
                         repair / "analyzer-cache-used.jsonl",
                         label="failed-review retry source cache",
                     ),
@@ -3556,15 +3641,21 @@ def main(argv: list[str] | None = None) -> int:
                 args._failed_review_retry_source = source_fixture
                 args._repair_analysis_fixture = None
                 args._repair_analyzer_cache = retry_cache
+                if scoped_recovery is not None:
+                    _configure_scoped_retry(args, _scoped_repair_inputs(repair))
             else:
                 args._repair_analysis_fixture = source_fixture
                 args._repair_analyzer_cache = None
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError, json.JSONDecodeError, semantic_analyzer.AnalyzerError, work_accounting_pipeline.WorkAccountingError) as exc:
             print(f"clockify review run: cannot prepare repair: {exc}", file=sys.stderr)
             return 2
     elif args.resume_from:
         try:
             source, snapshots = _resume_source(args.resume_from)
+            if (source / "repair-source.json").is_file():
+                scoped_inputs = _scoped_repair_inputs(source)
+                if scoped_inputs is not None:
+                    _configure_scoped_retry(args, scoped_inputs)
             if args.retry_failed_reviews:
                 if not (source / "repair-source.json").is_file():
                     raise ReviewRunError("failed-review retry resume requires an existing repair child")
@@ -3629,6 +3720,9 @@ def main(argv: list[str] | None = None) -> int:
                 if existing is not None:
                     print(existing)
                     return 0
+                if (source / "repair-source.json").exists():
+                    args._repair_analysis_fixture = _repair_analysis_fixture(source)
+                    args._repair_analyzer_cache = None
             run_dirs = (source,)
             args._resume_snapshots = snapshots
         except (

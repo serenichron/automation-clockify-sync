@@ -58,6 +58,111 @@ def _timing_report(activities, events, proposals):
     return {"schema_version": "semantic-recovery-timing-review/v1", "temporal_overlap_is_not_financial_credit": True, "capacities_are_not_effort_estimates": True, "new_proposal_count": 0, "activities": rows}
 
 
+RECOVERY_INPUT_FILES = (
+    "recovery-receipt.json", "recovery-plan.json", "source-scope-input.json",
+    "source-semantic-analysis.json", "preserved-source-proposals.json",
+    "semantic-analysis.json", "analyzer-response-cache.jsonl", "analyzer-cache-used.jsonl",
+)
+
+
+def validate_cached_recovery(source_dir, recovery_dir, failed_review_digests):
+    """Reconstruct a source-bound recovery from sealed cache, never provider output."""
+    try:
+        from scripts import clockify_review_run as review
+    except ModuleNotFoundError:
+        import clockify_review_run as review
+    source_dir, recovery_dir = Path(source_dir), Path(recovery_dir)
+    if source_dir.is_symlink() or recovery_dir.is_symlink():
+        raise ValueError("cached recovery roots must not be symlinks")
+    source_dir, recovery_dir = source_dir.resolve(strict=True), recovery_dir.resolve(strict=True)
+    files = {name: review._read_snapshot_source(recovery_dir / name, label="cached recovery input")
+             for name in RECOVERY_INPUT_FILES}
+    receipt = json.loads(files["recovery-receipt.json"])
+    if not isinstance(receipt, dict):
+        raise ValueError("cached recovery receipt must be an object")
+    source_bytes = review._read_snapshot_source(source_dir / "semantic-analysis.json", label="cached recovery source")
+    proposal_bytes = review._read_snapshot_source(source_dir / "proposals.json", label="cached recovery proposals")
+    source_sha = hashlib.sha256(source_bytes).hexdigest()
+    if (receipt.get("schema_version") != "semantic-only-recovery-receipt/v1"
+        or Path(str(receipt.get("source_run", ""))).resolve() != source_dir
+        or receipt.get("source_semantic_sha256") != source_sha
+        or files["source-semantic-analysis.json"] != source_bytes
+        or files["preserved-source-proposals.json"] != proposal_bytes
+        or receipt.get("source_proposals_sha256") != hashlib.sha256(proposal_bytes).hexdigest()
+        or receipt.get("scope_file_sha256") != hashlib.sha256(files["source-scope-input.json"]).hexdigest()
+        or receipt.get("new_proposal_count") != 0 or receipt.get("accounting_performed") is not False
+        or receipt.get("external_writes") is not False
+        or receipt.get("preserved_source_proposal_count") != len(json.loads(proposal_bytes))):
+        raise ValueError("cached recovery source or receipt binding differs")
+    selected = json.loads(files["source-scope-input.json"])
+    scope_key = receipt.get("scope_key")
+    if not isinstance(scope_key, str) or not scope_key:
+        raise ValueError("cached recovery selected scope is missing")
+    for key in scope_key.split("."):
+        if not isinstance(selected, dict) or key not in selected:
+            raise ValueError("cached recovery selected scope key is absent")
+        selected = selected[key]
+    source, analysis = json.loads(source_bytes), json.loads(files["semantic-analysis.json"])
+    if not isinstance(source, dict) or not isinstance(analysis, dict):
+        raise ValueError("cached recovery semantic inputs must be objects")
+    provenance = analysis.get("failed_review_retry", {})
+    if not isinstance(provenance, dict):
+        raise ValueError("cached recovery retry provenance must be an object")
+    digests = pipeline._canonical_retry_digests(failed_review_digests)
+    if review._retry_provenance_digests(provenance) != digests:
+        raise ValueError("cached recovery original failed groups differ")
+    seed = files["analyzer-response-cache.jsonl"]
+    original_cache = review._read_snapshot_source(source_dir / "analyzer-cache-used.jsonl", label="cached recovery source cache")
+    if not seed.startswith(original_cache):
+        raise ValueError("cached recovery seed does not preserve sealed source cache")
+    cache = semantic.AnalyzerResponseCache(recovery_dir / "analyzer-response-cache.jsonl")
+    endpoints = [endpoint for endpoint in cache.sealed_endpoints()
+                 if (endpoint.model, endpoint.revision) == semantic.CURRENT_LIVE_FLASH_ROUTE]
+    if len(endpoints) != 1:
+        raise ValueError("cached recovery lacks one exact approved Flash route")
+    primary = endpoints[0]
+    ledger, all_events = pipeline.load_ledger(source_dir / "evidence/evidence-ledger.json")
+    members = pipeline.meeting_reconciliation.manifest_member_identities(ledger.manifest.document())
+    events, _noise = pipeline._analysis_events(all_events, members)
+    routing = pipeline._read_json(source_dir / "routing.json")
+    events = pipeline._with_semantic_route_hints(events, routing)
+    targets = pipeline._failed_review_retry_targets(source, events, cache.path, digests)
+    options = dict(primary=primary, cache=cache, review_taxonomy=pipeline._semantic_review_taxonomy(routing),
+                   targets=targets, source_semantic_sha256=source_sha, selected_evidence_ids=selected,
+                   scoped_review_mode=provenance.get("mode"), private_text_approved=True)
+    plan = pipeline.run_scoped_failed_review_retry(source, events, plan_only=True, **options)
+    captured_plan = json.loads(files["recovery-plan.json"])
+    if not isinstance(captured_plan, dict):
+        raise ValueError("cached recovery request plan must be an object")
+    if (any(plan[key] != captured_plan.get(key) for key in plan)
+        or plan["selected_scope_digest"] != receipt.get("selected_scope_digest")
+        or plan["selected_scope_digest"] != provenance.get("selected_scope_digest")
+        or sorted(selected) != provenance.get("selected_evidence_ids")
+        or plan["selected_event_count"] != receipt.get("selected_event_count")
+        or len(plan["requests"]) != receipt.get("request_count")):
+        raise ValueError("cached recovery exact request plan or selected scope differs")
+    def refuse_transport(*_args):
+        raise ValueError("cached recovery cache miss; inference is prohibited")
+    reconstructed = pipeline.run_scoped_failed_review_retry(source, events, transport=refuse_transport, **options)
+    if any(reconstructed.get(key) != analysis.get(key) for key in ("activities", "exceptions", "omissions", "failed_review_retry")):
+        raise ValueError("cached recovery semantic output differs from sealed decisions")
+    snapshot = analysis.get("analyzer_cache", {}).get("snapshot", {})
+    records = cache.records_for_snapshot(analysis.get("analyzer_cache", {}).get("records", []), configured_endpoints=(primary,))
+    used = b"".join((semantic.canonical_json(record) + "\n").encode() for record in records)
+    if (used != files["analyzer-cache-used.jsonl"]
+        or snapshot != {"path": "analyzer-cache-used.jsonl", "record_count": len(records), "sha256": hashlib.sha256(used).hexdigest()}
+        or reconstructed["analyzer_cache"]["records"] != analysis["analyzer_cache"]["records"]):
+        raise ValueError("cached recovery used-cache closure differs")
+    classified = [eid for section in ("activities", "exceptions", "omissions") for row in reconstructed[section] for eid in row["evidence_ids"]]
+    if (len(classified) != len(set(classified)) or set(classified) != {event["evidence_id"] for event in events}
+        or reconstructed["activities"][:len(source["activities"])] != source["activities"]):
+        raise ValueError("cached recovery changed source assertions or evidence conservation")
+    return {"files": files, "analysis": reconstructed, "selected_evidence_ids": sorted(selected),
+            "target_digests": digests, "selected_scope_digest": plan["selected_scope_digest"],
+            "mode": plan["mode"], "request_count": len(plan["requests"]),
+            "residual_event_counts": plan["residual_event_counts"]}
+
+
 def run(args):
     source_dir = args.source_run.resolve()
     source_path = source_dir / "semantic-analysis.json"

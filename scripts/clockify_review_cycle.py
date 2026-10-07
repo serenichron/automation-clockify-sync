@@ -23,6 +23,12 @@ import sys
 from typing import Any, Iterator, Mapping
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+# systemd executes this file directly with cwd=/ and no PYTHONPATH.  Make
+# package imports (including lazy imports in native-credit dependencies) resolve
+# against this immutable release rather than the caller's working directory.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 try:
     from scripts.autopilot_process import ChildTimeoutConfig, run_child_bounded
     from scripts import (
@@ -273,8 +279,14 @@ def load_config(path: Path) -> dict[str, Any]:
         raise CycleError("config must be valid JSON") from exc
     if not isinstance(config, dict) or not _REQUIRED.issubset(config):
         raise CycleError("config is missing required review-cycle fields")
-    if set(config) - (_REQUIRED | {"runs_dir", "catchup_until", "max_slices", "total_child_budget_seconds", "monthly_unresolved_alias_proof"}):
+    if set(config) - (_REQUIRED | {"runs_dir", "catchup_until", "max_slices", "total_child_budget_seconds", "monthly_unresolved_alias_proof", "native_credit_input"}):
         raise CycleError("config contains unsupported review-cycle fields")
+    if "native_credit_input" in config:
+        handle = config["native_credit_input"]
+        if (not isinstance(handle, Mapping) or set(handle) != {"path", "sha256"}
+                or not isinstance(handle["path"], str) or not _valid_digest(handle["sha256"])):
+            raise CycleError("native credit input must be an exact hash-bound handle")
+        _canonical_runtime_path(handle["path"], label="native credit input")
     if not isinstance(config["calendly_optional"], bool):
         raise CycleError("calendly_optional must be boolean")
     try:
@@ -1316,6 +1328,10 @@ def _stage_from_state(
     stored = record.get(key)
     if stored is None:
         return None
+    if key == "source" and "native_credit_transition" in record:
+        transition = _verified_native_credit_transition(config, record, since, until)
+        if transition.get("adopted_source") is not None:
+            expected_snapshot_digests = transition["adopted_source"]["snapshot_digests"]
     if not isinstance(stored, Mapping) or not isinstance(stored.get("result_path"), str):
         raise CycleError(f"stored {key} stage is invalid")
     stored_runtime_digest = stored.get("runtime_identity_digest")
@@ -1794,11 +1810,15 @@ def _collector_ancestor_from_repair(
         }
         cache_keys = {"analyzer_cache_path", "analyzer_cache_sha256"}
         correction_keys = {"source_corrections_sha256", "repair_corrections_sha256"}
+        native_keys = {"clockify_native_checkpoint", "clockify_native_artifact_digests"}
+        scoped_keys = {"scoped_recovery_artifacts"}
         if not isinstance(lineage, dict) or (
-            set(lineage) not in (
+            set(lineage) - native_keys - scoped_keys not in (
                 base_keys, base_keys | cache_keys, base_keys | correction_keys,
                 base_keys | cache_keys | correction_keys,
-            ) or lineage.get("schema_version") != 1
+            ) or set(lineage) & native_keys not in (set(), native_keys)
+            or (scoped_keys <= set(lineage) and not cache_keys <= set(lineage))
+            or lineage.get("schema_version") != 1
         ):
             raise CycleError("repair provenance schema is invalid")
         source_id = lineage["source_run_id"]
@@ -1820,6 +1840,14 @@ def _collector_ancestor_from_repair(
         )
         if _digest(parent_bundle_path) != lineage["source_completion_sha256"]:
             raise CycleError("repair source completion digest differs")
+        try:
+            clockify_review_run._scoped_repair_inputs(current, source_dir=parent)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise CycleError("repair scoped recovery provenance differs") from exc
+        try:
+            clockify_review_run._verified_native_checkpoint_copy(parent, current, lineage)
+        except (OSError, ValueError) as exc:
+            raise CycleError("repair native checkpoint provenance differs") from exc
         try:
             parent_bundle = collector_receipts.load_completion_bundle(
                 parent_bundle_path, run_dir=parent,
@@ -2006,6 +2034,242 @@ def _verify_credit_adoption_transition(
     ancestor, _bundle = _collector_ancestor_from_repair(config, source, bundle)
     if ancestor == source or _digest(ancestor / "review-corrections.jsonl") != frozen_digest:
         raise CycleError("credit adoption does not descend from frozen corrections")
+
+
+def _native_credit_plan(config: Mapping[str, Any], source: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Produce recording-only credits from an explicit finite original-proof packet."""
+    if "native_credit_input" not in config:
+        return None
+    from scripts import clockify_source_adoptions as adoptions, clockify_checkpoint_snapshot
+    from scripts import work_accounting_pipeline as pipeline
+    try:
+        if source.get("coverage", {}).get("status") != "complete" or source["coverage"].get("incomplete_sources") != []:
+            raise ValueError("native credit source is not complete")
+        cache: dict[tuple[str, str], bytes] = {}
+        packet = json.loads(adoptions._capture(config["native_credit_input"], cache))
+        if (not isinstance(packet, dict) or set(packet) != {"schema_version", "posted"}
+                or packet["schema_version"] != "clockify-native-credit-input/v1"
+                or not isinstance(packet["posted"], list) or len(packet["posted"]) > 512):
+            raise ValueError("finite native credit input shape differs")
+        run_dir = _canonical_runtime_path(source["run_dir"], label="native credit source")
+        proposals = _json_file(run_dir / "proposals.json", "native credit proposals")
+        if _digest(run_dir / "proposals.json") != source["proposals_digest"]:
+            raise ValueError("native credit source proposals differ")
+        report, artifacts = collector_receipts.verified_run_native_checkpoint(run_dir)
+        if not artifacts:
+            raise ValueError("native credit requires sealed completed collection proof")
+        metadata = report["clockify_native_checkpoint"]
+        request = metadata["request"]
+        if (request["workspace_id"], request["user_id"]) != (config["workspace_id"], config["member_id"]):
+            raise ValueError("native credit target differs from collection")
+        proof = clockify_checkpoint_snapshot.load_checkpoint_snapshot(run_dir / collector_receipts.NATIVE_CHECKPOINT_PREFIX,
+            workspace_id=request["workspace_id"], user_id=request["user_id"],
+            since=dt.datetime.fromisoformat(request["since_utc"].replace("Z", "+00:00")),
+            until=dt.datetime.fromisoformat(request["until_utc"].replace("Z", "+00:00")),
+            expected_manifest_sha256=metadata["manifest_sha256"])
+        ledger_path = run_dir / "evidence/evidence-ledger.json"
+        if _digest(ledger_path) != source["artifact_digests"]["evidence_ledger"]:
+            raise ValueError("native credit ledger differs from completed source")
+        ledger_doc = _json_file(ledger_path, "native credit ledger")
+        current_by_recording: dict[tuple[str, str, str], list[str]] = {}
+        for proposal in proposals:
+            review_id = stable_review_id(proposal)
+            events = adoptions._source_events(proposal, ledger_doc)
+            try:
+                identity = adoptions._native_meeting_identity(events, proposal)
+            except adoptions.AdoptionError:
+                continue  # Session work and ambiguous recordings never imply equivalence.
+            current_by_recording.setdefault(identity, []).append(review_id)
+        priors: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+        native_ids: set[str] = set()
+        for item in packet["posted"]:
+            if not isinstance(item, dict) or set(item) != {"receipt", "prior_review_id", "clockify_entry_id", "artifacts"}:
+                raise ValueError("native credit posted handle shape differs")
+            native_id = item["clockify_entry_id"]
+            if not isinstance(native_id, str) or not native_id or native_id in native_ids:
+                raise ValueError("native credit repeats an entry")
+            native_ids.add(native_id)
+            prior = adoptions.verify_prior_native_proof(item["artifacts"], item["prior_review_id"], native_id,
+                workspace_id=config["workspace_id"], member_id=config["member_id"], capture_cache=cache)
+            receipt = json.loads(adoptions._capture(item["receipt"], cache))
+            terminal = prior["native_confirmed"]
+            rows = [row for row in receipt["entries"] if row["review_id"] == item["prior_review_id"]]
+            if (receipt.get("schema_version") != "clockify-native-sheet-post-receipt/v1"
+                    or receipt.get("status") != "complete" or receipt.get("plan_digest") != terminal["plan_digest"]
+                    or receipt.get("approval_digest") != terminal["approval_digest"]
+                    or receipt.get("event_ledger_sha256") != item["artifacts"]["native_events"]["sha256"].removeprefix("sha256:")
+                    or len(rows) != 1 or rows[0].get("clockify_entry_id") != native_id
+                    or rows[0].get("payload_digest") != prior["payload_digest"]
+                    or rows[0].get("disposition") != terminal["disposition"]):
+                raise ValueError("native credit receipt differs from confirmed original POST")
+            entries = [entry for entry in proof.entries if entry.get("id") == native_id]
+            if len(entries) != 1 or not adoptions.current_live_matches(prior["payload"], entries[0],
+                    workspace_id=config["workspace_id"], member_id=config["member_id"], entry_id=native_id):
+                raise ValueError("native credit retained entry differs from current checkpoint")
+            try:
+                identity = adoptions._native_meeting_identity(prior["source_events"], prior["prior_proposal"])
+            except adoptions.AdoptionError:
+                continue
+            priors.setdefault(identity, []).append({key: item[key] for key in ("prior_review_id", "clockify_entry_id", "artifacts")})
+        credits = []
+        for identity, targets in current_by_recording.items():
+            if len(targets) != 1 or identity not in priors:
+                continue
+            current = adoptions._source(proposals, ledger_doc, targets[0])
+            start, end = pipeline._parse_dt(current["start"]), pipeline._parse_dt(current["end"])
+            matched = []
+            for prior_item in priors[identity]:
+                prior = adoptions.verify_prior_native_proof(prior_item["artifacts"], prior_item["prior_review_id"], prior_item["clockify_entry_id"],
+                    workspace_id=config["workspace_id"], member_id=config["member_id"], capture_cache=cache)
+                if max(start, pipeline._parse_dt(prior["payload"]["start"])) < min(end, pipeline._parse_dt(prior["payload"]["end"])):
+                    matched.append(prior_item)
+            if not matched:
+                continue
+            declaration = {"operation_anchor": "native-recording/" + _value_digest(identity).removeprefix("sha256:"),
+                "coverage_kind": "source_native_meeting_intersection", "current_review_ids": targets,
+                "artifacts": {"current_proposals": {"path": str(run_dir / "proposals.json"), "sha256": source["proposals_digest"]},
+                    "current_source_ledger": {"path": str(ledger_path), "sha256": source["artifact_digests"]["evidence_ledger"]}},
+                "prior_entries": matched}
+            credits.append(adoptions.build_recurring_credit(declaration, workspace_id=config["workspace_id"], member_id=config["member_id"]))
+        return {"credits": credits, "collection_snapshot": proof, "input_handle": dict(config["native_credit_input"]),
+                "checkpoint_sha256": metadata["manifest_sha256"]}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise CycleError("native credit input or source proof is invalid") from exc
+
+
+def _verified_native_credit_transition(config: Mapping[str, Any], record: Mapping[str, Any], since: str, until: str) -> dict[str, Any]:
+    """Verify correction ancestry before interpreting an adopted source snapshot."""
+    transition = record["native_credit_transition"]
+    if not isinstance(transition, dict):
+        raise CycleError("native credit transition is invalid")
+    body = {key: value for key, value in transition.items() if key != "transition_digest"}
+    required = {"schema_version", "since", "until", "original_source", "input_handle", "checkpoint_sha256"}
+    phases = ({"credits"}, {"corrections"}, {"corrections", "preparation_started"},
+        {"corrections", "preparation_started", "child_run_dir"},
+        {"corrections", "preparation_started", "child_run_dir", "adopted_source"})
+    if (transition.get("transition_digest") != _value_digest(body)
+            or set(body) - required not in phases or not required <= set(body)
+            or body.get("schema_version") != "clockify-cycle-native-credit/v1"
+            or body.get("since") != since or body.get("until") != until):
+        raise CycleError("native credit transition binding differs")
+    original = body["original_source"]
+    verified = _validate_stage(config, Path(original["result_path"]), since, until, replay=False,
+        expected_snapshot_digests=original["snapshot_digests"],
+        expected_runtime_digest=original.get("runtime_identity_digest"), historical_state_validation=True)
+    if verified != original:
+        raise CycleError("native credit original source changed")
+    report, _artifacts = collector_receipts.verified_run_native_checkpoint(Path(original["run_dir"]))
+    if body["checkpoint_sha256"] != report.get("clockify_native_checkpoint", {}).get("manifest_sha256"):
+        raise CycleError("native credit collection binding changed")
+    if body.get("adopted_source") is None and record.get("source") != original:
+        raise CycleError("native credit transition selected another original source")
+    adopted = body.get("adopted_source")
+    if adopted is not None:
+        if record.get("source") != adopted:
+            raise CycleError("native credit adopted source differs")
+        for name, digest in original["snapshot_digests"].items():
+            if name != "review-corrections.jsonl" and adopted["snapshot_digests"].get(name) != digest:
+                raise CycleError("native credit changed non-correction input")
+        _verify_credit_adoption_transition(config, Path(adopted["run_dir"]),
+            original["snapshot_digests"]["review-corrections.jsonl"], adopted["snapshot_digests"]["review-corrections.jsonl"])
+    return body
+
+
+def _adopt_native_credit(config: Mapping[str, Any], state: dict[str, Any], state_path: Path,
+        record: dict[str, Any], since: str, until: str, source: Mapping[str, Any], budget: list[float]) -> dict[str, Any]:
+    """Prepare once, resume one exact offline repair, then adopt before replay."""
+    from scripts import review_corrections, work_accounting_pipeline as pipeline
+    if "native_credit_transition" not in record:
+        plan = _native_credit_plan(config, source)
+        if plan is None or not plan["credits"]:
+            return dict(source)
+        if record.get("replay") is not None or record.get("replay_return") is not None:
+            raise CycleError("native credit cannot replace a source after replay started")
+        body = {"schema_version": "clockify-cycle-native-credit/v1", "since": since, "until": until,
+            "original_source": dict(source), "input_handle": plan["input_handle"], "checkpoint_sha256": plan["checkpoint_sha256"],
+            "credits": plan["credits"]}
+        record["native_credit_transition"] = {**body, "transition_digest": _value_digest(body)}
+        _persist_state(state_path, state, since, record)
+    body = _verified_native_credit_transition(config, record, since, until)
+    if body.get("adopted_source") is not None:
+        return dict(body["adopted_source"])
+    parent = Path(body["original_source"]["run_dir"])
+    expected_override = _path(config, "state_dir") / "native-credit-corrections" / f"{since}.jsonl"
+    if "credits" in body:
+        # The sealed plan is persisted before append. A crash resumes its exact
+        # prefix without reopening original posting handles or duplicating credit.
+        override = expected_override
+        parent_bytes = clockify_review_run._read_snapshot_source(parent / "review-corrections.jsonl", label="native credit parent corrections")
+        if not override.exists() and not override.is_symlink():
+            override.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            clockify_review_run._write_snapshot(override, parent_bytes, label="native credit correction override")
+        existing_bytes = clockify_review_run._read_snapshot_source(override, label="native credit pending correction override")
+        if not existing_bytes.startswith(parent_bytes):
+            raise CycleError("native credit correction override is not the original prefix")
+        parent_records = review_corrections._read_log(parent / "review-corrections.jsonl")
+        tail = review_corrections._read_log(override)[len(parent_records):]
+        if len(tail) > len(body["credits"]) or any(review_corrections._without_integrity(row) != credit
+                for row, credit in zip(tail, body["credits"])):
+            raise CycleError("native credit pending correction prefix differs from sealed plan")
+        report, _ = collector_receipts.verified_run_native_checkpoint(parent)
+        from scripts import clockify_checkpoint_snapshot
+        metadata = report["clockify_native_checkpoint"]
+        request = metadata["request"]
+        proof = clockify_checkpoint_snapshot.load_checkpoint_snapshot(parent / collector_receipts.NATIVE_CHECKPOINT_PREFIX,
+            workspace_id=request["workspace_id"], user_id=request["user_id"],
+            since=dt.datetime.fromisoformat(request["since_utc"].replace("Z", "+00:00")),
+            until=dt.datetime.fromisoformat(request["until_utc"].replace("Z", "+00:00")), expected_manifest_sha256=body["checkpoint_sha256"])
+        proposals = _json_file(parent / "proposals.json", "native credit proposals")
+        _ledger, events = pipeline.load_ledger(parent / "evidence/evidence-ledger.json")
+        for credit in body["credits"]:
+            review_corrections.append_verified_posted_credit(override, credit, runs_root=_runs_dir(config),
+                current_proposals=proposals, existing_blocks=pipeline._existing_blocks(events), collection_snapshot=proof)
+        body.pop("credits")
+        body["corrections"] = {"path": str(override), "sha256": _digest(override)}
+        record["native_credit_transition"] = {**body, "transition_digest": _value_digest(body)}
+        _persist_state(state_path, state, since, record)
+    override = _canonical_runtime_path(body["corrections"]["path"], label="native credit corrections")
+    if override != expected_override or _digest(override) != body["corrections"]["sha256"]:
+        raise CycleError("native credit correction override changed")
+    if "child_run_dir" not in body:
+        if body.get("preparation_started"):
+            raise CycleError("native credit interrupted before repair handle was sealed; explicit recovery required")
+        body["preparation_started"] = True
+        record["native_credit_transition"] = {**body, "transition_digest": _value_digest(body)}
+        _persist_state(state_path, state, since, record)
+        clockify_review_run._configure_runs_root(_runs_dir(config))
+        child = clockify_review_run._prepare_repair_run(parent, corrections_override=override)
+        body["child_run_dir"] = str(child)
+        record["native_credit_transition"] = {**body, "transition_digest": _value_digest(body)}
+        _persist_state(state_path, state, since, record)
+    child = _canonical_runtime_path(body["child_run_dir"], label="native credit repair child")
+    if child.parent != _runs_dir(config):
+        raise CycleError("native credit child is outside configured runs")
+    lineage = _json_file(child / "repair-source.json", "native credit child provenance")
+    if lineage.get("source_run_id") != parent.name or _digest(child / "review-corrections.jsonl") != body["corrections"]["sha256"]:
+        raise CycleError("native credit repair is not the exact prepared child")
+    clockify_review_run._repair_analysis_fixture(child)
+    result_path = clockify_review_run._adopt_completed_resume(child)
+    if result_path is None:
+        command = [sys.executable, str(_path(config, "root") / "scripts/clockify_review_run.py"),
+            "--runs-root", str(_runs_dir(config)), "--resume-from", str(child),
+            "--state", str(_path(config, "state_dir") / "review-state.json")]
+        result = _run_budgeted_child(command, root=_path(config, "root"), runs_dir=_runs_dir(config), budget=budget, cap=2700, grace=30)
+        if result.timed_out or result.returncode:
+            raise CycleError("native credit repair unfinished; resume exact recorded child")
+        result_path = _result(result.stdout, _runs_dir(config))
+        if result_path.parent != child:
+            raise CycleError("native credit repair returned another child")
+    expected = dict(body["original_source"]["snapshot_digests"])
+    expected["review-corrections.jsonl"] = body["corrections"]["sha256"]
+    adopted = _validate_stage(config, result_path, since, until, replay=False, expected_snapshot_digests=expected)
+    _verify_credit_adoption_transition(config, child,
+        body["original_source"]["snapshot_digests"]["review-corrections.jsonl"], body["corrections"]["sha256"])
+    body["adopted_source"] = adopted
+    record["source"] = adopted
+    record["native_credit_transition"] = {**body, "transition_digest": _value_digest(body)}
+    _persist_state(state_path, state, since, record)
+    return adopted
 
 
 def _interval_from_stage(
@@ -4067,6 +4331,13 @@ def _run_slice(
     _finish_runner_attempt(record)
     _persist_state(state_path, state, since, record)
 
+    try:
+        source = _adopt_native_credit(config, state, state_path, record, since, until, source, budget)
+    except _BudgetExhausted:
+        record["status"] = "source_verified"
+        _persist_state(state_path, state, since, record)
+        return {"status": "incomplete", "reason": "total_child_budget_exhausted", "slice": {"since": since, "until": until}}
+    expected_snapshots = source["snapshot_digests"]
     replay = _stage_from_state(
         config, record, "replay", since, until, replay=True,
         expected_snapshot_digests=source["snapshot_digests"],

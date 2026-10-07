@@ -22,6 +22,11 @@ import sys
 import tempfile
 from typing import Any, Iterable, Mapping, Sequence
 
+# Standalone accounting children must resolve lazy proof-validation imports
+# from this release even with cwd=/ and no inherited PYTHONPATH.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 try:
     from scripts import caveman_renderer
     from scripts import clockify_sync_collect as collector
@@ -817,12 +822,17 @@ def analyze_ledger(
     review_routing: Mapping[str, Any] | None = None,
     failed_review_retry_source: Path | None = None,
     failed_review_retry_digest: str | Sequence[str] | None = None,
+    failed_review_retry_selected_evidence_ids: Sequence[str] | None = None,
+    failed_review_retry_cache_only: bool = False,
+    failed_review_retry_scoped_mode: str = "fresh",
 ) -> dict[str, Any]:
     known = {str(event.get("evidence_id")) for event in events}
     if (failed_review_retry_source is None) != (failed_review_retry_digest is None):
         raise WorkAccountingError("failed-review retry source and target must be paired")
     if failed_review_retry_source is not None and analysis_fixture is not None:
         raise WorkAccountingError("failed-review retry cannot use an analysis fixture")
+    if (failed_review_retry_cache_only or failed_review_retry_selected_evidence_ids is not None) and failed_review_retry_source is None:
+        raise WorkAccountingError("scoped cached retry requires an exact source and targets")
     if analysis_fixture:
         fixture = _read_json(analysis_fixture)
         raw_activities = fixture.get("activities", [])
@@ -893,7 +903,16 @@ def analyze_ledger(
             if key in fixture:
                 result[key] = copy.deepcopy(fixture[key])
         return result
-    primary = semantic_analyzer.AnalyzerEndpoint.from_env(
+    sealed_cache = None
+    if failed_review_retry_cache_only:
+        if analyzer_cache_path is None or failed_review_retry_selected_evidence_ids is None:
+            raise WorkAccountingError("cache-only retry requires sealed cache and selected scope")
+        sealed_cache = semantic_analyzer.AnalyzerResponseCache(analyzer_cache_path)
+        endpoints = [endpoint for endpoint in sealed_cache.sealed_endpoints()
+                     if (endpoint.model, endpoint.revision) == semantic_analyzer.CURRENT_LIVE_FLASH_ROUTE]
+        if len(endpoints) != 1:
+            raise WorkAccountingError("cache-only retry lacks one exact approved Flash route")
+    primary = endpoints[0] if sealed_cache is not None else semantic_analyzer.AnalyzerEndpoint.from_env(
         "CLOCKIFY_ANALYZER_PRIMARY",
         default_model=semantic_analyzer.DEFAULT_PRIMARY_MODEL,
     )
@@ -915,7 +934,7 @@ def analyze_ledger(
         )
         retry_cache_sha256 = retry_source_document["analyzer_cache"]["snapshot"]["sha256"]
     fallback = semantic_analyzer.AnalyzerEndpoint.from_env("CLOCKIFY_ANALYZER_FALLBACK")
-    cache = (
+    cache = sealed_cache or (
         semantic_analyzer.AnalyzerResponseCache(
             analyzer_cache_path, record_review_diagnostics=retry_targets is not None,
         )
@@ -943,7 +962,7 @@ def analyze_ledger(
                     "confidence": "medium",
                 })
     hinted_events = _with_semantic_route_hints(events, routing)
-    scoped_retry = retry_targets is not None and any(
+    scoped_retry = retry_targets is not None and (failed_review_retry_selected_evidence_ids is not None or any(
         isinstance(row, Mapping)
         and tuple(sorted(str(value) for value in row.get("evidence_ids", []))) in retry_targets
         and (
@@ -959,14 +978,19 @@ def analyze_ledger(
             )
         )
         for row in retry_source_document.get("exceptions", [])
-    )
+    ))
     if scoped_retry:
+        def cache_only_transport(*_args):
+            raise WorkAccountingError("scoped retry cache miss; inference is prohibited")
         result = run_scoped_failed_review_retry(
             retry_source_document, hinted_events, primary=primary, cache=cache,
             review_taxonomy=review_taxonomy or [], targets=retry_targets,
             source_semantic_sha256=hashlib.sha256(
                 failed_review_retry_source.read_bytes()
             ).hexdigest(),
+            selected_evidence_ids=failed_review_retry_selected_evidence_ids,
+            scoped_review_mode=failed_review_retry_scoped_mode,
+            **({"transport": cache_only_transport, "private_text_approved": True} if failed_review_retry_cache_only else {}),
         )
     else:
         result = semantic_analyzer.analyze_tiered(
@@ -1988,7 +2012,7 @@ def _session_timing_contexts(
         source = event.get("source_ref") or {}
         attrs = _attributes(event)
         if (
-            source_type not in {"hermes_db_sessions_event", "hermes_sessions_event", "claude_bursts_event"}
+            source_type not in {"hermes_db_sessions_event", "hermes_sessions_event", "claude_bursts_event", "codex_sessions_event"}
             or source.get("source_type") != source_type.removesuffix("_event")
             or not source.get("machine") or not source.get("session_id")
             or attrs.get("role") != "user"
@@ -2889,6 +2913,9 @@ def run_accounting(
     analyzer_workers: int | None = None,
     failed_review_retry_source: Path | None = None,
     failed_review_retry_digest: str | Sequence[str] | None = None,
+    failed_review_retry_selected_evidence_ids: Sequence[str] | None = None,
+    failed_review_retry_cache_only: bool = False,
+    failed_review_retry_scoped_mode: str = "fresh",
 ) -> dict[str, Any]:
     ledger_path = run_dir / "evidence" / "evidence-ledger.json"
     ledger, all_events = load_ledger(ledger_path)
@@ -2935,6 +2962,9 @@ def run_accounting(
         review_routing=routing,
         failed_review_retry_source=failed_review_retry_source,
         failed_review_retry_digest=failed_review_retry_digest,
+        failed_review_retry_selected_evidence_ids=failed_review_retry_selected_evidence_ids,
+        failed_review_retry_cache_only=failed_review_retry_cache_only,
+        failed_review_retry_scoped_mode=failed_review_retry_scoped_mode,
     )
     if analysis_fixture is None and analyzer_cache_path is not None:
         analysis["analyzer_cache"]["snapshot"] = _seal_analyzer_cache_snapshot(
@@ -3249,8 +3279,8 @@ def run_accounting(
             evidence_id = str(event["evidence_id"])
             if evidence_id not in session_timing_contexts:
                 continue
-            if event.get("source_type") == "claude_bursts_event" and not any(
-                other.get("source_type") == "claude_bursts_event"
+            if event.get("source_type") in {"claude_bursts_event", "codex_sessions_event"} and not any(
+                other.get("source_type") == event.get("source_type")
                 and semantic_analyzer._semantic_context_key(other) == semantic_analyzer._semantic_context_key(event)
                 and _attributes(other).get("role") == "assistant"
                 and _attributes(other).get("kind", "message") == "message"
@@ -3264,12 +3294,25 @@ def run_accounting(
             context = session_timing_contexts[evidence_id]
             timing_contexts[context["pool_id"]] = context
         intervals = _activity_observed_intervals(cited)
-        borrowed_timing_context = not intervals and bool(timing_contexts)
+        context_intervals = sorted(
+            (dict(context["interval"]) for context in timing_contexts.values()),
+            key=lambda interval: (interval["start"], interval["end"]),
+        )
+        cited_capacity = _interval_capacity_minutes(intervals)
+        requested_minutes = int((activity.get("effort") or {}).get("recommended_minutes") or 0)
+        # Codex result points often follow their human request by only seconds.
+        # Such a citation-local span must not suppress a larger paired human
+        # placement pool. This remains estimated, globally shared capacity,
+        # never an observed duration of the outcome or assistant runtime.
+        codex_under_capacity = (
+            bool(cited) and bool(timing_contexts)
+            and all(event.get("source_type") == "codex_sessions_event" for event in cited)
+            and requested_minutes > cited_capacity
+            and _interval_capacity_minutes(context_intervals) > cited_capacity
+        )
+        borrowed_timing_context = bool(timing_contexts) and (not intervals or codex_under_capacity)
         if borrowed_timing_context:
-            intervals = sorted(
-                (dict(context["interval"]) for context in timing_contexts.values()),
-                key=lambda interval: (interval["start"], interval["end"]),
-            )
+            intervals = context_intervals
             shared_timing_pool_ids.update(timing_contexts)
         observed_capacity = _interval_capacity_minutes(intervals)
         if not intervals or observed_capacity == 0:
@@ -3824,6 +3867,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--analyzer-workers", type=int)
     parser.add_argument("--failed-review-retry-source", type=Path)
     parser.add_argument("--failed-review-retry-digest", action="append")
+    parser.add_argument("--failed-review-retry-selected-evidence-id", action="append")
+    parser.add_argument("--failed-review-retry-cache-only", action="store_true")
+    parser.add_argument("--failed-review-retry-scoped-mode", default="fresh")
     return parser.parse_args(argv)
 
 
@@ -3842,6 +3888,9 @@ def main(argv: list[str] | None = None) -> int:
             analyzer_workers=args.analyzer_workers,
             failed_review_retry_source=args.failed_review_retry_source,
             failed_review_retry_digest=args.failed_review_retry_digest,
+            failed_review_retry_selected_evidence_ids=args.failed_review_retry_selected_evidence_id,
+            failed_review_retry_cache_only=args.failed_review_retry_cache_only,
+            failed_review_retry_scoped_mode=args.failed_review_retry_scoped_mode,
         )
     except (WorkAccountingError, semantic_analyzer.AnalyzerError, work_allocator.AllocationError, ValueError) as exc:
         print(f"work accounting blocked: {exc}", file=sys.stderr)
