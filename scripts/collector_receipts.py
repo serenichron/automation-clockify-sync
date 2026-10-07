@@ -451,6 +451,27 @@ class FrozenSourceSnapshot:
     verified_artifact_digests: Mapping[str, str]
 
 
+@dataclass(frozen=True)
+class PendingCollectorSource:
+    """Verified raw admission, explicitly not a historical completion receipt."""
+
+    run_dir: Path
+    slice_id: str
+    since_utc: str
+    until_utc: str
+    source_coverage_digest: str
+    collector_runtime_identity: dict[str, object]
+    source_bundle_digest: str
+    verified_artifact_bytes: Mapping[str, bytes]
+    verified_artifact_digests: Mapping[str, str]
+    pending_binding: Mapping[str, object]
+    native_checkpoint_metadata: Mapping[str, object]
+
+    @property
+    def legacy_completion_bundle_digest(self) -> None:
+        return None
+
+
 def _historical_transport_projection(event: evidence_ledger.EvidenceEvent) -> evidence_ledger.EvidenceEvent:
     """Reproduce the one attested pre-transport-receipt event shape, never its code."""
     attributes = dict(event.attributes)
@@ -965,6 +986,149 @@ def load_collector_source_bundle(path: Path, *, run_dir: Path) -> CollectorSourc
         verified_artifact_bytes=dict(verified_bytes),
         verified_artifact_digests=dict(verified_digests),
     )
+
+
+def load_pending_collector_source(run_dir: Path, *, checkpoint_root: Path) -> PendingCollectorSource:
+    """Admit exact complete raw bytes and existing native proof without any writes."""
+    from scripts import clockify_sync_collect as collector, collector_slices as slices
+    from scripts import collector_checkpoints as checkpoints, clockify_checkpoint_snapshot as native
+    from scripts import reconciliation_manifest
+
+    run_dir = _safe_path(Path(run_dir))
+    checkpoint_root = _safe_path(Path(checkpoint_root))
+    if (run_dir / "completion-bundle.json").exists() or (run_dir / "completion-bundle.json").is_symlink():
+        raise CollectorReceiptError("pending source must not have a completion bundle")
+    contents: dict[str, bytes] = {}
+    digests: dict[str, str] = {}
+
+    def read(relative: str) -> bytes:
+        content, digest = _safe_read_bytes_and_digest(_safe_path(run_dir / relative, run_dir=run_dir))
+        contents[relative], digests[relative] = content, digest
+        return content
+
+    try:
+        pending = json.loads(read("slice-finalization.json"))
+        if not isinstance(pending, dict) or set(pending) != {
+            "schema_version", "backlog_identity", "slice_id", "since_utc", "until_utc",
+        } or pending["schema_version"] != "collector-slice-finalization/v1":
+            raise ValueError("pending schema differs")
+        identity = slices.BacklogIdentity(**pending["backlog_identity"])
+        planned = slices.plan_slices(
+            datetime.fromisoformat(identity.since_utc.replace("Z", "+00:00")),
+            datetime.fromisoformat(identity.until_utc.replace("Z", "+00:00")),
+            zone=ZoneInfo(identity.timezone), max_days=identity.max_days,
+        )
+        slice_ = next(item for item in planned if item.slice_id == pending["slice_id"])
+        since, until = slice_.since, slice_.until
+        if collector.iso_utc(since) != pending["since_utc"] or collector.iso_utc(until) != pending["until_utc"]:
+            raise ValueError("pending bounds differ")
+        backlog = slices.BacklogStore(checkpoint_root).read_existing(identity, planned)
+        if any(item.slice_id == slice_.slice_id for item in backlog.completed):
+            raise ValueError("pending slice already has a completion receipt")
+        backlog_path = _safe_path(backlog.directory / "backlog-manifest.json", run_dir=checkpoint_root)
+        backlog_bytes, backlog_digest = _safe_read_bytes_and_digest(backlog_path)
+        # Verify the exact opened bytes as well as the read_existing contract.
+        opened_backlog = slices.BacklogStore(checkpoint_root)._state_from_manifest(identity, tuple(planned), backlog.directory, json.loads(backlog_bytes))
+        if opened_backlog != backlog:
+            raise ValueError("pending backlog changed during validation")
+        report = json.loads(read("run-report.json"))
+        if not isinstance(report, dict):
+            raise ValueError("pending report is not an object")
+        read("run-report.md")
+        period = reconciliation_manifest.ReconciliationManifest.from_document(json.loads(read("period-manifest.json")))
+        original_inputs = {"period-manifest.json": digests["period-manifest.json"]}
+        for name in ("routing.json", "review-corrections.jsonl", "review-acceptance.jsonl"):
+            read(name)
+            original_inputs[name] = digests[name]
+        if not period.identity.since <= since < until <= period.identity.until:
+            raise ValueError("pending period bounds differ")
+        ledger_doc = json.loads(read("evidence/evidence-ledger.json"))
+        manifest = evidence_ledger.LedgerManifest.from_document(ledger_doc["manifest"])
+        ledger = evidence_ledger.EvidenceLedger(
+            tuple(evidence_ledger.EvidenceEvent.from_document(item) for item in ledger_doc["events"]),
+            manifest.source_inventory, manifest.timezone, manifest.member_identities,
+        )
+        ledger.validate(manifest)
+        coverage = manifest.document()["source_completeness"]
+        if coverage["status"] != "complete" or coverage["incomplete_sources"] != []:
+            raise ValueError("pending raw coverage is incomplete")
+        raw = {key: json.loads(read(relative)) for key, relative in _COLLECTOR_RAW_ARTIFACTS.items()}
+        if (run_dir / "evidence/enriched-context.json").exists() or (run_dir / "evidence/enriched-context.json").is_symlink():
+            raw["enriched_context"] = json.loads(read("evidence/enriched-context.json"))
+        reconstructed = evidence_ledger.EvidenceLedger(
+            tuple(evidence_ledger.normalize_collector_snapshot(raw)), evidence_ledger.source_inventory_from_collector(raw),
+            manifest.timezone, manifest.member_identities,
+        )
+        if reconstructed.manifest.document() != manifest.document():
+            raise ValueError("pending raw reconstruction differs")
+        mode = report.get("collection_mode", {})
+        if not isinstance(mode, dict):
+            raise ValueError("pending collection mode is not an object")
+        collector._verified_existing_slice_bundle(
+            run_dir, since, until, report["date_range"]["reason"],
+            calendly_optional=mode.get("calendly_optional") is True,
+            coordinator=mode.get("coordinator") or "omarchy-precision",
+        )
+        coverage_digest, _ = _completion_identities_from_documents(report, ledger_doc,
+            since_utc=pending["since_utc"], until_utc=pending["until_utc"])
+        ci, request = native._request(period.identity.workspace_id, period.identity.member_id, since, until)
+        page_store = checkpoints.PageCheckpointStore(backlog.directory / "source-checkpoints")
+        directory = page_store._directory_for(ci)
+        checkpoint_path = _safe_path(directory / "manifest.json", run_dir=checkpoint_root)
+        page_files = {"manifest.json": native._read(checkpoint_path)}
+        page_manifest = native._document(page_files["manifest.json"])
+        if page_manifest.get("identity") != ci.document():
+            raise ValueError("pending native identity differs")
+        for i, reference in enumerate(page_manifest["pages"], 1):
+            relative = f"pages/{i:06d}.json"
+            if reference.get("path") != relative:
+                raise ValueError("pending native locator differs")
+            page_files[relative] = native._read(directory / relative)
+        evidence = contents["evidence/clockify-existing.json"]
+        entries, observed, _ = native._validate(directory, page_files, evidence,
+            identity=ci, request=request, since=since, until=until)
+        checkpoint_relative = f"checkpoint/{directory.name}"
+        native_files = {f"{checkpoint_relative}/{name}": value for name, value in page_files.items()}
+        native_files["clockify-existing.json"] = evidence
+        proof = dict(schema_version=native.SCHEMA_VERSION, request=request, checkpoint_identity=ci.document(),
+            snapshot_at=observed, entry_count=len(entries), page_count=len(page_manifest["pages"]),
+            source_checkpoint_manifest=str(checkpoint_path), source_clockify_evidence=str(run_dir / "evidence/clockify-existing.json"),
+            files={name: native._hash(value) for name, value in native_files.items()})
+        proof_bytes = checkpoints._canonical(proof) + b"\n"
+        native_files["snapshot.json"] = proof_bytes
+        native_metadata = {"manifest_sha256": native._hash(proof_bytes), "request": request}
+        if "clockify_native_checkpoint" in report:
+            original_native = _verified_native_checkpoint(report, run_dir=run_dir,
+                since_utc=pending["since_utc"], until_utc=pending["until_utc"], clockify_evidence=evidence)
+            if report["clockify_native_checkpoint"]["request"] != request:
+                raise ValueError("pending copied native request differs")
+            for name, content in original_native.items():
+                relative = name.removeprefix(NATIVE_CHECKPOINT_PREFIX)
+                if relative != "snapshot.json" and native_files.get(relative) != content:
+                    raise ValueError("pending copied native pages differ from original checkpoint")
+                contents[name], digests[name] = content, "sha256:" + native._hash(content)
+            native_files = {name.removeprefix(NATIVE_CHECKPOINT_PREFIX): content for name, content in original_native.items()}
+            native_metadata = dict(report["clockify_native_checkpoint"])
+        binding = {
+            "schema_version": "pending-collector-source/v1", "source_run_dir": str(run_dir),
+            "checkpoint_root": str(checkpoint_root), "backlog_manifest_path": str(backlog_path),
+            "backlog_manifest_digest": backlog_digest, "original_snapshot_digests": original_inputs,
+            "original_artifact_digests": dict(sorted(digests.items())),
+            "native_checkpoint_digests": {name: "sha256:" + native._hash(value) for name, value in sorted(page_files.items())},
+        }
+        # Existing derivation consumes raw artifacts only; original snapshots and
+        # pending metadata are bound separately, never installed as child completion.
+        for name in (*original_inputs, "slice-finalization.json", "run-report.md"):
+            contents.pop(name)
+            digests.pop(name)
+        for name, value in native_files.items():
+            relative = NATIVE_CHECKPOINT_PREFIX + name
+            contents[relative], digests[relative] = value, "sha256:" + native._hash(value)
+        return PendingCollectorSource(run_dir, slice_.slice_id, pending["since_utc"], pending["until_utc"],
+            coverage_digest, dict(report["runtime_identity"]), _digest(binding), contents, digests, binding,
+            native_metadata)
+    except (OSError, ValueError, TypeError, KeyError, StopIteration) as exc:
+        raise CollectorReceiptError("pending collector source proof is invalid") from exc
 
 
 def verify_frozen_source(run_dir: Path) -> FrozenSourceSnapshot:

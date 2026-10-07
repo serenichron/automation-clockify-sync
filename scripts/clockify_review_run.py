@@ -1069,11 +1069,16 @@ def _prepare_collector_derivation_run(
     snapshot_contents: Mapping[str, bytes] | None = None,
     executor_runtime_identity: Mapping[str, Any] | None = None,
     environment: Mapping[str, str] | None = None,
+    pending_checkpoint_root: Path | None = None,
 ) -> Path:
     """Create a write-once executor attempt from one immutable collector source."""
     source = _run_child(source, label="collector source")
-    identity = collector_receipts.load_collector_source_bundle(
-        source / "completion-bundle.json", run_dir=source
+    # Pending admission is explicit. A missing historical seal must not relax
+    # ordinary completed-source derivation callers into a different contract.
+    pending_source = pending_checkpoint_root is not None
+    identity = (
+        collector_receipts.load_pending_collector_source(source, checkpoint_root=pending_checkpoint_root)
+        if pending_source else collector_receipts.load_collector_source_bundle(source / "completion-bundle.json", run_dir=source)
     )
     executor = dict(
         executor_runtime_identity or clockify_sync_collect.collector_runtime_identity()
@@ -1108,13 +1113,25 @@ def _prepare_collector_derivation_run(
     )
     if set(exact_snapshots) != set(_RECONCILIATION_INPUTS.values()):
         raise ReviewRunError("collector derivation reconciliation snapshots are incomplete")
+    if pending_source:
+        for name, expected in identity.pending_binding["original_snapshot_digests"].items():
+            if name != "routing.json" and "sha256:" + hashlib.sha256(exact_snapshots[name]).hexdigest() != expected:
+                raise ReviewRunError("pending derivation must preserve original reconciliation inputs")
+        routing = json.loads(exact_snapshots["routing.json"])
+        binding = routing.get("semantic_subject_binding") if isinstance(routing, Mapping) else None
+        if not isinstance(routing, Mapping) or routing.get("semantic_actor_contract") != semantic_analyzer.ACTOR_CONTRACT or not isinstance(binding, Mapping):
+            raise ReviewRunError("pending derivation requires explicit current actor binding")
+        try:
+            semantic_analyzer.with_actor_context([], subject_binding=binding)
+        except semantic_analyzer.AnalyzerError as exc:
+            raise ReviewRunError("pending derivation actor subject binding is invalid") from exc
     invocation = str((environment or os.environ).get("INVOCATION_ID") or "")
     invocation_digest = (
         "sha256:" + hashlib.sha256(invocation.encode("utf-8")).hexdigest()
         if invocation else None
     )
     lineage_payload = {
-        "schema_version": "collector-derivation/v1",
+        "schema_version": "collector-derivation/pending-v1" if pending_source else "collector-derivation/v1",
         "source_run_id": source.name,
         "source_bundle_digest": identity.source_bundle_digest,
         "collector_runtime_identity": collector_runtime,
@@ -1126,6 +1143,8 @@ def _prepare_collector_derivation_run(
         },
         "systemd_invocation_digest": invocation_digest,
     }
+    if pending_source:
+        lineage_payload["pending_source_binding"] = dict(identity.pending_binding)
     locator_payload = {
         key: value
         for key, value in lineage_payload.items()
@@ -1136,11 +1155,21 @@ def _prepare_collector_derivation_run(
             locator_payload, sort_keys=True, separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
-    existing_attempts = sorted(
-        RUNS.resolve().glob(f"collector-derivation-{locator}-attempt-*")
-    )
+    prefix = "collector-derivation-"
+    if pending_source:
+        source_locator = hashlib.sha256(str(source).encode()).hexdigest()
+        prefix += f"pending-{source_locator}-"
+        siblings = sorted(RUNS.resolve().glob(f"{prefix}*-attempt-*"))
+        if any(item.name != f"{prefix}{locator}-attempt-1" for item in siblings) or len(siblings) > 1:
+            raise ReviewRunError("pending derivation source/input/runtime binding drifted or is ambiguous")
+    existing_attempts = sorted(RUNS.resolve().glob(f"{prefix}{locator}-attempt-*"))
     for existing in existing_attempts:
         existing = _run_child(existing, label="collector derivation candidate")
+        if pending_source:
+            _parent, _identity, prior = _verified_collector_derivation(existing)
+            if any(prior.get(key) != value for key, value in lineage_payload.items() if key != "systemd_invocation_digest"):
+                raise ReviewRunError("pending derivation immutable binding differs")
+            return existing
         result_path = existing / "autopilot-result.json"
         result = _optional_snapshot_json(
             result_path, label="collector derivation terminal result"
@@ -1167,7 +1196,7 @@ def _prepare_collector_derivation_run(
         return existing
     attempt = 1
     while True:
-        target = RUNS.resolve() / f"collector-derivation-{locator}-attempt-{attempt}"
+        target = RUNS.resolve() / f"{prefix}{locator}-attempt-{attempt}"
         try:
             target.mkdir()
         except FileExistsError:
@@ -1215,6 +1244,8 @@ def _prepare_collector_derivation_run(
         if not isinstance(report, dict):
             raise ReviewRunError("collector source run report must be an object")
         report = dict(report)
+        if pending_source:
+            report["clockify_native_checkpoint"] = dict(identity.native_checkpoint_metadata)
         report.update({
             "run_id": target.name,
             "collector_source_run_id": source.name,
@@ -1268,7 +1299,7 @@ def _prepare_collector_derivation_run(
 
 def _verified_collector_derivation(
     run_dir: Path,
-) -> tuple[Path, collector_receipts.CollectorSourceBundle, dict[str, Any]]:
+) -> tuple[Path, collector_receipts.CollectorSourceBundle | collector_receipts.PendingCollectorSource, dict[str, Any]]:
     run_dir = _run_child(run_dir, label="collector derivation")
     lineage_path = run_dir / "collector-source.json"
     if lineage_path.is_symlink():
@@ -1289,7 +1320,10 @@ def _verified_collector_derivation(
         "systemd_invocation_digest", "attempt", "source_slice_id",
         "source_since_utc", "source_until_utc", "lineage_digest",
     }
-    if set(lineage) != expected_keys or lineage.get("schema_version") != "collector-derivation/v1":
+    pending_source = lineage.get("schema_version") == "collector-derivation/pending-v1"
+    if pending_source:
+        expected_keys.add("pending_source_binding")
+    if set(lineage) != expected_keys or lineage.get("schema_version") not in {"collector-derivation/v1", "collector-derivation/pending-v1"}:
         raise ReviewRunError("collector derivation lineage schema is invalid")
     unsigned = dict(lineage)
     digest = unsigned.pop("lineage_digest")
@@ -1301,9 +1335,17 @@ def _verified_collector_derivation(
     source = _run_child(Path(str(lineage["source_run_dir"])), label="collector source")
     if source.name != lineage.get("source_run_id"):
         raise ReviewRunError("collector derivation source identity differs")
-    identity = collector_receipts.load_collector_source_bundle(
-        source / "completion-bundle.json", run_dir=source
-    )
+    if pending_source:
+        pending_binding = lineage["pending_source_binding"]
+        if not isinstance(pending_binding, Mapping):
+            raise ReviewRunError("pending derivation ancestor binding is invalid")
+        identity = collector_receipts.load_pending_collector_source(
+            source, checkpoint_root=Path(str(pending_binding.get("checkpoint_root", "")))
+        )
+        if dict(identity.pending_binding) != pending_binding:
+            raise ReviewRunError("pending derivation ancestor binding drifted")
+    else:
+        identity = collector_receipts.load_collector_source_bundle(source / "completion-bundle.json", run_dir=source)
     if (
         identity.source_bundle_digest != lineage.get("source_bundle_digest")
         or identity.slice_id != lineage.get("source_slice_id")
@@ -1382,6 +1424,16 @@ def _verified_collector_derivation(
         )
         if snapshot_digests.get(filename) != "sha256:" + hashlib.sha256(content).hexdigest():
             raise ReviewRunError("collector derivation snapshot binding differs")
+        if pending_source and filename != "routing.json" and snapshot_digests.get(filename) != identity.pending_binding["original_snapshot_digests"][filename]:
+            raise ReviewRunError("pending derivation original input differs")
+    if pending_source:
+        routing = json.loads(_read_snapshot_source(run_dir / "routing.json", label="pending actor routing"))
+        if not isinstance(routing, Mapping) or routing.get("semantic_actor_contract") != semantic_analyzer.ACTOR_CONTRACT or not isinstance(routing.get("semantic_subject_binding"), Mapping):
+            raise ReviewRunError("pending derivation actor binding is invalid")
+        try:
+            semantic_analyzer.with_actor_context([], subject_binding=routing["semantic_subject_binding"])
+        except semantic_analyzer.AnalyzerError as exc:
+            raise ReviewRunError("pending derivation actor subject binding is invalid") from exc
     try:
         report = json.loads(derived_contents["run-report.json"])
     except (KeyError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -1397,9 +1449,13 @@ def _verified_collector_derivation(
         raise ReviewRunError("collector derivation runtime provenance differs")
     source_report = json.loads(identity.verified_artifact_bytes["run-report.json"])
     native_key = "clockify_native_checkpoint"
-    if (native_key in report) != (native_key in source_report) or (
-        native_key in source_report and report[native_key] != source_report[native_key]
-    ):
+    if pending_source:
+        native_differs = native_key not in report or report[native_key] != identity.native_checkpoint_metadata
+    else:
+        native_differs = (native_key in report) != (native_key in source_report) or (
+            native_key in source_report and report[native_key] != source_report[native_key]
+        )
+    if native_differs:
         raise ReviewRunError("collector derivation native checkpoint report binding differs")
     return source, identity, lineage
 
@@ -3157,6 +3213,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--resume-from", type=Path,
         help="Resume accounting for one existing, locally snapshotted source run.",
     )
+    parser.add_argument("--derive-pending-from", type=Path,
+                        help="Derive one verified complete pending raw source into a new actor-bound child without collection.")
     parser.add_argument("--repair-from", type=Path, help="Re-derive accounting in a distinct run from a completed source's exact snapshots and validated cache.")
     parser.add_argument(
         "--materialize-frozen-from", type=Path,
@@ -3589,6 +3647,15 @@ def _adopt_completed_recovery(source: Path) -> Path | None:
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(raw_argv)
+    if args.derive_pending_from is not None and (
+        args.replay_from or args.resume_from or args.repair_from or args.materialize_frozen_from
+        or args.recover_source_debt_from or args.since or args.until or args.no_enrich or args.calendly_optional
+        or args.retry_failed_reviews or args.retry_review_digest or args.scoped_recovery_from
+        or any(_option_was_supplied(raw_argv, name) for name in ("--period-manifest", "--corrections", "--acceptance-ledger"))
+        or not _option_was_supplied(raw_argv, "--routing")
+    ):
+        print("clockify review run: pending derivation requires only explicit actor routing and original non-routing inputs", file=sys.stderr)
+        return 2
     if args.materialize_frozen_from is not None:
         if (
             not _option_was_supplied(raw_argv, "--runs-root")
@@ -3675,7 +3742,7 @@ def main(argv: list[str] | None = None) -> int:
     ):
         print("clockify review run: frozen materialization cannot override collection, reconciliation or analyzer inputs", file=sys.stderr)
         return 2
-    if not args.replay_from and not args.resume_from and not args.repair_from and not recovery_mode and not args.materialize_frozen_from and args.period_manifest is None:
+    if not args.replay_from and not args.resume_from and not args.repair_from and not recovery_mode and not args.materialize_frozen_from and not args.derive_pending_from and args.period_manifest is None:
         print(
             "clockify review run: every fresh run requires --period-manifest",
             file=sys.stderr,
@@ -3683,7 +3750,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     reconciliation_contents: dict[str, bytes] | None = None
-    if not args.replay_from and not args.resume_from and not args.repair_from and not recovery_mode and not args.materialize_frozen_from:
+    if not args.replay_from and not args.resume_from and not args.repair_from and not recovery_mode and not args.materialize_frozen_from and not args.derive_pending_from:
         try:
             reconciliation_contents = {
                 filename: _read_snapshot_source(
@@ -3708,7 +3775,24 @@ def main(argv: list[str] | None = None) -> int:
 
     collector_code = 0
     collector_error = ""
-    if args.materialize_frozen_from is not None:
+    if args.derive_pending_from is not None:
+        try:
+            source, snapshots = _resume_source(args.derive_pending_from)
+            if (source / "completion-bundle.json").exists() or (source / "completion-bundle.json").is_symlink():
+                raise ReviewRunError("pending derivation cannot accept a sealed source")
+            snapshots["routing.json"] = args.routing
+            child = _prepare_collector_derivation_run(source, snapshots,
+                pending_checkpoint_root=clockify_sync_collect.collector_checkpoint_root())
+            existing = _adopt_completed_collector_derivation(child)
+            if existing is not None:
+                print(existing)
+                return 0
+            run_dirs = (child,)
+            args._pending_derivation_child = child
+        except (OSError, ValueError, json.JSONDecodeError, collector_receipts.CollectorReceiptError) as exc:
+            print(f"clockify review run: cannot derive pending source: {exc}", file=sys.stderr)
+            return 2
+    elif args.materialize_frozen_from is not None:
         try:
             frozen = _prepare_frozen_source_run(args.materialize_frozen_from)
             existing = _adopt_completed_resume(frozen)
@@ -3870,6 +3954,8 @@ def main(argv: list[str] | None = None) -> int:
                 if (source / "repair-source.json").exists():
                     args._repair_analysis_fixture = _repair_analysis_fixture(source)
                     args._repair_analyzer_cache = None
+                if (source / "collector-source.json").exists():
+                    _verified_collector_derivation(source)
             run_dirs = (source,)
             args._resume_snapshots = snapshots
         except (
@@ -3920,7 +4006,7 @@ def main(argv: list[str] | None = None) -> int:
 
     for run_dir in run_dirs:
         run_args = argparse.Namespace(**vars(args))
-        if args.replay_from or args.repair_from or args.materialize_frozen_from:
+        if args.replay_from or args.repair_from or args.materialize_frozen_from or args.derive_pending_from:
             snapshots = {
                 filename: run_dir / filename for filename in _RECONCILIATION_INPUTS.values()
             }

@@ -67,6 +67,7 @@ except ModuleNotFoundError:  # pragma: no cover
 
 SCHEMA_VERSION = "clockify-review-cycle/v1"
 RECEIPT_SCHEMA_VERSION = "clockify-review-delivery/v1"
+PARTIAL_RECEIPT_SCHEMA_VERSION = "clockify-review-partial-publication/v1"
 HISTORICAL_ADOPTION_SCHEMA_VERSION = "clockify-historical-adoption/v1"
 HISTORICAL_ADOPTION_REQUEST_SCHEMA_VERSION = "clockify-historical-adoption-request/v1"
 DERIVED_ADOPTION_SCHEMA_VERSION = "clockify-historical-adoption/v2"
@@ -839,8 +840,7 @@ def _select_work(
             and raw.get("status") in {"source_verified", "replay_verified", "failed"}
             and isinstance(raw.get("source"), Mapping)
             and isinstance(raw["source"].get("coverage"), Mapping)
-            and raw["source"].get("coverage", {}).get("status") == "complete"
-            and raw["source"].get("coverage", {}).get("incomplete_sources") == []
+            and _publication_ready(raw["source"].get("coverage", {}))
         ),
         key=lambda item: item[0],
     )
@@ -1286,7 +1286,7 @@ def _validate_collector_source_stage(
         raise CycleError("collector source compatibility is invalid")
     collector_runtime = lineage["collector_runtime_identity"]
     executor_runtime = lineage["executor_runtime_identity"]
-    return {
+    stage = {
         "stage_kind": "collector_source",
         "result_path": str(result_path),
         "result_digest": _digest(result_path),
@@ -1304,6 +1304,12 @@ def _validate_collector_source_stage(
         "until_utc": identity.until_utc,
         "compatibility_version": compatibility,
     }
+    if lineage["schema_version"] == "collector-derivation/pending-v1":
+        stage["pending_derivation"] = {
+            "derivation_run_dir": str(derived),
+            "lineage_digest": _digest(derived / "collector-source.json"),
+        }
+    return stage
 
 
 def _validate_raw_collector_source_stage(
@@ -1528,6 +1534,22 @@ def _migrate_legacy_stage_runtime(
                 state["slices"][since] = record
 
 
+def _publication_ready(coverage: Mapping[str, Any]) -> bool:
+    """A missing activity source is a recovery gap, not a review visibility gate."""
+    if coverage.get("status") == "complete" and coverage.get("incomplete_sources") == []:
+        return True
+    sources = coverage.get("sources")
+    gaps = coverage.get("incomplete_sources")
+    return (
+        coverage.get("status") == "incomplete"
+        and isinstance(gaps, list) and bool(gaps)
+        and all(isinstance(source, str) and source != "clockify" for source in gaps)
+        and isinstance(sources, Mapping)
+        and isinstance(sources.get("clockify"), Mapping)
+        and sources["clockify"].get("status") == "complete"
+    )
+
+
 def completion_status(result: Mapping[str, Any]) -> dict[str, Any]:
     """Keep collection and exception completeness separate in durable state."""
     coverage = result.get("source_completeness")
@@ -1585,6 +1607,97 @@ def _recovery_command(
         "--state", str(_path(config, "state_dir") / "review-state.json"),
         "--analyzer-cache", str(_path(config, "cache")),
     ]
+
+
+def _pending_resume_command(config: Mapping[str, Any], child: Path) -> list[str]:
+    return [sys.executable, str(_path(config, "root") / "scripts/clockify_review_run.py"),
+            "--runs-root", str(_runs_dir(config)), "--resume-from", str(child),
+            "--state", str(_path(config, "state_dir") / "review-state.json"),
+            "--analyzer-cache", str(_path(config, "cache"))]
+
+
+def _prepare_pending_derivation_launch(
+    config: Mapping[str, Any], record: dict[str, Any], since: str, until: str,
+) -> dict[str, Any] | None:
+    """Bind one explicit pending ancestor and actual child; never guess a failed launch."""
+    runtime = config.get("_runtime_identity")
+    if not isinstance(runtime, Mapping):
+        raise CycleError("pending derivation requires current runtime identity")
+    runs = _runs_dir(config)
+    checkpoint_root = _collector_checkpoint_root(config, os.environ)
+    prior = record.get("pending_derivation_binding")
+    if prior is not None:
+        if not isinstance(prior, Mapping):
+            raise CycleError("pending derivation launch binding is invalid")
+        body = {key: value for key, value in prior.items() if key != "binding_digest"}
+        child = _canonical_runtime_path(str(body.get("child_run_dir", "")), label="pending child")
+        if child.parent != runs:
+            raise CycleError("pending derivation child escaped runs")
+        try:
+            source, identity, lineage = clockify_review_run._verified_collector_derivation(child)
+        except (OSError, ValueError) as exc:
+            raise CycleError("pending derivation ancestor changed") from exc
+        command = _pending_resume_command(config, child)
+        if (set(body) != {"schema_version", "source_run_dir", "source_digest", "child_run_dir", "lineage_digest",
+                         "command", "command_digest", "runtime_identity_digest", "snapshot_digests"}
+            or body.get("schema_version") != "pending-derivation-launch/v1"
+            or prior.get("binding_digest") != _value_digest(body)
+            or str(source) != body.get("source_run_dir") or identity.source_bundle_digest != body.get("source_digest")
+            or lineage.get("schema_version") != "collector-derivation/pending-v1"
+            or lineage["pending_source_binding"]["checkpoint_root"] != str(checkpoint_root)
+            or lineage["pending_source_binding"]["original_snapshot_digests"] != _stored_snapshot_digests(record)
+            or lineage["executor_runtime_identity"] != dict(runtime)
+            or _digest(child / "collector-source.json") != body.get("lineage_digest")
+            or body.get("runtime_identity_digest") != _value_digest(dict(runtime))
+            or body.get("command") != command or body.get("command_digest") != _value_digest(command)
+            or body.get("snapshot_digests") != lineage["snapshot_digests"]
+            or _digest(_path(config, "routing", file=True)) != lineage["snapshot_digests"]["routing.json"]):
+            raise CycleError("pending derivation launch binding drifted")
+        return dict(prior)
+    interval = _generic_interval(config, since, until)
+    frozen = _stored_snapshot_digests(record)
+    candidates = []
+    # The exact calendar/slice-ID prefix bounds lookup; no global run inventory.
+    prefix = f"{since.replace('-', '')}-{until.replace('-', '')}-{interval.slice_id.removeprefix('sha256:')}-"
+    for source in sorted(runs.glob(prefix + "*")):
+        if source.is_symlink():
+            raise CycleError("pending source candidate is symlinked")
+        if not source.is_dir() or (source / "completion-bundle.json").exists() or (source / "completion-bundle.json").is_symlink():
+            continue
+        try:
+            if {name: _digest(source / name) for name in frozen} != frozen:
+                continue
+            ledger = _json_file(source / "evidence/evidence-ledger.json", "pending candidate ledger")
+            manifest = ledger.get("manifest") if isinstance(ledger, Mapping) else None
+            coverage = manifest.get("source_completeness") if isinstance(manifest, Mapping) else None
+            if not isinstance(coverage, Mapping):
+                raise ValueError("pending candidate coverage is invalid")
+            if coverage.get("status") != "complete" or coverage.get("incomplete_sources") != []:
+                continue
+            identity = collector_receipts.load_pending_collector_source(source, checkpoint_root=checkpoint_root)
+        except (OSError, ValueError) as exc:
+            raise CycleError("complete pending source proof cannot be verified") from exc
+        if identity.slice_id != interval.slice_id or identity.since_utc != interval.since_utc or identity.until_utc != interval.until_utc:
+            raise CycleError("pending source exact interval differs")
+        candidates.append((source, identity))
+    if len(candidates) > 1:
+        raise CycleError("complete pending source is ambiguous")
+    if not candidates:
+        return None
+    source, identity = candidates[0]
+    snapshots = {name: source / name for name in frozen}
+    snapshots["routing.json"] = _path(config, "routing", file=True)
+    child = clockify_review_run._prepare_collector_derivation_run(source, snapshots,
+        executor_runtime_identity=runtime, pending_checkpoint_root=checkpoint_root)
+    _source, verified, lineage = clockify_review_run._verified_collector_derivation(child)
+    command = _pending_resume_command(config, child)
+    body = {"schema_version": "pending-derivation-launch/v1", "source_run_dir": str(source),
+        "source_digest": verified.source_bundle_digest, "child_run_dir": str(child),
+        "lineage_digest": _digest(child / "collector-source.json"), "command": command,
+        "command_digest": _value_digest(command), "runtime_identity_digest": _value_digest(dict(runtime)),
+        "snapshot_digests": lineage["snapshot_digests"]}
+    record["pending_derivation_binding"] = {**body, "binding_digest": _value_digest(body)}
+    return record["pending_derivation_binding"]
 
 
 def _run_budgeted_child(
@@ -1820,6 +1933,9 @@ def _delivery_document(
         "review_ids": list(source["review_ids"]),
         "publication_receipts": publication_receipts,
     }
+    if source.get("coverage", {}).get("status") == "incomplete":
+        unsigned["schema_version"] = PARTIAL_RECEIPT_SCHEMA_VERSION
+        unsigned["source_completeness"] = dict(source["coverage"])
     if publication_profile is not None:
         unsigned["publication_profile"] = publication_profile
     if publication_profile == clockify_monthly_unresolved.ALIAS_PROFILE:
@@ -2685,15 +2801,26 @@ def _audit_bundle(stage: Mapping[str, Any]) -> tuple[
 ]:
     run_dir = Path(str(stage.get("run_dir") or ""))
     try:
-        bundle = collector_receipts.load_collector_source_bundle(
-            run_dir / "completion-bundle.json", run_dir=run_dir
-        )
+        pending = stage.get("pending_derivation")
+        if pending is None:
+            bundle = collector_receipts.load_collector_source_bundle(
+                run_dir / "completion-bundle.json", run_dir=run_dir
+            )
+        else:
+            if not isinstance(pending, Mapping) or set(pending) != {"derivation_run_dir", "lineage_digest"}:
+                raise ValueError("pending audit provenance is invalid")
+            derived = Path(str(pending["derivation_run_dir"]))
+            if derived.parent != run_dir.parent or _digest(derived / "collector-source.json") != pending["lineage_digest"]:
+                raise ValueError("pending audit lineage differs")
+            ancestor, bundle, lineage = clockify_review_run._verified_collector_derivation(derived)
+            if ancestor != run_dir or lineage["schema_version"] != "collector-derivation/pending-v1":
+                raise ValueError("pending audit ancestor differs")
         ledger = json.loads(
             bundle.verified_artifact_bytes["evidence/evidence-ledger.json"]
         )
         report = json.loads(bundle.verified_artifact_bytes["run-report.json"])
     except (
-        collector_receipts.CollectorReceiptError, KeyError, json.JSONDecodeError,
+        OSError, ValueError, collector_receipts.CollectorReceiptError, KeyError, json.JSONDecodeError,
     ) as exc:
         raise CycleError("coverage audit collector bundle is invalid") from exc
     manifest = ledger.get("manifest") if isinstance(ledger, Mapping) else None
@@ -3356,7 +3483,7 @@ def _routing_transition_source(
 
 def _fresh_input_binding(
     config: Mapping[str, Any], record: dict[str, Any], since: str, until: str,
-    manifest: Path,
+    manifest: Path, *, command: list[str] | None = None,
 ) -> dict[str, str]:
     """Pin one modern attempt without replacing a terminal legacy contract."""
     frozen = _stored_snapshot_digests(record)
@@ -3420,7 +3547,7 @@ def _fresh_input_binding(
         if record.get("source") is None and (
             dict(runtime) != body["runtime_identity"]
             or _expected_snapshot_digests(config, manifest) != dict(expected)
-            or _value_digest(_review_command(config, since, until)) != attempt["command_digest"]
+            or _value_digest(command or _review_command(config, since, until)) != attempt["command_digest"]
         ):
             raise CycleError("active fresh attempt runtime or inputs have drifted")
         return dict(expected)
@@ -3443,7 +3570,19 @@ def _fresh_input_binding(
     ):
         raise CycleError("fresh routing binding is not an eligible terminal legacy attempt")
     _validate_config_identity(config)
-    for result in _runs_dir(config).glob("*/autopilot-result.json"):
+    pending_launch = record.get("pending_derivation_binding")
+    if pending_launch is not None and (
+        not isinstance(pending_launch, Mapping)
+        or pending_launch.get("command") != command
+        or pending_launch.get("command_digest") != _value_digest(command)
+        or pending_launch.get("runtime_identity_digest") != _value_digest(dict(runtime))
+        or pending_launch.get("snapshot_digests") != current
+    ):
+        raise CycleError("fresh pending launch binding differs")
+    # An explicit verified pending ancestor/child is already bound. Its exact
+    # terminal child is adopted below, never inferred from a global orphan scan.
+    orphan_results = [] if pending_launch is not None else _runs_dir(config).glob("*/autopilot-result.json")
+    for result in orphan_results:
         try:
             _validate_stage(config, result, since, until, replay=False, expected_snapshot_digests=current)
         except (CycleError, OSError, ValueError):
@@ -3453,7 +3592,7 @@ def _fresh_input_binding(
     if not isinstance(history, list):
         raise CycleError("source attempt history is invalid")
     record["source_attempt_history"] = [*history, {"source_attempt": dict(attempt), "expected_snapshot_digests": frozen}]
-    new_attempt = _source_attempt(record, _review_command(config, since, until), _generic_interval(config, since, until), advance_frontier=attempt["advance_frontier"])
+    new_attempt = _source_attempt(record, command or _review_command(config, since, until), _generic_interval(config, since, until), advance_frontier=attempt["advance_frontier"])
     record["runner_attempt"] = {"runtime_identity_digest": _value_digest(dict(runtime)), "source_attempt_ordinal": new_attempt["ordinal"], "status": "pending"}
     body = {
         "schema_version": "clockify-fresh-input-binding/v1", "since": since, "until": until,
@@ -3479,6 +3618,20 @@ def _verify_fresh_native_source(config: Mapping[str, Any], record: Mapping[str, 
             identity = collector_receipts.load_collector_source_bundle(path / "completion-bundle.json", run_dir=path)
         binding = record["fresh_input_binding"]
         runtime = binding["runtime_identity"]
+        pending = record.get("pending_derivation_binding")
+        if pending is not None:
+            # Reuse independently complete historical raw coverage; never claim
+            # its collector runtime/export contract was the new executor's.
+            if (not (path / "collector-source.json").is_file()
+                or not isinstance(pending, Mapping) or str(path) != pending.get("child_run_dir")
+                or str(_parent) != pending.get("source_run_dir")
+                or identity.source_bundle_digest != pending.get("source_digest")
+                or _lineage.get("schema_version") != "collector-derivation/pending-v1"
+                or _lineage["executor_runtime_identity"] != runtime
+                or _digest(path / "collector-source.json") != pending.get("lineage_digest")
+                or _lineage["snapshot_digests"] != binding["snapshot_digests"]):
+                raise ValueError("pending executor differs from its recorded binding")
+            return identity.source_bundle_digest
         if identity.collector_runtime_identity != runtime:
             raise ValueError("collector runtime differs from fresh binding")
         sessions = json.loads(identity.verified_artifact_bytes["evidence/sessions.json"])
@@ -3615,7 +3768,7 @@ def _validate_delivered_state(config: Mapping[str, Any], state: Mapping[str, Any
         raise CycleError("cycle state slices are invalid")
     for since, raw_record in slices.items():
         if not isinstance(raw_record, Mapping) or raw_record.get("status") not in {
-            "delivered", "delivered_with_exceptions",
+            "delivered", "delivered_with_exceptions", "published_with_source_gaps",
         }:
             continue
         until = raw_record.get("until")
@@ -3665,7 +3818,10 @@ def _validate_delivered_state(config: Mapping[str, Any], state: Mapping[str, Any
             _verify_historical_adoption(
                 stage_config, raw_record, adoption, since, until, source, replay,
             )
-        receipt = raw_record.get("delivery_receipt")
+        partial = raw_record.get("status") == "published_with_source_gaps"
+        if partial != (source["coverage"].get("status") != "complete"):
+            raise CycleError("publication status differs from source coverage")
+        receipt = raw_record.get("publication_receipt" if partial else "delivery_receipt")
         if not isinstance(receipt, str):
             raise CycleError("delivered slice has no delivery receipt")
         title = _sheet_title(config["monthly_sheet_title_template"], since=since)
@@ -4248,17 +4404,27 @@ def _run_slice(
         _persist_state(state_path, state, since, record)
     expected_snapshots = _stored_snapshot_digests(record)
     transition_validation: dict[str, Any] = {}
+    pending_launch = None
+    if record.get("pending_derivation_binding") is not None or (
+        generic is not None and generic.status == "exhausted" and record.get("source") is None
+        and "runner_attempt" not in record
+        and _expected_snapshot_digests(config, manifest_path) != expected_snapshots
+    ):
+        pending_launch = _prepare_pending_derivation_launch(config, record, since, until)
     fresh_binding = "fresh_input_binding" in record or (
         "runner_attempt" not in record and record.get("source") is None
         and _expected_snapshot_digests(config, manifest_path) != expected_snapshots
     )
     if fresh_binding:
-        expected_snapshots = _fresh_input_binding(config, record, since, until, manifest_path)
+        expected_snapshots = _fresh_input_binding(config, record, since, until, manifest_path,
+            **({"command": pending_launch["command"]} if pending_launch is not None else {}))
         _persist_state(state_path, state, since, record)
         transition_validation = {"expected_runtime_digest": _value_digest(record["fresh_input_binding"]["runtime_identity"]), "historical_state_validation": True}
         if record.get("source") is None:
             completed = []
-            for result in _runs_dir(config).glob("*/autopilot-result.json"):
+            results = ([Path(pending_launch["child_run_dir"]) / "autopilot-result.json"] if pending_launch is not None
+                       else _runs_dir(config).glob("*/autopilot-result.json"))
+            for result in results:
                 try:
                     if clockify_review_run._adopt_completed_resume(result.parent) is None:
                         continue
@@ -4275,7 +4441,7 @@ def _run_slice(
                 _finish_attempt(record, record["source_attempt"])
                 record["status"] = "source_verified"
                 _persist_state(state_path, state, since, record)
-            elif record.get("fresh_child_started"):
+            elif record.get("fresh_child_started") and pending_launch is None:
                 raise CycleError("fresh attempt already launched without verified completion; no duplicate child")
     elif "routing_transition" in record or (
         record.get("source") is None
@@ -4341,7 +4507,7 @@ def _run_slice(
     attempt: dict[str, Any] | None = None
     collector_source: dict[str, Any] | None = None
     if source is None:
-        review_command = _review_command(config, since, until)
+        review_command = pending_launch["command"] if pending_launch is not None else _review_command(config, since, until)
         interval = generic.interval if generic is not None else _generic_interval(
             config, since, until
         )
@@ -4358,9 +4524,23 @@ def _run_slice(
             and _attempt_failure_exists(debt_store, interval, previous)
         ):
             _finish_attempt(record, previous)
+        pending_previous = record.get("source_attempt") if pending_launch is not None else None
         attempt = _source_attempt(
             record, review_command, interval, advance_frontier=advance_frontier
         )
+        if pending_launch is not None:
+            if isinstance(pending_previous, Mapping) and pending_previous.get("status") == "finished":
+                record["source_attempt_history"] = [*record["source_attempt_history"], {
+                    "source_attempt": dict(pending_previous),
+                    "expected_snapshot_digests": dict(expected_snapshots),
+                }]
+            if attempt["command_digest"] != pending_launch["command_digest"]:
+                raise CycleError("pending source attempt command differs")
+            fresh = record["fresh_input_binding"]
+            body = {key: value for key, value in fresh.items() if key != "binding_digest"}
+            body["source_attempt"] = {key: value for key, value in attempt.items() if key != "status"}
+            body["history_digest"] = _value_digest(record["source_attempt_history"])
+            record["fresh_input_binding"] = {**body, "binding_digest": _value_digest(body)}
         if isinstance(runtime, Mapping):
             record["runner_attempt"] = {
                 "runtime_identity_digest": _value_digest(dict(runtime)),
@@ -4483,7 +4663,8 @@ def _run_slice(
         })
         _persist_state(state_path, state, since, record)
     coverage = source["coverage"]
-    if coverage.get("status") != "complete" or coverage.get("incomplete_sources") != []:
+    partial_publication = coverage.get("status") != "complete" or coverage.get("incomplete_sources") != []
+    if partial_publication:
         if _bind_incomplete_recovery_parents(config, record, debt_store, source):
             _persist_state(state_path, state, since, record)
         exact_recorded = _record_exact_debts(config, debt_store, source)
@@ -4507,11 +4688,12 @@ def _run_slice(
         _finish_runner_attempt(record)
         record["status"] = "recovery_blocked"
         _persist_state(state_path, state, since, record)
-        return {
-            "status": "recovery_blocked",
-            "slice": {"since": since, "until": until},
-            "advance_frontier": advance_frontier,
-        }
+        if not _publication_ready(coverage):
+            return {
+                "status": "recovery_blocked",
+                "slice": {"since": since, "until": until},
+                "advance_frontier": advance_frontier,
+            }
 
     _resolve_generic(debt_store, generic, source)
     source_coverage.write(debt_path, debt_store.document())
@@ -4519,7 +4701,8 @@ def _run_slice(
     _persist_state(state_path, state, since, record)
 
     try:
-        source = _adopt_native_credit(config, state, state_path, record, since, until, source, budget)
+        if not partial_publication:
+            source = _adopt_native_credit(config, state, state_path, record, since, until, source, budget)
     except _BudgetExhausted:
         record["status"] = "source_verified"
         _persist_state(state_path, state, since, record)
@@ -4577,7 +4760,10 @@ def _run_slice(
         record.update({"status": "replay_verified", "replay": replay})
         _persist_state(state_path, state, since, record)
 
-    receipt_path = state_dir / "delivery-receipts" / f"{since}.json"
+    receipt_path = (
+        state_dir / "partial-publication-receipts" / f"{since}-{source['run_id']}.json"
+        if partial_publication else state_dir / "delivery-receipts" / f"{since}.json"
+    )
     publisher_result_path = (
         _runs_dir(config) / f"publication-{source['run_id']}" / "autopilot-result.json"
     )
@@ -4633,15 +4819,16 @@ def _run_slice(
 
     record.update({
         "status": (
+            "published_with_source_gaps" if partial_publication else
             "delivered_with_exceptions" if source["exception_ids"] else "delivered"
         ),
         "source_run_id": source["run_id"],
         "replay_run_id": replay["run_id"],
-        "delivery_receipt": str(receipt_path.resolve()),
         "review_ids": source["review_ids"],
         "exception_ids": source["exception_ids"],
         "exceptions_complete": not source["exception_ids"],
     })
+    record["publication_receipt" if partial_publication else "delivery_receipt"] = str(receipt_path.resolve())
     _persist_state(state_path, state, since, record)
     return {
         "status": record["status"],

@@ -356,16 +356,24 @@ class ReviewCycleSourceDebtEndToEndTests(unittest.TestCase):
         }
         self.config["catchup_until"] = "2026-09-09"
         commands: list[list[str]] = []
+        def publish_available(command, **_kwargs):
+            command = list(command)
+            commands.append(command)
+            self.assertIn("--replay-from", command)
+            # Raw coverage can be classified, but the deliberately drifted
+            # downstream quality artifact must not be resealed or published.
+            return ChildResult(2, "", "quality artifact digest mismatch", False, 1.0)
         with mock.patch.object(
             cycle, "run_child_bounded",
-            side_effect=lambda command, **_kwargs: commands.append(list(command)),
+            side_effect=publish_available,
         ):
             first = cycle.run_cycle(
                 self.config, enable_sheet_write=True, today=dt.date(2026, 9, 14)
             )
 
-        self.assertEqual("recovery_blocked", first["status"])
-        self.assertEqual([], commands)
+        self.assertEqual("failed", first["status"])
+        self.assertEqual(1, len(commands))
+        self.assertIn("--replay-from", commands[0])
         after_gate = source_coverage.SourceDebtStore.from_document(
             source_coverage.read(debt_path)
         )
@@ -382,6 +390,8 @@ class ReviewCycleSourceDebtEndToEndTests(unittest.TestCase):
             (self.state_dir / "review-cycle-state.json").read_text(encoding="utf-8")
         )
         record = state["slices"]["2026-09-07"]
+        self.assertIsNone(state["completed_through"])
+        self.assertNotIn("delivery_receipt", record)
         self.assertEqual(
             cycle._value_digest(old_runtime),
             record["source"]["runtime_identity_digest"],
