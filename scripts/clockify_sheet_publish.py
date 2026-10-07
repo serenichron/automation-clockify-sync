@@ -230,39 +230,66 @@ class GwsSheetsGateway:
         self, spreadsheet_id: str, sheet_id: int, start_row: int,
         grid_rows: int, rows: Sequence[Sequence[Any]],
     ) -> None:
-        """Native append with formatting/validation scoped only to new rows."""
+        """Native row-atomic append, bounded below Linux's per-argument limit."""
         if not rows:
             return
         if start_row < 3 or any(len(row) != 12 for row in rows):
             raise PublicationError("monthly append lacks a data-row format exemplar")
-        end_index = start_row - 1 + len(rows)
-        requests: list[dict[str, Any]] = []
-        if end_index > grid_rows:
-            requests.append({"appendDimension": {
-                "sheetId": sheet_id, "dimension": "ROWS", "length": end_index - grid_rows,
+        # gws accepts inline JSON, so bound the actual UTF-8 argument including
+        # formatting/grid requests. Never split or truncate a proof-bearing row.
+        max_payload_bytes = 96 * 1024
+
+        def payload(chunk: Sequence[Sequence[Any]], start_index: int, capacity: int) -> str:
+            end_index = start_index + len(chunk)
+            requests: list[dict[str, Any]] = []
+            if end_index > capacity:
+                requests.append({"appendDimension": {
+                    "sheetId": sheet_id, "dimension": "ROWS", "length": end_index - capacity,
+                }})
+            destination = {"sheetId": sheet_id, "startRowIndex": start_index,
+                           "endRowIndex": end_index, "startColumnIndex": 0, "endColumnIndex": 12}
+            exemplar = {**destination, "startRowIndex": start_row - 2, "endRowIndex": start_row - 1}
+            for paste_type in ("PASTE_FORMAT", "PASTE_DATA_VALIDATION"):
+                requests.append({"copyPaste": {
+                    "source": exemplar, "destination": destination, "pasteType": paste_type,
+                }})
+            # Clear the exemplar's row-specific automatic hyperlink only.
+            requests.append({"repeatCell": {
+                "range": destination, "cell": {}, "fields": "userEnteredFormat.textFormat.link",
             }})
-        destination = {"sheetId": sheet_id, "startRowIndex": start_row - 1,
-                       "endRowIndex": end_index, "startColumnIndex": 0, "endColumnIndex": 12}
-        exemplar = {**destination, "startRowIndex": start_row - 2, "endRowIndex": start_row - 1}
-        for paste_type in ("PASTE_FORMAT", "PASTE_DATA_VALIDATION"):
-            requests.append({"copyPaste": {
-                "source": exemplar, "destination": destination, "pasteType": paste_type,
+            requests.append({"updateCells": {
+                "range": destination, "fields": "userEnteredValue",
+                "rows": [{"values": [{"userEnteredValue": {"stringValue": str(value)}}
+                                      for value in row]} for row in chunk],
             }})
-        # Sheets may store an automatic hyperlink in the exemplar's format.
-        # Clear only that row-specific link on new cells, retaining every other
-        # copied format/validation field; new URL values get their own links.
-        requests.append({"repeatCell": {
-            "range": destination, "cell": {}, "fields": "userEnteredFormat.textFormat.link",
-        }})
-        requests.append({"updateCells": {
-            "range": destination, "fields": "userEnteredValue",
-            "rows": [{"values": [{"userEnteredValue": {"stringValue": str(value)}}
-                                  for value in row]} for row in rows],
-        }})
-        self._call([
-            "spreadsheets", "batchUpdate", "--params", json.dumps({"spreadsheetId": spreadsheet_id}),
-            "--json", json.dumps({"requests": requests}, ensure_ascii=False),
-        ])
+            return json.dumps({"requests": requests}, ensure_ascii=False)
+
+        # Preflight every chunk before any mutation: even a late oversize row
+        # must fail without expanding the grid or writing an earlier prefix.
+        bodies: list[str] = []
+        chunk: list[Sequence[Any]] = []
+        start_index = start_row - 1
+        capacity = grid_rows
+        encoded = ""
+        for row in rows:
+            candidate = payload([*chunk, row], start_index, capacity)
+            if len(candidate.encode("utf-8")) > max_payload_bytes:
+                if chunk:
+                    bodies.append(encoded)
+                    start_index += len(chunk)
+                    capacity = max(capacity, start_index)
+                chunk = []
+                candidate = payload([row], start_index, capacity)
+                if len(candidate.encode("utf-8")) > max_payload_bytes:
+                    raise PublicationError("single monthly row exceeds safe gws JSON payload size")
+            chunk.append(row)
+            encoded = candidate
+        bodies.append(encoded)
+        for body in bodies:
+            self._call([
+                "spreadsheets", "batchUpdate", "--params", json.dumps({"spreadsheetId": spreadsheet_id}),
+                "--json", body,
+            ])
 
 
 def _timestamp(value: Any) -> str:
