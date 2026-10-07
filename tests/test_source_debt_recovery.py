@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import hashlib
 import json
@@ -294,7 +295,14 @@ class SourceDebtRecoveryTests(unittest.TestCase):
             recovery.seal_recovery_receipt(derived)
         return derived, bundle
 
-    def make_parent(self) -> Path:
+    def make_parent(
+        self, *, enriched_context: dict[str, object] | None = None,
+    ) -> Path:
+        if enriched_context is not None:
+            hermes_db = self.root / "hermes.db"
+            hermes_db.write_bytes(b"")
+            self.fleet["machines"][0]["hermes_db"] = str(hermes_db)
+            (self.root / "fleet.json").write_text(json.dumps(self.fleet) + "\n")
         slices = collector.plan_slices(SINCE, UNTIL, zone=collector.BUCHAREST)
         compatibility = collector._backlog_compatibility_version(
             self.routing, self.fleet, calendly_optional=True,
@@ -308,9 +316,22 @@ class SourceDebtRecoveryTests(unittest.TestCase):
         store = collector.BacklogStore(self.checkpoints)
         state = store.open(identity, slices)
         parent = collector._slice_run_dir(slices[0], compatibility)
-        with mock.patch.object(collector, "collect_remote_sessions", return_value=self.failed_peer()):
+        enrichment = (
+            mock.patch.object(
+                collector,
+                "extract_hermes_db_context",
+                return_value=json.loads(json.dumps(enriched_context["hermes_contexts"])),
+            )
+            if enriched_context is not None
+            else contextlib.nullcontext()
+        )
+        with mock.patch.object(
+            collector, "collect_remote_sessions", return_value=self.failed_peer()
+        ), enrichment:
             collector._collect_slice(
-                argparse.Namespace(enrich=False, calendly_optional=True),
+                argparse.Namespace(
+                    enrich=enriched_context is not None, calendly_optional=True,
+                ),
                 self.routing, self.fleet, {"_missing": True}, {"_missing": True},
                 SINCE, UNTIL, "fixture", collector.PageCheckpointStore(state.directory / "source-checkpoints"),
                 parent, calendly_env={"_missing": True}, coordinator="omarchy-precision",
@@ -335,6 +356,23 @@ class SourceDebtRecoveryTests(unittest.TestCase):
             "sha256:" + hashlib.sha256(bundle_path.read_bytes()).hexdigest(),
         )
         return parent
+
+    @staticmethod
+    def enriched_context() -> dict[str, object]:
+        return {
+            "claude_contexts": [],
+            "hermes_contexts": [{
+                "session_id": "retained-enriched-session",
+                "start": "2026-07-01T06:00:00+00:00",
+                "end": "2026-07-01T06:10:00+00:00",
+                "user_messages": [{
+                    "timestamp": "2026-07-01T06:01:00+00:00",
+                    "user_message": "private fixture",
+                    "prev_assistant": "",
+                    "next_assistant": "",
+                }],
+            }],
+        }
 
     def test_distinct_attempt_collects_once_reuses_and_preserves_parent(self) -> None:
         """Returning the parent or recollecting a completed attempt is a bug."""
@@ -417,6 +455,71 @@ class SourceDebtRecoveryTests(unittest.TestCase):
             ).hexdigest(),
             lineage["parent_ledger_digest"],
         )
+
+    def test_recovery_preserves_optional_enriched_context_and_receipt_binding(self) -> None:
+        """Peer replacement must retain and bind non-peer enriched evidence."""
+        parent = self.make_parent(enriched_context=self.enriched_context())
+        enriched_path = parent / "evidence" / "enriched-context.json"
+        enriched_path.write_text(
+            json.dumps(
+                json.loads(enriched_path.read_text(encoding="utf-8")),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ) + "\n",
+            encoding="utf-8",
+        )
+        enriched_bytes = enriched_path.read_bytes()
+        enriched_digest = "sha256:" + hashlib.sha256(enriched_bytes).hexdigest()
+        parent_ledger, _events = pipeline.load_ledger(
+            parent / "evidence" / "evidence-ledger.json"
+        )
+        expected = [
+            event.document() for event in parent_ledger.events
+            if event.source_type == "enriched_hermes_contexts"
+        ]
+        self.assertEqual(1, len(expected))
+
+        derived, _bundle = self.make_terminal_recovery(
+            parent, SOURCE, ATTEMPT_1, peer=self.healthy_peer(),
+        )
+
+        self.assertEqual(enriched_bytes, (derived / "evidence" / "enriched-context.json").read_bytes())
+        derived_ledger, _events = pipeline.load_ledger(
+            derived / "evidence" / "evidence-ledger.json"
+        )
+        self.assertEqual(expected, [
+            event.document() for event in derived_ledger.events
+            if event.source_type == "enriched_hermes_contexts"
+        ])
+        receipt = recovery.verify_recovery_receipt(derived).document
+        self.assertEqual(
+            enriched_digest,
+            receipt["artifacts"]["raw_providers"]["enriched_context"]["sha256"],
+        )
+
+    def test_optional_enriched_context_rejects_malformed_and_symlink_artifacts(self) -> None:
+        """Optional means absent is valid, never that an unsafe present file is ignored."""
+        parent = self.make_parent(enriched_context=self.enriched_context())
+        enriched_path = parent / "evidence" / "enriched-context.json"
+        valid = enriched_path.read_bytes()
+        for kind in ("malformed", "symlink"):
+            with self.subTest(kind=kind):
+                if enriched_path.is_symlink() or enriched_path.exists():
+                    enriched_path.unlink()
+                if kind == "malformed":
+                    enriched_path.write_text("{not-json\n", encoding="utf-8")
+                    error = "parent evidence artifact is invalid"
+                else:
+                    outside = self.root / "outside-enriched.json"
+                    outside.write_bytes(valid)
+                    enriched_path.symlink_to(outside)
+                    error = "missing or unsafe"
+                with mock.patch.object(collector, "collect_remote_sessions") as transport:
+                    with self.assertRaisesRegex(
+                        recovery.SourceDebtRecoveryError, error,
+                    ):
+                        recovery.recover(parent, SOURCE, ATTEMPT_1)
+                transport.assert_not_called()
 
     def test_mutated_parent_raw_peer_evidence_is_rejected_before_transport(self) -> None:
         parent = self.make_parent()

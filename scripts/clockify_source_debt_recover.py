@@ -47,6 +47,9 @@ _EVIDENCE_FILES = {
     "multica_issues": "evidence/multica-issues.json",
     "sessions": "evidence/sessions.json",
 }
+_OPTIONAL_EVIDENCE_FILES = {
+    "enriched_context": "evidence/enriched-context.json",
+}
 _PEER_EVENT_TYPES = frozenset({
     "claude_bursts", "hermes_sessions", "hermes_db_sessions",
     "codex_sessions", "repository_events",
@@ -121,11 +124,7 @@ def _verified_parent_evidence(
     raw, _digests = _parent_evidence(
         type("RawParent", (), {"run_dir": parent})()  # read-only path adapter
     )
-    snapshot = {
-        "clockify": raw["clockify"], "fathom": raw["fathom"],
-        "calendly": raw["calendly"], "multica_issues": raw["multica_issues"],
-        "sessions": raw["sessions"],
-    }
+    snapshot = dict(raw)
     try:
         reconstructed = evidence_ledger.EvidenceLedger(
             tuple(evidence_ledger.normalize_collector_snapshot(snapshot)),
@@ -154,7 +153,7 @@ def _rebuild_peer_ledger(
         )
         if peer_event and not isinstance(event_machine, str):
             raise SourceDebtRecoveryError("bound peer event attribution is incomplete")
-        if event_machine != machine_name:
+        if not peer_event or event_machine != machine_name:
             retained.append(event)
     snapshot = {"sessions": [dict(recovered)]}
     try:
@@ -195,6 +194,10 @@ def _evidence_for_rebuilt_ledger(
         dict(recovered) if item.get("machine") == machine_name else dict(item)
         for item in sessions
     ]
+    if "enriched_context" in parent_evidence:
+        materialized["enriched_context"] = json.loads(json.dumps(
+            parent_evidence["enriched_context"]
+        ))
     try:
         reconstructed = evidence_ledger.EvidenceLedger(
             tuple(evidence_ledger.normalize_collector_snapshot(materialized)),
@@ -206,7 +209,10 @@ def _evidence_for_rebuilt_ledger(
         raise SourceDebtRecoveryError("rebuilt raw evidence is invalid") from exc
     if reconstructed.manifest.document() != ledger.manifest.document():
         raise SourceDebtRecoveryError("rebuilt raw evidence does not match bound ledger")
-    return materialized
+    return {
+        name: materialized[name]
+        for name in _EVIDENCE_FILES
+    }
 
 
 def _ledger_recovery_document(
@@ -226,10 +232,19 @@ def _ledger_recovery_document(
     return {**unsigned, "lineage_digest": _digest(unsigned)}
 
 
+def _evidence_files(run_dir: Path) -> dict[str, str]:
+    files = dict(_EVIDENCE_FILES)
+    for key, relative in _OPTIONAL_EVIDENCE_FILES.items():
+        path = run_dir / relative
+        if path.exists() or path.is_symlink():
+            files[key] = relative
+    return files
+
+
 def _parent_evidence(parent: _Parent) -> tuple[dict[str, Any], dict[str, str]]:
     evidence: dict[str, Any] = {}
     digests: dict[str, str] = {}
-    for key, relative in _EVIDENCE_FILES.items():
+    for key, relative in _evidence_files(parent.run_dir).items():
         path = parent.run_dir / relative
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
@@ -788,7 +803,24 @@ def recover(parent_run: Path, source: str, attempt_id: str) -> RecoveryResult:
             ledger_override=ledger,
             preclaimed_run_dir=True,
         )
+        for name, relative in _OPTIONAL_EVIDENCE_FILES.items():
+            if name in parent_evidence:
+                source_path = parent.run_dir / relative
+                expected_digest = _file_digest(
+                    source_path, label=f"parent optional evidence {name}"
+                )
+                content = source_path.read_bytes()
+                if _digest_bytes(content) != expected_digest:
+                    raise SourceDebtRecoveryError("parent optional evidence changed during recovery")
+                (run_dir / relative).write_bytes(content)
         report = _read_object(run_dir / "run-report.json", label="recovery run report")
+        evidence = report.get("evidence")
+        evidence_files = evidence.get("evidence_files") if isinstance(evidence, Mapping) else None
+        if not isinstance(evidence_files, dict):
+            raise SourceDebtRecoveryError("recovery evidence file inventory is invalid")
+        for name, relative in _OPTIONAL_EVIDENCE_FILES.items():
+            if name in parent_evidence:
+                evidence_files[name] = str(run_dir / relative)
         report["source_debt_recovery"] = transition
         collector.write_json(run_dir / "run-report.json", report)
         _write_immutable_json(
@@ -993,7 +1025,7 @@ def _recovery_receipt_document(
                 run_dir / relative, label=f"derived raw provider {name}"
             ),
         }
-        for name, relative in sorted(_EVIDENCE_FILES.items())
+        for name, relative in sorted(_evidence_files(run_dir).items())
     }
     unsigned: dict[str, Any] = {
         "schema_version": _RECEIPT_SCHEMA,
