@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import base64
 import bisect
+from concurrent.futures import ThreadPoolExecutor
 import datetime as dt
 import email.utils
 import fnmatch
@@ -3387,14 +3388,24 @@ def _multica_comment_history(
     origin = _multica_server_origin(str(config.get("server_url") or config.get("serverUrl") or config.get("base_url")))
     workspace_id = str(config.get("workspace_id") or config.get("workspaceId"))
     seen_issues: set[str] = set()
+    issues: list[Mapping[str, Any]] = []
     for issue in rows:
         issue_id = issue.get("id")
         if not isinstance(issue_id, str) or not issue_id:
-            errors.append({"reason": "issue has no usable comment-history identity"})
+            issues.append(issue)
             continue
         if issue_id in seen_issues:
             continue
         seen_issues.add(issue_id)
+        issues.append(issue)
+
+    def collect_issue(issue: Mapping[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+        # Deduplicated identities have disjoint atomic checkpoint directories.
+        issue_id = issue.get("id")
+        if not isinstance(issue_id, str) or not issue_id:
+            return [], [{"reason": "issue has no usable comment-history identity"}]
+        issue_comments: list[dict[str, Any]] = []
+        issue_errors: list[dict[str, str]] = []
         try:
             state = None
             if checkpoint_store is not None:
@@ -3428,11 +3439,10 @@ def _multica_comment_history(
             valid, records_complete = _multica_comment_rows(payload, issue_id, since, until)
             complete = transport_complete and records_complete
             snapshot = _multica_sanitized_issues([issue], None, None)[0]
-            comments.extend({**comment, "server_origin": origin, "workspace_id": workspace_id,
-                             "issue_snapshot": snapshot} for comment in valid)
+            issue_comments.extend({**comment, "server_origin": origin, "workspace_id": workspace_id,
+                                   "issue_snapshot": snapshot} for comment in valid)
             if not complete:
-                errors.append({"issue_id": issue_id, "reason": "comment history response incomplete or malformed"})
-                continue
+                return issue_comments, [{"issue_id": issue_id, "reason": "comment history response incomplete or malformed"}]
             if state is not None and not state.complete:
                 if not state.pages:
                     signature = _multica_page_signature(valid)
@@ -3440,7 +3450,16 @@ def _multica_comment_history(
                 checkpoint_store.mark_complete(state)
         except Exception:
             # Never expose CLI diagnostics or credentials in source debt.
-            errors.append({"issue_id": issue_id, "reason": "comment history collection or checkpoint failed"})
+            issue_errors.append({"issue_id": issue_id, "reason": "comment history collection or checkpoint failed"})
+        return issue_comments, issue_errors
+
+    # Bound both running and queued CLI reads. Merge in inventory order rather
+    # than completion order; failures keep debt and never trigger extra retries.
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        for start in range(0, len(issues), 4):
+            for issue_comments, issue_errors in executor.map(collect_issue, issues[start:start + 4]):
+                comments.extend(issue_comments)
+                errors.extend(issue_errors)
     return comments, errors
 
 

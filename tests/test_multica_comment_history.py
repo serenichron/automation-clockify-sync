@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -32,6 +33,125 @@ COMMENT = {"id": "comment-september", "issue_id": "issue-158", "parent_id": None
 
 
 class MulticaCommentHistoryTests(unittest.TestCase):
+    def test_comment_reads_overlap_at_most_four_and_merge_in_inventory_order(self):
+        """Catches serial reads, uncapped transport, duplicate submissions or completion-order output."""
+        issues = [{**ISSUE, "id": f"issue-{index}"} for index in range(8)]
+        lock = threading.Lock()
+        first_batch = threading.Barrier(4)
+        finished = [threading.Event() for _ in range(4)]
+        completion_order = []
+        active = maximum = 0
+        calls = []
+
+        def cli(command, **_kwargs):
+            nonlocal active, maximum
+            issue_id = command[8]
+            with lock:
+                calls.append(issue_id)
+                active += 1
+                maximum = max(maximum, active)
+            try:
+                index = int(issue_id.rsplit("-", 1)[1])
+                if index < 4:
+                    first_batch.wait(timeout=2)
+                    if index < 3 and not finished[index + 1].wait(timeout=2):
+                        raise RuntimeError("concurrent peer did not finish")
+                payload = [{**COMMENT, "id": f"comment-{issue_id}", "issue_id": issue_id}]
+                with lock:
+                    completion_order.append(issue_id)
+                if index < 4:
+                    finished[index].set()
+                return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
+            finally:
+                with lock:
+                    active -= 1
+
+        with mock.patch.object(collector, "_multica_cli_identity_matches", return_value=True), \
+                mock.patch.object(collector.subprocess, "run", side_effect=cli):
+            comments, errors = collector._multica_comment_history(
+                [*issues, issues[0]], CONFIG, SINCE, UNTIL, None)
+        self.assertEqual([], errors)
+        self.assertEqual([f"comment-issue-{index}" for index in range(8)],
+                         [row["id"] for row in comments])
+        self.assertEqual(4, maximum)
+        self.assertEqual(8, len(calls))
+        self.assertEqual(["issue-3", "issue-2", "issue-1", "issue-0"], completion_order[:4])
+
+    def test_concurrent_checkpoint_finalization_failure_resumes_saved_page_without_transport(self):
+        """Catches discarding a committed page after interrupted completion marking."""
+        issues = [{**ISSUE, "id": f"issue-{index}"} for index in range(4)]
+
+        def cli(command, **_kwargs):
+            issue_id = command[8]
+            return subprocess.CompletedProcess(command, 0, json.dumps([
+                {**COMMENT, "id": f"comment-{issue_id}", "issue_id": issue_id}]), "")
+
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(collector, "_multica_cli_identity_matches", return_value=True):
+            store = checkpoints.PageCheckpointStore(Path(directory))
+            complete = store.mark_complete
+            failed_identity = collector._multica_comment_checkpoint_identity(
+                CONFIG["server_url"], CONFIG["workspace_id"], "issue-1", SINCE, UNTIL)
+
+            def interrupt(state):
+                if state.identity == failed_identity:
+                    raise OSError("synthetic interrupted completion")
+                return complete(state)
+
+            with mock.patch.object(collector.subprocess, "run", side_effect=cli), \
+                    mock.patch.object(store, "mark_complete", side_effect=interrupt):
+                comments, errors = collector._multica_comment_history(issues, CONFIG, SINCE, UNTIL, store)
+            self.assertEqual(["issue-1"], [row["issue_id"] for row in errors])
+            self.assertEqual(4, len(comments))
+            self.assertFalse(store.open(failed_identity).complete)
+            with mock.patch.object(collector.subprocess, "run", side_effect=AssertionError("saved page refetched")):
+                resumed, errors = collector._multica_comment_history(issues, CONFIG, SINCE, UNTIL, store)
+            self.assertEqual([], errors)
+            self.assertEqual(comments, resumed)
+            self.assertTrue(store.open(failed_identity).complete)
+
+    def test_concurrent_failure_keeps_valid_evidence_and_reuses_other_checkpoints(self):
+        """Catches treating rate-limit diagnostics as complete or refetching committed peers."""
+        issues = [{**ISSUE, "id": f"issue-{index}"} for index in range(6)]
+        calls = []
+        failing = True
+
+        def cli(command, **_kwargs):
+            issue_id = command[8]
+            calls.append(issue_id)
+            payload = [{**COMMENT, "id": f"comment-{issue_id}", "issue_id": issue_id}]
+            stderr = "429 rate limited" if failing and issue_id == "issue-2" else ""
+            return subprocess.CompletedProcess(command, 1 if stderr else 0, json.dumps(payload), stderr)
+
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(collector, "_multica_cli_identity_matches", return_value=True), \
+                mock.patch.object(collector.subprocess, "run", side_effect=cli):
+            store = checkpoints.PageCheckpointStore(Path(directory))
+            comments, errors = collector._multica_comment_history(issues, CONFIG, SINCE, UNTIL, store)
+            self.assertEqual(["issue-2"], [row["issue_id"] for row in errors])
+            self.assertEqual(6, len(comments))
+            failing = False
+            calls.clear()
+            resumed, errors = collector._multica_comment_history(issues, CONFIG, SINCE, UNTIL, store)
+            self.assertEqual([], errors)
+            self.assertEqual(["issue-2"], calls)
+            self.assertEqual(comments, resumed)
+            calls.clear()
+            replayed, errors = collector._multica_comment_history(issues, CONFIG, SINCE, UNTIL, store)
+            self.assertEqual([], calls)
+            self.assertEqual([], errors)
+            self.assertEqual(comments, replayed)
+
+    def test_concurrent_errors_keep_original_inventory_order(self):
+        """Catches moving invalid issue identities ahead of earlier transport failures."""
+        with mock.patch.object(collector, "_multica_cli_identity_matches", return_value=True), \
+                mock.patch.object(collector.subprocess, "run", side_effect=OSError("offline")):
+            comments, errors = collector._multica_comment_history(
+                [ISSUE, {**ISSUE, "id": None}], CONFIG, SINCE, UNTIL, None)
+        self.assertEqual([], comments)
+        self.assertEqual("issue-158", errors[0].get("issue_id"))
+        self.assertNotIn("issue_id", errors[1])
+
     def collect(self, home, *, comments=None, rows=None, stderr="", returncode=0, store=None,
                 profile_config=None, transport_error=None, environment=None, raw_stdout=None,
                 strict_since=False):
