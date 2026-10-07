@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
 from scripts.clockify_sheet_publish import project_allowlist
 from scripts import work_accounting_pipeline as pipeline
+from scripts import semantic_analyzer as semantic
 
 
 MODULE_PATH = Path(__file__).parents[1] / "scripts" / "clockify_sync_collect.py"
@@ -220,6 +222,37 @@ class FathomRoutingTests(unittest.TestCase):
         client = {**internal, "calendar_invitees_domains_type": "only_internal",
                   "calendar_invitees": [{"email": "alex@lensofalex.com", "is_external": False}]}
         self.assertEqual("Lens of Alex Retainer", collector.route_meeting(client, routing)["project_name"])
+
+    def test_frozen_semantic_meeting_hint_preserves_sealed_request_cache(self):
+        # Normalizing a historical only_internal hint must not alter frozen request bytes.
+        routing = collector.load_json(MODULE_PATH.parents[1] / "routing.json")
+        raw = {**meeting("Agency planning review"), "calendar_invitees_domains_type": "only_internal",
+               "semantic_evidence_status": "available", "transcript": [{"text": "Planning review."}]}
+        event = {"evidence_id": "ev-" + "a" * 64, "source_type": "fathom",
+                 "source_ref": {"source_type": "fathom", "source_id": "frozen-recording"},
+                 "observed_at": "2026-09-23T07:11:28Z",
+                 "raw_source_span": {"start": "2026-09-23T07:11:28Z", "end": "2026-09-23T08:09:55Z"},
+                 "attributes": raw}
+        endpoint = semantic.AnalyzerEndpoint("primary", "https://offline.invalid", "fixture")
+        candidate = {"activities": [], "exceptions": [], "omissions": []}
+        frozen_body = semantic._review_body([event], candidate=candidate, model="fixture", taxonomy=[])
+        with tempfile.TemporaryDirectory() as directory:
+            cache = semantic.AnalyzerResponseCache(Path(directory) / "cache.jsonl")
+            response = {"activities": [], "exceptions": [], "omissions": []}
+            cache.store_accepted(endpoint, frozen_body, response)
+            hinted = pipeline._with_semantic_route_hints([event], routing)
+            current_body = semantic._review_body(hinted, candidate=candidate, model="fixture", taxonomy=[])
+            self.assertIsNotNone(cache.lookup(endpoint, current_body))
+            self.assertEqual(frozen_body, current_body)
+            self.assertEqual([event], hinted)
+        native, error = pipeline.resolve_route({}, [event], routing)
+        self.assertIsNone(error)
+        self.assertEqual("Serenichron Level 1", native["project_name"])
+        self.assertEqual(["Project Management"], native["tag_names"])
+        opted_in = pipeline._with_semantic_route_hints([event], routing, normalize_meeting_domains_type=True)
+        self.assertEqual("Serenichron Level 1", opted_in[0]["semantic_route_hint"]["project_name"])
+        self.assertEqual(["Project Management"], opted_in[0]["semantic_route_hint"]["tag_names"])
+        self.assertNotIn("semantic_route_hint", event)
 
     def test_matched_meeting_becomes_stable_proposal(self):
         proposals, ambiguous, skipped = collector.build_proposals(

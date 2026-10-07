@@ -3603,7 +3603,9 @@ def route_session(burst: dict[str, Any], routing: dict[str, Any]) -> dict[str, A
     return {"action": "ambiguous", "reason": "No route matched session label/path"}
 
 
-def route_meeting(meeting: dict[str, Any], routing: dict[str, Any]) -> dict[str, Any]:
+def route_meeting(
+    meeting: dict[str, Any], routing: dict[str, Any], *, normalize_domains_type: bool = True,
+) -> dict[str, Any]:
     """Route a Fathom meeting by invitee domain or title pattern."""
     title = str(meeting.get("title") or "")
     domains_type = str(meeting.get("calendar_invitees_domains_type") or "")
@@ -3617,7 +3619,7 @@ def route_meeting(meeting: dict[str, Any], routing: dict[str, Any]) -> dict[str,
         for invitee in meeting.get("calendar_invitees", [])
         if isinstance(invitee, dict)
     ]
-    if domains_type == "only_internal" and not any(invitee.get("is_external") is True for invitee in invitees):
+    if normalize_domains_type and domains_type == "only_internal" and not any(invitee.get("is_external") is True for invitee in invitees):
         domains_type = "internal_only"
     if (
         not domains_type

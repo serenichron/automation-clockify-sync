@@ -1099,11 +1099,13 @@ def _semantic_review_taxonomy(routing: Mapping[str, Any]) -> list[dict[str, Any]
 
 
 def _semantic_route_hint(
-    event: Mapping[str, Any], routing: Mapping[str, Any]
+    event: Mapping[str, Any], routing: Mapping[str, Any], *, normalize_meeting_domains_type: bool = False,
 ) -> dict[str, Any] | None:
     record = _event_record(event)
     if event.get("source_type") in {"fathom", "calendly"}:
-        candidate = collector.route_meeting(record, dict(routing))
+        candidate = collector.route_meeting(
+            record, dict(routing), normalize_domains_type=normalize_meeting_domains_type,
+        )
     else:
         candidate = _route_session_record(record, routing)
     action = str(candidate.get("action") or "")
@@ -1128,12 +1130,14 @@ def _semantic_route_hint(
 
 
 def _with_semantic_route_hints(
-    events: list[dict[str, Any]], routing: Mapping[str, Any]
+    events: list[dict[str, Any]], routing: Mapping[str, Any], *, normalize_meeting_domains_type: bool = False,
 ) -> list[dict[str, Any]]:
+    # Frozen v17 request bodies predate collector domain alias normalization.
+    # A new semantic contract may opt in; accounting keeps the corrected default.
     hinted: list[dict[str, Any]] = []
     for event in events:
         copied = dict(event)
-        if hint := _semantic_route_hint(event, routing):
+        if hint := _semantic_route_hint(event, routing, normalize_meeting_domains_type=normalize_meeting_domains_type):
             copied["semantic_route_hint"] = hint
         hinted.append(copied)
     return hinted
