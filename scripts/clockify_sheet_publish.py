@@ -1222,12 +1222,19 @@ def _plan_monthly_unresolved(
     rows: Sequence[Sequence[Any]],
     aliases: Mapping[str, Any] | None = None,
     source_dir: Path | None = None,
+    historical_sources: Path | None = None,
 ) -> dict[str, Any]:
     if any(len(row) != 12 or not str(row[0]).startswith("uev-") for row in rows):
         raise PublicationError("monthly unresolved row contract is invalid")
     ids = [row[0] for row in rows]
     if len(ids) != len(set(ids)):
         raise PublicationError("duplicate monthly stable evidence ID")
+    source_handles, sources_handle = {}, None
+    if historical_sources is not None:
+        try:
+            source_handles, sources_handle = monthly_unresolved.load_historical_sources(historical_sources)
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise PublicationError("monthly historical source bindings are invalid") from exc
     metadata = gateway.spreadsheet(spreadsheet_id)
     properties = [sheet.get("properties", {}) for sheet in metadata.get("sheets", [])
                   if sheet.get("properties", {}).get("title") == sheet_title]
@@ -1274,14 +1281,15 @@ def _plan_monthly_unresolved(
             if source_dir is None:
                 raise PublicationError(f"monthly machine-field conflict: {row[0]}")
             try:
-                canonical_aliases.append(monthly_unresolved.canonical_source_alias(source_dir, list(row), prior, layout=layout))
+                canonical_aliases.append(monthly_unresolved.canonical_source_alias(
+                    source_dir, list(row), prior, layout=layout, historical_sources=source_handles))
             except (OSError, KeyError, TypeError, ValueError) as exc:
                 raise PublicationError(f"monthly canonical machine-field conflict: {row[0]}") from exc
     if appends and len(existing) < 2:
         raise PublicationError("monthly unresolved tab lacks a native data-row exemplar")
     return {"sheet_title": sheet_title, "sheet_id": prop["sheetId"], "grid_rows": grid["rowCount"],
             "existing": existing, "appends": appends, "rows": [list(row) for row in rows], "aliases": aliases,
-            "canonical_aliases": canonical_aliases, "layout": layout}
+            "canonical_aliases": canonical_aliases, "layout": layout, "historical_sources": sources_handle}
 
 
 def _apply_monthly_unresolved(
@@ -1307,6 +1315,8 @@ def _apply_monthly_unresolved(
         result["source_aliases"] = monthly_unresolved.alias_metadata(plan["rows"], plan["aliases"])
     if plan["canonical_aliases"]:
         result["canonical_source_aliases"] = plan["canonical_aliases"]
+    if plan["historical_sources"] is not None:
+        result["historical_sources"] = plan["historical_sources"]
     if plan["layout"] is not None:
         by_id = {row[0]: padded(row) for row in observed[1:] if row}
         evidence = {
@@ -1325,8 +1335,10 @@ def publish_monthly_unresolved(
     rows: Sequence[Sequence[Any]],
     aliases: Mapping[str, Any] | None = None,
     source_dir: Path | None = None,
+    historical_sources: Path | None = None,
 ) -> dict[str, Any]:
-    plan = _plan_monthly_unresolved(gateway, spreadsheet_id=spreadsheet_id, sheet_title=sheet_title, rows=rows, aliases=aliases, source_dir=source_dir)
+    plan = _plan_monthly_unresolved(gateway, spreadsheet_id=spreadsheet_id, sheet_title=sheet_title, rows=rows, aliases=aliases,
+                                   source_dir=source_dir, historical_sources=historical_sources)
     return _apply_monthly_unresolved(gateway, spreadsheet_id=spreadsheet_id, plan=plan)
 
 
@@ -1345,6 +1357,7 @@ def publish_proposal_partitions(
     monthly_source_dir: Path | None = None,
     meeting_bindings: Path | None = None,
     source_dir: Path | None = None,
+    monthly_historical_sources: Path | None = None,
 ) -> dict[str, Any]:
     proposal_partitions: tuple[tuple[str, list[Mapping[str, Any]]], ...] = (
         (sheet_title, [
@@ -1414,6 +1427,7 @@ def publish_proposal_partitions(
             gateway, spreadsheet_id=spreadsheet_id,
             sheet_title=monthly_unresolved.title_for_review(sheet_title), rows=monthly_rows, aliases=monthly_aliases,
             source_dir=monthly_source_dir,
+            historical_sources=monthly_historical_sources,
         )
     publications: list[dict[str, Any]] = []
     for (destination, rows), plan in zip(partitions, plans, strict=True):
@@ -1500,8 +1514,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--enable-write", action="store_true")
     parser.add_argument("--monthly-unresolved", action="store_true")
     parser.add_argument("--monthly-unresolved-alias-proof", type=Path)
+    parser.add_argument("--monthly-unresolved-historical-sources", type=Path)
     parser.add_argument("--meeting-publication-bindings", type=Path)
     args = parser.parse_args(argv)
+    if args.monthly_unresolved_historical_sources is not None and not (args.monthly_unresolved and args.proposals is not None):
+        parser.error("monthly historical sources require --monthly-unresolved and --proposals")
 
     quality = _json(args.quality_report)
     replay = _json(args.replay_integrity)
@@ -1549,6 +1566,8 @@ def main(argv: list[str] | None = None) -> int:
                 monthly_rows = monthly_unresolved.project_rows(args.proposals.parent)
                 if args.monthly_unresolved_alias_proof is not None:
                     monthly_aliases = monthly_unresolved.load_alias_proofs(args.monthly_unresolved_alias_proof, args.proposals.parent)
+                if args.monthly_unresolved_historical_sources is not None:
+                    monthly_unresolved.load_historical_sources(args.monthly_unresolved_historical_sources)
             except (OSError, KeyError, TypeError, ValueError) as exc:
                 raise PublicationError("monthly unresolved source/replay projection is invalid") from exc
     meeting_preview_aliases = []
@@ -1591,6 +1610,7 @@ def main(argv: list[str] | None = None) -> int:
             monthly_source_dir=args.proposals.parent,
             meeting_bindings=args.meeting_publication_bindings,
             source_dir=args.proposals.parent,
+            monthly_historical_sources=args.monthly_unresolved_historical_sources,
         )
     else:
         result = publish(
@@ -1628,6 +1648,7 @@ def main(argv: list[str] | None = None) -> int:
                      **({"source_aliases": item["source_aliases"]} if "source_aliases" in item else {}),
                      **({"meeting_aliases": item["meeting_aliases"]} if "meeting_aliases" in item else {}),
                      **({"canonical_source_aliases": item["canonical_source_aliases"]} if "canonical_source_aliases" in item else {}),
+                     **({"historical_sources": item["historical_sources"]} if "historical_sources" in item else {}),
                      **({field: item[field] for field in ("monthly_layout", "monthly_target_readback")} if "monthly_layout" in item else {})}
                     for item in document["publications"]
                 ],

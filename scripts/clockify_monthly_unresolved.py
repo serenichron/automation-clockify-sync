@@ -424,17 +424,68 @@ def alias_metadata(rows: list[list[Any]], aliases: dict[str, Any]) -> list[dict[
             for row in rows if row[0] in aliases]
 
 
-def canonical_source_alias(source_dir: Path, requested: list[Any], existing: list[Any], *, layout: str | None = None) -> dict[str, Any]:
-    """Recognize only a rederivable canonical row from one pinned sibling run."""
+HISTORICAL_SOURCES_SCHEMA = "monthly-unresolved-historical-sources/v1"
+
+
+def load_historical_sources(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
+    """Admit only explicitly pinned original ledger locators, never scan roots."""
+    from scripts import clockify_source_adoptions as adoptions
+    path = Path(path).absolute()
+    if path.resolve() != path:
+        raise ValueError("monthly historical source manifest must be an original file")
+    _, digest = _read(path.parent, path.name)
+    handle = {"path": str(path), "sha256": digest}
+    document = json.loads(adoptions._capture(handle, {}))
+    if (not isinstance(document, dict) or set(document) != {"schema_version", "sources"}
+        or document["schema_version"] != HISTORICAL_SOURCES_SCHEMA
+        or not isinstance(document["sources"], list) or not document["sources"]):
+        raise ValueError("monthly historical source manifest schema differs")
+    sources = {}
+    for source in document["sources"]:
+        if not isinstance(source, dict) or set(source) != {"source_run_id", "source_ledger"}:
+            raise ValueError("monthly historical source binding is invalid")
+        name = source["source_run_id"]
+        if (not isinstance(name, str) or not name or name in {".", ".."}
+                or Path(name).name != name or name in sources):
+            raise ValueError("monthly historical source name is unsafe or ambiguous")
+        ledger = source["source_ledger"]
+        adoptions._capture(ledger, {})
+        ledger_path = Path(ledger["path"])
+        if (ledger_path.name != "evidence-ledger.json" or ledger_path.parent.name != "evidence"
+                or ledger_path.parent.parent.name != name):
+            raise ValueError("monthly historical source locator differs from its original run")
+        _, ledger_digest = _ledger_events(ledger_path.parent.parent)
+        if ledger_digest != ledger["sha256"]:
+            raise ValueError("monthly historical source ledger differs")
+        sources[name] = dict(ledger)
+    return sources, handle
+
+
+def _historical_source(source_dir: Path, name: Any, sources: dict[str, Any] | None = None) -> tuple[Path, dict[str, str] | None]:
+    if not isinstance(name, str) or not name or name in {".", ".."} or Path(name).name != name:
+        raise ValueError("canonical alias source is not a direct run name")
+    if sources is not None and name in sources:
+        from scripts import clockify_source_adoptions as adoptions
+        handle = sources[name]
+        adoptions._capture(handle, {})
+        path = Path(handle["path"])
+        if path.name != "evidence-ledger.json" or path.parent.name != "evidence" or path.parent.parent.name != name:
+            raise ValueError("canonical alias explicit historical locator differs")
+        return path.parent.parent, handle
+    historical = source_dir.parent / name
+    if historical.is_symlink() or not historical.is_dir() or historical.resolve().parent != source_dir.parent.resolve():
+        raise ValueError("canonical alias historical source is unsafe")
+    return historical, None
+
+
+def canonical_source_alias(source_dir: Path, requested: list[Any], existing: list[Any], *, layout: str | None = None,
+                           historical_sources: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Reconstruct a canonical sibling row or explicitly pinned original source."""
     provenance = json.loads(existing[11])
     if not isinstance(provenance, dict) or set(provenance) != {"source_run_id", "artifacts", "evidence_ids"}:
         raise ValueError("existing row is not canonical monthly provenance")
     name = provenance["source_run_id"]
-    if not isinstance(name, str) or not name or name in {".", ".."} or Path(name).name != name:
-        raise ValueError("canonical alias source is not a direct sibling run")
-    historical = source_dir.parent / name
-    if historical.is_symlink() or not historical.is_dir() or historical.resolve().parent != source_dir.parent.resolve():
-        raise ValueError("canonical alias historical source is unsafe")
+    historical, explicit_handle = _historical_source(source_dir, name, historical_sources)
     for relative, expected in provenance["artifacts"].items():
         _, digest = _read(historical, relative)
         if digest != expected:
@@ -451,10 +502,12 @@ def canonical_source_alias(source_dir: Path, requested: list[Any], existing: lis
         raise ValueError("canonical alias cited ledger content differs")
     return {"stable_evidence_id": requested[0], "source_run_id": name,
             "historical_provenance": existing[11], "preserved_machine_digest": machine_digest(existing),
-            "historical_ledger_digest": ledger_digest}
+            "historical_ledger_digest": ledger_digest,
+            **({"historical_source": explicit_handle} if explicit_handle is not None else {})}
 
 
-def validate_canonical_aliases(source_dir: Path, rows: list[list[Any]], aliases: Any, *, layout: str | None = None) -> list[dict[str, Any]]:
+def validate_canonical_aliases(source_dir: Path, rows: list[list[Any]], aliases: Any, *, layout: str | None = None,
+                               historical_sources: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Independently reconstruct publisher-reported aliases, without Sheets."""
     if not isinstance(aliases, list) or not aliases:
         raise ValueError("canonical source aliases must be a nonempty list")
@@ -469,16 +522,13 @@ def validate_canonical_aliases(source_dir: Path, rows: list[list[Any]], aliases:
         provenance = json.loads(alias["historical_provenance"])
         name = provenance.get("source_run_id")
         # Validate the name before resolving or reading any producer locator.
-        if not isinstance(name, str) or not name or name in {".", ".."} or Path(name).name != name:
-            raise ValueError("canonical alias source is not a direct sibling run")
-        historical = source_dir.parent / name
-        if historical.is_symlink() or not historical.is_dir() or historical.resolve().parent != source_dir.parent.resolve():
-            raise ValueError("canonical alias historical source is unsafe")
+        historical, _ = _historical_source(source_dir, name, historical_sources)
         old_rows = rows_for_layout(project_rows(historical), layout)
         old = next((row for row in old_rows if row[0] == identity), None)
         if old is None:
             raise ValueError("canonical alias historical identity is absent")
-        proof = canonical_source_alias(source_dir, requested[identity], old, layout=layout)
+        proof = canonical_source_alias(source_dir, requested[identity], old, layout=layout,
+                                       historical_sources=historical_sources)
         if proof != alias:
             raise ValueError("canonical source alias metadata differs from its frozen source")
         validated.append(proof)

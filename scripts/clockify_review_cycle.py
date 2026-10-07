@@ -282,7 +282,7 @@ def load_config(path: Path) -> dict[str, Any]:
         raise CycleError("config must be valid JSON") from exc
     if not isinstance(config, dict) or not _REQUIRED.issubset(config):
         raise CycleError("config is missing required review-cycle fields")
-    if set(config) - (_REQUIRED | {"runs_dir", "catchup_until", "max_slices", "total_child_budget_seconds", "monthly_unresolved_alias_proof", "meeting_publication_bindings", "native_credit_input", "private_routing"}):
+    if set(config) - (_REQUIRED | {"runs_dir", "catchup_until", "max_slices", "total_child_budget_seconds", "monthly_unresolved_alias_proof", "monthly_unresolved_historical_sources", "meeting_publication_bindings", "native_credit_input", "private_routing"}):
         raise CycleError("config contains unsupported review-cycle fields")
     if "native_credit_input" in config:
         handle = config["native_credit_input"]
@@ -292,6 +292,8 @@ def load_config(path: Path) -> dict[str, Any]:
         _canonical_runtime_path(handle["path"], label="native credit input")
     if "meeting_publication_bindings" in config:
         _canonical_runtime_path(config["meeting_publication_bindings"], label="meeting publication bindings")
+    if "monthly_unresolved_historical_sources" in config:
+        _canonical_runtime_path(config["monthly_unresolved_historical_sources"], label="monthly historical sources")
     if not isinstance(config["calendly_optional"], bool):
         raise CycleError("calendly_optional must be boolean")
     try:
@@ -1759,6 +1761,8 @@ def _publisher_command(
     ]
     if config.get("monthly_unresolved_alias_proof"):
         command.extend(["--monthly-unresolved-alias-proof", str(config["monthly_unresolved_alias_proof"])])
+    if config.get("monthly_unresolved_historical_sources"):
+        command.extend(["--monthly-unresolved-historical-sources", str(config["monthly_unresolved_historical_sources"])])
     meeting_bindings = _meeting_bindings_for_target(config, sheet_title)
     if meeting_bindings is not None:
         command.extend(["--meeting-publication-bindings", str(meeting_bindings)])
@@ -1793,6 +1797,22 @@ def _publication_profile(config: Mapping[str, Any], profile: str | None) -> str 
 
 
 def _receipt_publication_config(config: Mapping[str, Any], document: Mapping[str, Any]) -> Mapping[str, Any]:
+    records = document.get("publication_receipts", document.get("publications", []))
+    historical_handles = [item["historical_sources"] for item in records
+                          if isinstance(item, Mapping) and "historical_sources" in item] if isinstance(records, list) else []
+    if historical_handles:
+        try:
+            from scripts import clockify_source_adoptions
+            if len(historical_handles) != 1:
+                raise ValueError("monthly historical source receipt is ambiguous")
+            proof = historical_handles[0]
+            clockify_source_adoptions._capture(proof, {})
+            clockify_monthly_unresolved.load_historical_sources(Path(proof["path"]))
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise CycleError("delivery monthly historical source manifest has drifted") from exc
+        config = {**config, "monthly_unresolved_historical_sources": proof["path"]}
+    elif "monthly_unresolved_historical_sources" in config:
+        config = {key: value for key, value in config.items() if key != "monthly_unresolved_historical_sources"}
     if "meeting_publication_bindings" in document:
         from scripts import clockify_source_adoptions
         proof = document["meeting_publication_bindings"]
@@ -1880,6 +1900,13 @@ def _expected_publication_receipts(
             )
             if aliases:
                 receipt["source_aliases"] = clockify_monthly_unresolved.alias_metadata(rows, aliases)
+            if config.get("monthly_unresolved_historical_sources"):
+                try:
+                    _, historical_handle = clockify_monthly_unresolved.load_historical_sources(
+                        Path(str(config["monthly_unresolved_historical_sources"])))
+                except (OSError, ValueError, TypeError, KeyError) as exc:
+                    raise CycleError("monthly historical source manifest differs") from exc
+                receipt["historical_sources"] = historical_handle
             receipts.append(receipt)
     return receipts
 
@@ -1907,6 +1934,7 @@ def _validated_publication_document(
         {**{field: item.get(field) for field in retained_fields},
          **({"source_aliases": item["source_aliases"]} if "source_aliases" in item else {}),
          **({"meeting_aliases": item["meeting_aliases"]} if "meeting_aliases" in item else {}),
+         **({"historical_sources": item["historical_sources"]} if "historical_sources" in item else {}),
          **({field: item.get(field) for field in ("monthly_layout", "monthly_target_readback")}
             if "monthly_layout" in item or "monthly_target_readback" in item else {})}
         for item in publications if isinstance(item, Mapping)
@@ -1937,6 +1965,7 @@ def _validated_publication_document(
                 **_publication_receipt(spreadsheet_id=canonical_receipt["spreadsheet_id"],
                     sheet_title=canonical_receipt["sheet_title"], rows=rows),
                 **({"source_aliases": expected[index]["source_aliases"]} if "source_aliases" in expected[index] else {}),
+                **({"historical_sources": expected[index]["historical_sources"]} if "historical_sources" in expected[index] else {}),
                 "monthly_layout": item["monthly_layout"],
                 "monthly_target_readback": item.get("monthly_target_readback"),
             }
@@ -1952,9 +1981,16 @@ def _validated_publication_document(
         if source_dir is None:
             raise CycleError("publisher canonical alias source context is missing")
         try:
+            historical_sources = None
+            if "historical_sources" in expected[index]:
+                from scripts import clockify_source_adoptions
+                handle = expected[index]["historical_sources"]
+                clockify_source_adoptions._capture(handle, {})
+                historical_sources, _ = clockify_monthly_unresolved.load_historical_sources(Path(handle["path"]))
             aliases = clockify_monthly_unresolved.validate_canonical_aliases(
                 source_dir, legacy_rows.get(index, clockify_monthly_unresolved.project_rows(source_dir)),
                 item["canonical_source_aliases"], layout=item.get("monthly_layout"),
+                historical_sources=historical_sources,
             )
         except (OSError, KeyError, TypeError, ValueError) as exc:
             raise CycleError("publisher canonical alias proof differs") from exc
