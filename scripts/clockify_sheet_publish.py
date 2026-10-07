@@ -109,7 +109,12 @@ class GwsSheetsGateway:
     def values(self, spreadsheet_id: str, range_name: str) -> list[list[Any]]:
         response = self._call([
             "spreadsheets", "values", "get", "--params",
-            json.dumps({"spreadsheetId": spreadsheet_id, "range": range_name}),
+            json.dumps({
+                "spreadsheetId": spreadsheet_id,
+                "range": range_name,
+                "valueRenderOption": "UNFORMATTED_VALUE",
+                "dateTimeRenderOption": "FORMATTED_STRING",
+            }),
         ])
         rows = response.get("values", [])
         return rows if isinstance(rows, list) else []
@@ -763,9 +768,11 @@ def _sheet_row_count(metadata: Mapping[str, Any], title: str) -> int:
 
 
 def _same_cell(left: Any, right: Any) -> bool:
-    """Compare API-formatted cells with equivalent raw scalar inputs."""
+    """Compare raw scalars exactly, allowing equivalent JSON numeric types."""
     if left in (None, "") and right in (None, ""):
         return True
+    if type(left) in (int, float) and type(right) in (int, float):
+        return left == right
     return str(left) == str(right)
 
 

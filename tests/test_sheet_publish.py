@@ -261,6 +261,66 @@ def portfolio_document():
 
 
 class SheetPublicationTests(unittest.TestCase):
+    def test_readback_uses_exact_raw_minutes_instead_of_rounded_sheet_display(self):
+        rows = []
+        for segment, minutes in ((1, 2), (2, 43.733333333333334)):
+            row = publisher.proposal_row(proposal(segment), "run-1")
+            row[3] = minutes
+            rows.append(row)
+
+        def sheet_read(arguments, **_kwargs):
+            params = json.loads(arguments[arguments.index("--params") + 1])
+            actual = [list(row) for row in rows]
+            if params.get("valueRenderOption") != "UNFORMATTED_VALUE":
+                actual[0][3] = "2."
+                actual[1][3] = "43.733333"
+            # Genuine typed dates must retain their string representation,
+            # rather than becoming serial numbers under unformatted reads.
+            elif params.get("dateTimeRenderOption") != "FORMATTED_STRING":
+                actual[0][1] = 46235.416666666664
+            return mock.Mock(returncode=0, stderr="", stdout=json.dumps({
+                "values": [publisher.HEADER, *actual],
+            }))
+
+        with mock.patch.object(publisher.subprocess, "run", side_effect=sheet_read):
+            publisher._verify_readback(
+                publisher.GwsSheetsGateway(), "sheet", "'August 2026 review'",
+                1000, rows, new_ids=frozenset(row[0] for row in rows),
+            )
+
+    def test_raw_readback_rejects_altered_fractional_minutes_without_tolerance(self):
+        row = publisher.proposal_row(proposal(), "run-1")
+        row[3] = 43.733333333333334
+        actual = list(row)
+        actual[3] = 43.73333333333333
+        with mock.patch.object(publisher.subprocess, "run", return_value=mock.Mock(
+            returncode=0, stderr="", stdout=json.dumps({
+                "values": [publisher.HEADER, actual],
+            }),
+        )):
+            with self.assertRaisesRegex(publisher.PublicationError, "machine fields"):
+                publisher._verify_readback(
+                    publisher.GwsSheetsGateway(), "sheet", "'August 2026 review'",
+                    1000, [row],
+                )
+
+    def test_approved_raw_integral_float_minutes_are_unchanged_without_writes(self):
+        row = publisher.proposal_row(proposal(), "run-1")
+        prior = list(row)
+        prior[3] = 10.0
+        prior[9] = "approved"
+        prior[13] = "posted"
+        prior[14] = "Preserve this human note"
+        gateway = StatefulGateway([publisher.HEADER, prior])
+        result = publisher.publish(
+            gateway, spreadsheet_id="sheet", sheet_title="August 2026 review",
+            template_title="Proposals", rows=[row],
+        )
+        self.assertEqual(1, result["unchanged"])
+        self.assertEqual([], gateway.updated)
+        self.assertEqual(0, result["appended"])
+        self.assertEqual(prior, gateway.rows[1])
+
     def test_sheet_duration_format_displays_fractional_minutes_without_padding_integers(self):
         # Numeric precision is not reviewable if the emitted Sheet format hides it.
         with mock.patch.object(publisher.subprocess, "run", return_value=mock.Mock(
