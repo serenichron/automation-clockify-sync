@@ -23,18 +23,30 @@ START = dt.datetime(2026, 9, 7, 9, tzinfo=dt.timezone.utc)
 
 
 class RecurringNativeCreditTests(unittest.TestCase):
-    def fixture(self, root, *, prior_minutes=(30,), current_minutes=(30,), kind="equal_accomplishment", prior_offsets=None):
+    def fixture(self, root, *, prior_minutes=(30,), current_minutes=(30,), kind="equal_accomplishment", prior_offsets=None, current_meeting_attrs=None, current_end_seconds=844):
         self.assertTrue(callable(getattr(adoption, "build_recurring_credit", None)), "recurring credit producer is missing")
         make = native_fixtures.NativeSheetPostTests()
         rows, priors = [], []
         cursor = START
         total = sum(prior_minutes)
-        event = evidence_ledger.evidence_event(
-            "fathom" if kind == "whole_recording_aliases" else "repository_events",
-            {"source_type": "fathom" if kind == "whole_recording_aliases" else "repository_events", "source_id": "recording-123"},
-            observed_at=START.isoformat(), raw_source_span={"start": START.isoformat(), "end": (START + dt.timedelta(minutes=total)).isoformat()},
-            attributes={"description": "Source-accounted accomplishment"},
-        )
+        intersection = kind == "source_native_meeting_intersection"
+        recording = kind == "whole_recording_aliases" or intersection
+        meeting_attrs = {"recording_id": "recording-123", "share_url": "https://fathom.video/share/fixture-123",
+                         "title": "Discovery call", "semantic_evidence_status": "available",
+                         "recorded_by_email": "vlad@serenichron.com", "calendar_invitees": [{"email": "prospect@example.test"}]}
+        old_end = START + dt.timedelta(minutes=prior_minutes[0] if intersection else total)
+        if intersection:
+            event = evidence_ledger.normalize_collector_snapshot({"fathom": {"meetings": [{
+                **meeting_attrs, "start": START.isoformat(), "end": old_end.isoformat(),
+            }]}})[0]
+            self.assertNotIn("recording_id", event.attributes)
+        else:
+            event = evidence_ledger.evidence_event(
+                "fathom" if recording else "repository_events",
+                {"source_type": "fathom" if recording else "repository_events", "source_id": "recording-123"},
+                observed_at=START.isoformat(), raw_source_span={"start": START.isoformat(), "end": old_end.isoformat()},
+                attributes={"description": "Source-accounted accomplishment"},
+            )
         ledger = evidence_ledger.EvidenceLedger((event,))
         ledger_doc = {"schema_version": ledger.manifest.schema_version, "manifest": ledger.manifest.document(), "events": [event.document()]}
         for index, minutes in enumerate(prior_minutes):
@@ -45,7 +57,7 @@ class RecurringNativeCreditTests(unittest.TestCase):
             priors.append(prior)
             row = native_fixtures.row(f"wka-prior-{index}-s01", cursor.astimezone(dt.timezone(dt.timedelta(hours=3))).strftime("%Y-%m-%d %H:%M:%S"),
                                       (cursor + dt.timedelta(minutes=minutes)).astimezone(dt.timezone(dt.timedelta(hours=3))).strftime("%Y-%m-%d %H:%M:%S"), minutes)
-            row[8] = "Human-approved wording"
+            row[8] = f"Human-approved wording {index}" if intersection else "Human-approved wording"
             rows.append(row)
             cursor += dt.timedelta(minutes=minutes)
         plan = make._plan(native_fixtures.capture(*rows))
@@ -59,6 +71,18 @@ class RecurringNativeCreditTests(unittest.TestCase):
             interval["duration"] = f"PT{int((native.legacy._parse(interval['end']) - native.legacy._parse(interval['start'])).total_seconds())}S"
         current = [proposal_fixtures._proposal(f"current-{index}", [event.evidence_id], "Current editorial description", START.isoformat(), minutes)
                    for index, minutes in enumerate(current_minutes)]
+        current_ledger_doc = ledger_doc
+        if intersection:
+            current_start, current_end = START + dt.timedelta(seconds=3), START + dt.timedelta(seconds=current_end_seconds)
+            current_event = evidence_ledger.normalize_collector_snapshot({"fathom": {"meetings": [{
+                **(meeting_attrs if current_meeting_attrs is None else current_meeting_attrs),
+                "start": current_start.isoformat(), "end": current_end.isoformat(),
+            }]}})[0]
+            current_ledger = evidence_ledger.EvidenceLedger((current_event,))
+            current_ledger_doc = {"schema_version": current_ledger.manifest.schema_version,
+                                  "manifest": current_ledger.manifest.document(), "events": [current_event.document()]}
+            current[0].update(start=current_start.isoformat(), end=current_end.isoformat(), duration_seconds=current_end_seconds - 3, duration_minutes=(current_end_seconds - 3) / 60)
+            current[0]["provenance"]["evidence_ids"] = [current_event.evidence_id]
         for row in current:
             row["clockify_project_suffix"] = "other-current-route"
         artifact = adoption_fixtures.artifact
@@ -73,7 +97,7 @@ class RecurringNativeCreditTests(unittest.TestCase):
             "operation_anchor": "audit/recording-123/accomplishment", "coverage_kind": kind,
             "current_review_ids": [f"{row['review_activity_key']}-s01" for row in current],
             "artifacts": {"current_proposals": artifact(root / "current-proposals.json", current),
-                          "current_source_ledger": dict(handles["source_ledger"])},
+                          "current_source_ledger": artifact(root / "current-source-ledger.json", current_ledger_doc)},
             "prior_entries": [{"prior_review_id": f"wka-prior-{index}-s01", "clockify_entry_id": entry["id"], "artifacts": handles}
                               for index, entry in enumerate(gateway.entries)],
         }
@@ -86,7 +110,86 @@ class RecurringNativeCreditTests(unittest.TestCase):
     def apply(self, proposals, credits, proof):
         return pipeline._apply_verified_posted_credits(proposals, [], credits, collection_snapshot=proof)
 
-    def accounting_run_fixture(self, root, proof):
+    def test_native_recording_precision_drift_credits_union_and_retains_four_second_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            current, declaration, proof = self.fixture(Path(tmp), prior_minutes=(14, 14), prior_offsets=(0, 0),
+                                                       current_minutes=(14,), kind="source_native_meeting_intersection")
+            credit = self.seal(declaration)
+            rows, credited = self.apply(current, [credit], proof)
+            self.assertEqual(1, len(rows))
+            self.assertEqual(4, rows[0]["duration_seconds"])
+            self.assertEqual("2026-09-07T09:14:00+00:00", rows[0]["start"])
+            self.assertEqual("2026-09-07T09:14:04+00:00", rows[0]["end"])
+            self.assertEqual(837, rows[0]["provenance"]["credited_overlap_receipt"]["credited_seconds"])
+            self.assertEqual(837, credited[0]["verified_posted_credit"]["covered_seconds"])
+            self.assertNotIn("credited_overlap_receipt", credited[0])  # Partial credit must not tombstone its live tail.
+            self.assertEqual(2, len(credited[0]["clockify_entry_ids"]))
+            self.assertNotEqual(credit["current_targets"][0]["source_events"][0]["evidence_id"],
+                                credit["prior_proofs"][0]["source_events"][0]["evidence_id"])
+
+    def test_native_recording_credit_rejects_missing_conflicting_identity_or_share_url(self):
+        for attrs in ({}, {"share_url": "https://fathom.video/share/fixture-123"},
+                      {"recording_id": "different", "share_url": "https://fathom.video/share/fixture-123"},
+                      {"recording_id": "recording-123"},
+                      {"recording_id": "recording-123", "share_url": "https://fathom.video/share/fixture-123", "provider_recording_id": "different"},
+                      {"recording_id": "recording-123", "share_url": "https://fathom.video/share/different"}):
+            with self.subTest(attrs=attrs), tempfile.TemporaryDirectory() as tmp:
+                _, declaration, _ = self.fixture(Path(tmp), prior_minutes=(14,), current_minutes=(14,),
+                                                kind="source_native_meeting_intersection", current_meeting_attrs=attrs)
+                with self.assertRaises(ValueError):
+                    self.seal(declaration)
+
+    def test_native_recording_credit_never_credits_unverified_or_drifted_native_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            current, declaration, proof = self.fixture(Path(tmp), prior_minutes=(14,), current_minutes=(14,),
+                                                       kind="source_native_meeting_intersection")
+            credit = self.seal(declaration)
+            for mutation in ("missing", "interval", "scope"):
+                entries = copy.deepcopy(proof.entries)
+                if mutation == "missing": entries = []
+                elif mutation == "interval": entries[0]["timeInterval"]["end"] = "2026-09-07T09:13:00Z"
+                else: entries[0]["userId"] = "other-member"
+                changed = snapshot.ClockifyCheckpointSnapshot(entries, proof.manifest, proof.manifest_sha256, {})
+                self.assertEqual((current, []), self.apply(current, [credit], changed))
+            self.assertEqual((current, []), self.apply(current, [credit], None))
+
+    def test_native_recording_credit_rejects_ambiguous_source_and_tampered_proof(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            current, declaration, proof = self.fixture(Path(tmp), prior_minutes=(14,), current_minutes=(14,),
+                                                       kind="source_native_meeting_intersection")
+            original = self.seal(declaration)
+            credit = copy.deepcopy(original)
+            target = credit["current_targets"][0]
+            old = target["source_events"][0]
+            extra = evidence_ledger.evidence_event("fathom", {"source_type": "fathom", "source_id": "other"},
+                observed_at=old["observed_at"], raw_source_span=old["raw_source_span"],
+                attributes={"recording_id": "other", "share_url": "https://fathom.video/share/fixture-123"})
+            target["source_events"].append(extra.document())
+            target["proposal"]["provenance"]["evidence_ids"].append(extra.evidence_id)
+            target["proposal_digest"] = adoption.recurring_proposal_digest(target["proposal"])
+            credit["credit_digest"] = adoption_fixtures.native._document_digest(credit, "credit_digest")
+            with self.assertRaises(ValueError): adoption.validate_recurring_credit(credit)
+            credit = copy.deepcopy(original)
+            credit["prior_proofs"][0]["native_confirmed"]["clockify_entry_id"] = "unverified"
+            credit["credit_digest"] = adoption_fixtures.native._document_digest(credit, "credit_digest")
+            self.assertEqual((current, []), self.apply(current, [credit], proof))
+            credit = copy.deepcopy(original)
+            credit["prior_proofs"][0]["source_events"] = []
+            credit["credit_digest"] = adoption_fixtures.native._document_digest(credit, "credit_digest")
+            self.assertEqual((current, []), self.apply(current, [credit], proof))
+            credit = copy.deepcopy(original)
+            target = credit["current_targets"][0]
+            old = target["source_events"][0]
+            conflicting = evidence_ledger.evidence_event("fathom", old["source_ref"],
+                observed_at=old["observed_at"], raw_source_span=old["raw_source_span"],
+                attributes={**old["attributes"], "recording_id": "conflicting-optional-id"})
+            target["source_events"] = [conflicting.document()]
+            target["proposal"]["provenance"]["evidence_ids"] = [conflicting.evidence_id]
+            target["proposal_digest"] = adoption.recurring_proposal_digest(target["proposal"])
+            credit["credit_digest"] = adoption_fixtures.native._document_digest(credit, "credit_digest")
+            self.assertEqual((current, []), self.apply(current, [credit], proof))
+
+    def accounting_run_fixture(self, root, proof, *, current_source=False):
         since, until = START.replace(day=1, hour=0), START.replace(month=10, day=1, hour=0)
         store = collector_checkpoints.PageCheckpointStore(root / "cache")
         state = store.open(collector._clockify_checkpoint_identity("workspace-1", "user-1", since, until), initial_metadata={"snapshot_at": "2026-10-04T12:00:00Z"})
@@ -101,7 +204,7 @@ class RecurringNativeCreditTests(unittest.TestCase):
         captured = snapshot.capture_checkpoint_snapshot(checkpoint_manifest=state.directory / "manifest.json",
             clockify_evidence=source, destination=destination, workspace_id="workspace-1", user_id="user-1", since=since, until=until)
         (run_dir / "evidence/clockify-existing.json").write_bytes(source.read_bytes())
-        original = json.loads((root / "source-ledger.json").read_bytes())
+        original = json.loads((root / ("current-source-ledger.json" if current_source else "source-ledger.json")).read_bytes())
         events = [evidence_ledger.EvidenceEvent.from_document(event) for event in original["events"]]
         events.extend(evidence_ledger.normalize_collector_snapshot({"clockify": projection}))
         ledger = evidence_ledger.EvidenceLedger(tuple(events), {"clockify": {"status": "complete"}, "fathom": {"status": "complete"}, "multica_issues": {"status": "complete"}})
@@ -112,6 +215,57 @@ class RecurringNativeCreditTests(unittest.TestCase):
         analysis = root / "analysis.json"
         analysis.write_text(json.dumps(accounting_fixtures.analysis_for([events[0].evidence_id], recommended=30)))
         return run_dir, analysis, ledger_doc, report
+
+    def test_accounting_native_intersection_retains_four_seconds_without_tombstoning_tail(self):
+        self.accounting_intersection_fixture(full_coverage=False)
+
+    def test_accounting_native_intersection_full_coverage_emits_publisher_tombstone(self):
+        result, baseline = self.accounting_intersection_fixture(full_coverage=True)
+        from scripts import clockify_sheet_publish as publisher
+        from test_sheet_publish import StatefulGateway
+        row = publisher.proposal_row(baseline["proposals"][0], "fixture-run")
+        row[14] = "Preserve human note"
+        gateway = StatefulGateway([publisher.HEADER, row])
+        self.assertEqual(1, publisher._apply_tombstones(
+            gateway, spreadsheet_id="sheet", sheet_title="August 2026 review",
+            tombstones=result["review_tombstones"]))
+        self.assertEqual(row[:9], gateway.rows[1][:9])
+        self.assertEqual("superseded", gateway.rows[1][9])
+        self.assertEqual("superseded", gateway.rows[1][13])
+        self.assertEqual("Preserve human note", gateway.rows[1][14])
+
+    def accounting_intersection_fixture(self, *, full_coverage):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, declaration, proof = self.fixture(root, prior_minutes=(14, 14), prior_offsets=(0, 0),
+                                                 current_minutes=(14,), kind="source_native_meeting_intersection",
+                                                 current_end_seconds=840 if full_coverage else 844)
+            run_dir, analysis, ledger_doc, _ = self.accounting_run_fixture(root, proof, current_source=True)
+            baseline = pipeline.run_accounting(run_dir, root=accounting_fixtures.ROOT, analysis_fixture=analysis)
+            self.assertEqual(837 if full_coverage else 841, baseline["proposals"][0]["duration_seconds"])
+            declaration["artifacts"] = {
+                "current_proposals": adoption_fixtures.artifact(root / "current-accounting-proposals.json", baseline["proposals"]),
+                "current_source_ledger": adoption_fixtures.artifact(root / "current-accounting-ledger.json", ledger_doc),
+            }
+            declaration["current_review_ids"] = [adoption._review_id(baseline["proposals"][0])]
+            credit = self.seal(declaration)
+            corrections = root / "review-corrections.jsonl"
+            captured = pipeline._accounting_collection_snapshot(run_dir, ledger_doc["events"])
+            self.assertTrue(review_corrections.append_verified_posted_credit(
+                corrections, credit, runs_root=run_dir.parent, current_proposals=baseline["proposals"],
+                existing_blocks=[], collection_snapshot=captured))
+            result = pipeline.run_accounting(run_dir, root=accounting_fixtures.ROOT, analysis_fixture=analysis,
+                                             corrections_path=corrections)
+            if full_coverage:
+                self.assertEqual([], result["proposals"])
+                self.assertEqual(1, len(result["review_tombstones"]))
+                self.assertEqual(837, result["review_tombstones"][0]["credited_overlap_receipt"]["credited_seconds"])
+                return result, baseline
+            self.assertEqual(1, len(result["proposals"]))
+            self.assertEqual(4, result["proposals"][0]["duration_seconds"])
+            self.assertEqual([], result["review_tombstones"])
+            from scripts import clockify_sheet_publish as publisher
+            self.assertEqual(4 / 60, publisher.proposal_row(result["proposals"][0], "fixture-run")[3])
 
     def test_equal_credit_uses_approved_editorial_payload_and_preserves_independent_work(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -389,6 +389,39 @@ def _recording(event: Mapping[str, Any]) -> tuple[str, str, str] | None:
     return (str(ref["source_id"]), native.legacy._utc(span["start"]), native.legacy._utc(span["end"]))
 
 
+def _native_meeting_identity(events: Sequence[Mapping[str, Any]], proposal: Mapping[str, Any]) -> tuple[str, str, str]:
+    """Bind one immutable native recording, not its precision-sensitive digest."""
+    from scripts import clockify_native_sheet_post as native
+    identities = set()
+    if not events or proposal.get("duration_seconds") != _seconds(proposal):
+        raise AdoptionError("native meeting source or exact proposal interval differs")
+    for event in events:
+        provider, ref, attrs, span = (event.get("source_type"), event.get("source_ref"),
+                                      event.get("attributes"), event.get("raw_source_span"))
+        if provider not in {"fathom", "calendly"} or not all(isinstance(value, Mapping) for value in (ref, attrs, span)):
+            raise AdoptionError("native meeting requires recording source evidence")
+        source_id, url = ref.get("source_id"), attrs.get("share_url")
+        # Fathom normalization places its recording ID in source_ref and
+        # deliberately excludes it from attributes. Calendly retains both.
+        identifier = source_id if provider == "fathom" else attrs.get("recording_id")
+        if (type(identifier) not in (str, int) or type(source_id) not in (str, int)
+                or not str(identifier).strip() or str(identifier) != str(source_id)
+                or re.fullmatch(r"row-\d+", str(identifier))
+                or ref.get("source_type") != provider or not isinstance(url, str)
+                or not re.fullmatch(r"https://[^/\s]+/\S+", url)):
+            raise AdoptionError("native meeting recording identity or share URL is missing or conflicting")
+        if any(attrs.get(field) not in (None, "") and str(attrs[field]) != str(identifier)
+               for field in ("recording_id", "id", "provider_recording_id")):
+            raise AdoptionError("native meeting has conflicting provider recording identities")
+        if not (native.legacy._parse(span["start"]) <= native.legacy._parse(proposal["start"])
+                < native.legacy._parse(proposal["end"]) <= native.legacy._parse(span["end"])):
+            raise AdoptionError("native meeting proposal exceeds its original recording interval")
+        identities.add((provider, str(identifier), url))
+    if len(identities) != 1:
+        raise AdoptionError("native meeting source identity is ambiguous")
+    return next(iter(identities))
+
+
 def validate_recurring_credit(record: Mapping[str, Any]) -> dict[str, Any]:
     """Validate an audited coverage unit using sealed original facts only."""
     from scripts import clockify_native_sheet_post as native
@@ -439,6 +472,18 @@ def validate_recurring_credit(record: Mapping[str, Any]) -> dict[str, Any]:
             spans = sorted((native.legacy._parse(proof["payload"]["start"]), native.legacy._parse(proof["payload"]["end"])) for proof in priors)
             if any(right[0] < left[1] for left, right in zip(spans, spans[1:])):
                 raise AdoptionError("aggregate prior coverage overlaps")
+        elif kind == "source_native_meeting_intersection":
+            if len(targets) != 1:
+                raise AdoptionError("native meeting intersection must bind one current target")
+            target = targets[0]
+            identity = _native_meeting_identity(target["source_events"], target["proposal"])
+            for proof in priors:
+                if _native_meeting_identity(proof["source_events"], proof["prior_proposal"]) != identity:
+                    raise AdoptionError("native meeting intersection sources differ")
+            start, end = native.legacy._parse(target["proposal"]["start"]), native.legacy._parse(target["proposal"]["end"])
+            if not any(max(start, native.legacy._parse(proof["payload"]["start"]))
+                       < min(end, native.legacy._parse(proof["payload"]["end"])) for proof in priors):
+                raise AdoptionError("native meeting intersection has no proved coverage")
         elif kind == "whole_recording_aliases":
             if len(priors) != 1:
                 raise AdoptionError("whole recording coverage must consume one prior")

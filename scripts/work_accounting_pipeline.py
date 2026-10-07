@@ -2651,6 +2651,33 @@ def _apply_verified_posted_credits(
                     else:
                         for row in matched:
                             survivors.remove(row)
+                            covered_seconds = row["duration_seconds"]
+                            intersection_receipt = None
+                            fully_credited_intersection = False
+                            if credit["coverage_kind"] == "source_native_meeting_intersection":
+                                counterparts = [{"block_id": proof["clockify_entry_id"],
+                                                 "start": _parse_dt(proof["payload"]["start"]),
+                                                 "end": _parse_dt(proof["payload"]["end"])}
+                                                for proof in credit["prior_proofs"]]
+                                sliced = _slice_proposal_around_credits(
+                                    row, counterparts, "existing_clockify_overlap", [],
+                                    fully_credited_reason="verified previously posted recording interval",
+                                )
+                                for residual in sliced:
+                                    # Native entry IDs are receipt identities, not
+                                    # ev-* warning identities. Keep the original
+                                    # ledger-backed warnings; native counterparts
+                                    # remain in the sealed interval receipt.
+                                    residual["review_warnings"] = copy.deepcopy(row.get("review_warnings", []))
+                                survivors.extend(sliced)
+                                fully_credited_intersection = not sliced
+                                intersection_receipt = _credited_overlap_receipt(
+                                    _parse_dt(row["start"]), _parse_dt(row["end"]),
+                                    [warning for block in counterparts if (warning := _overlap_warning(
+                                        _parse_dt(row["start"]), _parse_dt(row["end"]), block,
+                                        "existing_clockify_overlap")) is not None],
+                                )
+                                covered_seconds = intersection_receipt["credited_seconds"]
                             skipped.append({"id": row["candidate_key"], "activity_id": row["activity_id"],
                                             "candidate_key": row["candidate_key"], "review_activity_key": row["review_activity_key"],
                                             "allocation_segment": row["allocation_segment"], "evidence_ids": list(row["provenance"]["evidence_ids"]),
@@ -2659,10 +2686,14 @@ def _apply_verified_posted_credits(
                                             "coverage_kind": credit["coverage_kind"], "credit_digest": credit["credit_digest"],
                                             "collection_snapshot_sha256": collection_snapshot.manifest_sha256,
                                             "verified_posted_credit": {
-                                                "covered_seconds": row["duration_seconds"],
+                                                "covered_seconds": covered_seconds,
                                                 "allocation_capacity_recovery": row["provenance"].get("allocation_capacity_recovery") is True,
+                                                **({"intersection_receipt": intersection_receipt}
+                                                   if intersection_receipt is not None else {}),
                                             },
-                                            "clockify_entry_ids": [proof["clockify_entry_id"] for proof in credit["prior_proofs"]]})
+                                            "clockify_entry_ids": [proof["clockify_entry_id"] for proof in credit["prior_proofs"]],
+                                            **({"credited_overlap_receipt": intersection_receipt}
+                                               if fully_credited_intersection else {})})
         except (ValueError, TypeError, KeyError, AttributeError):
             # An invalid recurring group must never hide a reviewable proposal.
             survivors, skipped = list(proposals), []
