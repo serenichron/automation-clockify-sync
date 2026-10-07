@@ -16,6 +16,7 @@ from scripts import clockify_review_cycle as cycle
 from scripts import collector_receipts, collector_slices
 from scripts import clockify_review_run as review_run
 from scripts import semantic_analyzer
+from ops.systemd.user import clockify_review_cycle_release as release_helper
 from scripts.autopilot_process import ChildResult
 from task3_scenario_contract import assert_scenario_contract
 
@@ -90,6 +91,7 @@ def make_run(
     compatibility_version: str = "fixture-collector-lineage/v1",
     runtime_identity: dict[str, object] | None = None,
     collector_source_marker: bool = False,
+    analyzer_tier: str = "primary",
 ) -> Path:
     run_dir = (runs_dir or root / "runs") / name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -139,7 +141,7 @@ def make_run(
             "evidence_bundle_manifest": bundle_manifest,
             "ledger_evidence_digest": "sha256:" + "c" * 64,
             "activities": [
-                {"analyzer_model": "fixture-model", "analyzer_tier": "primary"}
+                {"analyzer_model": "fixture-model", "analyzer_tier": analyzer_tier}
             ],
             "analysis_chunks": [],
             "analyzer_cache": {"records": []},
@@ -291,6 +293,215 @@ def make_run(
 
 
 class ReviewCycleDeliveryTests(unittest.TestCase):
+    def routing_transition_fixture(self):
+        """Real completed source plus a sealed immutable synthetic release."""
+        self.state_dir.mkdir()
+        manifest = cycle._ensure_period(self.config, self.state_dir, "2026-09-07", "2026-09-09", bind_inputs=True)
+        old = cycle._expected_snapshot_digests(self.config, manifest)
+        routing = json.loads((self.root / "routing.json").read_text())
+        routing["session_routes"][0]["project_suffix"] = "775f9e"
+        write_json(self.root / "routing.json", routing)
+        release = self.root / "releases" / ("a" * 40)
+        release.mkdir(parents=True)
+        shutil.copyfile(self.root / "routing.json", release / "routing.json")
+        release_helper._make_payload_read_only(release)
+        release.chmod(0o555)
+        tree = release_helper._tree_manifest(release)
+        identity = {
+            "schema_version": "clockify-user-release/v1", "git_sha": "a" * 40,
+            "root": str(release), "tree_manifest": tree,
+            "tree_digest": release_helper._manifest_digest(tree),
+            "routing_sha256": hashlib.sha256((release / "routing.json").read_bytes()).hexdigest(),
+        }
+        release.chmod(0o755)
+        write_json(release / ".clockify-release.json", identity)
+        (release / ".clockify-release.json").chmod(0o444)
+        release.chmod(0o555)
+        runtime = {"canonical_root": str(release), "collector_path": str(release / "scripts" / "clockify_sync_collect.py"), "git_sha": None, "git_dirty": None}
+        config = {**self.config, "root": str(release), "routing": str(release / "routing.json"), "runs_dir": str(self.root / "runs"), "_runtime_identity": runtime}
+        command = cycle._review_command(config, "2026-09-07", "2026-09-09")
+        record = {"expected_snapshot_digests": old, "period_manifest": str(manifest), "until": "2026-09-09", "status": "incomplete"}
+        attempt = cycle._source_attempt(record, command, cycle._generic_interval(config, "2026-09-07", "2026-09-09"), advance_frontier=True)
+        record["runner_attempt"] = {"runtime_identity_digest": cycle._value_digest(runtime), "source_attempt_ordinal": attempt["ordinal"], "status": "pending"}
+        source = make_run(self.root, "source-run", replay=False, runtime_identity=runtime, analyzer_tier="fixture")
+        return config, record, manifest, source
+
+    def test_approved_routing_transition_adopts_completed_source_preserving_original_inputs(self):
+        """Catches stale routing bindings forcing new collection after verified completion."""
+        config, record, manifest, result = self.routing_transition_fixture()
+        original = dict(record["expected_snapshot_digests"])
+        source = cycle._routing_transition_source(config, record, "2026-09-07", "2026-09-09", manifest)
+        self.assertEqual(str(result), source["result_path"])
+        self.assertEqual(original, record["expected_snapshot_digests"])
+        self.assertNotEqual(original["routing.json"], source["snapshot_digests"]["routing.json"])
+        self.assertEqual("unique verified completed legacy-attempt result", record["routing_transition"]["eligibility_basis"])
+
+    def test_routing_transition_rejects_ambiguous_completed_sources(self):
+        """Catches selecting an arbitrary orphan when launch records do not name a run."""
+        config, record, manifest, _ = self.routing_transition_fixture()
+        make_run(self.root, "second-source", replay=False, runtime_identity=config["_runtime_identity"], compatibility_version="other-compatible-lineage/v1", analyzer_tier="fixture")
+        with self.assertRaisesRegex(cycle.CycleError, "unique"):
+            cycle._routing_transition_source(config, record, "2026-09-07", "2026-09-09", manifest)
+
+    def test_routing_transition_ignores_malformed_unrelated_sibling(self):
+        """Catches malformed sibling report preventing adoption of the one valid source."""
+        config, record, manifest, result = self.routing_transition_fixture()
+        sibling = self.root / "runs" / "malformed-sibling"
+        write_json(sibling / "autopilot-result.json", {})
+        write_json(sibling / "run-report.json", [])
+        try:
+            source = cycle._routing_transition_source(config, record, "2026-09-07", "2026-09-09", manifest)
+        except AttributeError as exc:
+            self.fail(f"malformed unrelated sibling blocked valid orphan: {exc}")
+        self.assertEqual(str(result), source["result_path"])
+
+    def test_routing_transition_rejects_release_tree_mutation(self):
+        """Catches trusting current config/source agreement without immutable release proof."""
+        config, record, manifest, _ = self.routing_transition_fixture()
+        route = Path(config["routing"])
+        route.chmod(0o644)
+        write_json(route, {"workspace_id": "workspace-1", "member_id": "member-1"})
+        with self.assertRaisesRegex(cycle.CycleError, "release"):
+            cycle._routing_transition_source(config, record, "2026-09-07", "2026-09-09", manifest)
+
+    def test_routing_transition_resume_delivers_and_repeats_without_fresh_review(self):
+        """Catches the coordinator ignoring a verified orphan and launching inference again."""
+        config, record, manifest, source = self.routing_transition_fixture()
+        state = cycle._state(self.state_dir / "absent.json", recovery_since="2026-09-07")
+        state["slices"]["2026-09-07"] = record
+        write_json(self.state_dir / "review-cycle-state.json", state)
+        original_bytes = source.read_bytes()
+        original_inputs = dict(record["expected_snapshot_digests"])
+
+        def child(command, **_kwargs):
+            if "--replay-from" in command:
+                path = make_run(self.root, "replay-run", replay=True, snapshots_from=source.parent, runtime_identity=config["_runtime_identity"], analyzer_tier="fixture")
+                return ChildResult(0, str(path) + "\n", "", False, 0.1)
+            if "clockify_sheet_publish.py" in command[1]:
+                return publisher_result_for_command(config, command)
+            self.fail("fresh collection/inference invoked despite completed orphan")
+
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=child):
+            first = cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 10))
+        self.assertEqual("delivered", first["status"])
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=AssertionError("child invoked on repeat")):
+            repeated = cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 10))
+        self.assertEqual("idle", repeated["status"])
+        saved = json.loads((self.state_dir / "review-cycle-state.json").read_text())["slices"]["2026-09-07"]
+        self.assertEqual(original_inputs, saved["expected_snapshot_digests"])
+        self.assertEqual(original_bytes, source.read_bytes())
+        write_json(Path(config["corrections"]), {"later": "unrelated live correction"})
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=AssertionError("child invoked on later input drift")):
+            self.assertEqual("idle", cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 10))["status"])
+
+    def test_routing_transition_new_fix_runtime_adopts_exact_old_launch(self):
+        """Catches deployment of the fix itself making the sealed old launch unusable."""
+        config, record, manifest, result = self.routing_transition_fixture()
+        old_root = Path(config["root"])
+        new_root = old_root.parent / ("b" * 40)
+        new_root.mkdir()
+        shutil.copyfile(old_root / "routing.json", new_root / "routing.json")
+        release_helper._make_payload_read_only(new_root)
+        new_root.chmod(0o555)
+        tree = release_helper._tree_manifest(new_root)
+        identity = {"schema_version": "clockify-user-release/v1", "git_sha": "b" * 40, "root": str(new_root), "tree_manifest": tree, "tree_digest": release_helper._manifest_digest(tree), "routing_sha256": hashlib.sha256((new_root / "routing.json").read_bytes()).hexdigest()}
+        new_root.chmod(0o755)
+        write_json(new_root / ".clockify-release.json", identity)
+        (new_root / ".clockify-release.json").chmod(0o444)
+        new_root.chmod(0o555)
+        runtime = {**config["_runtime_identity"], "canonical_root": str(new_root), "collector_path": str(new_root / "scripts/clockify_sync_collect.py")}
+        config.update(root=str(new_root), routing=str(new_root / "routing.json"), _runtime_identity=runtime)
+        try:
+            source = cycle._routing_transition_source(config, record, "2026-09-07", "2026-09-09", manifest)
+        except cycle.CycleError as exc:
+            self.fail(f"approved fix deployment rejected exact sealed launch: {exc}")
+        self.assertEqual(str(result), source["result_path"])
+        self.assertEqual(record["runner_attempt"]["runtime_identity_digest"], source["runtime_identity_digest"])
+        state = cycle._state(self.state_dir / "absent.json", recovery_since="2026-09-07")
+        state["slices"]["2026-09-07"] = record
+        write_json(self.state_dir / "review-cycle-state.json", state)
+        launch_runtime = json.loads((result.parent / "run-report.json").read_text())["runtime_identity"]
+        def child(command, **_kwargs):
+            if "--replay-from" in command:
+                path = make_run(self.root, "replay-run", replay=True, snapshots_from=result.parent, runtime_identity=launch_runtime, analyzer_tier="fixture")
+                return ChildResult(0, str(path) + "\n", "", False, 0.1)
+            if "clockify_sheet_publish.py" in command[1]:
+                return publisher_result_for_command(config, command)
+            self.fail("fresh collection/inference after fix deployment")
+        try:
+            with mock.patch.object(cycle, "run_child_bounded", side_effect=child):
+                outcome = cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 10))
+        except cycle.CycleError as exc:
+            self.fail(f"sealed old source/replay rejected by fix deployment: {exc}")
+        self.assertEqual("delivered", outcome["status"])
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=AssertionError("child invoked")):
+            self.assertEqual("idle", cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 10))["status"])
+        # A subsequent approved runtime does not rewrite the sealed slice's
+        # original routing/correction authority.
+        later = {**config, "root": str(old_root), "routing": str(old_root / "routing.json"), "_runtime_identity": launch_runtime}
+        write_json(Path(config["corrections"]), {"later": "correction"})
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=AssertionError("child invoked after later release")):
+            self.assertEqual("idle", cycle.run_cycle(later, enable_sheet_write=True, today=dt.date(2026, 9, 10))["status"])
+
+    def test_routing_transition_rejects_nonrouting_drift_and_wrong_launch(self):
+        """Catches using routing adoption to relax other inputs or runtime provenance."""
+        config, record, manifest, _ = self.routing_transition_fixture()
+        write_json(Path(config["corrections"]), {"unauthorized": "change"})
+        with self.assertRaisesRegex(cycle.CycleError, "immutable inputs"):
+            cycle._routing_transition_source(config, record, "2026-09-07", "2026-09-09", manifest)
+        write_json(Path(config["corrections"]), {})
+        record["runner_attempt"]["runtime_identity_digest"] = "sha256:" + "f" * 64
+        with self.assertRaisesRegex(cycle.CycleError, "unique"):
+            cycle._routing_transition_source(config, record, "2026-09-07", "2026-09-09", manifest)
+
+    def test_routing_transition_recovers_finalized_legacy_attempt_without_relaunch(self):
+        """Catches terminal classification finalizing an attempt before source adoption."""
+        config, record, _, result = self.routing_transition_fixture()
+        record["source_attempt"]["status"] = "finished"
+        record["runner_attempt"]["status"] = "finished"
+        record["status"] = "incomplete"
+        original_attempt = dict(record["source_attempt"])
+        original_runner = dict(record["runner_attempt"])
+        original_inputs = dict(record["expected_snapshot_digests"])
+        state = cycle._state(self.state_dir / "absent.json", recovery_since="2026-09-07")
+        state["slices"]["2026-09-07"] = record
+        write_json(self.state_dir / "review-cycle-state.json", state)
+        def child(command, **_kwargs):
+            if "--replay-from" in command:
+                path = make_run(self.root, "replay-run", replay=True, snapshots_from=result.parent, runtime_identity=config["_runtime_identity"], analyzer_tier="fixture")
+                return ChildResult(0, str(path) + "\n", "", False, 0.1)
+            if "clockify_sheet_publish.py" in command[1]:
+                return publisher_result_for_command(config, command)
+            self.fail("fresh review launched for finalized completed legacy attempt")
+        try:
+            with mock.patch.object(cycle, "run_child_bounded", side_effect=child):
+                outcome = cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 10))
+        except cycle.CycleError as exc:
+            self.fail(f"finalized valid legacy attempt could not resume: {exc}")
+        self.assertEqual("delivered", outcome["status"])
+        saved = json.loads((self.state_dir / "review-cycle-state.json").read_text())["slices"]["2026-09-07"]
+        self.assertEqual(original_attempt, saved["source_attempt"])
+        self.assertEqual(original_runner, saved["runner_attempt"])
+        self.assertEqual(original_inputs, saved["expected_snapshot_digests"])
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=AssertionError("child invoked on repeat")):
+            self.assertEqual("idle", cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 10))["status"])
+
+    def test_routing_transition_crash_resume_pins_candidate_and_rejects_tampering(self):
+        """Catches a crash after sealing choosing another run or accepting receipt drift."""
+        config, record, manifest, result = self.routing_transition_fixture()
+        first = cycle._routing_transition_source(config, record, "2026-09-07", "2026-09-09", manifest)
+        write_json(self.state_dir / "sealed-crash-state.json", record)
+        resumed = json.loads((self.state_dir / "sealed-crash-state.json").read_text())
+        make_run(self.root, "later-completed-source", replay=False, runtime_identity=config["_runtime_identity"], compatibility_version="later-lineage/v1", analyzer_tier="fixture")
+        self.assertEqual(first, cycle._routing_transition_source(config, resumed, "2026-09-07", "2026-09-09", manifest))
+        resumed["routing_transition"]["source"]["result_digest"] = "sha256:" + "0" * 64
+        with self.assertRaisesRegex(cycle.CycleError, "receipt has drifted"):
+            cycle._routing_transition_source(config, resumed, "2026-09-07", "2026-09-09", manifest)
+        resumed = json.loads((self.state_dir / "sealed-crash-state.json").read_text())
+        write_json(result, {"tampered": True})
+        with self.assertRaises((cycle.CycleError, ValueError)):
+            cycle._routing_transition_source(config, resumed, "2026-09-07", "2026-09-09", manifest)
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

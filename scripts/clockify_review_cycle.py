@@ -11,6 +11,7 @@ import argparse
 import datetime as dt
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 from contextlib import contextmanager
@@ -2688,6 +2689,147 @@ def _stored_snapshot_digests(record: Mapping[str, Any]) -> dict[str, str]:
     return dict(value)
 
 
+def _routing_transition_source(
+    config: Mapping[str, Any], record: dict[str, Any], since: str, until: str,
+    manifest_path: Path,
+) -> dict[str, Any] | None:
+    """Adopt one verified legacy orphan; never relax the original input binding."""
+    frozen = _stored_snapshot_digests(record)
+    receipt = record.get("routing_transition")
+    if receipt is not None:
+        if not isinstance(receipt, Mapping):
+            raise CycleError("routing transition receipt is invalid")
+        body = {key: value for key, value in receipt.items() if key != "receipt_digest"}
+        if receipt.get("receipt_digest") != _value_digest(body):
+            raise CycleError("routing transition receipt has drifted")
+        adopted = receipt.get("adopted_snapshot_digests")
+        if not isinstance(adopted, Mapping) or set(adopted) != set(frozen):
+            raise CycleError("routing transition receipt inputs are invalid")
+        adopted = dict(adopted)
+    else:
+        adopted = _expected_snapshot_digests(config, manifest_path)
+    if receipt is None and adopted == frozen:
+        return None
+    runtime = config.get("_runtime_identity")
+    runner = _runner_attempt(record)
+    attempt = record.get("source_attempt")
+    if (
+        not isinstance(runtime, Mapping) or runner is None
+        or not isinstance(attempt, Mapping)
+        or receipt is None and (
+            (runner["status"], attempt.get("status")) not in {
+                ("pending", "started"), ("finished", "finished"),
+            }
+            or any(key in record for key in ("source", "replay", "delivery_receipt"))
+        )
+        or any(adopted[name] != frozen[name] for name in frozen if name != "routing.json")
+        or adopted["routing.json"] == frozen["routing.json"]
+        or _digest(manifest_path) != frozen["period-manifest.json"]
+    ):
+        raise CycleError("routing transition does not match the stored launch and immutable inputs")
+    root = _path(config, "root")
+    if runtime.get("canonical_root") != str(root) or runtime.get("git_dirty") not in (None, False):
+        raise CycleError("routing transition release runtime is invalid")
+    try:
+        helper_path = Path(__file__).resolve().parents[1] / "ops/systemd/user/clockify_review_cycle_release.py"
+        spec = importlib.util.spec_from_file_location("clockify_transition_release", helper_path)
+        if spec is None or spec.loader is None:
+            raise ValueError("release identity validator is unavailable")
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        authority_root = root if receipt is None else Path(str(receipt.get("adopting_release_root") or ""))
+        authority_sha = root.name if receipt is None else str(receipt.get("adopting_release_sha") or "")
+        identity = helper._identity(authority_root, authority_sha)
+        if receipt is None and runtime.get("git_sha") not in (None, identity["git_sha"]):
+            raise ValueError("runtime SHA differs from release")
+        if adopted["routing.json"] != "sha256:" + identity["routing_sha256"]:
+            raise ValueError("routing differs from immutable release")
+        if receipt is None:
+            if _path(config, "routing", file=True) != root / "routing.json":
+                raise ValueError("routing path differs from release")
+            _validate_config_identity(config)
+    except (OSError, ValueError) as exc:
+        raise CycleError("routing transition release identity cannot be verified") from exc
+
+    def verified(path: Path) -> dict[str, Any]:
+        report = _json_file(path / "run-report.json", "transition launch report")
+        if not isinstance(report, Mapping):
+            raise CycleError("routing transition launch report is invalid")
+        launch = report.get("runtime_identity")
+        if not isinstance(launch, Mapping) or _value_digest(dict(launch)) != runner["runtime_identity_digest"]:
+            raise CycleError("routing transition source differs from exact launch runtime")
+        launch_root = Path(str(launch.get("canonical_root") or ""))
+        launch_identity = helper._identity(launch_root, launch_root.name)
+        if (
+            launch.get("git_dirty") not in (None, False)
+            or launch.get("git_sha") not in (None, launch_identity["git_sha"])
+            or launch_identity["routing_sha256"] != identity["routing_sha256"]
+        ):
+            raise CycleError("routing transition original release differs")
+        launch_config = {**config, "root": str(launch_root), "routing": str(launch_root / "routing.json")}
+        if attempt.get("command_digest") != _value_digest(_review_command(launch_config, since, until)):
+            raise CycleError("routing transition command differs from original launch")
+        completed = clockify_review_run._adopt_completed_resume(path)
+        if completed is None:
+            raise CycleError("routing transition source is not completed")
+        stage = _validate_stage(config, completed, since, until, replay=False, expected_snapshot_digests=adopted,
+            expected_runtime_digest=runner["runtime_identity_digest"], historical_state_validation=True)
+        analysis = _json_file(path / "semantic-analysis.json", "transition semantic analysis")
+        if clockify_review_run._analysis_is_inference_backed(analysis):
+            cache = _safe_run_file(path, str(path / "analyzer-cache-used.jsonl"), "transition sealed analyzer cache")
+            snapshot = analysis.get("analyzer_cache", {}).get("snapshot", {})
+            if snapshot.get("path") != cache.name or snapshot.get("sha256") != _digest(cache).removeprefix("sha256:"):
+                raise CycleError("routing transition sealed analyzer cache differs")
+            clockify_review_run._preflight_replay_analyzer_cache(path, cache, analysis)
+        return stage
+
+    attempt_identity = {key: value for key, value in attempt.items() if key != "status"}
+    if receipt is not None:
+        if not isinstance(receipt, Mapping):
+            raise CycleError("routing transition receipt is invalid")
+        body = {key: value for key, value in receipt.items() if key != "receipt_digest"}
+        if (
+            set(body) != {"schema_version", "eligibility_basis", "since", "until", "frozen_snapshot_digests", "adopted_snapshot_digests", "runtime_identity_digest", "release_identity_digest", "adopting_release_root", "adopting_release_sha", "source_attempt", "source"}
+            or body.get("schema_version") != "clockify-routing-transition/v1"
+            or body.get("eligibility_basis") != "unique verified completed legacy-attempt result"
+            or
+            receipt.get("receipt_digest") != _value_digest(body)
+            or body.get("frozen_snapshot_digests") != frozen
+            or body.get("adopted_snapshot_digests") != adopted
+            or body.get("runtime_identity_digest") != runner["runtime_identity_digest"]
+            or body.get("release_identity_digest") != _value_digest(identity)
+            or body.get("source_attempt") != attempt_identity
+            or body.get("since") != since or body.get("until") != until
+        ):
+            raise CycleError("routing transition receipt has drifted")
+        path = _safe_run_file(_runs_dir(config), body.get("source", {}).get("result_path"), "transition source result")
+        source = verified(path.parent)
+        if body.get("source") != source:
+            raise CycleError("routing transition source has drifted")
+        return source
+    candidates = []
+    for path in sorted(_runs_dir(config).glob("*/autopilot-result.json")):
+        try:
+            candidates.append(verified(path.parent))
+        except (CycleError, OSError, ValueError):
+            continue
+    if len(candidates) != 1:
+        raise CycleError("routing transition requires a unique verified completed source")
+    source = candidates[0]
+    body = {
+        "schema_version": "clockify-routing-transition/v1",
+        "eligibility_basis": "unique verified completed legacy-attempt result",
+        "since": since, "until": until,
+        "frozen_snapshot_digests": frozen, "adopted_snapshot_digests": adopted,
+        "runtime_identity_digest": runner["runtime_identity_digest"],
+        "release_identity_digest": _value_digest(identity),
+        "adopting_release_root": str(root), "adopting_release_sha": identity["git_sha"],
+        "source_attempt": attempt_identity, "source": source,
+    }
+    record["routing_transition"] = {**body, "receipt_digest": _value_digest(body)}
+    return source
+
+
 def _historical_adoption_document(
     config: Mapping[str, Any], record: Mapping[str, Any], since: str, until: str,
 ) -> dict[str, Any] | None:
@@ -2797,6 +2939,11 @@ def _validate_delivered_state(config: Mapping[str, Any], state: Mapping[str, Any
         if not events_path.is_file() or not manifest_path.is_file():
             raise CycleError("delivered slice period evidence is missing")
         expected_snapshots = _stored_snapshot_digests(raw_record)
+        if "routing_transition" in raw_record:
+            transitioned = _routing_transition_source(config, dict(raw_record), since, until, manifest_path)
+            if transitioned is None:
+                raise CycleError("delivered routing transition source is missing")
+            expected_snapshots = transitioned["snapshot_digests"]
         adoption = _historical_adoption_document(config, raw_record, since, until)
         stage_config = config
         if adoption is not None:
@@ -3410,6 +3557,27 @@ def _run_slice(
         )
         _persist_state(state_path, state, since, record)
     expected_snapshots = _stored_snapshot_digests(record)
+    transition_validation: dict[str, Any] = {}
+    if "routing_transition" in record or (
+        record.get("source") is None
+        and _expected_snapshot_digests(config, manifest_path) != expected_snapshots
+    ):
+        transitioned = _routing_transition_source(config, record, since, until, manifest_path)
+        if transitioned is None:
+            raise CycleError("routing transition source is missing")
+        # Seal the candidate before changing source state; a crash here resumes
+        # only this exact completed result, never a new collection attempt.
+        _persist_state(state_path, state, since, record)
+        expected_snapshots = transitioned["snapshot_digests"]
+        transition_validation = {
+            "expected_runtime_digest": transitioned["runtime_identity_digest"],
+            "historical_state_validation": True,
+        }
+        if record.get("source") is None:
+            record["source"] = transitioned
+            _finish_attempt(record, record["source_attempt"])
+            record["status"] = "source_verified"
+            _persist_state(state_path, state, since, record)
 
     source: dict[str, Any] | None
     stored_source = record.get("source")
@@ -3645,6 +3813,7 @@ def _run_slice(
             config, _result(child.stdout, _runs_dir(config)), since, until, replay=True,
             expected_snapshot_digests=source["snapshot_digests"],
             source_run_id=str(source["run_id"]), source_run_dir=str(source["run_dir"]),
+            **transition_validation,
         )
         if replay["accounting_digest"] != source["accounting_digest"]:
             raise CycleError("replay accounting does not exactly match the source")
@@ -3688,11 +3857,13 @@ def _run_slice(
         verified_source = _validate_stage(
             config, Path(str(source["result_path"])), since, until, replay=False,
             expected_snapshot_digests=expected_snapshots,
+            **transition_validation,
         )
         verified_replay = _validate_stage(
             config, Path(str(replay["result_path"])), since, until, replay=True,
             expected_snapshot_digests=source["snapshot_digests"],
             source_run_id=str(source["run_id"]), source_run_dir=str(source["run_dir"]),
+            **transition_validation,
         )
         if verified_source != source or verified_replay != replay:
             raise CycleError("delivery inputs drifted while the publisher was running")
