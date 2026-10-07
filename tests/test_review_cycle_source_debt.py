@@ -729,6 +729,118 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
         self.assertTrue(all("resume_state_digest" not in row for row in fathom))
         self.assertNotIn(str(self.root), json.dumps(report))
 
+    def test_coverage_audit_keeps_legacy_warning_out_of_configured_frontiers(self):
+        """Synthetic warning windows must not erase real configured-source continuity."""
+        machines = ("macbook", "omarchy-desktop", "omarchy-precision")
+        write_json(self.root / "fleet.json", {
+            "machines": [
+                {"name": machine, "enabled": True} for machine in machines
+            ],
+        })
+        first = self.verified_audit_stage(
+            "audit-before-gap", since=dt.date(2026, 9, 7),
+            until=dt.date(2026, 9, 9), calendly_optional=True,
+            calendly_status="excluded", machines=machines,
+        )
+        second = self.verified_audit_stage(
+            "audit-real-gaps", since=dt.date(2026, 9, 9),
+            until=dt.date(2026, 9, 11), calendly_optional=True,
+            calendly_status="excluded", fathom_status="unavailable",
+            machines=machines,
+            machine_statuses={"macbook": ("unavailable", "unavailable")},
+        )
+        self.write_audit_state([first, second])
+
+        warning_document = source_coverage._conservative_warning_document(
+            "legacy_source_coverage_invalid"
+        )
+        store = source_coverage.SourceDebtStore.from_document(warning_document)
+        peer = source_coverage.SourceInterval(
+            source="peer/macbook", since_utc=str(second["since_utc"]),
+            until_utc=str(second["until_utc"]), slice_id=str(second["slice_id"]),
+            compatibility_version=str(second["compatibility_version"]),
+        )
+        generic = source_coverage.SourceInterval(
+            source="runner/unclassified", since_utc=str(second["since_utc"]),
+            until_utc=str(second["until_utc"]), slice_id=str(second["slice_id"]),
+            compatibility_version=cycle.GENERIC_COMPATIBILITY_VERSION,
+        )
+        for interval, digest in ((peer, "8"), (generic, "9")):
+            store.record_failure(
+                interval, failure_class="coverage_incomplete", retryable=True,
+                resume_state_digest="sha256:" + digest * 64,
+                attempted_at="2026-09-11T00:00:00Z",
+            )
+        source_coverage.write(
+            self.state_dir / "source-coverage.json",
+            store.document(
+                migration_warnings=warning_document["migration_warnings"]
+            ),
+        )
+
+        report = cycle.source_interval_coverage_audit(self.config)
+
+        configured = {
+            "clockify", "fathom", "multica_issues",
+            "sessions/macbook", "repositories/macbook",
+            "sessions/omarchy-desktop", "repositories/omarchy-desktop",
+            "sessions/omarchy-precision", "repositories/omarchy-precision",
+        }
+        self.assertEqual(configured, set(report["configured_sources"]))
+        self.assertEqual(
+            "2026-09-08T21:00:00Z", report["frontiers"]["fathom"]
+        )
+        self.assertEqual(
+            "2026-09-08T21:00:00Z",
+            report["frontiers"]["sessions/macbook"],
+        )
+        self.assertEqual(
+            "2026-09-08T21:00:00Z",
+            report["frontiers"]["repositories/macbook"],
+        )
+        for source in configured - {
+            "fathom", "sessions/macbook", "repositories/macbook",
+        }:
+            self.assertEqual(
+                "2026-09-10T21:00:00Z", report["frontiers"][source],
+                source,
+            )
+        warning = next(
+            row for row in report["intervals"]
+            if row["source"] == "legacy/unknown"
+        )
+        self.assertEqual("active", warning["status"])
+        self.assertIn(warning["resume_state_digest"], {
+            "sha256:legacy-state-invalid",
+        })
+        self.assertEqual(
+            {item.debt_id for item in store.active()},
+            set(report["active_debt_ids"]),
+        )
+        self.assertNotIn(
+            warning["source"],
+            {item.interval.source for item in store.eligible("2026-09-11T00:00:00Z")},
+        )
+        selected = cycle._select_work(
+            {**self.config, "max_slices": 1},
+            {
+                "scheduled_through": "2026-09-11",
+                "next_work_class": "exact",
+                "slices": {
+                    "2026-09-09": {
+                        "until": "2026-09-11",
+                        "status": "recovery_blocked",
+                        "source": second,
+                    },
+                },
+            },
+            store,
+            today=dt.date(2026, 9, 11),
+        )
+        self.assertEqual(1, len(selected))
+        self.assertEqual("exact", selected[0][2])
+        self.assertEqual("peer/macbook", selected[0][3].interval.source)
+
     def test_coverage_audit_derives_delivered_stage_identity_without_writes(self):
         # Requiring pre-normalized collector fields loses real delivered windows.
         stage = self.downstream_audit_stage("audit-delivered")

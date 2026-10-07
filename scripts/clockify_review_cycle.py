@@ -3142,6 +3142,14 @@ def source_interval_coverage_audit(config: Mapping[str, Any]) -> dict[str, Any]:
     windows = sorted({
         (str(row["since_utc"]), str(row["until_utc"]), str(row["slice_id"]))
         for row in ordered
+        if not (
+            row["source"] == "legacy/unknown"
+            and row["since_utc"] == "1970-01-01T00:00:00Z"
+            and row["until_utc"] == "1970-01-02T00:00:00Z"
+            and row["slice_id"] == "legacy-corruption-warning"
+            and row["compatibility_version"]
+            == source_coverage.LEGACY_COMPATIBILITY_VERSION
+        )
     })
     frontiers: dict[str, str | None] = {}
     for source in sorted(configured):
