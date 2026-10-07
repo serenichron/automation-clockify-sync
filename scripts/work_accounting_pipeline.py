@@ -2665,10 +2665,27 @@ def _apply_verified_posted_credits(
                                 )
                                 for residual in sliced:
                                     # Native entry IDs are receipt identities, not
-                                    # ev-* warning identities. Keep the original
-                                    # ledger-backed warnings; native counterparts
-                                    # remain in the sealed interval receipt.
+                                    # ev-* warning identities. Rebind the original
+                                    # ledger-backed warnings to each residual;
+                                    # native counterparts stay in the sealed receipt.
                                     residual["review_warnings"] = copy.deepcopy(row.get("review_warnings", []))
+                                    rebound = []
+                                    for warning in residual["review_warnings"]:
+                                        blocks = [block for block in existing_blocks
+                                                  if isinstance(warning, dict)
+                                                  and block.get("kind") == "existing_clockify"
+                                                  and block.get("block_id") == warning.get("counterpart_id")]
+                                        if (len(blocks) == 1 and type(warning.get("overlap_duration_seconds")) is int
+                                                and warning == _overlap_warning(_parse_dt(row["start"]),
+                                                    _parse_dt(row["end"]), blocks[0], "existing_clockify_overlap")):
+                                            warning = _overlap_warning(_parse_dt(residual["start"]),
+                                                _parse_dt(residual["end"]), blocks[0], "existing_clockify_overlap")
+                                            if warning is None:
+                                                continue
+                                        # Unrecognized or invalid warnings stay intact,
+                                        # so splitting cannot weaken quality validation.
+                                        rebound.append(warning)
+                                    residual["review_warnings"] = rebound
                                 survivors.extend(sliced)
                                 fully_credited_intersection = not sliced
                                 intersection_receipt = _credited_overlap_receipt(

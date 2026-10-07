@@ -99,6 +99,20 @@ def make_run(
     run_dir = (runs_dir or root / "runs") / name
     run_dir.mkdir(parents=True, exist_ok=True)
     proposals = [proposal()] if proposals is None else proposals
+    # Monthly evidence fixtures must cite real content-addressed ledger events;
+    # older routed-only scenarios intentionally keep their minimal fixture.
+    candidates = [*(ambiguous or []), *(p for p in proposals if p.get("routing_disposition") == "unresolved-routing")]
+    monthly_events = []
+    if candidates and ledger_from is None:
+        for index, candidate in enumerate(candidates):
+            event = evidence_ledger.evidence_event(
+                "codex_session", {"source_id": f"fixture-{index}", "machine": "test"},
+                observed_at="2026-09-07T09:00:00+03:00",
+                raw_source_span={"start": "2026-09-07T09:00:00+03:00", "end": "2026-09-07T10:00:00+03:00"},
+                attributes={"title": "Synthetic review evidence"},
+            )
+            monthly_events.append(event)
+            candidate.setdefault("evidence_ids", [event.evidence_id])
     coverage = (
         {"status": "complete", "incomplete_sources": []}
         if coverage is None
@@ -134,6 +148,16 @@ def make_run(
     )
     if ledger_from is not None:
         shutil.copyfile(ledger_from / "evidence/evidence-ledger.json", run_dir / "evidence/evidence-ledger.json")
+    elif monthly_events:
+        ledger = evidence_ledger.EvidenceLedger(tuple(monthly_events), timezone="Europe/Bucharest")
+        write_json(run_dir / "evidence/evidence-ledger.json", {
+            "schema_version": "evidence-ledger/v1", "manifest": ledger.manifest.document(),
+            "events": [event.document() for event in ledger.events],
+        })
+        report_path = run_dir / "run-report.json"
+        report = json.loads(report_path.read_text())
+        report["evidence_ledger"]["source_completeness"] = ledger.manifest.document()["source_completeness"]
+        write_json(report_path, report)
     bundle_manifest = {
         "schema_version": "clockify-semantic-evidence-bundle/v1",
         "digest": semantic_analyzer.stable_digest("sebm-", [], length=64),
@@ -171,6 +195,7 @@ def make_run(
     for field in accounting_remove:
         accounting.pop(field, None)
     write_json(run_dir / "work-accounting-result.json", accounting)
+    write_json(run_dir / "ambiguous.json", accounting.get("ambiguous", []))
     write_json(
         run_dir / "quality_report.json",
         {"status": "pass", "summary": {"total_proposals": len(proposals)}},
@@ -1176,11 +1201,40 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
         receipt_path = self.state_dir / "delivery-receipts" / "2026-09-07.json"
         receipt = json.loads(receipt_path.read_text())
         self.assertEqual(
-            ["September 2026 portfolio review", "unresolved-evidence"],
+            ["September 2026 portfolio review", "September 2026 unresolved evidence"],
             [item["sheet_title"] for item in receipt["publication_receipts"]],
         )
         self.assertTrue(all(item["row_ids"] for item in receipt["publication_receipts"]))
+        self.assertEqual("visible-monthly-unresolved/v1", receipt["publication_profile"])
+        self.assertTrue(any("--monthly-unresolved" in command for command in commands))
         self.assertTrue(all(item["readback_id"].startswith("sheet-readback/") for item in receipt["publication_receipts"]))
+
+        # Missing profile means the exact old hidden 15-column contract, not a
+        # request to migrate or rewrite a historical delivered receipt.
+        state = json.loads((self.state_dir / "review-cycle-state.json").read_text())
+        record = state["slices"]["2026-09-07"]
+        legacy = cycle._delivery_document(
+            self.config, "2026-09-07", "2026-09-09", record["source"], record["replay"],
+            sheet_title="September 2026 portfolio review", publication_profile=None,
+        )
+        self.assertNotIn("publication_profile", legacy)
+        self.assertEqual("unresolved-evidence", legacy["publication_receipts"][1]["sheet_title"])
+        historical = self.state_dir / "historical-delivery.json"
+        write_json(historical, legacy)
+        original = historical.read_bytes()
+        with mock.patch.object(cycle.clockify_monthly_unresolved, "project_rows", side_effect=AssertionError("legacy projection invoked")):
+            cycle._verify_delivery_receipt(
+                historical, self.config, "2026-09-07", "2026-09-09", record["source"], record["replay"],
+                sheet_title="September 2026 portfolio review",
+            )
+        self.assertEqual(original, historical.read_bytes())
+        unknown = {**receipt, "publication_profile": "unknown/v99"}
+        write_json(historical, unknown)
+        with self.assertRaises(cycle.CycleError):
+            cycle._verify_delivery_receipt(
+                historical, self.config, "2026-09-07", "2026-09-09", record["source"], record["replay"],
+                sheet_title="September 2026 portfolio review",
+            )
 
         receipt["publication_receipts"][1]["readback_id"] = "sheet-readback/tampered"
         write_json(receipt_path, receipt)
@@ -1290,7 +1344,7 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
             cycle,
             "run_child_bounded",
             side_effect=self.child_for_runs(
-                commands, source_options={"ambiguous": [{"id": "ambiguous-1"}]}
+                commands, source_options={"ambiguous": [{"id": "ambiguous-1", "exception_kind": "low_confidence"}]}
             ),
         ):
             result = cycle.run_cycle(

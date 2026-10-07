@@ -33,6 +33,7 @@ try:
         reconciliation_manifest,
         semantic_analyzer,
         source_coverage,
+        clockify_monthly_unresolved,
     )
     from scripts.clockify_sheet_publish import (
         _publication_receipt,
@@ -49,6 +50,7 @@ except ModuleNotFoundError:  # pragma: no cover
     import reconciliation_manifest  # type: ignore[no-redef]
     import semantic_analyzer  # type: ignore[no-redef]
     import source_coverage  # type: ignore[no-redef]
+    import clockify_monthly_unresolved  # type: ignore[no-redef]
     from clockify_sheet_publish import (  # type: ignore[no-redef]
         _publication_receipt,
         project_allowlist,
@@ -271,7 +273,7 @@ def load_config(path: Path) -> dict[str, Any]:
         raise CycleError("config must be valid JSON") from exc
     if not isinstance(config, dict) or not _REQUIRED.issubset(config):
         raise CycleError("config is missing required review-cycle fields")
-    if set(config) - (_REQUIRED | {"runs_dir", "catchup_until", "max_slices", "total_child_budget_seconds"}):
+    if set(config) - (_REQUIRED | {"runs_dir", "catchup_until", "max_slices", "total_child_budget_seconds", "monthly_unresolved_alias_proof"}):
         raise CycleError("config contains unsupported review-cycle fields")
     if not isinstance(config["calendly_optional"], bool):
         raise CycleError("calendly_optional must be boolean")
@@ -1514,7 +1516,7 @@ def _publisher_command(
     root = _path(config, "root")
     source_dir = Path(str(source["run_dir"]))
     replay_dir = Path(str(replay["run_dir"]))
-    return [
+    command = [
         sys.executable,
         str(root / "scripts" / "clockify_sheet_publish.py"),
         "--spreadsheet-id", str(config["spreadsheet_id"]),
@@ -1525,12 +1527,33 @@ def _publisher_command(
         "--routing-snapshot", str((source_dir / "routing.json").resolve()),
         "--run-id", str(source["run_id"]),
         "--result-output", str(result_path),
+        "--monthly-unresolved",
         "--enable-write",
     ]
+    if config.get("monthly_unresolved_alias_proof"):
+        command.extend(["--monthly-unresolved-alias-proof", str(config["monthly_unresolved_alias_proof"])])
+    return command
+
+
+def _publication_profile(config: Mapping[str, Any], profile: str | None) -> str | None:
+    if profile == "configured":
+        return (clockify_monthly_unresolved.ALIAS_PROFILE if config.get("monthly_unresolved_alias_proof")
+                else clockify_monthly_unresolved.PROFILE)
+    return profile
+
+
+def _receipt_publication_config(config: Mapping[str, Any], document: Mapping[str, Any]) -> Mapping[str, Any]:
+    if document.get("publication_profile") != clockify_monthly_unresolved.ALIAS_PROFILE:
+        return config
+    proof = document.get("publication_alias_proof")
+    if not isinstance(proof, Mapping) or not isinstance(proof.get("path"), str) or _digest(Path(proof["path"])) != proof.get("digest"):
+        raise CycleError("delivery alias proof artifact has drifted")
+    return {**config, "monthly_unresolved_alias_proof": proof["path"]}
 
 
 def _expected_publication_receipts(
     config: Mapping[str, Any], source: Mapping[str, Any], *, sheet_title: str,
+    publication_profile: str | None = "configured",
 ) -> list[dict[str, Any]]:
     proposals, _exceptions = _validate_accounting(Path(str(source["run_dir"])))
     source_dir = Path(str(source["run_dir"])).resolve()
@@ -1548,7 +1571,10 @@ def _expected_publication_receipts(
             if item.get("routing_disposition") == "unresolved-routing"
         ]),
     )
-    return [
+    publication_profile = _publication_profile(config, publication_profile)
+    if publication_profile not in (None, clockify_monthly_unresolved.PROFILE, clockify_monthly_unresolved.ALIAS_PROFILE):
+        raise CycleError("unknown delivery publication profile")
+    receipts = [
         _publication_receipt(
             spreadsheet_id=str(config["spreadsheet_id"]),
             sheet_title=title,
@@ -1559,12 +1585,29 @@ def _expected_publication_receipts(
                 for item in members
             ],
         )
-        for title, members in partitions if members
+        for title, members in partitions if members and (
+            publication_profile is None or title != "unresolved-evidence"
+        )
     ]
+    if publication_profile in (clockify_monthly_unresolved.PROFILE, clockify_monthly_unresolved.ALIAS_PROFILE):
+        rows = clockify_monthly_unresolved.project_rows(source_dir)
+        aliases = {}
+        if publication_profile == clockify_monthly_unresolved.ALIAS_PROFILE:
+            aliases = clockify_monthly_unresolved.load_alias_proofs(Path(str(config["monthly_unresolved_alias_proof"])), source_dir)
+        if rows:
+            receipt = _publication_receipt(
+                spreadsheet_id=str(config["spreadsheet_id"]),
+                sheet_title=clockify_monthly_unresolved.title_for_review(sheet_title), rows=rows,
+            )
+            if aliases:
+                receipt["source_aliases"] = clockify_monthly_unresolved.alias_metadata(rows, aliases)
+            receipts.append(receipt)
+    return receipts
 
 
 def _validated_publication_document(
     document: object, expected: list[dict[str, Any]],
+    *, source_dir: Path | None = None,
 ) -> list[dict[str, Any]]:
     if not isinstance(document, Mapping):
         raise CycleError("publisher result contract is invalid")
@@ -1582,32 +1625,63 @@ def _validated_publication_document(
         "readback_id", "receipt_id",
     )
     retained = [
-        {field: item.get(field) for field in retained_fields}
+        {**{field: item.get(field) for field in retained_fields},
+         **({"source_aliases": item["source_aliases"]} if "source_aliases" in item else {})}
         for item in publications if isinstance(item, Mapping)
     ]
-    if len(retained) != len(publications) or retained != expected:
+    base_expected = [{key: value for key, value in item.items() if key != "canonical_source_aliases"} for item in expected]
+    if len(retained) != len(publications) or retained != base_expected:
         raise CycleError("publisher result destinations or readbacks differ")
+    for index, item in enumerate(publications):
+        if "canonical_source_aliases" not in item:
+            if "canonical_source_aliases" in expected[index]:
+                raise CycleError("publisher canonical alias readback is missing")
+            continue
+        if source_dir is None:
+            raise CycleError("publisher canonical alias source context is missing")
+        try:
+            aliases = clockify_monthly_unresolved.validate_canonical_aliases(
+                source_dir, clockify_monthly_unresolved.project_rows(source_dir), item["canonical_source_aliases"],
+            )
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            raise CycleError("publisher canonical alias proof differs") from exc
+        ids = {alias["stable_evidence_id"] for alias in aliases}
+        explicit_ids = {alias["stable_evidence_id"] for alias in item.get("source_aliases", [])}
+        if not ids.issubset(set(item["row_ids"])) or ids & explicit_ids or (
+            "canonical_source_aliases" in expected[index] and aliases != expected[index]["canonical_source_aliases"]
+        ):
+            raise CycleError("publisher canonical alias destination or identities differ")
+        retained[index]["canonical_source_aliases"] = aliases
     return retained
 
 
 def _publisher_result(
     stdout: str, runs: Path, expected: list[dict[str, Any]],
+    *, source_dir: Path | None = None,
 ) -> list[dict[str, Any]]:
     path = _result(stdout, runs)
     return _validated_publication_document(
-        _json_file(path, "publisher result"), expected,
+        _json_file(path, "publisher result"), expected, source_dir=source_dir,
     )
 
 
 def _delivery_document(
     config: Mapping[str, Any], since: str, until: str,
     source: Mapping[str, Any], replay: Mapping[str, Any], *, sheet_title: str,
+    publication_profile: str | None = "configured",
+    publication_readbacks: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    publication_profile = _publication_profile(config, publication_profile)
     try:
         publication_receipts = _expected_publication_receipts(
-            config, source, sheet_title=sheet_title,
+            config, source, sheet_title=sheet_title, publication_profile=publication_profile,
         )
-    except (TypeError, ValueError, RuntimeError) as exc:
+        if publication_readbacks is not None:
+            publication_receipts = _validated_publication_document({
+                "schema_version": "sheet-publication-result/v1", "status": "published",
+                "external_writes": True, "clockify_writes": 0, "publications": publication_readbacks,
+            }, publication_receipts, source_dir=Path(str(source["run_dir"])))
+    except (OSError, KeyError, TypeError, ValueError, RuntimeError) as exc:
         raise CycleError("proposal cannot produce the expected sheet row contract") from exc
     unsigned: dict[str, Any] = {
         "schema_version": RECEIPT_SCHEMA_VERSION,
@@ -1634,6 +1708,11 @@ def _delivery_document(
         "review_ids": list(source["review_ids"]),
         "publication_receipts": publication_receipts,
     }
+    if publication_profile is not None:
+        unsigned["publication_profile"] = publication_profile
+    if publication_profile == clockify_monthly_unresolved.ALIAS_PROFILE:
+        path = Path(str(config["monthly_unresolved_alias_proof"]))
+        unsigned["publication_alias_proof"] = {"path": str(path), "digest": _digest(path)}
     return {**unsigned, "receipt_digest": _value_digest(unsigned)}
 
 
@@ -1655,9 +1734,15 @@ def _verify_delivery_receipt(
     if path.is_symlink() or not path.is_file():
         raise CycleError("delivery receipt is missing or unsafe")
     document = _json_file(path, "delivery receipt")
-    expected = _delivery_document(
-        config, since, until, source, replay, sheet_title=sheet_title
-    )
+    config = _receipt_publication_config(config, document)
+    try:
+        expected = _delivery_document(
+            config, since, until, source, replay, sheet_title=sheet_title,
+            publication_profile=document.get("publication_profile"),
+            publication_readbacks=document.get("publication_receipts"),
+        )
+    except CycleError as exc:
+        raise CycleError("delivery receipt target or immutable inputs have drifted") from exc
     if document != expected:
         raise CycleError("delivery receipt target or immutable inputs have drifted")
 
@@ -3059,10 +3144,13 @@ def _verify_historical_adoption(
     ):
         raise CycleError("historical publication result identity differs")
     title = _sheet_title(config["monthly_sheet_title_template"], since=since)
-    expected = _expected_publication_receipts(config, source, sheet_title=title)
-    if document.get("publication_receipts") != expected:
+    config = _receipt_publication_config(config, document)
+    expected = _expected_publication_receipts(config, source, sheet_title=title,
+        publication_profile=document.get("publication_profile"))
+    validated = _validated_publication_document(_json_file(path, "publisher result"), expected,
+        source_dir=Path(str(source["run_dir"])))
+    if document.get("publication_receipts") != validated:
         raise CycleError("historical publication row identity differs")
-    _validated_publication_document(_json_file(path, "publisher result"), expected)
 
 
 def _validate_delivered_state(config: Mapping[str, Any], state: Mapping[str, Any]) -> None:
@@ -4030,15 +4118,15 @@ def _run_slice(
     publisher_result_path = (
         _runs_dir(config) / f"publication-{source['run_id']}" / "autopilot-result.json"
     )
-    receipt = _delivery_document(
-        config, since, until, source, replay, sheet_title=sheet_title
-    )
     if receipt_path.exists():
         _verify_delivery_receipt(
             receipt_path, config, since, until, source, replay,
             sheet_title=sheet_title,
         )
     else:
+        receipt = _delivery_document(
+            config, since, until, source, replay, sheet_title=sheet_title
+        )
         try:
             child = _run_budgeted_child(
                 _publisher_command(
@@ -4057,8 +4145,8 @@ def _run_slice(
             record["status"] = "failed"
             _persist_state(state_path, state, since, record)
             return {"status": "failed", "slice": {"since": since, "until": until}}
-        _publisher_result(
-            child.stdout, _runs_dir(config), receipt["publication_receipts"]
+        publication_readbacks = _publisher_result(
+            child.stdout, _runs_dir(config), receipt["publication_receipts"], source_dir=Path(str(source["run_dir"])),
         )
         verified_source = _validate_stage(
             config, Path(str(source["result_path"])), since, until, replay=False,
@@ -4075,6 +4163,9 @@ def _run_slice(
             raise CycleError("delivery inputs drifted while the publisher was running")
         if fresh_binding:
             _verify_fresh_native_source(config, record, verified_source)
+        receipt = _delivery_document(
+            config, since, until, source, replay, sheet_title=sheet_title, publication_readbacks=publication_readbacks,
+        )
         _write_delivery_receipt(receipt_path, receipt)
 
     record.update({
@@ -4216,9 +4307,14 @@ def adopt_historical_slice(
         if replay["accounting_digest"] != source["accounting_digest"]:
             raise CycleError("historical replay accounting differs")
         title = _sheet_title(config["monthly_sheet_title_template"], since=since)
+        publication_document = _json_file(publication_path, "publisher result")
+        publication_profile = publication_document.get("publication_profile")
+        publication_config = _receipt_publication_config(config, publication_document)
         expected_publications = _expected_publication_receipts(
-            config, source, sheet_title=title,
+            publication_config, source, sheet_title=title, publication_profile=publication_profile,
         )
+        expected_publications = _validated_publication_document(publication_document, expected_publications,
+            source_dir=Path(str(source["run_dir"])))
         checkpoint_capture: dict[str, str] = {}
         if derived:
             _interval_from_derived_stage(
@@ -4247,6 +4343,10 @@ def adopt_historical_slice(
             "publication_result_digest": request["publication_result_digest"],
             "publication_receipts": expected_publications,
         }
+        if publication_profile is not None:
+            unsigned["publication_profile"] = publication_profile
+        if publication_profile == clockify_monthly_unresolved.ALIAS_PROFILE:
+            unsigned["publication_alias_proof"] = publication_document["publication_alias_proof"]
         if derived:
             unsigned["source_provenance"] = dict(request["source_provenance"])
         else:
@@ -4260,7 +4360,8 @@ def adopt_historical_slice(
             validation_config, record, adoption, since, until, source, replay,
         )
         delivery = _delivery_document(
-            config, since, until, source, replay, sheet_title=title,
+            publication_config, since, until, source, replay, sheet_title=title, publication_profile=publication_profile,
+            publication_readbacks=expected_publications,
         )
         receipt_path = state_dir / "delivery-receipts" / f"{since}.json"
         adoption_path = state_dir / "historical-adoption-receipts" / f"{since}.json"

@@ -413,8 +413,17 @@ def _native_meeting_identity(events: Sequence[Mapping[str, Any]], proposal: Mapp
         if any(attrs.get(field) not in (None, "") and str(attrs[field]) != str(identifier)
                for field in ("recording_id", "id", "provider_recording_id")):
             raise AdoptionError("native meeting has conflicting provider recording identities")
-        if not (native.legacy._parse(span["start"]) <= native.legacy._parse(proposal["start"])
-                < native.legacy._parse(proposal["end"]) <= native.legacy._parse(span["end"])):
+        if provider == "fathom":
+            # Historical Fathom spans use offsetless Bucharest local time,
+            # exactly as the accounting pipeline interprets sealed evidence.
+            from scripts import work_accounting_pipeline as pipeline
+            span_start, span_end = pipeline._parse_dt(span["start"]), pipeline._parse_dt(span["end"])
+        else:
+            span_start, span_end = native.legacy._parse(span["start"]), native.legacy._parse(span["end"])
+        if span_start is None or span_end is None:
+            raise AdoptionError("native meeting recording interval is invalid")
+        if not (span_start <= native.legacy._parse(proposal["start"])
+                < native.legacy._parse(proposal["end"]) <= span_end):
             raise AdoptionError("native meeting proposal exceeds its original recording interval")
         identities.add((provider, str(identifier), url))
     if len(identities) != 1:

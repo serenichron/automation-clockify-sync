@@ -451,7 +451,7 @@ class ReviewCycleEntrypointTests(unittest.TestCase):
         with mock.patch.object(
             cycle,
             "run_child_bounded",
-            side_effect=self.child_for_runs(commands, ambiguous=[{"id": "exception-1"}]),
+            side_effect=self.child_for_runs(commands, ambiguous=[{"id": "exception-1", "exception_kind": "low_confidence"}]),
         ):
             code, result, _error = self.call_main(enable_write=True, config=config_path)
             idle_code, idle, _error = self.call_main(enable_write=True, config=config_path)

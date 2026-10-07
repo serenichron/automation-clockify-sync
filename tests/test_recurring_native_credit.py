@@ -23,7 +23,7 @@ START = dt.datetime(2026, 9, 7, 9, tzinfo=dt.timezone.utc)
 
 
 class RecurringNativeCreditTests(unittest.TestCase):
-    def fixture(self, root, *, prior_minutes=(30,), current_minutes=(30,), kind="equal_accomplishment", prior_offsets=None, current_meeting_attrs=None, current_end_seconds=844):
+    def fixture(self, root, *, prior_minutes=(30,), current_minutes=(30,), kind="equal_accomplishment", prior_offsets=None, current_meeting_attrs=None, current_end_seconds=844, prior_source_local=False, prior_source_span_minutes=None):
         self.assertTrue(callable(getattr(adoption, "build_recurring_credit", None)), "recurring credit producer is missing")
         make = native_fixtures.NativeSheetPostTests()
         rows, priors = [], []
@@ -35,9 +35,15 @@ class RecurringNativeCreditTests(unittest.TestCase):
                          "title": "Discovery call", "semantic_evidence_status": "available",
                          "recorded_by_email": "vlad@serenichron.com", "calendar_invitees": [{"email": "prospect@example.test"}]}
         old_end = START + dt.timedelta(minutes=prior_minutes[0] if intersection else total)
+        if prior_source_span_minutes is not None:
+            old_end = START + dt.timedelta(minutes=prior_source_span_minutes)
         if intersection:
+            source_start, source_end = START, old_end
+            if prior_source_local:
+                source_start = START.astimezone(collector.BUCHAREST).replace(tzinfo=None)
+                source_end = old_end.astimezone(collector.BUCHAREST).replace(tzinfo=None)
             event = evidence_ledger.normalize_collector_snapshot({"fathom": {"meetings": [{
-                **meeting_attrs, "start": START.isoformat(), "end": old_end.isoformat(),
+                **meeting_attrs, "start": source_start.isoformat(), "end": source_end.isoformat(),
             }]}})[0]
             self.assertNotIn("recording_id", event.attributes)
         else:
@@ -107,8 +113,52 @@ class RecurringNativeCreditTests(unittest.TestCase):
     def seal(self, declaration):
         return adoption.build_recurring_credit(declaration, workspace_id="workspace-1", member_id="user-1")
 
-    def apply(self, proposals, credits, proof):
-        return pipeline._apply_verified_posted_credits(proposals, [], credits, collection_snapshot=proof)
+    def apply(self, proposals, credits, proof, existing_blocks=None):
+        return pipeline._apply_verified_posted_credits(proposals, existing_blocks or [], credits, collection_snapshot=proof)
+
+    def test_retained_only_offsetless_fathom_span_credits_837_and_preserves_four_seconds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            current, declaration, proof = self.fixture(Path(tmp), prior_minutes=(14,), current_minutes=(14,),
+                kind="source_native_meeting_intersection", prior_source_local=True)
+            try:
+                credit = self.seal(declaration)
+            except ValueError as error:
+                self.fail(f"historical Bucharest Fathom span rejected: {error}")
+            rows, credited = self.apply(current, [credit], proof)
+            self.assertEqual(1, len(credit["prior_proofs"]))
+            self.assertEqual(1, len(credited[0]["clockify_entry_ids"]))
+            self.assertEqual(837, credited[0]["verified_posted_credit"]["covered_seconds"])
+            self.assertEqual(4, rows[0]["duration_seconds"])
+            self.assertEqual("2026-09-07T09:14:00+00:00", rows[0]["start"])
+            self.assertEqual("2026-09-07T09:14:04+00:00", rows[0]["end"])
+            self.assertNotIn("credited_overlap_receipt", credited[0])
+
+    def test_offsetless_fathom_span_uses_bucharest_winter_offset(self):
+        event = evidence_ledger.normalize_collector_snapshot({"fathom": {"meetings": [{
+            "recording_id": "winter-fixture", "share_url": "https://fathom.video/share/winter-fixture",
+            "start": "2026-12-07T11:00:00", "end": "2026-12-07T11:14:00",
+        }]}})[0].document()
+        proposal = {"start": "2026-12-07T09:00:00Z", "end": "2026-12-07T09:14:00Z", "duration_seconds": 840}
+        try:
+            identity = adoption._native_meeting_identity([event], proposal)
+        except ValueError as error:
+            self.fail(f"winter Bucharest Fathom span rejected: {error}")
+        self.assertEqual(("fathom", "winter-fixture", "https://fathom.video/share/winter-fixture"), identity)
+
+    def test_fathom_span_keeps_explicit_offset_and_rejects_malformed_time(self):
+        proposal = {"start": "2026-09-07T09:00:00Z", "end": "2026-09-07T09:14:00Z", "duration_seconds": 840}
+        def event(start, end):
+            return evidence_ledger.normalize_collector_snapshot({"fathom": {"meetings": [{
+                "recording_id": "offset-fixture", "share_url": "https://fathom.video/share/offset-fixture",
+                "start": start, "end": end,
+            }]}})[0].document()
+        self.assertEqual("offset-fixture", adoption._native_meeting_identity(
+            [event("2026-09-07T10:00:00+01:00", "2026-09-07T10:14:00+01:00")], proposal)[1])
+        for start, end in (("2026-09-07T10:00:00+02:00", "2026-09-07T10:14:00+02:00"),
+                           ("not-a-timestamp", "2026-09-07T12:14:00"),
+                           ("2026-09-07T12:00:00", "not-a-timestamp")):
+            with self.subTest(start=start, end=end), self.assertRaises(ValueError):
+                adoption._native_meeting_identity([event(start, end)], proposal)
 
     def test_native_recording_precision_drift_credits_union_and_retains_four_second_tail(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -218,6 +268,100 @@ class RecurringNativeCreditTests(unittest.TestCase):
 
     def test_accounting_native_intersection_retains_four_seconds_without_tombstoning_tail(self):
         self.accounting_intersection_fixture(full_coverage=False)
+
+    def test_native_intersection_residual_rebinds_real_ledger_overlap_warnings_for_quality(self):
+        from scripts import clockify_sync_quality as quality
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, declaration, proof = self.fixture(root, prior_minutes=(14,), current_minutes=(14,),
+                kind="source_native_meeting_intersection", prior_source_local=True)
+            manual = copy.deepcopy(proof.entries[0])
+            manual.update(id="retained-manual-fixture", description="Independent manual meeting")
+            manual["timeInterval"].update(end=(START + dt.timedelta(minutes=15, seconds=48)).isoformat(), duration="PT948S")
+            proof.entries.append(manual)
+            native_before = copy.deepcopy(proof.entries)
+            run_dir, analysis, ledger_doc, _ = self.accounting_run_fixture(root, proof, current_source=True)
+            baseline = pipeline.run_accounting(run_dir, root=accounting_fixtures.ROOT, analysis_fixture=analysis)
+            target = baseline["proposals"][0]
+            declaration["artifacts"] = {
+                "current_proposals": adoption_fixtures.artifact(root / "accounted-proposals.json", baseline["proposals"]),
+                "current_source_ledger": adoption_fixtures.artifact(root / "accounted-ledger.json", ledger_doc),
+            }
+            declaration["current_review_ids"] = [adoption._review_id(target)]
+            credit = self.seal(declaration)
+            captured = pipeline._accounting_collection_snapshot(run_dir, ledger_doc["events"])
+            rows, credited = self.apply(baseline["proposals"], [credit], captured,
+                                       pipeline._existing_blocks(ledger_doc["events"]))
+            existing = json.loads((run_dir / "evidence/clockify-existing.json").read_text())["entries"]
+            self.assertEqual([], quality.find_time_overlaps(rows, existing))
+            self.assertEqual(837, credited[0]["verified_posted_credit"]["covered_seconds"])
+            self.assertEqual(4, rows[0]["duration_seconds"])
+            overlaps = [w for w in rows[0]["review_warnings"] if w["type"] == "existing_clockify_overlap"]
+            self.assertEqual(1, len(overlaps))
+            manual_event = evidence_ledger._snapshot_event("clockify", existing[1], 2)
+            self.assertEqual(manual_event.evidence_id, overlaps[0]["counterpart_id"])
+            self.assertEqual(rows[0]["start"], overlaps[0]["overlap_start"])
+            self.assertEqual(rows[0]["end"], overlaps[0]["overlap_end"])
+            self.assertEqual(4, overlaps[0]["overlap_duration_seconds"])
+            self.assertEqual([w for w in target["review_warnings"] if w["type"] != "existing_clockify_overlap"],
+                             [w for w in rows[0]["review_warnings"] if w["type"] != "existing_clockify_overlap"])
+            self.assertEqual(native_before, proof.entries)
+            self.assertEqual(native_before, captured.entries)
+            self.assertEqual([], baseline["review_tombstones"])
+
+    def test_native_intersection_middle_credit_clips_warnings_for_both_disjoint_residuals(self):
+        from scripts import clockify_sync_quality as quality
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            current, declaration, proof = self.fixture(root, prior_minutes=(3,), prior_offsets=(3,), current_minutes=(14,),
+                kind="source_native_meeting_intersection", prior_source_span_minutes=14)
+            existing = [{"id": "manual-fixture", "start": START.isoformat(),
+                         "end": (START + dt.timedelta(minutes=15)).isoformat(), "project_id_suffix": "manual"},
+                        {"id": "posted-fixture", "start": (START + dt.timedelta(minutes=3)).isoformat(),
+                         "end": (START + dt.timedelta(minutes=6)).isoformat(), "project_id_suffix": "posted"}]
+            warnings, blocks = [], []
+            for index, entry in enumerate(existing, 1):
+                block = {"block_id": evidence_ledger._snapshot_event("clockify", entry, index).evidence_id,
+                         "start": pipeline._parse_dt(entry["start"]), "end": pipeline._parse_dt(entry["end"]),
+                         "project_id_suffix": entry["project_id_suffix"]}
+                block["kind"] = "existing_clockify"
+                blocks.append(block)
+                warnings.append(pipeline._overlap_warning(pipeline._parse_dt(current[0]["start"]),
+                    pipeline._parse_dt(current[0]["end"]), block, "existing_clockify_overlap"))
+            note = {"type": "unresolved_routing", "reason_code": "no_deterministic_route"}
+            current[0]["billable"] = True
+            current[0]["review_warnings"] = [*warnings, note]
+            declaration["artifacts"]["current_proposals"] = adoption_fixtures.artifact(root / "current-with-warnings.json", current)
+            rows, credited = self.apply(current, [self.seal(declaration)], proof, blocks)
+            self.assertEqual([177, 484], [row["duration_seconds"] for row in rows])
+            self.assertEqual(180, credited[0]["verified_posted_credit"]["covered_seconds"])
+            self.assertEqual([], quality.find_time_overlaps(rows, existing))
+            for row in rows:
+                overlaps = [w for w in row["review_warnings"] if w["type"] == "existing_clockify_overlap"]
+                self.assertEqual(1, len(overlaps))
+                self.assertEqual(warnings[0]["counterpart_id"], overlaps[0]["counterpart_id"])
+                self.assertEqual(row["duration_seconds"], overlaps[0]["overlap_duration_seconds"])
+                self.assertIn(note, row["review_warnings"])
+                self.assertEqual(current[0]["billable"], row["billable"])
+                self.assertEqual(current[0]["clockify_project_suffix"], row["clockify_project_suffix"])
+
+    def test_native_intersection_preserves_unknown_and_inexact_ledger_warnings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            current, declaration, proof = self.fixture(root, prior_minutes=(14,), current_minutes=(14,),
+                kind="source_native_meeting_intersection")
+            block = {"block_id": "ev-known", "kind": "existing_clockify", "start": START,
+                     "end": START + dt.timedelta(minutes=14), "project_id_suffix": "known"}
+            unknown = pipeline._overlap_warning(pipeline._parse_dt(current[0]["start"]),
+                pipeline._parse_dt(current[0]["end"]), {**block, "block_id": "ev-unknown"}, "existing_clockify_overlap")
+            inexact = {**unknown, "counterpart_id": "ev-known", "overlap_start": START.isoformat(),
+                       "overlap_duration_seconds": 840}
+            wrong_project = {**unknown, "counterpart_id": "ev-known", "counterpart_project_suffix": "other"}
+            current[0]["review_warnings"] = [unknown, inexact, wrong_project]
+            declaration["artifacts"]["current_proposals"] = adoption_fixtures.artifact(root / "current-invalid-warnings.json", current)
+            rows, _ = self.apply(current, [self.seal(declaration)], proof, [block])
+            self.assertEqual(4, rows[0]["duration_seconds"])
+            self.assertEqual([unknown, inexact, wrong_project], rows[0]["review_warnings"])
 
     def test_accounting_native_intersection_full_coverage_emits_publisher_tombstone(self):
         result, baseline = self.accounting_intersection_fixture(full_coverage=True)

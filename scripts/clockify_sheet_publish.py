@@ -20,8 +20,10 @@ from typing import Any, Mapping, Protocol, Sequence
 
 try:
     from scripts import clockify_portfolio_replay as portfolio_replay
+    from scripts import clockify_monthly_unresolved as monthly_unresolved
 except ImportError:  # pragma: no cover - direct script execution fallback
     import clockify_portfolio_replay as portfolio_replay  # type: ignore[no-redef]
+    import clockify_monthly_unresolved as monthly_unresolved  # type: ignore[no-redef]
 
 
 HEADER = [
@@ -221,6 +223,44 @@ class GwsSheetsGateway:
                 "insertDataOption": "INSERT_ROWS",
             }),
             "--json", json.dumps({"majorDimension": "ROWS", "values": list(rows)}, ensure_ascii=False),
+        ])
+
+    def append_monthly_rows(
+        self, spreadsheet_id: str, sheet_id: int, start_row: int,
+        grid_rows: int, rows: Sequence[Sequence[Any]],
+    ) -> None:
+        """Native append with formatting/validation scoped only to new rows."""
+        if not rows:
+            return
+        if start_row < 3 or any(len(row) != 12 for row in rows):
+            raise PublicationError("monthly append lacks a data-row format exemplar")
+        end_index = start_row - 1 + len(rows)
+        requests: list[dict[str, Any]] = []
+        if end_index > grid_rows:
+            requests.append({"appendDimension": {
+                "sheetId": sheet_id, "dimension": "ROWS", "length": end_index - grid_rows,
+            }})
+        destination = {"sheetId": sheet_id, "startRowIndex": start_row - 1,
+                       "endRowIndex": end_index, "startColumnIndex": 0, "endColumnIndex": 12}
+        exemplar = {**destination, "startRowIndex": start_row - 2, "endRowIndex": start_row - 1}
+        for paste_type in ("PASTE_FORMAT", "PASTE_DATA_VALIDATION"):
+            requests.append({"copyPaste": {
+                "source": exemplar, "destination": destination, "pasteType": paste_type,
+            }})
+        # Sheets may store an automatic hyperlink in the exemplar's format.
+        # Clear only that row-specific link on new cells, retaining every other
+        # copied format/validation field; new URL values get their own links.
+        requests.append({"repeatCell": {
+            "range": destination, "cell": {}, "fields": "userEnteredFormat.textFormat.link",
+        }})
+        requests.append({"updateCells": {
+            "range": destination, "fields": "userEnteredValue",
+            "rows": [{"values": [{"userEnteredValue": {"stringValue": str(value)}}
+                                  for value in row]} for row in rows],
+        }})
+        self._call([
+            "spreadsheets", "batchUpdate", "--params", json.dumps({"spreadsheetId": spreadsheet_id}),
+            "--json", json.dumps({"requests": requests}, ensure_ascii=False),
         ])
 
 
@@ -1123,6 +1163,103 @@ def _write_result(path: Path, document: Mapping[str, Any]) -> None:
             Path(temporary).unlink(missing_ok=True)
 
 
+def _plan_monthly_unresolved(
+    gateway: SheetsGateway, *, spreadsheet_id: str, sheet_title: str,
+    rows: Sequence[Sequence[Any]],
+    aliases: Mapping[str, Any] | None = None,
+    source_dir: Path | None = None,
+) -> dict[str, Any]:
+    if any(len(row) != 12 or not str(row[0]).startswith("uev-") for row in rows):
+        raise PublicationError("monthly unresolved row contract is invalid")
+    ids = [row[0] for row in rows]
+    if len(ids) != len(set(ids)):
+        raise PublicationError("duplicate monthly stable evidence ID")
+    metadata = gateway.spreadsheet(spreadsheet_id)
+    properties = [sheet.get("properties", {}) for sheet in metadata.get("sheets", [])
+                  if sheet.get("properties", {}).get("title") == sheet_title]
+    if len(properties) != 1 or properties[0].get("hidden") is True:
+        raise PublicationError("visible monthly unresolved tab is missing or hidden")
+    prop = properties[0]
+    grid = prop.get("gridProperties", {})
+    if grid.get("columnCount", 0) < 12:
+        raise PublicationError("monthly unresolved tab grid is invalid")
+    range_name = f"{_a1_title(sheet_title)}!A1:L{grid['rowCount']}"
+    existing = gateway.values(spreadsheet_id, range_name)
+    if not existing or existing[0] != monthly_unresolved.HEADER:
+        raise PublicationError("monthly unresolved header differs")
+    by_id = {}
+    for raw in existing[1:]:
+        if not any(value != "" for value in raw):
+            continue
+        prior = list(raw) + [""] * (12 - len(raw))
+        identity = str(prior[0])
+        if not identity or identity in by_id:
+            raise PublicationError("blank or duplicate existing monthly stable evidence ID")
+        by_id[identity] = prior
+    appends = []
+    aliases = aliases or {}
+    canonical_aliases = []
+    for row in rows:
+        prior = by_id.get(row[0])
+        alias = aliases.get(row[0])
+        if alias is not None:
+            if (alias["spreadsheet_id"] != spreadsheet_id or alias["sheet_title"] != sheet_title
+                or alias["sheet_id"] != prop["sheetId"] or prior is None
+                or monthly_unresolved.machine_digest(prior) != monthly_unresolved.machine_digest(alias["machine_row"])):
+                raise PublicationError("monthly source alias target or pinned machine cells conflict")
+            continue
+        if prior is None:
+            appends.append(list(row))
+        elif any(not _same_cell(prior[index], row[index]) for index in (*range(10), 11)):
+            if source_dir is None:
+                raise PublicationError(f"monthly machine-field conflict: {row[0]}")
+            try:
+                canonical_aliases.append(monthly_unresolved.canonical_source_alias(source_dir, list(row), prior))
+            except (OSError, KeyError, TypeError, ValueError) as exc:
+                raise PublicationError(f"monthly canonical machine-field conflict: {row[0]}") from exc
+    if appends and len(existing) < 2:
+        raise PublicationError("monthly unresolved tab lacks a native data-row exemplar")
+    return {"sheet_title": sheet_title, "sheet_id": prop["sheetId"], "grid_rows": grid["rowCount"],
+            "existing": existing, "appends": appends, "rows": [list(row) for row in rows], "aliases": aliases,
+            "canonical_aliases": canonical_aliases}
+
+
+def _apply_monthly_unresolved(
+    gateway: SheetsGateway, *, spreadsheet_id: str, plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    title = str(plan["sheet_title"])
+    existing = plan["existing"]
+    appends = plan["appends"]
+    if appends:
+        gateway.append_monthly_rows(  # type: ignore[attr-defined]
+            spreadsheet_id, plan["sheet_id"], len(existing) + 1, plan["grid_rows"], appends,
+        )
+    count = max(plan["grid_rows"], len(existing) + len(appends))
+    observed = gateway.values(spreadsheet_id, f"{_a1_title(title)}!A1:L{count}")
+    expected = [*existing, *appends]
+    # A retry's existing K is human-owned; the exact old prefix must survive.
+    padded = lambda row: list(row) + [""] * (12 - len(row))
+    if len(observed) != len(expected) or any(padded(a) != padded(b) for a, b in zip(observed, expected, strict=True)):
+        raise PublicationError("monthly unresolved exact readback differs")
+    result = {"appended": len(appends), "unchanged": len(plan["rows"]) - len(appends),
+              **_publication_receipt(spreadsheet_id=spreadsheet_id, sheet_title=title, rows=plan["rows"])}
+    if plan["aliases"]:
+        result["source_aliases"] = monthly_unresolved.alias_metadata(plan["rows"], plan["aliases"])
+    if plan["canonical_aliases"]:
+        result["canonical_source_aliases"] = plan["canonical_aliases"]
+    return result
+
+
+def publish_monthly_unresolved(
+    gateway: SheetsGateway, *, spreadsheet_id: str, sheet_title: str,
+    rows: Sequence[Sequence[Any]],
+    aliases: Mapping[str, Any] | None = None,
+    source_dir: Path | None = None,
+) -> dict[str, Any]:
+    plan = _plan_monthly_unresolved(gateway, spreadsheet_id=spreadsheet_id, sheet_title=sheet_title, rows=rows, aliases=aliases, source_dir=source_dir)
+    return _apply_monthly_unresolved(gateway, spreadsheet_id=spreadsheet_id, plan=plan)
+
+
 def publish_proposal_partitions(
     gateway: SheetsGateway,
     *,
@@ -1133,6 +1270,9 @@ def publish_proposal_partitions(
     tombstones: Sequence[Mapping[str, Any]] = (),
     run_id: str,
     project_allowlist: Mapping[str, str],
+    monthly_rows: Sequence[Sequence[Any]] | None = None,
+    monthly_aliases: Mapping[str, Any] | None = None,
+    monthly_source_dir: Path | None = None,
 ) -> dict[str, Any]:
     proposal_partitions: tuple[tuple[str, list[Mapping[str, Any]]], ...] = (
         (sheet_title, [
@@ -1153,7 +1293,7 @@ def publish_proposal_partitions(
             ],
         )
         for destination, members in proposal_partitions
-        if members
+        if members and (monthly_rows is None or destination != "unresolved-evidence")
     ]
     ids = [str(row[0]) for _destination, rows in partitions for row in rows]
     if len(ids) != len(set(ids)):
@@ -1171,6 +1311,13 @@ def publish_proposal_partitions(
         )
         for destination, rows in partitions
     ]
+    monthly_plan = None
+    if monthly_rows:
+        monthly_plan = _plan_monthly_unresolved(
+            gateway, spreadsheet_id=spreadsheet_id,
+            sheet_title=monthly_unresolved.title_for_review(sheet_title), rows=monthly_rows, aliases=monthly_aliases,
+            source_dir=monthly_source_dir,
+        )
     publications: list[dict[str, Any]] = []
     for (destination, rows), plan in zip(partitions, plans, strict=True):
         result = _apply_publish_plan(
@@ -1183,6 +1330,11 @@ def publish_proposal_partitions(
                 spreadsheet_id=spreadsheet_id, sheet_title=destination, rows=rows,
             ),
             **result,
+        })
+    if monthly_plan is not None:
+        publications.append({
+            "sheet_title": monthly_plan["sheet_title"], "row_count": len(monthly_rows),
+            **_apply_monthly_unresolved(gateway, spreadsheet_id=spreadsheet_id, plan=monthly_plan),
         })
     terminal_updates = 0
     for destination, members in (
@@ -1248,6 +1400,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--result-output", type=Path)
     parser.add_argument("--enable-write", action="store_true")
+    parser.add_argument("--monthly-unresolved", action="store_true")
+    parser.add_argument("--monthly-unresolved-alias-proof", type=Path)
     args = parser.parse_args(argv)
 
     quality = _json(args.quality_report)
@@ -1286,6 +1440,16 @@ def main(argv: list[str] | None = None) -> int:
             proposal_row(proposal, args.run_id, project_allowlist=projects)
             for proposal in proposals
         ]
+        monthly_rows = None
+        monthly_aliases = None
+        if args.monthly_unresolved:
+            try:
+                monthly_unresolved.verify_replay_artifacts(args.proposals.parent, args.replay_integrity.parent, replay)
+                monthly_rows = monthly_unresolved.project_rows(args.proposals.parent)
+                if args.monthly_unresolved_alias_proof is not None:
+                    monthly_aliases = monthly_unresolved.load_alias_proofs(args.monthly_unresolved_alias_proof, args.proposals.parent)
+            except (OSError, KeyError, TypeError, ValueError) as exc:
+                raise PublicationError("monthly unresolved source/replay projection is invalid") from exc
     if not args.enable_write:
         print(json.dumps({
             "status": "dry_run",
@@ -1305,6 +1469,9 @@ def main(argv: list[str] | None = None) -> int:
             tombstones=tombstones,
             run_id=args.run_id,
             project_allowlist=projects,
+            monthly_rows=monthly_rows,
+            monthly_aliases=monthly_aliases,
+            monthly_source_dir=args.proposals.parent,
         )
     else:
         result = publish(
@@ -1315,6 +1482,13 @@ def main(argv: list[str] | None = None) -> int:
             rows=rows,
         )
     document = {"status": "published", "external_writes": True, **result}
+    if args.proposals is not None and args.monthly_unresolved:
+        document["publication_profile"] = monthly_unresolved.PROFILE
+        if args.monthly_unresolved_alias_proof is not None:
+            proof_path = args.monthly_unresolved_alias_proof
+            document["publication_profile"] = monthly_unresolved.ALIAS_PROFILE
+            document["publication_alias_proof"] = {"path": str(proof_path),
+                "digest": "sha256:" + hashlib.sha256(proof_path.read_bytes()).hexdigest()}
     if args.result_output is not None:
         stable_document = document
         if args.proposals is not None:
@@ -1329,10 +1503,15 @@ def main(argv: list[str] | None = None) -> int:
                 "clockify_writes": document["clockify_writes"],
                 "terminal_updates": document["terminal_updates"],
                 "publications": [
-                    {field: item[field] for field in receipt_fields}
+                    {**{field: item[field] for field in receipt_fields},
+                     **({"source_aliases": item["source_aliases"]} if "source_aliases" in item else {}),
+                     **({"canonical_source_aliases": item["canonical_source_aliases"]} if "canonical_source_aliases" in item else {})}
                     for item in document["publications"]
                 ],
             }
+            for field in ("publication_profile", "publication_alias_proof"):
+                if field in document:
+                    stable_document[field] = document[field]
         _write_result(args.result_output, stable_document)
         print(args.result_output.resolve())
     else:
