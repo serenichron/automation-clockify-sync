@@ -181,9 +181,14 @@ def load_json(path: Path) -> Any:
     return json.loads(path.read_text())
 
 
+def _json_default(value: Any) -> Any:
+    """Keep frozen checkpoint mappings structured; retain other string fallbacks."""
+    return dict(value) if isinstance(value, Mapping) else str(value)
+
+
 def write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False, default=str) + "\n")
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False, default=_json_default) + "\n")
 
 
 def collector_script_sha256() -> str:
