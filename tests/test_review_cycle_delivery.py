@@ -16,6 +16,7 @@ from scripts import clockify_review_cycle as cycle
 from scripts import collector_receipts, collector_slices
 from scripts import clockify_review_run as review_run
 from scripts import semantic_analyzer
+from scripts import evidence_ledger, source_coverage
 from ops.systemd.user import clockify_review_cycle_release as release_helper
 from scripts.autopilot_process import ChildResult
 from task3_scenario_contract import assert_scenario_contract
@@ -92,6 +93,8 @@ def make_run(
     runtime_identity: dict[str, object] | None = None,
     collector_source_marker: bool = False,
     analyzer_tier: str = "primary",
+    ledger_from: Path | None = None,
+    record_checkpoint: bool = True,
 ) -> Path:
     run_dir = (runs_dir or root / "runs") / name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -101,6 +104,8 @@ def make_run(
         if coverage is None
         else coverage
     )
+    if ledger_from is not None:
+        coverage = json.loads((ledger_from / "evidence/evidence-ledger.json").read_text())["manifest"]["source_completeness"]
     local = ZoneInfo("Europe/Bucharest")
     since_dt = dt.datetime.combine(since, dt.time(), local)
     until_dt = dt.datetime.combine(until, dt.time(), local)
@@ -127,6 +132,8 @@ def make_run(
             "events": [],
         },
     )
+    if ledger_from is not None:
+        shutil.copyfile(ledger_from / "evidence/evidence-ledger.json", run_dir / "evidence/evidence-ledger.json")
     bundle_manifest = {
         "schema_version": "clockify-semantic-evidence-bundle/v1",
         "digest": semantic_analyzer.stable_digest("sebm-", [], length=64),
@@ -242,7 +249,7 @@ def make_run(
         run_dir, slice_=slice_, replay=replay
     )
     collector_receipts.write_completion_bundle(run_dir / "completion-bundle.json", bundle)
-    if not replay:
+    if not replay and record_checkpoint:
         identity = collector_slices.BacklogIdentity(
             since_utc=since_utc,
             until_utc=until_utc,
@@ -293,7 +300,7 @@ def make_run(
 
 
 class ReviewCycleDeliveryTests(unittest.TestCase):
-    def routing_transition_fixture(self):
+    def routing_transition_fixture(self, *, create_source=True, release_collector=False):
         """Real completed source plus a sealed immutable synthetic release."""
         self.state_dir.mkdir()
         manifest = cycle._ensure_period(self.config, self.state_dir, "2026-09-07", "2026-09-09", bind_inputs=True)
@@ -304,6 +311,10 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
         release = self.root / "releases" / ("a" * 40)
         release.mkdir(parents=True)
         shutil.copyfile(self.root / "routing.json", release / "routing.json")
+        if release_collector:
+            (release / "scripts").mkdir()
+            shutil.copyfile(Path(cycle.__file__).parent / "clockify_sync_collect.py", release / "scripts/clockify_sync_collect.py")
+            write_json(release / "fleet.json", {"machines":[{"name":"macbook", "enabled":True}]})
         release_helper._make_payload_read_only(release)
         release.chmod(0o555)
         tree = release_helper._tree_manifest(release)
@@ -323,8 +334,238 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
         record = {"expected_snapshot_digests": old, "period_manifest": str(manifest), "until": "2026-09-09", "status": "incomplete"}
         attempt = cycle._source_attempt(record, command, cycle._generic_interval(config, "2026-09-07", "2026-09-09"), advance_frontier=True)
         record["runner_attempt"] = {"runtime_identity_digest": cycle._value_digest(runtime), "source_attempt_ordinal": attempt["ordinal"], "status": "pending"}
-        source = make_run(self.root, "source-run", replay=False, runtime_identity=runtime, analyzer_tier="fixture")
+        source = make_run(self.root, "source-run", replay=False, runtime_identity=runtime, analyzer_tier="fixture") if create_source else None
         return config, record, manifest, source
+
+    def fresh_routing_fixture(self):
+        config, record, manifest, _ = self.routing_transition_fixture(create_source=False, release_collector=True)
+        record.pop("runner_attempt")
+        record["source_attempt"]["status"] = "finished"
+        state = cycle._state(self.state_dir / "absent.json", recovery_since="2026-09-07")
+        state["slices"]["2026-09-07"] = record
+        write_json(self.state_dir / "review-cycle-state.json", state)
+        return config, record, manifest
+
+    def make_modern_raw_source(self, config, *, name="source-run", attest=True, incomplete_peer=False):
+        result = make_run(self.root, name, replay=False, runtime_identity=config["_runtime_identity"], analyzer_tier="fixture", record_checkpoint=False)
+        run = result.parent
+        runtime = config["_runtime_identity"]
+        collector_digest = hashlib.sha256(Path(runtime["collector_path"]).read_bytes()).hexdigest()
+        host = {"machine": "macbook", "status": "ok", "complete": True,
+            "collector_contract": "canonical_export_v1", "claude_bursts": [], "hermes_sessions": [],
+            "hermes_db_sessions": [], "codex_sessions": [], "repository_events": [],
+            "repository_evidence_status": "complete", "errors": []}
+        if attest:
+            host["canonical_export_attestation"] = {"collector_script_sha256": collector_digest, "runtime_identity": runtime}
+            host["canonical_export"] = {"collector_script_sha256": collector_digest, "provenance": "full_context_remote_export"}
+        if incomplete_peer:
+            host.update(status="error", complete=False, errors=["synthetic unavailable sessions"])
+        raw = {"sessions": [host], "clockify": {"status": "ok", "complete": True, "entries": []},
+            "fathom": {"status": "ok", "complete": True, "meetings": []},
+            "calendly": {"status": "excluded", "complete": False, "recordings": []},
+            "multica_issues": {"status": "ok", "complete": True, "issues": []}}
+        for key, filename in {"sessions":"sessions.json", "clockify":"clockify-existing.json", "fathom":"fathom-meetings.json", "calendly":"calendly-recordings.json", "multica_issues":"multica-issues.json"}.items():
+            write_json(run / "evidence" / filename, raw[key])
+        ledger = evidence_ledger.EvidenceLedger(tuple(evidence_ledger.normalize_collector_snapshot(raw)), evidence_ledger.source_inventory_from_collector(raw), "Europe/Bucharest", ("member-1",))
+        write_json(run / "evidence/evidence-ledger.json", {"schema_version":"evidence-ledger/v1", "manifest":ledger.manifest.document(), "events":[event.document() for event in ledger.events]})
+        report = json.loads((run / "run-report.json").read_text())
+        report["evidence_ledger"] = {"source_completeness": ledger.manifest.document()["source_completeness"]}
+        report["collection_mode"] = {"coordinator":"omarchy-precision"}
+        write_json(run / "run-report.json", report)
+        finalization = json.loads((run / "slice-finalization.json").read_text())
+        slice_ = type("Slice", (), {"slice_id":finalization["slice_id"], "since":dt.datetime.fromisoformat(SINCE_UTC.replace("Z","+00:00")), "until":dt.datetime.fromisoformat(UNTIL_UTC.replace("Z","+00:00"))})()
+        bundle = collector_receipts.build_completion_bundle(run, slice_=slice_)
+        collector_receipts.write_completion_bundle(run / "completion-bundle.json", bundle)
+        doc = json.loads(result.read_text())
+        doc.update(completion_bundle_digest=bundle.bundle_digest, completion_bundle=bundle.document(), source_completeness=collector_receipts.completion_coverage(bundle))
+        write_json(result, doc)
+        backlog_identity = collector_slices.BacklogIdentity(**finalization["backlog_identity"])
+        planned = collector_slices.plan_slices(slice_.since,slice_.until,zone=ZoneInfo("Europe/Bucharest"),max_days=2)
+        checkpoint = self.state_dir / "collector-checkpoints"
+        checkpoint.mkdir(parents=True,exist_ok=True,mode=0o700)
+        checkpoint.chmod(0o700)
+        store=collector_slices.BacklogStore(checkpoint)
+        backlog=store.open(backlog_identity,planned)
+        store.record_complete(backlog,finalization["slice_id"],(run/"completion-bundle.json").resolve(),"sha256:"+hashlib.sha256((run/"completion-bundle.json").read_bytes()).hexdigest())
+        return result
+
+    def test_fresh_routing_attempt_binds_before_child_and_preserves_legacy_history(self):
+        """Catches stale no-runner legacy bindings stopping the next modern collection."""
+        config, original, _ = self.fresh_routing_fixture()
+        original_attempt = dict(original["source_attempt"])
+        original_inputs = dict(original["expected_snapshot_digests"])
+        # Actual legacy debt entrypoint: exhausted generic recovery, not a
+        # freshly scheduled slice, must select and resolve the new attempt.
+        state_path = self.state_dir / "review-cycle-state.json"
+        state = json.loads(state_path.read_text())
+        state["scheduled_through"] = "2026-09-09"
+        write_json(state_path, state)
+        debts = source_coverage.SourceDebtStore()
+        interval = cycle._generic_interval(config, "2026-09-07", "2026-09-09")
+        failure = debts.record_failure(interval, failure_class="result_unverified", retryable=True, resume_state_digest=original_attempt["resume_state_digest"], attempted_at="2026-09-10T00:00:00Z")
+        debts.exhaust(failure.debt_id, terminal_reason="retry_limit")
+        source_coverage.write(self.state_dir / "source-coverage.json", debts.document())
+        def child(command, **_kwargs):
+            if "--replay-from" in command:
+                path = make_run(self.root, "replay-run", replay=True, snapshots_from=self.root / "runs/source-run", runtime_identity=config["_runtime_identity"], analyzer_tier="fixture", ledger_from=self.root / "runs/source-run")
+                return ChildResult(0, str(path) + "\n", "", False, 0.1)
+            if "clockify_sheet_publish.py" in command[1]:
+                return publisher_result_for_command(config, command)
+            persisted = json.loads((self.state_dir / "review-cycle-state.json").read_text())["slices"]["2026-09-07"]
+            self.assertEqual(original_inputs, persisted["expected_snapshot_digests"])
+            self.assertEqual(original_attempt, persisted["source_attempt_history"][0]["source_attempt"])
+            self.assertEqual(2, persisted["source_attempt"]["ordinal"])
+            self.assertEqual("started", persisted["source_attempt"]["status"])
+            self.assertEqual("pending", persisted["runner_attempt"]["status"])
+            self.assertNotEqual(original_inputs["routing.json"], persisted["fresh_input_binding"]["snapshot_digests"]["routing.json"])
+            path = self.make_modern_raw_source(config)
+            return ChildResult(0, str(path) + "\n", "", False, 0.1)
+        try:
+            with mock.patch.object(cycle, "run_child_bounded", side_effect=child):
+                result = cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 10))
+        except cycle.CycleError as exc:
+            self.fail(f"modern fresh attempt blocked by legacy routing: {exc}")
+        self.assertEqual("delivered", result["status"])
+        recovered, _ = cycle._source_debt(self.state_dir / "source-coverage.json")
+        self.assertEqual((), recovered.active())
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=AssertionError("child on repeat")):
+            self.assertEqual("idle", cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 10))["status"])
+        write_json(Path(config["corrections"]), {"later":"unrelated live correction"})
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=AssertionError("child after live drift")):
+            self.assertEqual("idle", cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 10))["status"])
+
+    def test_fresh_routing_attempt_crash_reuses_completed_native_source(self):
+        """Catches retry after completion spawning another collection/inference process."""
+        config, original, _ = self.fresh_routing_fixture()
+        legacy = self.root / "cache/legacy-decisions.jsonl"
+        legacy.write_bytes(b'{"sealed":"legacy decision"}\n')
+        def crash(command, **_kwargs):
+            self.make_modern_raw_source(config)
+            raise RuntimeError("synthetic coordinator crash after completed child")
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=crash), self.assertRaisesRegex(RuntimeError, "synthetic coordinator crash"):
+            cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 10))
+        def resume(command, **_kwargs):
+            if "--replay-from" in command:
+                path = make_run(self.root, "replay-run", replay=True, snapshots_from=self.root / "runs/source-run", runtime_identity=config["_runtime_identity"], analyzer_tier="fixture", ledger_from=self.root / "runs/source-run")
+                return ChildResult(0, str(path) + "\n", "", False, 0.1)
+            if "clockify_sheet_publish.py" in command[1]:
+                return publisher_result_for_command(config, command)
+            self.fail("new collection/inference after completed fresh attempt crash")
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=resume):
+            result = cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 10))
+        self.assertEqual("delivered", result["status"])
+        saved = json.loads((self.state_dir / "review-cycle-state.json").read_text())["slices"]["2026-09-07"]
+        self.assertEqual(2, saved["source_attempt"]["ordinal"])
+        self.assertEqual(1, len(saved["source_attempt_history"]))
+        self.assertEqual(b'{"sealed":"legacy decision"}\n', legacy.read_bytes())
+
+    def test_fresh_routing_attempt_unresolved_launch_is_not_duplicated(self):
+        """Catches restarting an active/detached attempt with no verified completion."""
+        config, _, _ = self.fresh_routing_fixture()
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=RuntimeError("detached child")), self.assertRaises(RuntimeError):
+            cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 10))
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=AssertionError("duplicate child")), self.assertRaisesRegex(cycle.CycleError, "no duplicate child"):
+            cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 10))
+
+    def test_fresh_routing_attempt_budget_before_spawn_can_resume_once(self):
+        """Catches a no-spawn budget guard permanently marking a child as active."""
+        config, _, _ = self.fresh_routing_fixture()
+        limited = {**config, "total_child_budget_seconds":30}
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=AssertionError("child with no budget")):
+            result = cycle.run_cycle(limited, enable_sheet_write=True, today=dt.date(2026,9,10))
+        self.assertEqual("incomplete", result["status"])
+        def resume(command, **_kwargs):
+            if "--replay-from" in command:
+                path = make_run(self.root,"replay-run", replay=True,snapshots_from=self.root/"runs/source-run",runtime_identity=config["_runtime_identity"],analyzer_tier="fixture",ledger_from=self.root/"runs/source-run")
+            elif "clockify_sheet_publish.py" in command[1]:
+                return publisher_result_for_command(config,command)
+            else:
+                path = self.make_modern_raw_source(config)
+            return ChildResult(0,str(path)+"\n","",False,0.1)
+        try:
+            with mock.patch.object(cycle,"run_child_bounded",side_effect=resume):
+                result=cycle.run_cycle(config,enable_sheet_write=True,today=dt.date(2026,9,10))
+        except cycle.CycleError as exc:
+            self.fail(f"no-spawn attempt permanently blocked: {exc}")
+        self.assertEqual("delivered",result["status"])
+    def test_fresh_routing_attempt_rejects_nonrouting_and_active_runtime_drift(self):
+        """Catches routing adoption silently changing corrections or an active runtime."""
+        config, _, _ = self.fresh_routing_fixture()
+        write_json(Path(config["corrections"]), {"unapproved":"change"})
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=AssertionError("child")), self.assertRaisesRegex(cycle.CycleError, "terminal legacy"):
+            cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 10))
+        write_json(Path(config["corrections"]), {})
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=RuntimeError("detached child")), self.assertRaises(RuntimeError):
+            cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 10))
+        changed = {**config, "_runtime_identity": {**config["_runtime_identity"], "git_sha":"b"*40}}
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=AssertionError("child")), self.assertRaisesRegex(cycle.CycleError, "active fresh attempt"):
+            cycle.run_cycle(changed, enable_sheet_write=True, today=dt.date(2026, 9, 10))
+
+    def test_fresh_routing_attempt_rejects_unattested_complete_zero_native_source(self):
+        """Catches the legacy all-zero coverage illusion passing as modern completion."""
+        config, _, _ = self.fresh_routing_fixture()
+        def child(command, **_kwargs):
+            self.assertNotIn("--replay-from", command)
+            path = self.make_modern_raw_source(config, attest=False)
+            return ChildResult(0, str(path)+"\n", "", False, 0.1)
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=child), self.assertRaisesRegex(cycle.CycleError, "native coverage"):
+            cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 10))
+
+    def test_fresh_routing_attempt_generic_native_failure_never_replays_or_publishes(self):
+        """Catches generic classification retaining a source after native proof fails."""
+        config, original, _ = self.fresh_routing_fixture()
+        state_path = self.state_dir / "review-cycle-state.json"
+        state = json.loads(state_path.read_text())
+        state["scheduled_through"] = "2026-09-09"
+        write_json(state_path,state)
+        debts=source_coverage.SourceDebtStore()
+        interval=cycle._generic_interval(config,"2026-09-07","2026-09-09")
+        item=debts.record_failure(interval,failure_class="result_unverified",retryable=True,resume_state_digest=original["source_attempt"]["resume_state_digest"],attempted_at="2026-09-10T00:00:00Z")
+        debts.exhaust(item.debt_id,terminal_reason="retry_limit")
+        source_coverage.write(self.state_dir/"source-coverage.json",debts.document())
+        def child(command, **_kwargs):
+            self.assertNotIn("--replay-from",command,"invalid native source reached replay")
+            self.assertNotIn("clockify_sheet_publish.py",command[1],"invalid native source reached publisher")
+            path=self.make_modern_raw_source(config,attest=False)
+            return ChildResult(0,str(path)+"\n","",False,0.1)
+        with mock.patch.object(cycle,"run_child_bounded",side_effect=child), self.assertRaisesRegex(cycle.CycleError,"native coverage"):
+            cycle.run_cycle(config,enable_sheet_write=True,today=dt.date(2026,9,10))
+        record=json.loads(state_path.read_text())["slices"]["2026-09-07"]
+        self.assertNotIn("source",record)
+        persisted,_=cycle._source_debt(self.state_dir/"source-coverage.json")
+        self.assertTrue(persisted.active())
+
+    def test_fresh_routing_attempt_refuses_current_orphan_without_legacy_launch_binding(self):
+        """Catches fresh fallback hiding ambiguous or already completed modern results."""
+        config, _, _ = self.fresh_routing_fixture()
+        self.make_modern_raw_source(config)
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=AssertionError("child")), self.assertRaisesRegex(cycle.CycleError, "orphan.*fresh attempt forbidden"):
+            cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 10))
+
+    def test_fresh_routing_attempt_rejects_historical_incomplete_runtime_parent(self):
+        """Catches the old actionable-peer fallback bypassing exact fresh launch identity."""
+        config, _, _ = self.fresh_routing_fixture()
+        old = {**config,"_runtime_identity":{**config["_runtime_identity"],"git_sha":"b"*40}}
+        def child(command, **_kwargs):
+            self.assertNotIn("--replay-from",command)
+            path=self.make_modern_raw_source(old,incomplete_peer=True)
+            return ChildResult(0,str(path)+"\n","",False,0.1)
+        try:
+            with mock.patch.object(cycle,"run_child_bounded",side_effect=child):
+                cycle.run_cycle(config,enable_sheet_write=True,today=dt.date(2026,9,10))
+        except cycle.CycleError:
+            pass
+        record=json.loads((self.state_dir/"review-cycle-state.json").read_text())["slices"]["2026-09-07"]
+        self.assertNotIn("source",record,"historical runtime source was promoted as fresh native parent")
+
+    def test_fresh_routing_attempt_partial_peer_cannot_claim_unattested_repository_coverage(self):
+        """Catches incomplete sessions hiding an unproven complete repository source."""
+        config, _, _ = self.fresh_routing_fixture()
+        def child(command, **_kwargs):
+            path=self.make_modern_raw_source(config,incomplete_peer=True,attest=False)
+            return ChildResult(0,str(path)+"\n","",False,0.1)
+        with mock.patch.object(cycle,"run_child_bounded",side_effect=child), self.assertRaisesRegex(cycle.CycleError,"native coverage"):
+            cycle.run_cycle(config,enable_sheet_write=True,today=dt.date(2026,9,10))
 
     def test_approved_routing_transition_adopts_completed_source_preserving_original_inputs(self):
         """Catches stale routing bindings forcing new collection after verified completion."""
@@ -507,6 +748,7 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         runs_patch = mock.patch.object(review_run, "RUNS", self.root / "runs")
+        self.runs_patch = runs_patch
         runs_patch.start()
         self.addCleanup(runs_patch.stop)
         self.state_dir = self.root / "state"
@@ -544,6 +786,73 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
             "calendly_optional": True,
             "max_slices": 1,
         }
+
+    def test_configured_durable_runs_root_is_used_by_real_replay_consumer(self):
+        """Catches the service consumer retaining immutable-release/runs internally."""
+        self.runs_patch.stop()
+        previous = review_run.RUNS
+        self.addCleanup(review_run._configure_runs_root, previous)
+        durable = self.root / "durable-runs"
+        config = {**self.config, "runs_dir":str(durable)}
+        manifest = cycle._ensure_period(config, self.state_dir, "2026-09-07", "2026-09-09", bind_inputs=True)
+        source = make_run(self.root, "source-run", runs_dir=durable, replay=False)
+        review_run._configure_runs_root(durable)
+        replay = make_run(self.root, "replay-run", runs_dir=durable, replay=True, snapshots_from=source.parent)
+        review_run._configure_runs_root(previous)
+        expected = cycle._expected_snapshot_digests(config, manifest)
+        source_stage = cycle._validate_stage(config, source, "2026-09-07", "2026-09-09", replay=False, expected_snapshot_digests=expected)
+        state = cycle._state(self.state_dir / "absent.json", recovery_since="2026-09-07")
+        state["slices"]["2026-09-07"] = {"until":"2026-09-09", "period_manifest":str(manifest), "expected_snapshot_digests":expected, "status":"source_verified", "source":source_stage}
+        write_json(self.state_dir / "review-cycle-state.json", state)
+        def child(command, **_kwargs):
+            if "--replay-from" in command:
+                return ChildResult(0, str(replay)+"\n", "", False, 0.1)
+            if "clockify_sheet_publish.py" in command[1]:
+                return publisher_result_for_command(config, command)
+            self.fail("fresh review for verified source")
+        try:
+            with mock.patch.object(cycle, "run_child_bounded", side_effect=child):
+                result = cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026,9,10))
+        except cycle.CycleError as exc:
+            self.fail(f"valid durable source rejected by replay consumer: {exc}")
+        self.assertEqual("delivered", result["status"])
+        outside = self.root / "not-configured-runs/source-run"
+        outside.mkdir(parents=True)
+        with self.assertRaisesRegex(ValueError, "direct child"):
+            review_run.derive_replay_integrity(outside, replay.parent)
+
+    def test_returned_exact_source_replay_is_persisted_before_validation_and_reused(self):
+        """Catches a crash before replay validation discarding the exact returned locator."""
+        manifest = cycle._ensure_period(self.config, self.state_dir, "2026-09-07", "2026-09-09", bind_inputs=True)
+        source = make_run(self.root, "source-run", replay=False)
+        replay = make_run(self.root, "completed-replay", replay=True, snapshots_from=source.parent)
+        expected = cycle._expected_snapshot_digests(self.config, manifest)
+        stage = cycle._validate_stage(self.config, source, "2026-09-07", "2026-09-09", replay=False, expected_snapshot_digests=expected)
+        state = cycle._state(self.state_dir / "absent.json", recovery_since="2026-09-07")
+        state["slices"]["2026-09-07"] = {"until":"2026-09-09", "period_manifest":str(manifest), "expected_snapshot_digests":expected, "status":"source_verified", "source":stage}
+        write_json(self.state_dir / "review-cycle-state.json", state)
+        def child(command, **_kwargs):
+            if "--replay-from" in command:
+                return ChildResult(0, str(replay)+"\n", "", False, 0.1)
+            if "clockify_sheet_publish.py" in command[1]:
+                return publisher_result_for_command(self.config, command)
+            self.fail("fresh review was invoked")
+        persist = cycle._persist_state
+        def crash_after_locator(*args, **kwargs):
+            persist(*args, **kwargs)
+            if "replay_return" in args[3] and "replay" not in args[3]:
+                raise RuntimeError("crash after returned locator persisted")
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=child), mock.patch.object(cycle, "_persist_state", side_effect=crash_after_locator), self.assertRaisesRegex(RuntimeError, "returned locator"):
+            cycle.run_cycle(self.config, enable_sheet_write=True, today=dt.date(2026,9,10))
+        def resume(command, **_kwargs):
+            if "clockify_sheet_publish.py" in command[1]:
+                return publisher_result_for_command(self.config, command)
+            self.fail("exact returned replay was rerun after locator persistence")
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=resume):
+            outcome = cycle.run_cycle(self.config, enable_sheet_write=True, today=dt.date(2026,9,10))
+        self.assertEqual("delivered", outcome["status"])
+        saved = json.loads((self.state_dir / "review-cycle-state.json").read_text())["slices"]["2026-09-07"]
+        self.assertEqual(str(replay), saved["replay"]["result_path"])
 
     def test_checkpoint_root_defaults_to_durable_state_and_is_injected_into_child(self):
         """Catches collector checkpoints falling back under an immutable release."""

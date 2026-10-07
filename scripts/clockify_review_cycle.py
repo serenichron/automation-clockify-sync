@@ -2830,6 +2830,148 @@ def _routing_transition_source(
     return source
 
 
+def _fresh_input_binding(
+    config: Mapping[str, Any], record: dict[str, Any], since: str, until: str,
+    manifest: Path,
+) -> dict[str, str]:
+    """Pin one modern attempt without replacing a terminal legacy contract."""
+    frozen = _stored_snapshot_digests(record)
+    existing = record.get("fresh_input_binding")
+    if existing is not None and not isinstance(existing, Mapping):
+        raise CycleError("fresh input binding is invalid")
+    runtime = config.get("_runtime_identity")
+    if not isinstance(runtime, Mapping):
+        raise CycleError("fresh routing binding requires exact runtime identity")
+    root = _path(config, "root")
+    try:
+        helper_path = Path(__file__).resolve().parents[1] / "ops/systemd/user/clockify_review_cycle_release.py"
+        spec = importlib.util.spec_from_file_location("clockify_fresh_release", helper_path)
+        if spec is None or spec.loader is None:
+            raise ValueError("release validator unavailable")
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        authority = root if existing is None else Path(str(existing.get("release_root") or ""))
+        identity = helper._identity(authority, authority.name)
+    except (OSError, ValueError) as exc:
+        raise CycleError("fresh routing release identity cannot be verified") from exc
+    if existing is not None:
+        if not isinstance(existing, Mapping):
+            raise CycleError("fresh input binding is invalid")
+        body = {key: value for key, value in existing.items() if key != "binding_digest"}
+        expected = body.get("snapshot_digests")
+        attempt = record.get("source_attempt")
+        runner = _runner_attempt(record)
+        if (
+            set(body) != {"schema_version", "since", "until", "frozen_snapshot_digests", "snapshot_digests", "runtime_identity", "release_root", "release_identity_digest", "source_attempt", "history_digest"}
+            or body.get("schema_version") != "clockify-fresh-input-binding/v1"
+            or existing.get("binding_digest") != _value_digest(body)
+            or body.get("since") != since or body.get("until") != until
+            or body.get("frozen_snapshot_digests") != frozen
+            or not isinstance(expected, Mapping) or set(expected) != set(frozen)
+            or any(expected[name] != frozen[name] for name in frozen if name != "routing.json")
+            or expected["routing.json"] != "sha256:" + identity["routing_sha256"]
+            or body.get("release_identity_digest") != _value_digest(identity)
+            or body.get("history_digest") != _value_digest(record.get("source_attempt_history"))
+            or not isinstance(attempt, Mapping) or runner is None
+            or body.get("source_attempt") != {key: value for key, value in attempt.items() if key != "status"}
+            or runner["runtime_identity_digest"] != _value_digest(body.get("runtime_identity"))
+            or _digest(manifest) != expected["period-manifest.json"]
+        ):
+            raise CycleError("fresh input binding has drifted")
+        if record.get("source") is None and (
+            dict(runtime) != body["runtime_identity"]
+            or _expected_snapshot_digests(config, manifest) != dict(expected)
+            or _value_digest(_review_command(config, since, until)) != attempt["command_digest"]
+        ):
+            raise CycleError("active fresh attempt runtime or inputs have drifted")
+        return dict(expected)
+    attempt = record.get("source_attempt")
+    current = _expected_snapshot_digests(config, manifest)
+    if (
+        "runner_attempt" in record or "routing_transition" in record
+        or any(key in record for key in ("source", "replay", "delivery_receipt"))
+        or not isinstance(attempt, Mapping) or attempt.get("status") != "finished"
+        or set(attempt) != {"ordinal", "command_digest", "resume_state_digest", "status", "advance_frontier"}
+        or isinstance(attempt.get("ordinal"), bool) or not isinstance(attempt.get("ordinal"), int) or attempt["ordinal"] < 1
+        or not _valid_digest(attempt.get("command_digest")) or not _valid_digest(attempt.get("resume_state_digest"))
+        or not isinstance(attempt.get("advance_frontier"), bool)
+        or current["routing.json"] == frozen["routing.json"]
+        or any(current[name] != frozen[name] for name in frozen if name != "routing.json")
+        or runtime.get("canonical_root") != str(root) or runtime.get("git_dirty") not in (None, False)
+        or runtime.get("git_sha") not in (None, identity["git_sha"])
+        or _path(config, "routing", file=True) != root / "routing.json"
+        or current["routing.json"] != "sha256:" + identity["routing_sha256"]
+    ):
+        raise CycleError("fresh routing binding is not an eligible terminal legacy attempt")
+    _validate_config_identity(config)
+    for result in _runs_dir(config).glob("*/autopilot-result.json"):
+        try:
+            _validate_stage(config, result, since, until, replay=False, expected_snapshot_digests=current)
+        except (CycleError, OSError, ValueError):
+            continue
+        raise CycleError("completed current-input orphan requires binding; fresh attempt forbidden")
+    history = record.get("source_attempt_history", [])
+    if not isinstance(history, list):
+        raise CycleError("source attempt history is invalid")
+    record["source_attempt_history"] = [*history, {"source_attempt": dict(attempt), "expected_snapshot_digests": frozen}]
+    new_attempt = _source_attempt(record, _review_command(config, since, until), _generic_interval(config, since, until), advance_frontier=attempt["advance_frontier"])
+    record["runner_attempt"] = {"runtime_identity_digest": _value_digest(dict(runtime)), "source_attempt_ordinal": new_attempt["ordinal"], "status": "pending"}
+    body = {
+        "schema_version": "clockify-fresh-input-binding/v1", "since": since, "until": until,
+        "frozen_snapshot_digests": frozen, "snapshot_digests": current,
+        "runtime_identity": dict(runtime), "release_root": str(root),
+        "release_identity_digest": _value_digest(identity),
+        "source_attempt": {key: value for key, value in new_attempt.items() if key != "status"},
+        "history_digest": _value_digest(record["source_attempt_history"]),
+    }
+    record["fresh_input_binding"] = {**body, "binding_digest": _value_digest(body)}
+    return current
+
+
+def _verify_fresh_native_source(config: Mapping[str, Any], record: Mapping[str, Any], source: Mapping[str, Any]) -> str:
+    """Require reconstructed raw coverage and modern per-host exporter proof."""
+    path = Path(str(source["run_dir"]))
+    try:
+        if (path / "collector-source.json").exists():
+            _parent, identity, _lineage = clockify_review_run._verified_collector_derivation(path)
+        else:
+            identity = collector_receipts.load_collector_source_bundle(path / "completion-bundle.json", run_dir=path)
+        binding = record["fresh_input_binding"]
+        runtime = binding["runtime_identity"]
+        if identity.collector_runtime_identity != runtime:
+            raise ValueError("collector runtime differs from fresh binding")
+        sessions = json.loads(identity.verified_artifact_bytes["evidence/sessions.json"])
+        root = Path(binding["release_root"])
+        fleet = _json_file(root / "fleet.json", "fresh source fleet")
+        required = {item["name"] for item in fleet.get("machines", []) if item.get("enabled", True)}
+        if not required or not isinstance(sessions, list) or {item.get("machine") for item in sessions if isinstance(item, Mapping)} != required or len(sessions) != len(required):
+            raise ValueError("fresh native host coverage differs from approved fleet")
+        collector = clockify_review_run.clockify_sync_collect
+        digest = _digest(root / "scripts/clockify_sync_collect.py").removeprefix("sha256:")
+        for host in sessions:
+            name = host["machine"]
+            inventory = source["coverage"].get("sources", {})
+            if not any(inventory.get(kind + "/" + name, {}).get("status") == "complete" for kind in ("sessions", "repositories")):
+                continue  # Existing exact-source debt owns incomplete peer recovery.
+            if name != str(config.get("coordinator") or "omarchy-precision"):
+                attestation = host.get("canonical_export_attestation")
+                export = host.get("canonical_export")
+                if (
+                    host.get("collector_contract") != "canonical_export_v1"
+                    or not isinstance(attestation, Mapping) or not isinstance(export, Mapping)
+                    or export.get("provenance") != "full_context_remote_export"
+                    or attestation.get("collector_script_sha256") not in {digest, *collector.COMPATIBLE_CANONICAL_EXPORT_DIGESTS}
+                    or export.get("collector_script_sha256") != attestation.get("collector_script_sha256")
+                    or not isinstance(attestation.get("runtime_identity"), Mapping)
+                ):
+                    raise ValueError("fresh native peer lacks modern code attestation")
+        if record.get("fresh_native_source_digest") not in (None, identity.source_bundle_digest):
+            raise ValueError("fresh native source binding has drifted")
+        return identity.source_bundle_digest
+    except (OSError, ValueError, KeyError, TypeError, collector_receipts.CollectorReceiptError) as exc:
+        raise CycleError("fresh source native coverage cannot be verified") from exc
+
+
 def _historical_adoption_document(
     config: Mapping[str, Any], record: Mapping[str, Any], since: str, until: str,
 ) -> dict[str, Any] | None:
@@ -2939,6 +3081,8 @@ def _validate_delivered_state(config: Mapping[str, Any], state: Mapping[str, Any
         if not events_path.is_file() or not manifest_path.is_file():
             raise CycleError("delivered slice period evidence is missing")
         expected_snapshots = _stored_snapshot_digests(raw_record)
+        if "fresh_input_binding" in raw_record:
+            expected_snapshots = _fresh_input_binding(config, dict(raw_record), since, until, manifest_path)
         if "routing_transition" in raw_record:
             transitioned = _routing_transition_source(config, dict(raw_record), since, until, manifest_path)
             if transitioned is None:
@@ -2964,6 +3108,8 @@ def _validate_delivered_state(config: Mapping[str, Any], state: Mapping[str, Any
         )
         if source is None:
             raise CycleError("delivered slice has no verified source stage")
+        if "fresh_input_binding" in raw_record:
+            _verify_fresh_native_source(config, raw_record, source)
         replay = _stage_from_state(
             stage_config, raw_record, "replay", since, until, replay=True,
             expected_snapshot_digests=source["snapshot_digests"],
@@ -3558,7 +3704,36 @@ def _run_slice(
         _persist_state(state_path, state, since, record)
     expected_snapshots = _stored_snapshot_digests(record)
     transition_validation: dict[str, Any] = {}
-    if "routing_transition" in record or (
+    fresh_binding = "fresh_input_binding" in record or (
+        "runner_attempt" not in record and record.get("source") is None
+        and _expected_snapshot_digests(config, manifest_path) != expected_snapshots
+    )
+    if fresh_binding:
+        expected_snapshots = _fresh_input_binding(config, record, since, until, manifest_path)
+        _persist_state(state_path, state, since, record)
+        transition_validation = {"expected_runtime_digest": _value_digest(record["fresh_input_binding"]["runtime_identity"]), "historical_state_validation": True}
+        if record.get("source") is None:
+            completed = []
+            for result in _runs_dir(config).glob("*/autopilot-result.json"):
+                try:
+                    if clockify_review_run._adopt_completed_resume(result.parent) is None:
+                        continue
+                    candidate = _validate_stage(config, result, since, until, replay=False, expected_snapshot_digests=expected_snapshots, **transition_validation)
+                    _verify_fresh_native_source(config, record, candidate)
+                except (CycleError, OSError, ValueError):
+                    continue
+                completed.append(candidate)
+            if len(completed) > 1:
+                raise CycleError("fresh attempt completed source is ambiguous")
+            if completed:
+                record["source"] = completed[0]
+                record["fresh_native_source_digest"] = _verify_fresh_native_source(config, record, completed[0])
+                _finish_attempt(record, record["source_attempt"])
+                record["status"] = "source_verified"
+                _persist_state(state_path, state, since, record)
+            elif record.get("fresh_child_started"):
+                raise CycleError("fresh attempt already launched without verified completion; no duplicate child")
+    elif "routing_transition" in record or (
         record.get("source") is None
         and _expected_snapshot_digests(config, manifest_path) != expected_snapshots
     ):
@@ -3617,6 +3792,8 @@ def _run_slice(
             config, record, "source", since, until, replay=False,
             expected_snapshot_digests=expected_snapshots,
         )
+    if source is not None and fresh_binding:
+        _verify_fresh_native_source(config, record, source)
     attempt: dict[str, Any] | None = None
     collector_source: dict[str, Any] | None = None
     if source is None:
@@ -3657,12 +3834,18 @@ def _run_slice(
                 "advance_frontier": bool(attempt["advance_frontier"]),
             }
         try:
+            if fresh_binding:
+                record["fresh_child_started"] = True
+                _persist_state(state_path, state, since, record)
             child = _run_budgeted_child(
                 review_command, root=root, budget=budget, cap=2700, grace=30,
                 runs_dir=_runs_dir(config),
                 checkpoint_root=_collector_checkpoint_root(config, os.environ),
             )
         except _BudgetExhausted:
+            if fresh_binding:
+                # _run_budgeted_child raises this only before spawning.
+                record.pop("fresh_child_started", None)
             record["status"] = "incomplete"
             _persist_state(state_path, state, since, record)
             return {"status": "incomplete", "reason": "total_child_budget_exhausted", "slice": {"since": since, "until": until}, "advance_frontier": False}
@@ -3675,10 +3858,13 @@ def _run_slice(
                     result_path = None
                 if result_path is not None:
                     try:
-                        source = _validate_stage(
+                        candidate = _validate_stage(
                             config, result_path, since, until, replay=False,
                             expected_snapshot_digests=expected_snapshots,
                         )
+                        if fresh_binding:
+                            record["fresh_native_source_digest"] = _verify_fresh_native_source(config, record, candidate)
+                        source = candidate
                     except _QualityBlocked:
                         if (result_path.parent / "collector-source.json").exists():
                             collector_source = _validate_collector_source_stage(
@@ -3688,7 +3874,7 @@ def _run_slice(
                         else:
                             raise
                     except CycleError as exc:
-                        if "runtime identity" in str(exc):
+                        if "runtime identity" in str(exc) and not fresh_binding:
                             source = _validate_stage(
                                 config, result_path, since, until, replay=False,
                                 expected_snapshot_digests=expected_snapshots,
@@ -3794,23 +3980,43 @@ def _run_slice(
         source_run_id=str(source["run_id"]), source_run_dir=str(source["run_dir"]),
     )
     if replay is None:
-        try:
-            child = _run_budgeted_child(
-                _replay_command(config, Path(str(source["run_dir"]))),
-                root=root, runs_dir=_runs_dir(config),
-                budget=budget, cap=2700, grace=30,
-                checkpoint_root=_collector_checkpoint_root(config, os.environ),
-            )
-        except _BudgetExhausted:
-            record["status"] = "source_verified"
+        command = _replay_command(config, Path(str(source["run_dir"])))
+        returned = record.get("replay_return")
+        if returned is None:
+            try:
+                child = _run_budgeted_child(
+                    command, root=root, runs_dir=_runs_dir(config),
+                    budget=budget, cap=2700, grace=30,
+                    checkpoint_root=_collector_checkpoint_root(config, os.environ),
+                )
+            except _BudgetExhausted:
+                record["status"] = "source_verified"
+                _persist_state(state_path, state, since, record)
+                return {"status": "incomplete", "reason": "total_child_budget_exhausted", "slice": {"since": since, "until": until}}
+            if child.timed_out or child.returncode != 0:
+                record["status"] = "failed"
+                _persist_state(state_path, state, since, record)
+                return {"status": "failed", "slice": {"since": since, "until": until}}
+            result_path = _result(child.stdout, _runs_dir(config))
+            body = {"schema_version":"review-cycle-replay-return/v1", "source_digest":_value_digest(source), "command_digest":_value_digest(command), "result_path":str(result_path), "result_digest":_digest(result_path)}
+            returned = {**body, "return_digest":_value_digest(body)}
+            record["replay_return"] = returned
             _persist_state(state_path, state, since, record)
-            return {"status": "incomplete", "reason": "total_child_budget_exhausted", "slice": {"since": since, "until": until}}
-        if child.timed_out or child.returncode != 0:
-            record["status"] = "failed"
-            _persist_state(state_path, state, since, record)
-            return {"status": "failed", "slice": {"since": since, "until": until}}
+        if not isinstance(returned, Mapping):
+            raise CycleError("stored replay return is invalid")
+        body = {key:value for key,value in returned.items() if key != "return_digest"}
+        result_path = _safe_run_file(_runs_dir(config), body.get("result_path"), "returned replay result")
+        if (
+            set(body) != {"schema_version", "source_digest", "command_digest", "result_path", "result_digest"}
+            or body.get("schema_version") != "review-cycle-replay-return/v1"
+            or returned.get("return_digest") != _value_digest(body)
+            or body.get("source_digest") != _value_digest(source)
+            or body.get("command_digest") != _value_digest(command)
+            or body.get("result_digest") != _digest(result_path)
+        ):
+            raise CycleError("stored replay return binding has drifted")
         replay = _validate_stage(
-            config, _result(child.stdout, _runs_dir(config)), since, until, replay=True,
+            config, result_path, since, until, replay=True,
             expected_snapshot_digests=source["snapshot_digests"],
             source_run_id=str(source["run_id"]), source_run_dir=str(source["run_dir"]),
             **transition_validation,
@@ -3867,6 +4073,8 @@ def _run_slice(
         )
         if verified_source != source or verified_replay != replay:
             raise CycleError("delivery inputs drifted while the publisher was running")
+        if fresh_binding:
+            _verify_fresh_native_source(config, record, verified_source)
         _write_delivery_receipt(receipt_path, receipt)
 
     record.update({
@@ -4098,6 +4306,7 @@ def run_cycle(config: Mapping[str, Any], *, enable_sheet_write: bool, today: dt.
     state_dir = _path(config, "state_dir")
     if not root.is_dir():
         raise CycleError("root is unavailable")
+    clockify_review_run._configure_runs_root(_runs_dir(config))
     state_path = state_dir / "review-cycle-state.json"
     debt_path = state_dir / "source-coverage.json"
     with single_instance(state_dir / "review-cycle.lock") as acquired:
