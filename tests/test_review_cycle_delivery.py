@@ -459,6 +459,57 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
         with mock.patch.object(cycle, "run_child_bounded", side_effect=AssertionError("child after live drift")):
             self.assertEqual("idle", cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 10))["status"])
 
+    def test_fresh_binding_seals_effective_private_routing_not_release_base(self):
+        """Catches fresh input receipts pretending the immutable base routing was executed."""
+        config, record, manifest = self.fresh_routing_fixture()
+        base_path = Path(config["root"]) / "routing.json"
+        base = json.loads(base_path.read_text(encoding="utf-8"))
+        effective = {
+            **base,
+            "semantic_actor_contract": "clockify-semantic-actors/v1",
+            "semantic_subject_binding": {
+                "source_type": "multica",
+                "server_origin": "https://multica.example.invalid",
+                "workspace_id": "workspace-fixture",
+                "author_id": "comment-author-fixture",
+            },
+        }
+        private_path = self.root / "private-routing.json"
+        private_bytes = (
+            json.dumps(effective, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        private_path.write_bytes(private_bytes)
+        private_path.chmod(0o600)
+        config.update(
+            routing=str(private_path),
+            private_routing={
+                "sha256": hashlib.sha256(private_bytes).hexdigest(),
+                "base_sha256": hashlib.sha256(base_path.read_bytes()).hexdigest(),
+            },
+        )
+        cycle._validate_private_routing(config)
+
+        snapshots = cycle._fresh_input_binding(
+            config, record, "2026-09-07", "2026-09-09", manifest
+        )
+
+        expected = "sha256:" + hashlib.sha256(private_bytes).hexdigest()
+        self.assertEqual(expected, snapshots["routing.json"])
+        self.assertEqual(
+            expected,
+            record["fresh_input_binding"]["snapshot_digests"]["routing.json"],
+        )
+        record["source"] = {"sealed": True}
+        private_path.unlink()
+        later_config = {**config, "routing": str(base_path)}
+        later_config.pop("private_routing")
+        self.assertEqual(
+            snapshots,
+            cycle._fresh_input_binding(
+                later_config, record, "2026-09-07", "2026-09-09", manifest
+            ),
+        )
+
     def test_fresh_routing_attempt_crash_reuses_completed_native_source(self):
         """Catches retry after completion spawning another collection/inference process."""
         config, original, _ = self.fresh_routing_fixture()
@@ -601,6 +652,65 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
         self.assertEqual(original, record["expected_snapshot_digests"])
         self.assertNotEqual(original["routing.json"], source["snapshot_digests"]["routing.json"])
         self.assertEqual("unique verified completed legacy-attempt result", record["routing_transition"]["eligibility_basis"])
+
+    def test_routing_transition_receipt_seals_effective_private_routing(self):
+        """Catches a transition receipt substituting the immutable base routing digest."""
+        config, record, manifest, _ = self.routing_transition_fixture(create_source=False)
+        base_path = Path(config["root"]) / "routing.json"
+        base = json.loads(base_path.read_text(encoding="utf-8"))
+        effective = {
+            **base,
+            "semantic_actor_contract": "clockify-semantic-actors/v1",
+            "semantic_subject_binding": {
+                "source_type": "multica",
+                "server_origin": "https://multica.example.invalid",
+                "workspace_id": "workspace-fixture",
+                "author_id": "comment-author-fixture",
+            },
+        }
+        private_path = self.root / "routing.json"
+        private_bytes = (
+            json.dumps(effective, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        private_path.write_bytes(private_bytes)
+        private_path.chmod(0o600)
+        config.update(
+            routing=str(private_path),
+            private_routing={
+                "sha256": hashlib.sha256(private_bytes).hexdigest(),
+                "base_sha256": hashlib.sha256(base_path.read_bytes()).hexdigest(),
+            },
+        )
+        cycle._validate_private_routing(config)
+        record["source_attempt"]["command_digest"] = cycle._value_digest(
+            cycle._review_command(config, "2026-09-07", "2026-09-09")
+        )
+        result = make_run(
+            self.root, "source-run", replay=False,
+            runtime_identity=config["_runtime_identity"], analyzer_tier="fixture",
+        )
+
+        source = cycle._routing_transition_source(
+            config, record, "2026-09-07", "2026-09-09", manifest
+        )
+
+        expected = "sha256:" + hashlib.sha256(private_bytes).hexdigest()
+        self.assertEqual(str(result), source["result_path"])
+        self.assertEqual(
+            expected,
+            record["routing_transition"]["adopted_snapshot_digests"]["routing.json"],
+        )
+        self.assertEqual(
+            config["private_routing"], record["routing_transition"]["private_routing"]
+        )
+        resumed = json.loads(json.dumps(record))
+        later_config = {**config, "routing": str(base_path)}
+        later_config.pop("private_routing")
+        private_path.unlink()
+        repeated = cycle._routing_transition_source(
+            later_config, resumed, "2026-09-07", "2026-09-09", manifest
+        )
+        self.assertEqual(source, repeated)
 
     def test_routing_transition_rejects_ambiguous_completed_sources(self):
         """Catches selecting an arbitrary orphan when launch records do not name a run."""

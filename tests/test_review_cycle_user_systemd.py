@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import configparser
+import hashlib
 import importlib.util
 import json
 import os
@@ -279,6 +280,63 @@ class UserSystemdReleaseToolTests(unittest.TestCase):
         self.assertEqual(0o600, stat.S_IMODE(acceptance.stat().st_mode))
         self.assertEqual(os.getuid(), corrections.stat().st_uid)
         self.assertEqual(os.getuid(), acceptance.stat().st_uid)
+
+    def test_runtime_preflight_accepts_only_hash_bound_private_actor_routing(self) -> None:
+        """Catches canary rejecting a private actor binding for an immutable base release."""
+        source, sha = self.repository()
+        (source / "routing.json").write_text(
+            '{"revision":1,"workspace_id":"w"}\n', encoding="utf-8"
+        )
+        self.git(source, "add", "routing.json")
+        self.git(source, "commit", "-qm", "numeric routing fixture")
+        sha = self.git(source, "rev-parse", "HEAD")
+        release = self.tool.materialize(source, self.root / "releases", sha)
+        config = self.config(release, sha, "private-routing")
+        document = json.loads(config.read_text(encoding="utf-8"))
+        base = json.loads((release / "routing.json").read_text(encoding="utf-8"))
+        effective = {
+            **base,
+            "semantic_actor_contract": "clockify-semantic-actors/v1",
+            "semantic_subject_binding": {
+                "source_type": "multica",
+                "server_origin": "https://multica.example.invalid",
+                "workspace_id": "workspace-fixture",
+                "author_id": "comment-author-fixture",
+            },
+        }
+        private_routing = config.parent / "private-routing.json"
+        private_bytes = (
+            json.dumps(effective, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        private_routing.write_bytes(private_bytes)
+        private_routing.chmod(0o600)
+        document["routing"] = str(private_routing)
+        document["private_routing"] = {
+            "sha256": hashlib.sha256(private_bytes).hexdigest(),
+            "base_sha256": hashlib.sha256(
+                (release / "routing.json").read_bytes()
+            ).hexdigest(),
+        }
+        config.write_text(json.dumps(document) + "\n", encoding="utf-8")
+        config.chmod(0o600)
+
+        validated, validated_document = self.tool._validated_config(release, config)
+
+        self.assertEqual(config, validated)
+        self.assertEqual(str(private_routing), validated_document["routing"])
+
+        effective["revision"] = True
+        changed_bytes = (
+            json.dumps(effective, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        private_routing.write_bytes(changed_bytes)
+        document["private_routing"]["sha256"] = hashlib.sha256(
+            changed_bytes
+        ).hexdigest()
+        config.write_text(json.dumps(document) + "\n", encoding="utf-8")
+        config.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "only semantic actor"):
+            self.tool._validated_config(release, config)
 
     def test_bootstrapped_empty_ledgers_load_as_separate_empty_lists(self) -> None:
         """Catches passing the acceptance ledger to the corrections loader."""

@@ -20,6 +20,9 @@ from typing import Sequence
 IDENTITY_NAME = ".clockify-release.json"
 IDENTITY_SCHEMA = "clockify-user-release/v1"
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
+DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}")
+ACTOR_CONTRACT = "clockify-semantic-actors/v1"
+ACTOR_BINDING_KEYS = {"source_type", "server_origin", "workspace_id", "author_id"}
 
 
 def _sha(value: str) -> str:
@@ -252,8 +255,58 @@ def _validated_config(release: Path, config: Path) -> tuple[Path, dict[str, obje
         raise ValueError("review-cycle config must be valid JSON") from exc
     if not isinstance(document, dict) or document.get("root") != str(release):
         raise ValueError("review-cycle config root does not match release")
-    if document.get("routing") != str(release / "routing.json"):
-        raise ValueError("review-cycle config routing does not match release")
+    base_routing = release / "routing.json"
+    private_handle = document.get("private_routing")
+    if private_handle is None:
+        if document.get("routing") != str(base_routing):
+            raise ValueError("review-cycle config routing does not match release")
+    else:
+        if (
+            not isinstance(private_handle, dict)
+            or set(private_handle) != {"sha256", "base_sha256"}
+            or not all(
+                isinstance(private_handle.get(key), str)
+                and DIGEST_PATTERN.fullmatch(private_handle[key])
+                for key in ("sha256", "base_sha256")
+            )
+        ):
+            raise ValueError("private routing requires exact SHA-256 bindings")
+        base_bytes = base_routing.read_bytes()
+        if hashlib.sha256(base_bytes).hexdigest() != private_handle["base_sha256"]:
+            raise ValueError("private routing base does not match immutable release")
+        raw_routing = document.get("routing")
+        if not isinstance(raw_routing, str) or not raw_routing:
+            raise ValueError("private routing path is missing")
+        private_path = _private_file(Path(raw_routing), "private routing")
+        private_bytes = private_path.read_bytes()
+        if hashlib.sha256(private_bytes).hexdigest() != private_handle["sha256"]:
+            raise ValueError("private routing SHA-256 differs")
+        try:
+            base_document = json.loads(base_bytes)
+            private_document = json.loads(private_bytes)
+        except json.JSONDecodeError as exc:
+            raise ValueError("private routing must be valid JSON") from exc
+        if not isinstance(base_document, dict) or not isinstance(private_document, dict):
+            raise ValueError("private routing must be a JSON object")
+        actor_contract = private_document.pop("semantic_actor_contract", None)
+        actor_binding = private_document.pop("semantic_subject_binding", None)
+        if json.dumps(
+            private_document, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ) != json.dumps(
+            base_document, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ):
+            raise ValueError("private routing may change only semantic actor fields")
+        if actor_contract != ACTOR_CONTRACT or (
+            not isinstance(actor_binding, dict)
+            or set(actor_binding) != ACTOR_BINDING_KEYS
+            or actor_binding.get("source_type") != "multica"
+            or any(
+                not isinstance(actor_binding.get(key), str)
+                or not actor_binding[key].strip()
+                for key in ACTOR_BINDING_KEYS
+            )
+        ):
+            raise ValueError("private routing semantic actor binding is invalid")
     return config, document
 
 

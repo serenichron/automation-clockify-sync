@@ -194,6 +194,81 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
             },
         })
 
+    def downstream_audit_stage(
+        self, name: str, *, fathom_status: str = "complete",
+    ) -> dict[str, object]:
+        """Mirror delivered state with real snapshots, finalization and receipt."""
+        raw = self.verified_audit_stage(
+            name + "-raw", since=dt.date(2026, 9, 7),
+            until=dt.date(2026, 9, 9), calendly_optional=False,
+            fathom_status=fathom_status,
+        )
+        period = cycle._ensure_period(
+            self.config, self.state_dir, "2026-09-07", "2026-09-09",
+            bind_inputs=True,
+        )
+        path = make_run(
+            self.root, name, replay=False, proposals=[],
+            ledger_from=Path(str(raw["run_dir"])),
+        )
+        for source in (Path(str(raw["run_dir"])) / "evidence").iterdir():
+            if source.name != "evidence-ledger.json":
+                (path.parent / "evidence" / source.name).write_bytes(source.read_bytes())
+        config = {**self.config, "_runtime_identity": {"git_sha": "fixture-sha"}}
+        return cycle._validate_stage(
+            config, path, "2026-09-07", "2026-09-09", replay=False,
+            expected_snapshot_digests=cycle._expected_snapshot_digests(config, period),
+        )
+
+    def write_downstream_audit_state(self, stage: dict[str, object]) -> None:
+        self.write_audit_state([])
+        state = self.state()
+        state["slices"] = {"2026-09-07": {
+            "until": "2026-09-09", "source": stage,
+            "expected_snapshot_digests": stage["snapshot_digests"],
+        }}
+        write_json(self.state_dir / "review-cycle-state.json", state)
+
+    def repaired_audit_stage(self, parent: dict[str, object]) -> dict[str, object]:
+        source = Path(str(parent["run_dir"]))
+        path = make_run(
+            self.root, "audit-repair", replay=False, proposals=[],
+            ledger_from=source, snapshots_from=source, record_checkpoint=False,
+        )
+        child = path.parent
+        # A repair has no new collector evidence or finalization receipt.
+        (child / "slice-finalization.json").unlink()
+        report = json.loads((source / "run-report.json").read_bytes())
+        report.update(run_id=child.name, repair_of_run_id=source.name)
+        write_json(child / "run-report.json", report)
+        fixture = child / "repair-fixture" / "semantic-analysis.json"
+        fixture.parent.mkdir()
+        fixture.write_bytes((source / "semantic-analysis.json").read_bytes())
+        write_json(child / "repair-source.json", {
+            "schema_version": 1, "source_run_id": source.name,
+            "source_completion_sha256": cycle._digest(source / "completion-bundle.json"),
+            "ledger_identity": review_run._ledger_identity(source),
+            "source_coverage": parent["coverage"],
+            "semantic_analysis_fixture": "repair-fixture/semantic-analysis.json",
+            "semantic_analysis_sha256": cycle._digest(fixture).removeprefix("sha256:"),
+            "source_routing_sha256": cycle._digest(source / "routing.json"),
+            "repair_routing_sha256": cycle._digest(child / "routing.json"),
+        })
+        slice_ = collector_slices.plan_slices(
+            dt.datetime(2026, 9, 7, tzinfo=cycle.ZoneInfo("Europe/Bucharest")),
+            dt.datetime(2026, 9, 9, tzinfo=cycle.ZoneInfo("Europe/Bucharest")),
+            zone=cycle.ZoneInfo("Europe/Bucharest"), max_days=2,
+        )[0]
+        bundle = collector_receipts.build_completion_bundle(child, slice_=slice_)
+        collector_receipts.write_completion_bundle(child / "completion-bundle.json", bundle)
+        result = json.loads(path.read_bytes())
+        result.update(completion_bundle=bundle.document(), completion_bundle_digest=bundle.bundle_digest)
+        write_json(path, result)
+        return cycle._validate_stage(
+            self.config, path, "2026-09-07", "2026-09-09", replay=False,
+            expected_snapshot_digests=parent["snapshot_digests"],
+        )
+
     def test_verified_recovery_attempt_requires_external_receipt_identity(self):
         parent = {
             "run_dir": str((self.root / "runs" / "parent").resolve()),
@@ -653,6 +728,110 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
         self.assertEqual(["complete", "complete"], [row["status"] for row in fathom])
         self.assertTrue(all("resume_state_digest" not in row for row in fathom))
         self.assertNotIn(str(self.root), json.dumps(report))
+
+    def test_coverage_audit_derives_delivered_stage_identity_without_writes(self):
+        # Requiring pre-normalized collector fields loses real delivered windows.
+        stage = self.downstream_audit_stage("audit-delivered")
+        self.assertNotIn("compatibility_version", stage)
+        self.write_downstream_audit_state(stage)
+        before = {
+            str(path): path.read_bytes() for path in self.root.rglob("*")
+            if path.is_file()
+        }
+
+        try:
+            report = cycle.source_interval_coverage_audit(self.config)
+        except cycle.CycleError as exc:
+            self.fail(f"delivered source coverage must be observable: {exc}")
+
+        self.assertEqual("2026-09-08T21:00:00Z", report["frontiers"]["fathom"])
+        fathom = [row for row in report["intervals"] if row["source"] == "fathom"]
+        self.assertEqual(1, len(fathom))
+        self.assertEqual("fixture-collector-lineage/v1", fathom[0]["compatibility_version"])
+        self.assertEqual("complete", fathom[0]["status"])
+        self.assertEqual(before, {
+            str(path): path.read_bytes() for path in self.root.rglob("*")
+            if path.is_file()
+        })
+
+    def test_coverage_audit_rejects_altered_delivered_stage_identity(self):
+        # Reloading a valid bundle must not silently overwrite changed state.
+        stage = self.downstream_audit_stage("audit-stored-identity")
+        for field in (
+            "bundle_digest", "result_digest", "runtime_identity_digest",
+            "run_id", "run_dir", "coverage", "artifact_digests",
+        ):
+            with self.subTest(field=field):
+                changed = {**stage, field: "sha256:" + "f" * 64}
+                self.write_downstream_audit_state(changed)
+                with self.assertRaisesRegex(cycle.CycleError, "stored source identity drifted"):
+                    cycle.source_interval_coverage_audit(self.config)
+
+    def test_coverage_audit_rejects_delivered_snapshot_and_state_interval_drift(self):
+        stage = self.downstream_audit_stage("audit-snapshots")
+        changed = {**stage, "snapshot_digests": {
+            **stage["snapshot_digests"], "routing.json": "sha256:" + "f" * 64,
+        }}
+        self.write_downstream_audit_state(changed)
+        with self.assertRaisesRegex(cycle.CycleError, "snapshot digests"):
+            cycle.source_interval_coverage_audit(self.config)
+        self.write_downstream_audit_state(stage)
+        state = self.state()
+        state["slices"]["2026-09-07"]["until"] = "2026-09-10"
+        write_json(self.state_dir / "review-cycle-state.json", state)
+        with self.assertRaisesRegex(cycle.CycleError, "interval"):
+            cycle.source_interval_coverage_audit(self.config)
+
+    def test_coverage_audit_cannot_bypass_delivered_binding_with_added_collector_fields(self):
+        stage = self.downstream_audit_stage("audit-forged-collector")
+        bundle = collector_receipts.load_collector_source_bundle(
+            Path(str(stage["run_dir"])) / "completion-bundle.json",
+            run_dir=Path(str(stage["run_dir"])),
+        )
+        self.write_downstream_audit_state({
+            **stage, "stage_kind": "collector_source", "slice_id": bundle.slice_id,
+            "since_utc": bundle.since_utc, "until_utc": bundle.until_utc,
+            "compatibility_version": "forged-lineage/v1",
+        })
+        with self.assertRaisesRegex(cycle.CycleError, "stored source identity drifted"):
+            cycle.source_interval_coverage_audit(self.config)
+
+    def test_coverage_audit_rejects_delivered_finalization_and_compatibility_drift(self):
+        stage = self.downstream_audit_stage("audit-finalization")
+        self.write_downstream_audit_state(stage)
+        path = Path(str(stage["run_dir"])) / "slice-finalization.json"
+        original = json.loads(path.read_bytes())
+        for changed in (
+            {**original, "slice_id": "different-slice"},
+            {**original, "backlog_identity": {
+                **original["backlog_identity"], "compatibility_version": "different/v1",
+            }},
+        ):
+            with self.subTest(changed=changed):
+                write_json(path, changed)
+                with self.assertRaisesRegex(cycle.CycleError, "finalization|backlog"):
+                    cycle.source_interval_coverage_audit(self.config)
+
+    def test_coverage_audit_delivered_gap_still_requires_exact_debt(self):
+        stage = self.downstream_audit_stage("audit-gap", fathom_status="unavailable")
+        self.write_downstream_audit_state(stage)
+        with self.assertRaisesRegex(cycle.CycleError, "unbound"):
+            cycle.source_interval_coverage_audit(self.config)
+
+    def test_coverage_audit_follows_sealed_delivered_repair_ancestry(self):
+        parent = self.downstream_audit_stage("audit-repair-parent")
+        stage = self.repaired_audit_stage(parent)
+        self.write_downstream_audit_state(stage)
+        report = cycle.source_interval_coverage_audit(self.config)
+        self.assertEqual("2026-09-08T21:00:00Z", report["frontiers"]["fathom"])
+        fathom = [row for row in report["intervals"] if row["source"] == "fathom"]
+        self.assertEqual("fixture-collector-lineage/v1", fathom[0]["compatibility_version"])
+        lineage = Path(str(stage["run_dir"])) / "repair-source.json"
+        changed = json.loads(lineage.read_bytes())
+        changed["source_completion_sha256"] = "sha256:" + "f" * 64
+        write_json(lineage, changed)
+        with self.assertRaisesRegex(cycle.CycleError, "repair source completion digest"):
+            cycle.source_interval_coverage_audit(self.config)
 
     def test_coverage_audit_current_config_filters_disabled_optional_and_fleet_sources(self):
         write_json(self.root / "fleet.json", {

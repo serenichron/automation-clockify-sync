@@ -96,6 +96,8 @@ _REQUIRED = frozenset({
     "workspace_id", "member_id", "recovery_since", "timezone", "spreadsheet_id",
     "monthly_sheet_title_template", "calendly_optional",
 })
+_PRIVATE_ROUTING_KEYS = frozenset({"sha256", "base_sha256"})
+_ACTOR_BINDING_KEYS = frozenset({"source_type", "server_origin", "workspace_id", "author_id"})
 
 
 class CycleError(RuntimeError):
@@ -279,7 +281,7 @@ def load_config(path: Path) -> dict[str, Any]:
         raise CycleError("config must be valid JSON") from exc
     if not isinstance(config, dict) or not _REQUIRED.issubset(config):
         raise CycleError("config is missing required review-cycle fields")
-    if set(config) - (_REQUIRED | {"runs_dir", "catchup_until", "max_slices", "total_child_budget_seconds", "monthly_unresolved_alias_proof", "native_credit_input"}):
+    if set(config) - (_REQUIRED | {"runs_dir", "catchup_until", "max_slices", "total_child_budget_seconds", "monthly_unresolved_alias_proof", "native_credit_input", "private_routing"}):
         raise CycleError("config contains unsupported review-cycle fields")
     if "native_credit_input" in config:
         handle = config["native_credit_input"]
@@ -308,11 +310,93 @@ def load_config(path: Path) -> dict[str, Any]:
     _runs_dir(config)
     for key in ("routing", "corrections", "acceptance"):
         _path(config, key, file=True)
+    if "private_routing" in config:
+        _validate_private_routing(config)
     for key in ("workspace_id", "member_id", "spreadsheet_id", "monthly_sheet_title_template"):
         if not isinstance(config[key], str) or not config[key].strip():
             raise CycleError(f"{key} must be non-empty")
     _sheet_title(config["monthly_sheet_title_template"], since=config["recovery_since"])
     return config
+
+
+def _raw_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _validate_private_routing(config: Mapping[str, Any]) -> None:
+    handle = config.get("private_routing")
+    if (
+        not isinstance(handle, Mapping)
+        or set(handle) != _PRIVATE_ROUTING_KEYS
+        or not all(_raw_sha256(handle.get(key)) for key in _PRIVATE_ROUTING_KEYS)
+    ):
+        raise CycleError("private routing requires exact SHA-256 bindings")
+    root = _path(config, "root")
+    base_path = _canonical_runtime_path(root / "routing.json", label="base routing")
+    raw_routing = config.get("routing")
+    if not isinstance(raw_routing, str) or not raw_routing:
+        raise CycleError("private routing path is missing")
+    routing_path = _canonical_runtime_path(raw_routing, label="private routing")
+    if not routing_path.is_file() or routing_path.is_symlink():
+        raise CycleError("private routing must be a regular file")
+    if routing_path == base_path:
+        raise CycleError("private routing must be separate from immutable base routing")
+    details = routing_path.stat()
+    if details.st_uid != os.getuid() or stat.S_IMODE(details.st_mode) != 0o600:
+        raise CycleError("private routing must be user-owned mode 0600")
+    base_bytes = base_path.read_bytes()
+    routing_bytes = routing_path.read_bytes()
+    if hashlib.sha256(base_bytes).hexdigest() != handle["base_sha256"]:
+        raise CycleError("private routing base differs from configured SHA-256")
+    if hashlib.sha256(routing_bytes).hexdigest() != handle["sha256"]:
+        raise CycleError("private routing differs from configured SHA-256")
+    try:
+        base = json.loads(base_bytes)
+        effective = json.loads(routing_bytes)
+    except json.JSONDecodeError as exc:
+        raise CycleError("private routing must be valid JSON") from exc
+    if not isinstance(base, dict) or not isinstance(effective, dict):
+        raise CycleError("private routing must be a JSON object")
+    actor_contract = effective.pop("semantic_actor_contract", None)
+    subject_binding = effective.pop("semantic_subject_binding", None)
+    if (
+        _value_digest(effective) != _value_digest(base)
+        or actor_contract != semantic_analyzer.ACTOR_CONTRACT
+    ):
+        raise CycleError("private routing may add only the semantic actor contract")
+    if (
+        not isinstance(subject_binding, Mapping)
+        or set(subject_binding) != _ACTOR_BINDING_KEYS
+        or subject_binding.get("source_type") != "multica"
+        or any(
+            not isinstance(subject_binding.get(key), str)
+            or not subject_binding[key].strip()
+            for key in _ACTOR_BINDING_KEYS
+        )
+    ):
+        raise CycleError("private routing semantic subject binding is invalid")
+    try:
+        semantic_analyzer.with_actor_context([], subject_binding=subject_binding)
+    except semantic_analyzer.AnalyzerError as exc:
+        raise CycleError("private routing semantic subject binding is invalid") from exc
+
+
+def _effective_routing_digest(
+    config: Mapping[str, Any], identity: Mapping[str, Any], root: Path,
+) -> str:
+    private = config.get("private_routing")
+    if private is None:
+        if _path(config, "routing", file=True) != root / "routing.json":
+            raise CycleError("routing path differs from immutable release")
+        return "sha256:" + str(identity["routing_sha256"])
+    _validate_private_routing(config)
+    if not isinstance(private, Mapping) or private.get("base_sha256") != identity.get("routing_sha256"):
+        raise CycleError("private routing base differs from immutable release")
+    return "sha256:" + str(private["sha256"])
 
 
 def _atomic(path: Path, value: Mapping[str, Any]) -> None:
@@ -1472,9 +1556,16 @@ def completion_status(result: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _review_command(config: Mapping[str, Any], since: str, until: str) -> list[str]:
+def _review_command(
+    config: Mapping[str, Any], since: str, until: str, *,
+    sealed_routing_path: str | None = None,
+) -> list[str]:
     root = _path(config, "root")
-    command = [sys.executable, str(root / "scripts" / "clockify_review_run.py"), "--runs-root", str(_runs_dir(config)), "--since", since, "--until", (dt.date.fromisoformat(until) - dt.timedelta(days=1)).isoformat(), "--state", str(_path(config, "state_dir") / "review-state.json"), "--period-manifest", str(_path(config, "state_dir") / f"{since}.period-manifest.json"), "--routing", str(_path(config, "routing", file=True)), "--corrections", str(_path(config, "corrections", file=True)), "--acceptance-ledger", str(_path(config, "acceptance", file=True)), "--analyzer-cache", str(_path(config, "cache"))]
+    routing_path = (
+        str(_path(config, "routing", file=True))
+        if sealed_routing_path is None else sealed_routing_path
+    )
+    command = [sys.executable, str(root / "scripts" / "clockify_review_run.py"), "--runs-root", str(_runs_dir(config)), "--since", since, "--until", (dt.date.fromisoformat(until) - dt.timedelta(days=1)).isoformat(), "--state", str(_path(config, "state_dir") / "review-state.json"), "--period-manifest", str(_path(config, "state_dir") / f"{since}.period-manifest.json"), "--routing", routing_path, "--corrections", str(_path(config, "corrections", file=True)), "--acceptance-ledger", str(_path(config, "acceptance", file=True)), "--analyzer-cache", str(_path(config, "cache"))]
     if config["calendly_optional"]:
         command.append("--calendly-optional")
     return command
@@ -2688,11 +2779,55 @@ def source_interval_coverage_audit(config: Mapping[str, Any]) -> dict[str, Any]:
     )
     configured = _audit_configured_sources(config)
     verified: list[tuple[dict[str, str], Mapping[str, Any], str, bool | None]] = []
-    for raw in state["slices"].values():
+    for since, raw in state["slices"].items():
         if not isinstance(raw, Mapping):
             raise CycleError("cycle state slice is invalid")
         stage = raw.get("source") or raw.get("source_parent")
         if isinstance(stage, Mapping):
+            identity_fields = {"slice_id", "since_utc", "until_utc", "compatibility_version"}
+            if "artifact_digests" in stage or not identity_fields.intersection(stage):
+                # Delivered downstream stages predate the collector-stage shape.
+                # Verify their stored identity before deriving collector lineage;
+                # never replace altered state with newly loaded bundle facts.
+                until = raw.get("until")
+                snapshots = stage.get("snapshot_digests")
+                if not isinstance(until, str) or not isinstance(snapshots, Mapping):
+                    raise CycleError("coverage audit delivered source identity is invalid")
+                checked = _validate_stage(
+                    config, Path(str(stage.get("result_path"))), str(since), until,
+                    replay=False, expected_snapshot_digests=snapshots,
+                    allow_historical_runtime=True, historical_state_validation=True,
+                    expected_runtime_digest=stage.get("runtime_identity_digest"),
+                )
+                run_dir = Path(checked["run_dir"])
+                try:
+                    selected = collector_receipts.load_completion_bundle(
+                        run_dir / "completion-bundle.json", run_dir=run_dir,
+                    )
+                except collector_receipts.CollectorReceiptError as exc:
+                    raise CycleError("coverage audit delivered bundle is invalid") from exc
+                if "runtime_identity_digest" in stage:
+                    checked["runtime_identity_digest"] = selected.runtime_identity_digest
+                else:
+                    checked.pop("runtime_identity_digest", None)
+                if dict(stage) != checked:
+                    raise CycleError("coverage audit stored source identity drifted")
+                interval = _interval_from_stage(
+                    config, "runner/unclassified", stage, allow_verified_derivation=True,
+                )
+                ancestor, _ = _collector_ancestor_from_repair(config, run_dir, selected)
+                if (ancestor / "collector-source.json").exists():
+                    ancestor, _, _ = clockify_review_run._verified_collector_derivation(ancestor)
+                try:
+                    collector = collector_receipts.load_collector_source_bundle(
+                        ancestor / "completion-bundle.json", run_dir=ancestor,
+                    )
+                except collector_receipts.CollectorReceiptError as exc:
+                    raise CycleError("coverage audit collector ancestor is invalid") from exc
+                stage = {
+                    "run_dir": str(ancestor), "bundle_digest": collector.source_bundle_digest,
+                    **{field: getattr(interval, field) for field in identity_fields},
+                }
             verified.append(_audit_bundle(stage))
 
     intervals: dict[str, dict[str, Any]] = {}
@@ -3096,11 +3231,22 @@ def _routing_transition_source(
         identity = helper._identity(authority_root, authority_sha)
         if receipt is None and runtime.get("git_sha") not in (None, identity["git_sha"]):
             raise ValueError("runtime SHA differs from release")
-        if adopted["routing.json"] != "sha256:" + identity["routing_sha256"]:
+        private_authority = (
+            config.get("private_routing") if receipt is None
+            else receipt.get("private_routing")
+        )
+        authoritative_routing = (
+            _effective_routing_digest(config, identity, root)
+            if receipt is None
+            else (
+                "sha256:" + str(private_authority.get("sha256"))
+                if isinstance(private_authority, Mapping)
+                else "sha256:" + str(identity["routing_sha256"])
+            )
+        )
+        if adopted["routing.json"] != authoritative_routing:
             raise ValueError("routing differs from immutable release")
         if receipt is None:
-            if _path(config, "routing", file=True) != root / "routing.json":
-                raise ValueError("routing path differs from release")
             _validate_config_identity(config)
     except (OSError, ValueError) as exc:
         raise CycleError("routing transition release identity cannot be verified") from exc
@@ -3120,8 +3266,18 @@ def _routing_transition_source(
             or launch_identity["routing_sha256"] != identity["routing_sha256"]
         ):
             raise CycleError("routing transition original release differs")
-        launch_config = {**config, "root": str(launch_root), "routing": str(launch_root / "routing.json")}
-        if attempt.get("command_digest") != _value_digest(_review_command(launch_config, since, until)):
+        launch_config = {**config, "root": str(launch_root)}
+        if private_authority is None:
+            launch_config["routing"] = str(launch_root / "routing.json")
+        elif receipt is not None:
+            launch_config["routing"] = str(receipt.get("private_routing_path") or "")
+        sealed_routing_path = (
+            str(receipt.get("private_routing_path"))
+            if receipt is not None and private_authority is not None else None
+        )
+        if attempt.get("command_digest") != _value_digest(_review_command(
+            launch_config, since, until, sealed_routing_path=sealed_routing_path,
+        )):
             raise CycleError("routing transition command differs from original launch")
         completed = clockify_review_run._adopt_completed_resume(path)
         if completed is None:
@@ -3142,8 +3298,11 @@ def _routing_transition_source(
         if not isinstance(receipt, Mapping):
             raise CycleError("routing transition receipt is invalid")
         body = {key: value for key, value in receipt.items() if key != "receipt_digest"}
+        body_keys = {"schema_version", "eligibility_basis", "since", "until", "frozen_snapshot_digests", "adopted_snapshot_digests", "runtime_identity_digest", "release_identity_digest", "adopting_release_root", "adopting_release_sha", "source_attempt", "source"}
+        if private_authority is not None:
+            body_keys.update({"private_routing", "private_routing_path"})
         if (
-            set(body) != {"schema_version", "eligibility_basis", "since", "until", "frozen_snapshot_digests", "adopted_snapshot_digests", "runtime_identity_digest", "release_identity_digest", "adopting_release_root", "adopting_release_sha", "source_attempt", "source"}
+            set(body) != body_keys
             or body.get("schema_version") != "clockify-routing-transition/v1"
             or body.get("eligibility_basis") != "unique verified completed legacy-attempt result"
             or
@@ -3152,6 +3311,14 @@ def _routing_transition_source(
             or body.get("adopted_snapshot_digests") != adopted
             or body.get("runtime_identity_digest") != runner["runtime_identity_digest"]
             or body.get("release_identity_digest") != _value_digest(identity)
+            or private_authority is not None and (
+                not isinstance(private_authority, Mapping)
+                or set(private_authority) != _PRIVATE_ROUTING_KEYS
+                or private_authority.get("base_sha256") != identity["routing_sha256"]
+                or not _raw_sha256(private_authority.get("sha256"))
+                or not isinstance(body.get("private_routing_path"), str)
+                or not Path(body["private_routing_path"]).is_absolute()
+            )
             or body.get("source_attempt") != attempt_identity
             or body.get("since") != since or body.get("until") != until
         ):
@@ -3180,6 +3347,9 @@ def _routing_transition_source(
         "adopting_release_root": str(root), "adopting_release_sha": identity["git_sha"],
         "source_attempt": attempt_identity, "source": source,
     }
+    if "private_routing" in config:
+        body["private_routing"] = dict(config["private_routing"])
+        body["private_routing_path"] = str(_path(config, "routing", file=True))
     record["routing_transition"] = {**body, "receipt_digest": _value_digest(body)}
     return source
 
@@ -3215,15 +3385,30 @@ def _fresh_input_binding(
         expected = body.get("snapshot_digests")
         attempt = record.get("source_attempt")
         runner = _runner_attempt(record)
+        private_authority = body.get("private_routing")
+        body_keys = {"schema_version", "since", "until", "frozen_snapshot_digests", "snapshot_digests", "runtime_identity", "release_root", "release_identity_digest", "source_attempt", "history_digest"}
+        if private_authority is not None:
+            body_keys.add("private_routing")
+        authoritative_routing = (
+            "sha256:" + str(identity["routing_sha256"])
+            if private_authority is None
+            else "sha256:" + str(private_authority.get("sha256") if isinstance(private_authority, Mapping) else "")
+        )
         if (
-            set(body) != {"schema_version", "since", "until", "frozen_snapshot_digests", "snapshot_digests", "runtime_identity", "release_root", "release_identity_digest", "source_attempt", "history_digest"}
+            set(body) != body_keys
             or body.get("schema_version") != "clockify-fresh-input-binding/v1"
             or existing.get("binding_digest") != _value_digest(body)
             or body.get("since") != since or body.get("until") != until
             or body.get("frozen_snapshot_digests") != frozen
             or not isinstance(expected, Mapping) or set(expected) != set(frozen)
             or any(expected[name] != frozen[name] for name in frozen if name != "routing.json")
-            or expected["routing.json"] != "sha256:" + identity["routing_sha256"]
+            or expected["routing.json"] != authoritative_routing
+            or private_authority is not None and (
+                not isinstance(private_authority, Mapping)
+                or set(private_authority) != _PRIVATE_ROUTING_KEYS
+                or private_authority.get("base_sha256") != identity["routing_sha256"]
+                or not _raw_sha256(private_authority.get("sha256"))
+            )
             or body.get("release_identity_digest") != _value_digest(identity)
             or body.get("history_digest") != _value_digest(record.get("source_attempt_history"))
             or not isinstance(attempt, Mapping) or runner is None
@@ -3241,6 +3426,7 @@ def _fresh_input_binding(
         return dict(expected)
     attempt = record.get("source_attempt")
     current = _expected_snapshot_digests(config, manifest)
+    effective_routing = _effective_routing_digest(config, identity, root)
     if (
         "runner_attempt" in record or "routing_transition" in record
         or any(key in record for key in ("source", "replay", "delivery_receipt"))
@@ -3253,8 +3439,7 @@ def _fresh_input_binding(
         or any(current[name] != frozen[name] for name in frozen if name != "routing.json")
         or runtime.get("canonical_root") != str(root) or runtime.get("git_dirty") not in (None, False)
         or runtime.get("git_sha") not in (None, identity["git_sha"])
-        or _path(config, "routing", file=True) != root / "routing.json"
-        or current["routing.json"] != "sha256:" + identity["routing_sha256"]
+        or current["routing.json"] != effective_routing
     ):
         raise CycleError("fresh routing binding is not an eligible terminal legacy attempt")
     _validate_config_identity(config)
@@ -3278,6 +3463,8 @@ def _fresh_input_binding(
         "source_attempt": {key: value for key, value in new_attempt.items() if key != "status"},
         "history_digest": _value_digest(record["source_attempt_history"]),
     }
+    if "private_routing" in config:
+        body["private_routing"] = dict(config["private_routing"])
     record["fresh_input_binding"] = {**body, "binding_digest": _value_digest(body)}
     return current
 
