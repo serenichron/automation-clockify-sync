@@ -280,6 +280,107 @@ def _credits(selected: list[dict[str, Any]], all_sources: Mapping[str, Any]) -> 
                         "remaining_recoverable_minutes": 0, "native_residual_minutes": sum(c["native_residual_minutes"] for c in checks)}
 
 
+def _reviewed_routing_correction(binding: Mapping[str, Any], *, source: Mapping[str, Any],
+                                 proposal: Mapping[str, Any], row: list[Any], expected: list[Any],
+                                 preserve_description: bool, spreadsheet_id: str,
+                                 sheet_title: str, cache: dict) -> dict[str, Any]:
+    """Bind one witnessed historical representation, not a new native route.
+
+    The coordinator supplies trusted pinned operator artifacts. Hashes bind their
+    bytes, not the author's identity; this is not an arbitrary receipt discovery,
+    signature framework or re-authorization of the unrelated historical batch.
+    Original source/time credit and ordinary live-row/TOCTOU gates stay native.
+    """
+    from scripts import clockify_native_sheet_post as native, clockify_sheet_publish as publisher
+    canonical = adoptions.review_corrections.canonical_digest
+    if not isinstance(binding, Mapping) or set(binding) != {"operator_receipt", "correction_plan"}:
+        raise ValueError("pending selection reviewed routing binding differs")
+    receipt, plan = (json.loads(adoptions._capture(binding[name], cache))
+                     for name in ("operator_receipt", "correction_plan"))
+    if (receipt.get("schema_version") != "clockify-sheet-metadata-correction-receipt/v1"
+            or plan.get("schema_version") != "source-bound-sheet-metadata-plan/v1"
+            or (receipt.get("spreadsheet_id"), plan.get("spreadsheet_id"), plan.get("sheet_title"))
+            != (spreadsheet_id, spreadsheet_id, sheet_title)
+            or type(plan.get("sheet_id")) is not int or receipt.get("sheet_id") != plan["sheet_id"]):
+        raise ValueError("pending selection reviewed routing destination differs")
+    entries = [entry for entry in plan.get("rows", []) if entry.get("review_id") == row[0]]
+    if len(entries) != 1:
+        raise ValueError("pending selection reviewed routing target is absent or ambiguous")
+    entry = entries[0]
+    before, after = entry.get("expected_full_row"), entry.get("planned_full_row")
+    if (entry.get("column_L_source_id") != source["run_id"]
+            or entry.get("source_proposal_digest") != canonical(proposal)
+            or entry.get("source_proposal") != proposal
+            or entry.get("original_evidence_ids") != proposal["provenance"]["evidence_ids"]
+            or not isinstance(before, list) or not isinstance(after, list)
+            or len(before) != 15 or len(after) != 15
+            or entry.get("expected_full_row_digest") != canonical(before)
+            or before[0] != row[0] or before[11] != source["run_id"]
+            or before[9] != "pending" or before[13] != "unposted"):
+        raise ValueError("pending selection reviewed routing original source differs")
+    native_columns = [*range(9), 10, 11]
+    if preserve_description:
+        native_columns.remove(8)
+    if any((pipeline._parse_dt(before[i]) != pipeline._parse_dt(expected[i]) if i in {1, 2}
+            else not publisher._same_cell(before[i], expected[i])) for i in native_columns):
+        raise ValueError("pending selection reviewed routing preimage is not native")
+    changes = entry.get("changes")
+    if not isinstance(changes, list):
+        raise ValueError("pending selection reviewed routing changes differ")
+    rebuilt, changed = copy.deepcopy(before), set()
+    for change in changes:
+        column = change.get("index_zero_based")
+        if (type(column) is not int or column not in {4, 5, 8} or column in changed
+                or change.get("column") != {4: "E", 5: "F", 8: "I"}[column]
+                or change.get("expected") != before[column]):
+            raise ValueError("pending selection reviewed routing changes protected cells")
+        rebuilt[column] = change.get("replacement")
+        changed.add(column)
+    if (not {4, 5} <= changed or (8 in changed and not preserve_description)
+            or canonical(rebuilt) != canonical(after) or canonical(after) != canonical(row)
+            or any(canonical(before[i]) != canonical(after[i]) for i in range(15) if i not in {4, 5, 8})):
+        raise ValueError("pending selection reviewed routing postimage or current cells differ")
+    routes = {(route.get("project_suffix"), tuple(route.get("tag_suffixes", [])))
+              for route in native._route_values(source["routing"])
+              if route.get("project_name") == after[4]
+              and ", ".join(route.get("tag_names", [])) == after[5]
+              and route.get("project_suffix") in publisher.project_allowlist(source["routing"])
+              and len(route.get("tag_names", [])) == len(route.get("tag_suffixes", []))}
+    proof = entry.get("route_proof")
+    if (len(routes) != 1 or not isinstance(proof, Mapping)
+            or (proof.get("project_suffix"), tuple(proof.get("tag_suffixes", []))) not in routes):
+        raise ValueError("pending selection reviewed routing native project/task is absent or ambiguous")
+    write_result, readback = receipt.get("write_result", {}), receipt.get("readback", {})
+    if (write_result.get("isError") is not False or readback.get("isError") is not False
+            or write_result.get("structuredContent", {}).get("spreadsheetId") != spreadsheet_id
+            or not isinstance(write_result.get("structuredContent", {}).get("replies"), list)
+            or not write_result["structuredContent"]["replies"]):
+        raise ValueError("pending selection reviewed routing operator operation failed")
+    captured = readback.get("structuredContent", {})
+    sheets = captured.get("sheets", [])
+    if (captured.get("spreadsheetId") != spreadsheet_id or len(sheets) != 1
+            or (sheets[0].get("properties", {}).get("sheetId"), sheets[0].get("properties", {}).get("title"))
+            != (plan["sheet_id"], sheet_title)):
+        raise ValueError("pending selection reviewed routing readback destination differs")
+    matches = []
+    for grid in sheets[0].get("data", []):
+        start = grid.get("startRow", 0)
+        if type(start) is not int or start < 0 or grid.get("startColumn", 0) != 0:
+            raise ValueError("pending selection reviewed routing readback grid differs")
+        for offset, raw in enumerate(grid.get("rowData", [])):
+            values = [native._cell_value(cell) for cell in raw.get("values", [])]
+            if values and values[0] == row[0]:
+                matches.append((start + offset + 1, values))
+    if (len(matches) != 1 or matches[0][0] != entry.get("sheet_row_at_capture")
+            or len(matches[0][1]) != 15 or canonical(matches[0][1]) != canonical(after)):
+        raise ValueError("pending selection reviewed routing readback row differs")
+    return {**binding, "authority_boundary": "trusted_coordinator_invocation_not_author_signature",
+            "source_proposal_sha256": canonical(proposal), "preimage_sha256": canonical(before),
+            "postimage_sha256": canonical(after), "current_row_sha256": canonical(row),
+            "readback_row_sha256": canonical(matches[0][1]), "represented_columns": ["E", "F"],
+            "native_project_suffix": proof["project_suffix"], "native_tag_suffixes": proof["tag_suffixes"]}
+
+
 def verify(*, bindings_path: Path, source_dir: Path, proposals: Sequence[Mapping[str, Any]],
            spreadsheet_id: str, sheet_title: str, run_id: str, project_allowlist: Mapping[str, str]) -> dict[str, Any]:
     from scripts import clockify_sheet_publish as publisher
@@ -338,7 +439,7 @@ def verify(*, bindings_path: Path, source_dir: Path, proposals: Sequence[Mapping
     prior, seen = [], set(ids)
     for declaration in document["prior_rows"]:
         if (not {"review_id", "source", "disposition"} <= declaration.keys()
-                or declaration.keys() - {"review_id", "source", "disposition", "preserve_captured_routing", "preserve_captured_description"}
+                or declaration.keys() - {"review_id", "source", "disposition", "preserve_captured_routing", "preserve_captured_description", "reviewed_routing_correction"}
                 or declaration["disposition"] not in {"retain", "supersede", "inactive"}):
             raise ValueError("pending selection prior disposition differs")
         review_id = declaration["review_id"]
@@ -361,6 +462,14 @@ def verify(*, bindings_path: Path, source_dir: Path, proposals: Sequence[Mapping
                     or not row[4] or declaration["preserve_captured_routing"] is not True):
                 raise ValueError("pending selection captured routing preservation differs")
             columns = [i for i in columns if i not in {4, 5}]
+        if "reviewed_routing_correction" in declaration:
+            if "preserve_captured_routing" in declaration:
+                raise ValueError("pending selection routing representation mechanisms conflict")
+            record["reviewed_routing_correction"] = _reviewed_routing_correction(
+                declaration["reviewed_routing_correction"], source=source, proposal=record["proposal"],
+                row=row, expected=expected, preserve_description=declaration.get("preserve_captured_description") is True,
+                spreadsheet_id=spreadsheet_id, sheet_title=sheet_title, cache=cache)
+            columns = [i for i in columns if i not in {4, 5}]
         if any((pipeline._parse_dt(row[i]) != pipeline._parse_dt(expected[i]) if i in {1, 2}
                 else not publisher._same_cell(row[i], expected[i])) for i in columns):
             raise ValueError("pending selection captured native identity or duration differs")
@@ -368,7 +477,8 @@ def verify(*, bindings_path: Path, source_dir: Path, proposals: Sequence[Mapping
         if (inactive and (row[9] != "superseded" or row[13] not in {"superseded", "unposted"})) or (not inactive and (row[9] != "pending" or row[13] != "unposted")):
             raise ValueError("pending selection requires exact pending/unposted or inactive preimage")
         record.update(row=row, disposition=declaration["disposition"], verified_native_columns=[publisher.HEADER[i] for i in columns],
-                      representation_basis="immutable_captured_existing_review" if declaration.get("preserve_captured_description") or declaration.get("preserve_captured_routing") else "native_projection_and_capture")
+                      representation_basis="trusted_witnessed_routing_correction" if "reviewed_routing_correction" in record else
+                      "immutable_captured_existing_review" if declaration.get("preserve_captured_description") or declaration.get("preserve_captured_routing") else "native_projection_and_capture")
         prior.append(record)
         if declaration["disposition"] == "retain":
             selected.append(record)
@@ -424,6 +534,8 @@ def verify(*, bindings_path: Path, source_dir: Path, proposals: Sequence[Mapping
                "preserved_rows_sha256": digest([record["row"] for record in prior]), "replacements": replacements,
                "prior_representation_checks": [{"review_id": record["review_id"], "basis": record["representation_basis"],
                                                  "verified_native_columns": record["verified_native_columns"],
+                                                 **({"reviewed_routing_correction": record["reviewed_routing_correction"]}
+                                                    if "reviewed_routing_correction" in record else {}),
                                                  "all15_live_cells_must_match_capture": True} for record in prior],
                "supersession_contract": {"column": "J", "before": "pending", "after": "superseded",
                                            "review_status": "unposted", "other14_cells": "unchanged"},

@@ -141,6 +141,189 @@ class PendingSelectionTests(unittest.TestCase):
         self.assertFalse(any(w.get("type") == "existing_clockify_overlap" for row in gateway.rows[-13:]
                              for w in json.loads(row[12] or "[]")))
 
+    def reviewed_routing_binding(self):
+        from scripts import review_corrections
+        index = 16  # A retained, already resolved historical row.
+        proposal = self.retained[0]
+        original = copy.deepcopy(self.baseline[index])
+        corrected = copy.deepcopy(original)
+        corrected[4:6] = ["TST Prep Level 2", "Technical development"]
+        corrected[8] = "TSTP — Preserved the reviewed accomplishment"
+        routing = {"session_routes": [self.route, {
+            "project_name": "TST Prep Level 2", "project_suffix": "bc17f7",
+            "tag_names": ["Technical development"], "tag_suffixes": ["35aa9b54"],
+            "prefix": "TSTP", "billable": True}]}
+        source = self.binding["sources"]["prior"]["artifacts"]
+        source["routing"] = write(Path(source["routing"]["path"]), routing)
+        packet = json.loads(Path(source["receipt"]["path"]).read_text())
+        packet["input_hashes"]["routing.private.json"] = source["routing"]["sha256"][7:]
+        source["receipt"] = write(Path(source["receipt"]["path"]), packet)
+        self.routing_plan = {
+            "schema_version": "source-bound-sheet-metadata-plan/v1",
+            "spreadsheet_id": "sheet", "sheet_id": 7, "sheet_title": "August 2026 review",
+            "not_native_mutation_schema": True,
+            "rows": [{"review_id": original[0], "column_L_source_id": "prior-run",
+                      "sheet_row_at_capture": index + 2, "source_proposal": copy.deepcopy(proposal),
+                      "source_proposal_digest": review_corrections.canonical_digest(proposal),
+                      "original_evidence_ids": proposal["provenance"]["evidence_ids"],
+                      "expected_full_row": original,
+                      "expected_full_row_digest": review_corrections.canonical_digest(original),
+                      "planned_full_row": corrected,
+                      "changes": [{"column": column, "index_zero_based": number,
+                                   "expected": original[number], "replacement": corrected[number]}
+                                  for column, number in (("E", 4), ("F", 5), ("I", 8))],
+                      "route_proof": {"project_suffix": "bc17f7", "tag_suffixes": ["35aa9b54"]}}]}
+        cells = [{"userEnteredValue": {"numberValue" if type(value) in {int, float} else "stringValue": value}}
+                 for value in corrected]
+        self.operator_receipt = {
+            "schema_version": "clockify-sheet-metadata-correction-receipt/v1",
+            "spreadsheet_id": "sheet", "sheet_id": 7, "utc": "2026-08-01T12:00:00Z",
+            "verified_rows": 1, "changed_rows": 1, "changed_cells": 3,
+            "duration_and_disposition_unchanged": True,
+            "request": [{"updateCells": {"range": {"sheetId": 7, "startRowIndex": index + 1,
+                           "endRowIndex": index + 2, "startColumnIndex": number, "endColumnIndex": number + 1},
+                           "fields": "userEnteredValue", "rows": [{"values": [cells[number]]}]}}
+                        for number in (4, 5, 8)],
+            "write_result": {"content": [], "isError": False,
+                             "structuredContent": {"spreadsheetId": "sheet", "replies": [{}, {}, {}], "updatedSpreadsheet": None}},
+            "readback": {"content": [], "isError": False, "structuredContent": {
+                "spreadsheetId": "sheet", "sheets": [{"properties": {"sheetId": 7, "title": "August 2026 review"},
+                "data": [{"startRow": index + 1, "rowData": [{"values": cells}]}]}]}}}
+        self.baseline[index] = corrected
+        declaration = self.binding["prior_rows"][index]
+        declaration["preserve_captured_description"] = True
+        declaration["reviewed_routing_correction"] = {
+            "operator_receipt": write(self.root / "operator-receipt.json", self.operator_receipt),
+            "correction_plan": write(self.root / "routing-plan.json", self.routing_plan)}
+        self.binding["sheet_capture"] = write(self.root / "capture.json", {
+            "spreadsheet_id": "sheet", "sheet_title": "August 2026 review", "rows": self.baseline})
+        write(self.binding_path, self.binding)
+        return index, original, corrected
+
+    def test_witnessed_resolved_route_representation_retains_native_credit_and_repeat(self):
+        index, original, corrected = self.reviewed_routing_binding()
+        source_bytes = {name: Path(handle["path"]).read_bytes()
+                        for name, handle in self.binding["sources"]["prior"]["artifacts"].items()}
+        gateway = SelectionGateway([publisher.HEADER, *self.baseline])
+        try:
+            first = self.publish(gateway)
+        except publisher.PublicationError as exc:
+            self.fail(f"witnessed resolved routing is not representable: {exc.__cause__}")
+        self.assertEqual(corrected, gateway.rows[index + 1])
+        self.assertEqual(original[11], gateway.rows[index + 1][11])
+        self.assertEqual(34, first["pending_selection"]["saved_credit_minutes"])
+        self.assertEqual("Serenichron", self.retained[0]["client_project"])
+        check = first["pending_selection"]["prior_representation_checks"][index]
+        self.assertEqual("trusted_witnessed_routing_correction", check["basis"])
+        self.assertEqual("trusted_coordinator_invocation_not_author_signature", check["reviewed_routing_correction"]["authority_boundary"])
+        before = copy.deepcopy(gateway.rows)
+        again = self.publish(gateway)
+        self.assertEqual(before, gateway.rows)
+        self.assertEqual(0, again["publications"][0]["appended"])
+        self.assertEqual(0, again["publications"][0]["updated"])
+        self.assertEqual(0, again["terminal_updates"])
+        self.assertEqual(source_bytes, {name: Path(handle["path"]).read_bytes()
+                                       for name, handle in self.binding["sources"]["prior"]["artifacts"].items()})
+
+    def test_reviewed_route_binding_rejects_wrong_target_stale_or_unapproved_cells(self):
+        index, _, _ = self.reviewed_routing_binding()
+        saved_binding = copy.deepcopy(self.binding)
+        for mode in ("missing-receipt", "digest", "wrong-target", "wrong-source", "wrong-proposal", "preimage-digest",
+                     "failed-write", "failed-readback", "wrong-sheet", "short-grid", "grid-offset", "stale-readback",
+                     "duplicate-readback", "protected-cell", "current-cell", "undeclared-change",
+                     "unrelated-route", "ambiguous-route", "both-exceptions", "missing-I-exception"):
+            with self.subTest(mode=mode):
+                binding = copy.deepcopy(saved_binding)
+                plan, receipt = copy.deepcopy(self.routing_plan), copy.deepcopy(self.operator_receipt)
+                correction = binding["prior_rows"][index]["reviewed_routing_correction"]
+                row = plan["rows"][0]
+                grid = receipt["readback"]["structuredContent"]["sheets"][0]["data"][0]
+                if mode == "missing-receipt":
+                    correction.pop("operator_receipt")
+                elif mode == "wrong-target":
+                    row["review_id"] = "another-review-id"
+                elif mode == "wrong-source":
+                    row["column_L_source_id"] = "another-source"
+                elif mode == "wrong-proposal":
+                    row["source_proposal"]["activity_id"] = "another-activity"
+                elif mode == "preimage-digest":
+                    row["expected_full_row_digest"] = "sha256:" + "0" * 64
+                elif mode == "failed-write":
+                    receipt["write_result"]["isError"] = True
+                elif mode == "failed-readback":
+                    receipt["readback"]["isError"] = True
+                elif mode == "wrong-sheet":
+                    receipt["readback"]["structuredContent"]["sheets"][0]["properties"]["sheetId"] = 8
+                elif mode == "short-grid":
+                    grid["rowData"][0]["values"].pop()
+                elif mode == "grid-offset":
+                    grid["startRow"] += 1
+                elif mode == "stale-readback":
+                    grid["rowData"][0]["values"][4]["userEnteredValue"]["stringValue"] = "Serenichron"
+                elif mode == "duplicate-readback":
+                    grid["rowData"].append(copy.deepcopy(grid["rowData"][0]))
+                elif mode == "protected-cell":
+                    row["planned_full_row"][3] = 2
+                elif mode == "current-cell":
+                    capture = copy.deepcopy(self.baseline)
+                    capture[index][14] = "human edit"
+                    binding["sheet_capture"] = write(self.root / "changed-capture.json", {
+                        "spreadsheet_id": "sheet", "sheet_title": "August 2026 review", "rows": capture})
+                elif mode == "undeclared-change":
+                    row["changes"].pop()
+                elif mode in {"unrelated-route", "ambiguous-route"}:
+                    artifacts = binding["sources"]["prior"]["artifacts"]
+                    routing = json.loads(Path(saved_binding["sources"]["prior"]["artifacts"]["routing"]["path"]).read_text())
+                    if mode == "unrelated-route":
+                        routing["session_routes"].pop()
+                    else:
+                        route = copy.deepcopy(routing["session_routes"][-1])
+                        route["tag_suffixes"] = ["35aa9b55"]
+                        routing["session_routes"].append(route)
+                    artifacts["routing"] = write(self.root / "changed-route.json", routing)
+                    packet = json.loads(Path(artifacts["receipt"]["path"]).read_text())
+                    packet["input_hashes"]["routing.private.json"] = artifacts["routing"]["sha256"][7:]
+                    artifacts["receipt"] = write(self.root / "changed-packet.json", packet)
+                elif mode == "both-exceptions":
+                    binding["prior_rows"][index]["preserve_captured_routing"] = True
+                elif mode == "missing-I-exception":
+                    binding["prior_rows"][index].pop("preserve_captured_description")
+                if "operator_receipt" in correction:
+                    correction["operator_receipt"] = write(self.root / "changed-operator.json", receipt)
+                correction["correction_plan"] = write(self.root / "changed-plan.json", plan)
+                if mode == "digest":
+                    correction["operator_receipt"]["sha256"] = "sha256:" + "0" * 64
+                write(self.binding_path, binding)
+                gateway = SelectionGateway([publisher.HEADER, *self.baseline])
+                before = copy.deepcopy(gateway.rows)
+                with self.assertRaises(publisher.PublicationError):
+                    self.publish(gateway)
+                self.assertEqual(before, gateway.rows)
+                self.assertEqual([], gateway.prepared)
+                self.assertEqual([], gateway.updated)
+                self.assertEqual([], gateway.appended)
+
+    def test_reviewed_route_does_not_overwrite_collaborator_change_after_plan(self):
+        index, _, _ = self.reviewed_routing_binding()
+        class ConcurrentGateway(SelectionGateway):
+            def append_values(gateway, spreadsheet_id, range_name, rows):
+                super().append_values(spreadsheet_id, range_name, rows)
+                gateway.rows[index + 1][4] = "Collaborator routing"
+                gateway.collaborator_rows = copy.deepcopy(gateway.rows)
+        gateway = ConcurrentGateway([publisher.HEADER, *self.baseline])
+        with self.assertRaises(publisher.PublicationError):
+            self.publish(gateway)
+        self.assertTrue(hasattr(gateway, "collaborator_rows"), "the trusted correction must reach the publisher's existing TOCTOU gate")
+        self.assertEqual(gateway.collaborator_rows, gateway.rows)
+        self.assertFalse(any(row[9] == "superseded" for row in gateway.rows[1:17]))
+
+    def test_reviewed_route_does_not_waive_native_remaining_capacity(self):
+        self.reviewed_routing_binding()
+        # This existing real-publisher regression changes a retained native
+        # demand from one to two minutes and leaves one recoverable minute.
+        # A valid routing representation must still reject that time credit.
+        self.test_native_original_demand_is_not_capped_to_make_selection_pass()
+
     def test_distinct_work_overlap_warns_new_rows_and_preserves_retained_cells(self):
         event = self.add_clockify_context()
         gateway = SelectionGateway([publisher.HEADER, *self.baseline])
