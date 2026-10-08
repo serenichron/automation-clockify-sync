@@ -68,6 +68,7 @@ except ModuleNotFoundError:  # pragma: no cover
 SCHEMA_VERSION = "clockify-review-cycle/v1"
 RECEIPT_SCHEMA_VERSION = "clockify-review-delivery/v1"
 PARTIAL_RECEIPT_SCHEMA_VERSION = "clockify-review-partial-publication/v1"
+HISTORICAL_LITERAL_TIMESTAMP_PROJECTION = "literal-iso-wall-time/v1"
 HISTORICAL_ADOPTION_SCHEMA_VERSION = "clockify-historical-adoption/v1"
 HISTORICAL_ADOPTION_REQUEST_SCHEMA_VERSION = "clockify-historical-adoption-request/v1"
 DERIVED_ADOPTION_SCHEMA_VERSION = "clockify-historical-adoption/v2"
@@ -1844,9 +1845,28 @@ def _receipt_publication_config(config: Mapping[str, Any], document: Mapping[str
     return {**config, "monthly_unresolved_alias_proof": proof["path"]}
 
 
+def _receipt_proposal_row(
+    proposal: Mapping[str, Any], run_id: str, *, project_allowlist: Mapping[str, str],
+    timestamp_projection: str | None,
+) -> list[Any]:
+    """Reconstruct known old B/C cells only; never change the publisher default."""
+    row = proposal_row(proposal, run_id, project_allowlist=project_allowlist)
+    if timestamp_projection is None:
+        return row
+    if timestamp_projection != HISTORICAL_LITERAL_TIMESTAMP_PROJECTION:
+        raise CycleError("unknown historical timestamp projection")
+    for index, field in ((1, "start"), (2, "end")):
+        # Original v1 publication printed the ISO timestamp's literal wall
+        # label, without converting its offset. All other cells stay native.
+        value = dt.datetime.fromisoformat(str(proposal[field]).strip().replace("Z", "+00:00"))
+        row[index] = value.strftime("%Y-%m-%d %H:%M:%S" if value.second else "%Y-%m-%d %H:%M")
+    return row
+
+
 def _expected_publication_receipts(
     config: Mapping[str, Any], source: Mapping[str, Any], *, sheet_title: str,
     publication_profile: str | None = "configured",
+    timestamp_projection: str | None = None,
 ) -> list[dict[str, Any]]:
     proposals, _exceptions = _validate_accounting(Path(str(source["run_dir"])))
     source_dir = Path(str(source["run_dir"])).resolve()
@@ -1867,7 +1887,10 @@ def _expected_publication_receipts(
     publication_profile = _publication_profile(config, publication_profile)
     if publication_profile not in (None, clockify_monthly_unresolved.PROFILE, clockify_monthly_unresolved.ALIAS_PROFILE):
         raise CycleError("unknown delivery publication profile")
-    partition_rows = {title: [proposal_row(item, str(source["run_id"]), project_allowlist=projects) for item in members]
+    def receipt_row(item: Mapping[str, Any]) -> list[Any]:
+        return _receipt_proposal_row(item, str(source["run_id"]), project_allowlist=projects,
+            timestamp_projection=timestamp_projection)
+    partition_rows = {title: [receipt_row(item) for item in members]
                       for title, members in partitions if members and (
                           publication_profile is None or title != "unresolved-evidence")}
     meeting_bindings = _meeting_bindings_for_target(config, sheet_title)
@@ -1877,7 +1900,7 @@ def _expected_publication_receipts(
             from scripts import clockify_meeting_publication_alias as meeting_alias
             rows, aliases = meeting_alias.project(
                 bindings_path=meeting_bindings, source_dir=source_dir, proposals=proposals,
-                rows=[proposal_row(item, str(source["run_id"]), project_allowlist=projects) for item in proposals],
+                rows=[receipt_row(item) for item in proposals],
                 spreadsheet_id=str(config["spreadsheet_id"]), sheet_title=sheet_title,
             )
         except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
@@ -2040,11 +2063,13 @@ def _delivery_document(
     source: Mapping[str, Any], replay: Mapping[str, Any], *, sheet_title: str,
     publication_profile: str | None = "configured",
     publication_readbacks: list[dict[str, Any]] | None = None,
+    timestamp_projection: str | None = None,
 ) -> dict[str, Any]:
     publication_profile = _publication_profile(config, publication_profile)
     try:
         publication_receipts = _expected_publication_receipts(
             config, source, sheet_title=sheet_title, publication_profile=publication_profile,
+            timestamp_projection=timestamp_projection,
         )
         if publication_readbacks is not None:
             publication_receipts = _validated_publication_document({
@@ -2116,16 +2141,26 @@ def _verify_delivery_receipt(
         _verify_selected_delivery(config, document, since, until, source, replay)
         return
     config = _receipt_publication_config(config, document)
-    try:
-        expected = _delivery_document(
-            config, since, until, source, replay, sheet_title=sheet_title,
-            publication_profile=document.get("publication_profile"),
-            publication_readbacks=document.get("publication_receipts"),
-        )
-    except CycleError as exc:
-        raise CycleError("delivery receipt target or immutable inputs have drifted") from exc
-    if document != expected:
-        raise CycleError("delivery receipt target or immutable inputs have drifted")
+    projections: tuple[str | None, ...] = (None,)
+    if document.get("schema_version") in {RECEIPT_SCHEMA_VERSION, PARTIAL_RECEIPT_SCHEMA_VERSION}:
+        projections += (HISTORICAL_LITERAL_TIMESTAMP_PROJECTION,)
+    error = None
+    for projection in projections:
+        try:
+            expected = _delivery_document(
+                config, since, until, source, replay, sheet_title=sheet_title,
+                publication_profile=document.get("publication_profile"),
+                publication_readbacks=document.get("publication_receipts"),
+                timestamp_projection=projection,
+            )
+        except CycleError as exc:
+            error = exc
+            continue
+        # The *whole* sealed v1 contract must match one known renderer. This
+        # does not accept arbitrary/mixed timestamps or non-time metadata drift.
+        if document == expected:
+            return
+    raise CycleError("delivery receipt target or immutable inputs have drifted") from error
 
 
 def _persist_state(path: Path, state: dict[str, Any], since: str, record: dict[str, Any]) -> None:
