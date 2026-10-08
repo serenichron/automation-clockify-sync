@@ -185,13 +185,8 @@ def _meeting_credit(proposal: Mapping[str, Any], source: Mapping[str, Any]) -> d
             "basis": "saved_native_fixed_meeting_allocation"}
 
 
-def _covered_source_outcome(declaration: Mapping[str, Any], current: Mapping[str, Any],
-                            captured: Mapping[str, list[Any]], cache: dict) -> dict[str, Any]:
-    """Represent one whole already-posted recording, without adding credit."""
-    from scripts import clockify_native_sheet_post as native, clockify_sheet_publish as publisher
-    if (set(declaration) != {"current_review_id", "prior_review_id", "clockify_entry_id", "prior_proof_artifacts", "fresh_clockify_capture"}
-            or declaration["current_review_id"] != current["review_id"]):
-        raise ValueError("pending selection covered recording declaration differs")
+def _covered_native_evidence(declaration: Mapping[str, Any], cache: dict) -> tuple[dict, dict]:
+    """Authenticate the original POST and a complete current read-only GET."""
     live = json.loads(adoptions._capture(declaration["fresh_clockify_capture"], cache))
     target = live.get("verified_target", {})
     finished = _time(live["finished_utc"])
@@ -206,7 +201,128 @@ def _covered_source_outcome(declaration: Mapping[str, Any], current: Mapping[str
     proof = adoptions.verify_prior_native_proof(declaration["prior_proof_artifacts"], declaration["prior_review_id"],
         declaration["clockify_entry_id"], workspace_id=target["workspace_id"], member_id=target["member_id"], capture_cache=cache)
     entries = [entry for entry in live["entries"] if entry.get("id") == proof["clockify_entry_id"]]
-    if len(entries) != 1 or not adoptions.current_live_matches(proof["payload"], entries[0],
+    if len(entries) != 1:
+        raise ValueError("pending selection covered recording current provider payload differs")
+    return proof, entries[0]
+
+
+def _covered_posted_row(proof: Mapping[str, Any], declaration: Mapping[str, Any],
+                        proposal: Mapping[str, Any], captured: Mapping[str, list[Any]]) -> list[Any]:
+    from scripts import clockify_native_sheet_post as native, clockify_sheet_publish as publisher
+    prior = proof["prior_proposal"]
+    row = captured[proof["prior_review_id"]]
+    timezone = proof["native_plan"]["timezone"]
+    if (row[9] != "Approved" or row[13] != "posted" or row[6] != prior["activity_id"]
+            or row[11] != Path(declaration["prior_proof_artifacts"]["prior_proposals"]["path"]).parent.name
+            or row[8] != proof["payload"]["description"] or row[4] != prior["client_project"]
+            or row[5] != ", ".join(prior["tag_names"])
+            or not publisher._same_cell(row[3], proposal["duration_seconds"] / 60)
+            or any(native._utc(native._parse_sheet_time(row[index], timezone)) != proof["payload"][key]
+                   for index, key in ((1, "start"), (2, "end")))):
+        raise ValueError("pending selection covered recording Approved/posted Sheet representation differs")
+    return row
+
+
+def _covered_accomplishment(declaration: Mapping[str, Any], current: Mapping[str, Any],
+                            captured: Mapping[str, list[Any]], cache: dict) -> dict[str, Any]:
+    """A coordinator-reviewed exact native outcome, never semantic inference."""
+    from scripts import clockify_native_sheet_post as native
+    fields = {"current_review_id", "prior_review_id", "clockify_entry_id", "prior_proof_artifacts",
+              "fresh_clockify_capture", "semantic_adjudication", "observed_current_project"}
+    if set(declaration) != fields or declaration["current_review_id"] != current["review_id"]:
+        raise ValueError("pending selection covered accomplishment declaration differs")
+    proposal = current["proposal"]
+    if proposal.get("provenance", {}).get("canonical_meeting_id"):
+        raise ValueError("pending selection covered accomplishment cannot replace recording proof")
+    proof, entry = _covered_native_evidence(declaration, cache)
+    prior = proof["prior_proposal"]
+    if (prior.get("provenance", {}).get("canonical_meeting_id")
+            or type(proposal.get("duration_seconds")) is not int or proposal["duration_seconds"] <= 0
+            or proposal["duration_seconds"] != prior["duration_seconds"]
+            or proposal["duration_seconds"] != adoptions._seconds(proof["payload"])
+            or (_time(proposal["end"]) - _time(proposal["start"])).total_seconds() != proposal["duration_seconds"]
+            or any(_time(proposal[key]) != _time(prior[key]) or _time(proposal[key]) != _time(proof["payload"][key])
+                   for key in ("start", "end"))):
+        raise ValueError("pending selection covered accomplishment whole interval differs")
+    source_events = adoptions._source_events(proposal, current["source"]["ledger"])
+    atoms = {_atom(event) for event in source_events}
+    prior_atoms = {_atom(event) for event in proof["source_events"]}
+    if (not atoms or atoms != prior_atoms or atoms != current["atoms"]
+            or len(source_events) != len(atoms) or len(proof["source_events"]) != len(prior_atoms)
+            or any(event.get("source_type") in {"clockify", "existing_clockify", "fathom"} for event in source_events)):
+        raise ValueError("pending selection covered accomplishment complete source atoms differ")
+    witness = json.loads(adoptions._capture(declaration["semantic_adjudication"], cache))
+    witness_fields = {"schema_version", "current_review_id", "prior_review_id", "current_proposal_sha256",
+                      "prior_proposal_sha256", "current_semantic", "prior_semantic", "canonical_atoms_sha256",
+                      "same_bounded_accomplishment", "basis", "operation_anchor", "normalized_accomplishment",
+                      "adjudication_rationale"}
+    normalized = witness.get("normalized_accomplishment")
+    if (set(witness) != witness_fields or witness["schema_version"] != "pending-covered-accomplishment-adjudication/v1"
+            or witness["current_review_id"] != current["review_id"] or witness["prior_review_id"] != proof["prior_review_id"]
+            or witness["current_proposal_sha256"] != digest(proposal) or witness["prior_proposal_sha256"] != digest(prior)
+            or witness["canonical_atoms_sha256"] != digest(sorted(digest(atom) for atom in atoms))
+            or witness["same_bounded_accomplishment"] is not True or witness["basis"] != "coordinator_source_event_review"
+            or not isinstance(normalized, dict) or set(normalized) != {"action", "object", "outcome"}
+            or any(not isinstance(value, str) or not value.strip() for value in normalized.values())
+            or any(not isinstance(witness[name], str) or not witness[name].strip()
+                   for name in ("operation_anchor", "adjudication_rationale"))):
+        raise ValueError("pending selection covered accomplishment adjudication differs")
+    current_handles = current["source"]["artifacts"]
+    for name, saved, source_path in (
+            ("current_semantic", proposal, current_handles["proposals"]["path"]),
+            ("prior_semantic", prior, declaration["prior_proof_artifacts"]["prior_proposals"]["path"])):
+        binding = witness[name]
+        if (not isinstance(binding, dict) or set(binding) != {"artifact", "activity"}
+                or Path(binding["artifact"]["path"]) != Path(source_path).parent / "semantic-analysis.json"):
+            raise ValueError("pending selection covered accomplishment native semantic source differs")
+        semantic = json.loads(adoptions._capture(binding["artifact"], cache))
+        matches = [activity for activity in semantic.get("activities", []) if activity.get("activity_id") == saved["activity_id"]]
+        if (len(matches) != 1 or matches[0] != binding["activity"]
+                or not isinstance(matches[0].get("evidence_ids"), list)
+                or len(matches[0]["evidence_ids"]) != len(set(matches[0]["evidence_ids"]))
+                or set(matches[0]["evidence_ids"]) != set(saved["provenance"]["evidence_ids"])
+                or any(not isinstance(matches[0].get(field), str) or not matches[0][field].strip()
+                       for field in ("action", "object", "outcome"))):
+            raise ValueError("pending selection covered accomplishment native semantic activity differs")
+    observed = declaration["observed_current_project"]
+    if (not isinstance(observed, dict) or set(observed) != {"project_id", "project_name", "routing_snapshot"}
+            or not isinstance(observed["project_id"], str) or not observed["project_id"]
+            or not isinstance(observed["project_name"], str) or not observed["project_name"]
+            or observed["routing_snapshot"] != current_handles["routing"]):
+        raise ValueError("pending selection covered accomplishment observed route declaration differs")
+    routing = json.loads(adoptions._capture(observed["routing_snapshot"], cache))
+    routes = {(route.get("project_suffix"), route.get("project_name")) for route in native._route_values(routing)
+              if isinstance(route.get("project_suffix"), str) and route["project_suffix"]
+              and observed["project_id"].endswith(route["project_suffix"])}
+    if len(routes) != 1 or next(iter(routes))[1] != observed["project_name"]:
+        raise ValueError("pending selection covered accomplishment observed project is not uniquely configured")
+    current_payload = {**proof["payload"], "projectId": observed["project_id"]}
+    if not adoptions.current_live_matches(current_payload, entry, workspace_id=proof["workspace_id"],
+            member_id=proof["member_id"], entry_id=proof["clockify_entry_id"]):
+        raise ValueError("pending selection covered accomplishment current provider payload differs")
+    row = _covered_posted_row(proof, declaration, proposal, captured)
+    return {"review_id": current["review_id"], "prior_review_id": proof["prior_review_id"],
+            "clockify_entry_id": proof["clockify_entry_id"], "basis": "verified_posted_source_representation_only",
+            "covered_seconds": proposal["duration_seconds"], "prior_proof_artifacts": declaration["prior_proof_artifacts"],
+            "prior_proof_digest": proof["proof_digest"], "captured_posted_row": row,
+            "fresh_clockify_capture": declaration["fresh_clockify_capture"], "provider_entry_sha256": digest(entry),
+            "semantic_adjudication": declaration["semantic_adjudication"], "semantic_adjudication_sha256": digest(witness),
+            "historical_approved_project_id": proof["payload"]["projectId"], "observed_current_project": observed,
+            "current_project_authorized_by_historical_approval": observed["project_id"] == proof["payload"]["projectId"],
+            "authority_boundary": "trusted_coordinator_source_adjudication_not_human_financial_or_project_approval",
+            "new_pending_rows": 0, "accounting_credit_mutations": 0, "clockify_writes": 0}
+
+
+def _covered_source_outcome(declaration: Mapping[str, Any], current: Mapping[str, Any],
+                            captured: Mapping[str, list[Any]], cache: dict) -> dict[str, Any]:
+    """Represent one whole already-posted source, without adding credit."""
+    if "semantic_adjudication" in declaration:
+        return _covered_accomplishment(declaration, current, captured, cache)
+    if (set(declaration) != {"current_review_id", "prior_review_id", "clockify_entry_id", "prior_proof_artifacts", "fresh_clockify_capture"}
+            or declaration["current_review_id"] != current["review_id"]):
+        raise ValueError("pending selection covered recording declaration differs")
+    proof, entry = _covered_native_evidence(declaration, cache)
+    if not adoptions.current_live_matches(proof["payload"], entry,
             workspace_id=proof["workspace_id"], member_id=proof["member_id"], entry_id=proof["clockify_entry_id"]):
         raise ValueError("pending selection covered recording current provider payload differs")
     proposal = current["proposal"]
@@ -228,22 +344,13 @@ def _covered_source_outcome(declaration: Mapping[str, Any], current: Mapping[str
                        for suffix in proposal.get("tag_suffixes", []))
             or proposal["billable"] is not proof["payload"]["billable"]):
         raise ValueError("pending selection covered recording exact source, route or whole interval differs")
-    row = captured[proof["prior_review_id"]]
-    timezone = proof["native_plan"]["timezone"]
-    if (row[9] != "Approved" or row[13] != "posted" or row[6] != prior["activity_id"]
-            or row[11] != Path(declaration["prior_proof_artifacts"]["prior_proposals"]["path"]).parent.name
-            or row[8] != proof["payload"]["description"] or row[4] != prior["client_project"]
-            or row[5] != ", ".join(prior["tag_names"])
-            or not publisher._same_cell(row[3], proposal["duration_seconds"] / 60)
-            or any(native._utc(native._parse_sheet_time(row[index], timezone)) != proof["payload"][key]
-                   for index, key in ((1, "start"), (2, "end")))):
-        raise ValueError("pending selection covered recording Approved/posted Sheet representation differs")
+    row = _covered_posted_row(proof, declaration, proposal, captured)
     return {"review_id": current["review_id"], "prior_review_id": proof["prior_review_id"],
             "clockify_entry_id": proof["clockify_entry_id"], "basis": "verified_posted_source_representation_only",
             "canonical_meeting_id": canonical_id, "native_recording_identity": list(recording_identity),
             "covered_seconds": proposal["duration_seconds"], "prior_proof_artifacts": declaration["prior_proof_artifacts"],
             "prior_proof_digest": proof["proof_digest"], "captured_posted_row": row,
-            "fresh_clockify_capture": declaration["fresh_clockify_capture"], "provider_entry_sha256": digest(entries[0]),
+            "fresh_clockify_capture": declaration["fresh_clockify_capture"], "provider_entry_sha256": digest(entry),
             "new_pending_rows": 0, "accounting_credit_mutations": 0, "clockify_writes": 0}
 
 

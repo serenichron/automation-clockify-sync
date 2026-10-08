@@ -218,4 +218,111 @@ class CoveredPostedMeetingTests(unittest.TestCase):
                 with self.assertRaises(ValueError): self.verify(item,rows,declaration)
 
 
+class CoveredPostedAccomplishmentTests(unittest.TestCase):
+    def write(self, path, value):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(value), encoding="utf-8")
+        return consumer.artifact_handle(path)
+
+    def fixture(self, root):
+        item, rows, declaration, capture = CoveredPostedMeetingTests().fixture(root)
+        proposal = item["proposal"]
+        proposal["provenance"].pop("canonical_meeting_id")
+        event = evidence_ledger.evidence_event("codex_sessions_event",
+            {"machine": "test-host", "session_id": "delivery-review"},
+            observed_at=proposal["start"], attributes={"role": "assistant", "kind": "message",
+                "content": "Reviewed the deployment patch and confirmed the delivery fix."})
+        ledger = evidence_ledger.EvidenceLedger((event,), timezone="UTC")
+        document = {"schema_version": "evidence-ledger/v1", "manifest": ledger.manifest.document(),
+                    "events": [event.document()]}
+        proposal["provenance"]["evidence_ids"] = [event.evidence_id]
+        item["source"]["ledger"] = document
+        item["atoms"] = {consumer._atom(event.document())}
+        prior = copy.deepcopy(proposal)
+        prior.update(review_activity_key="wka-prior", activity_id="prior-delivery-review")
+        rows["wka-prior-s01"][6] = prior["activity_id"]
+        prior_proof = declaration["prior_proof_artifacts"]
+        prior_proof["prior_proposals"] = self.write(Path(prior_proof["prior_proposals"]["path"]), [prior])
+        prior_proof["source_ledger"] = self.write(Path(prior_proof["source_ledger"]["path"]), document)
+        current_semantic = {"activity_id": proposal["activity_id"], "evidence_ids": [event.evidence_id],
+                            "action": "Reviewed", "object": "the deployment patch", "outcome": "Confirmed delivery fix"}
+        prior_semantic = {"activity_id": prior["activity_id"], "evidence_ids": [event.evidence_id],
+                          "action": "Checked", "object": "deployment changes", "outcome": "Verified the fix"}
+        current_artifacts = {
+            "proposals": self.write(root/"current-run"/"proposals.json", [proposal]),
+            "ledger": self.write(root/"current-run"/"evidence/evidence-ledger.json", document),
+            "routing": self.write(root/"current-run"/"routing.json", {"session_routes": [{
+                "project_name": "Example Level 2", "project_suffix": "abcdef", "tag_names": ["Process"],
+                "tag_suffixes": ["654321"], "billable": True}]})}
+        item["source"]["artifacts"] = current_artifacts
+        witness = {"schema_version": "pending-covered-accomplishment-adjudication/v1",
+            "current_review_id": item["review_id"], "prior_review_id": "wka-prior-s01",
+            "current_proposal_sha256": consumer.digest(proposal), "prior_proposal_sha256": consumer.digest(prior),
+            "current_semantic": {"artifact": self.write(root/"current-run"/"semantic-analysis.json", {"activities": [current_semantic]}),
+                                 "activity": current_semantic},
+            "prior_semantic": {"artifact": self.write(root/"prior-run"/"semantic-analysis.json", {"activities": [prior_semantic]}),
+                               "activity": prior_semantic},
+            "canonical_atoms_sha256": consumer.digest(sorted(consumer.digest(atom) for atom in item["atoms"])),
+            "same_bounded_accomplishment": True, "basis": "coordinator_source_event_review",
+            "operation_anchor": "deployment-patch-delivery-fix",
+            "normalized_accomplishment": {"action": "Review", "object": "deployment patch", "outcome": "Confirmed delivery fix"},
+            "adjudication_rationale": "Both exact cited source events describe the same bounded patch review and delivery verification; their entire allocation is identical."}
+        declaration["semantic_adjudication"] = self.write(root/"adjudication.json", witness)
+        capture["entries"][0]["projectId"] = "project-abcdef"
+        declaration["fresh_clockify_capture"] = self.write(Path(declaration["fresh_clockify_capture"]["path"]), capture)
+        declaration["observed_current_project"] = {"project_id": "project-abcdef", "project_name": "Example Level 2",
+                                                    "routing_snapshot": current_artifacts["routing"]}
+        return item, rows, declaration, capture, witness
+
+    def verify(self, item, rows, declaration):
+        return consumer._covered_source_outcome(declaration, item, rows, {})
+
+    def test_reviewed_complete_accomplishment_covers_only_and_preserves_observed_project(self):
+        with tempfile.TemporaryDirectory() as temp:
+            item, rows, declaration, _, _ = self.fixture(Path(temp))
+            before = copy.deepcopy((item, rows))
+            proof = self.verify(item, rows, declaration)
+            self.assertEqual("verified_posted_source_representation_only", proof["basis"])
+            self.assertEqual(1800, proof["covered_seconds"])
+            self.assertEqual(0, proof["new_pending_rows"])
+            self.assertEqual(0, proof["accounting_credit_mutations"])
+            self.assertEqual(0, proof["clockify_writes"])
+            self.assertEqual("project-abcdef", proof["observed_current_project"]["project_id"])
+            self.assertFalse(proof["current_project_authorized_by_historical_approval"])
+            self.assertNotEqual(proof["historical_approved_project_id"], proof["observed_current_project"]["project_id"])
+            self.assertEqual(before, (item, rows))
+
+    def test_unknown_partial_or_unadjudicated_accomplishment_rejects(self):
+        for changed in ("atoms", "witness-hash", "same-operation", "current-semantic", "prior-semantic", "proposal", "basis"):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as temp:
+                item, rows, declaration, _, witness = self.fixture(Path(temp))
+                if changed == "atoms":
+                    item["source"]["ledger"]["events"][0]["attributes"]["content"] = "A different operation"
+                elif changed == "witness-hash":
+                    declaration["semantic_adjudication"]["sha256"] = "sha256:" + "0" * 64
+                elif changed == "same-operation": witness["same_bounded_accomplishment"] = False
+                elif changed == "current-semantic": witness["current_semantic"]["activity"]["outcome"] = "Different outcome"
+                elif changed == "prior-semantic": witness["prior_semantic"]["activity"]["object"] = "Different object"
+                elif changed == "proposal": item["proposal"]["description"] = "Unreviewed revised wording"
+                else: witness["basis"] = "shared_context_only"
+                if changed not in {"witness-hash", "atoms", "proposal"}:
+                    declaration["semantic_adjudication"] = self.write(Path(declaration["semantic_adjudication"]["path"]), witness)
+                with self.assertRaises(ValueError): self.verify(item, rows, declaration)
+
+    def test_current_provider_changes_other_than_explicit_configured_project_reject(self):
+        for changed in ("description", "tagIds", "billable", "start", "workspaceId", "userId", "projectId", "route-name", "route-hash", "sheet-route"):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as temp:
+                item, rows, declaration, capture, _ = self.fixture(Path(temp))
+                entry = capture["entries"][0]
+                if changed == "tagIds": entry[changed] = []
+                elif changed == "billable": entry[changed] = not entry[changed]
+                elif changed == "start": entry["timeInterval"]["start"] = "2026-09-29T09:01:00Z"
+                elif changed == "route-name": declaration["observed_current_project"]["project_name"] = "Unknown project"
+                elif changed == "route-hash": declaration["observed_current_project"]["routing_snapshot"]["sha256"] = "sha256:" + "0" * 64
+                elif changed == "sheet-route": rows["wka-prior-s01"][4] = "Example Level 2"
+                else: entry[changed] = "unrelated"
+                declaration["fresh_clockify_capture"] = self.write(Path(declaration["fresh_clockify_capture"]["path"]), capture)
+                with self.assertRaises(ValueError): self.verify(item, rows, declaration)
+
+
 if __name__ == "__main__": unittest.main()

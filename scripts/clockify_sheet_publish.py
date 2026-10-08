@@ -1435,7 +1435,7 @@ def publish_proposal_partitions(
     ]
     meeting_aliases: dict[str, list[dict[str, Any]]] = {}
     if selection is not None:
-        partitions = [(sheet_title, selection["rows"]), *[(title, rows) for title, rows in partitions if title != sheet_title]]
+        partitions = [(sheet_title, selection["rows"])]
     if meeting_bindings is not None:
         if source_dir is None or Path(source_dir).name != run_id:
             raise PublicationError("meeting representation current source run differs")
