@@ -2054,8 +2054,9 @@ def _session_timing_contexts(
     Mirror the collector's direct-human filter so automated user-role wrappers
     cannot borrow a surrounding genuine-human pool.
     """
+    event_list = list(events)
     groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
-    for event in events:
+    for event in event_list:
         source_type = str(event.get("source_type") or "")
         source = event.get("source_ref") or {}
         attrs = _attributes(event)
@@ -2070,7 +2071,8 @@ def _session_timing_contexts(
             continue
         groups.setdefault((source_type, str(source["machine"]), str(source["session_id"])), []).append(event)
     contexts: dict[str, dict[str, Any]] = {}
-    for members in groups.values():
+    pools: dict[tuple[str, str, str], list[tuple[dt.datetime, dt.datetime, dict[str, Any]]]] = {}
+    for group, members in groups.items():
         # Use only actual human timestamps, not assistant points or source
         # envelopes. The existing collector helper bounds these exact points
         # by local day and the established idle threshold for each source group.
@@ -2095,8 +2097,34 @@ def _session_timing_contexts(
                 "interval": interval,
                 "evidence_ids": ids,
             }
+            pools.setdefault(group, []).append((start, end, context))
             for evidence_id in ids:
                 contexts[evidence_id] = context
+    # Reviewed Codex outcomes can cite only the assistant result point. Index
+    # that point into its unique containing human pool without adding assistant
+    # runtime to the bounds or relabelling human anchors as outcome citations.
+    for event in event_list:
+        source = event.get("source_ref") or {}
+        attrs = _attributes(event)
+        if (
+            event.get("source_type") != "codex_sessions_event"
+            or source.get("source_type") != "codex_sessions"
+            or not source.get("machine") or not source.get("session_id")
+            or attrs.get("role") != "assistant"
+            or attrs.get("kind", "message") != "message" or attrs.get("tool_name")
+            or not str(attrs.get("content") or "").strip()
+            or collector.is_injected_session_message(str(attrs.get("content") or ""))
+        ):
+            continue
+        point = _parse_dt(
+            (event.get("raw_source_span") or {}).get("timestamp")
+            or event.get("observed_at")
+        )
+        group = ("codex_sessions_event", str(source["machine"]), str(source["session_id"]))
+        containing = [context for start, end, context in pools.get(group, [])
+                      if point is not None and start <= point <= end]
+        if len(containing) == 1:
+            contexts[str(event["evidence_id"])] = containing[0]
     return contexts
 
 
