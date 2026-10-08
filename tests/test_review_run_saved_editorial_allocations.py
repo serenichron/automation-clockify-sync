@@ -3,12 +3,14 @@ import copy
 import contextlib
 import io
 import json
+import shutil
 from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
 
 import test_review_run as fixtures
+import test_zero_allocation_wording as zero_wording
 from scripts import review_corrections, work_accounting_pipeline as accounting
 from test_review_run_chained_repair_replay import validate_repair
 
@@ -16,6 +18,98 @@ run = fixtures.review_run
 
 
 class SavedEditorialAllocationTests(unittest.TestCase):
+    def test_inherited_zero_transition_uses_authenticated_parent_output(self):
+        fixture=zero_wording.ZeroAllocationWordingTests()
+        fixture.setUp();self.addCleanup(fixture.doCleanups)
+        record=fixture.record()
+        child=fixture.root/'editorial';child.mkdir()
+        historical=child/'editorial-source';historical.mkdir()
+        for name in ('proposals.json','semantic-analysis.json','work-accounting-result.json'):
+            shutil.copyfile(fixture.source/name,historical/name)
+        semantic=copy.deepcopy(fixture.semantic)
+        semantic['activities'][0]['rendered_description']=zero_wording.NEW
+        zero_wording.write(historical/'semantic-analysis.json',semantic)
+        parent_log=historical/'review-corrections.jsonl'
+        review_corrections.append_zero_allocation_wording(parent_log,record)
+        parent=copy.deepcopy(fixture.accounting)
+        parent['correction_regression']=review_corrections.evaluate_regression_cases(review_corrections.load_regression_cases(parent_log),parent['proposals'])
+        zero_wording.write(historical/'work-accounting-result.json',parent)
+        zero_wording.write(historical/'routing.json',{})
+        for name in accounting.EDITORIAL_SAVED_FILES:
+            shutil.copyfile(historical/name,child/name)
+        proposals=copy.deepcopy(fixture.proposals)
+        proposals[0]['description']='SC — Clarified client reporting'
+        zero_wording.write(child/'proposals.json',proposals)
+        decision=review_corrections.build_decision({'id':'rvi-postable','current':fixture.proposals[0]},decision='modify',reviewer='agent',reviewed_at='2026-10-08T14:00:00Z',correction_categories=['wording'],rationale='Only accounted metadata changes.',field_patch={'description':{'op':'replace','value':proposals[0]['description']}})
+        review_corrections.append_decision(child/'review-corrections.jsonl',decision)
+        (child/'evidence').mkdir()
+        shutil.copyfile(fixture.source/'evidence/evidence-ledger.json',child/'evidence/evidence-ledger.json')
+        zero_wording.write(child/'repair-source.json',{'editorial_saved_artifacts':{name:zero_wording.digest(historical/name) for name in accounting.EDITORIAL_SAVED_FILES},'editorial_corrections_sha256':zero_wording.digest(child/'review-corrections.jsonl'),'editorial_ledger_sha256':zero_wording.digest(child/'evidence/evidence-ledger.json')})
+        with mock.patch.object(run,'RUNS',fixture.root):
+            try:
+                run._validate_zero_allocation_wording_run(child,child/'review-corrections.jsonl')
+            except run.ReviewRunError as error:
+                self.fail(f'inherited transition must validate its pinned historical output: {error}')
+            for relative in ('editorial-source/proposals.json','evidence/evidence-ledger.json','review-corrections.jsonl'):
+                with self.subTest(tampered=relative):
+                    path=child/relative;before=path.read_bytes()
+                    path.write_bytes(before+b' ')
+                    with self.assertRaises(run.ReviewRunError):
+                        run._validate_zero_allocation_wording_run(child,child/'review-corrections.jsonl')
+                    path.write_bytes(before)
+
+    def test_inherited_zero_allocation_wording_survives_editorial_replay(self):
+        # Treating inherited source-only wording as a decision either blocks
+        # editorial repair or invents a proposal for untimed contested work.
+        fixture=zero_wording.ZeroAllocationWordingTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        source=fixture.source
+        record=fixture.record()
+        review_corrections.append_zero_allocation_wording(source/'review-corrections.jsonl',record)
+        semantic=copy.deepcopy(fixture.semantic)
+        semantic['activities'][0]['rendered_description']=zero_wording.NEW
+        semantic['activities'].append({'activity_id':'act-postable','evidence_ids':fixture.activity['evidence_ids']})
+        fixture.accounting['fathom_reconciliation']=[]
+        zero_wording.write(source/'semantic-analysis.json',semantic)
+        zero_wording.write(source/'work-accounting-result.json',fixture.accounting)
+        zero_wording.write(source/'routing.json',{})
+        saved={name:(source/name).read_bytes() for name in accounting.EDITORIAL_SAVED_FILES}
+        corrections=fixture.root/'child.jsonl'
+        corrections.write_bytes(saved['review-corrections.jsonl'])
+        decision=review_corrections.build_decision({'id':'rvi-postable','current':fixture.proposals[0]},decision='modify',reviewer='agent',reviewed_at='2026-10-08T14:00:00Z',correction_categories=['wording'],rationale='Clarify only this accounted source.',field_patch={'description':{'op':'replace','value':'SC — Clarified client reporting'}})
+        review_corrections.append_decision(corrections,decision)
+        lineage={'editorial_saved_artifacts':{},'editorial_corrections_sha256':zero_wording.digest(corrections)}
+        for output_name in ('child','replay'):
+            output=fixture.root/output_name;output.mkdir()
+            (output/'editorial-source').mkdir()
+            (output/'editorial-source/review-corrections.jsonl').write_bytes(saved['review-corrections.jsonl'])
+            try:
+                with mock.patch.object(accounting.work_allocator,'allocate_work',side_effect=AssertionError('must not allocate')):
+                    result=accounting._derive_saved_editorial_accounting(output,{},corrections,(lineage,saved))
+            except (accounting.WorkAccountingError,review_corrections.ReviewDecisionError) as error:
+                self.fail(f'inherited zero-allocation wording must stay non-postable: {error}')
+            self.assertEqual(fixture.accounting['allocation'],result['allocation'])
+            self.assertEqual(fixture.accounting['ambiguous'],result['ambiguous'])
+            self.assertEqual(['act-postable'],[p['activity_id'] for p in result['proposals']])
+            self.assertEqual('SC — Clarified client reporting',result['proposals'][0]['description'])
+            self.assertEqual({'pass':1,'fail':0,'not_applicable':1},result['correction_regression']['summary'])
+            self.assertEqual(zero_wording.NEW,json.loads((output/'semantic-analysis.json').read_bytes())['activities'][0]['rendered_description'])
+        self.assertEqual((fixture.root/'child/proposals.json').read_bytes(),(fixture.root/'replay/proposals.json').read_bytes())
+        with self.subTest('new ordinary tail cannot disappear as not-applicable'):
+            missing=fixture.root/'missing.jsonl'
+            missing.write_bytes(saved['review-corrections.jsonl'])
+            decision=review_corrections.build_decision({'id':'rvi-missing','current':{**fixture.proposals[0],'activity_id':'act-missing'}},decision='modify',reviewer='agent',reviewed_at='2026-10-08T14:00:00Z',correction_categories=['wording'],rationale='Exact target must exist.',field_patch={'description':{'op':'replace','value':'SC — Clarified client reporting'}})
+            review_corrections.append_decision(missing,decision)
+            with self.assertRaisesRegex(accounting.WorkAccountingError,'absent or ambiguous'):
+                accounting._derive_saved_editorial_accounting(fixture.root/'child',{},missing,({**lineage,'editorial_corrections_sha256':zero_wording.digest(missing)},saved))
+        with self.subTest('historically timed zero target cannot be not-applicable'):
+            timed=copy.deepcopy(fixture.accounting)
+            timed['allocation']['allocations'].append({'activity_id':'act-zero','duration_minutes':1})
+            changed={**saved,'work-accounting-result.json':json.dumps(timed).encode()}
+            with self.assertRaisesRegex(accounting.WorkAccountingError,'saved credit is not absent'):
+                accounting._derive_saved_editorial_accounting(fixture.root/'child',{},corrections,(lineage,changed))
+
     def test_external_editorial_input_overrides_cannot_bypass_pinned_snapshots(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);runs=root/'runs'

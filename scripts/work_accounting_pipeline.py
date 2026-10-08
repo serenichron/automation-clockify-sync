@@ -3088,7 +3088,24 @@ def _derive_saved_editorial_accounting(
     parent_records = review_corrections._read_log(run_dir / "editorial-source/review-corrections.jsonl")
     records = review_corrections._read_log(corrections_path)
     tail = records[len(parent_records):]
-    cases = review_corrections.derive_regression_cases(records)
+    cases = review_corrections.load_regression_cases(corrections_path)
+    inherited_zero = {record["correction_id"]: record for record in parent_records
+                      if record.get("record_type") == review_corrections.ZERO_ALLOCATION_WORDING}
+    inherited_unallocated_cases = set()
+    for case in cases:
+        record = inherited_zero.get(case.get("zero_allocation_wording_id"))
+        if record is None:
+            continue
+        target = (record["activity_id"], record["evidence_fingerprint"])
+        contested = [row for row in original["allocation"]["contested_time"]
+                     if row.get("activity_id") == record["activity_id"]]
+        if (any(review_corrections.proposal_target(proposal) == target for proposal in original_proposals)
+                or any(row.get("activity_id") == record["activity_id"] for row in original["allocation"]["allocations"])
+                or len(contested) != 1
+                or any(contested[0].get(field) != record[field] for field in
+                       ("requested_minutes", "allocated_minutes", "unallocated_minutes"))):
+            raise WorkAccountingError("inherited zero-allocation wording saved credit is not absent")
+        inherited_unallocated_cases.add(case["regression_case_id"])
     result = copy.deepcopy(original)
     seen = set()
     route_choices = []
@@ -3128,7 +3145,10 @@ def _derive_saved_editorial_accounting(
             if description is not None:
                 proposal["description"] = proposal["rendered_description"] = description
     regression = review_corrections.evaluate_regression_cases(cases, result["proposals"])
-    if any(case["status"] != "pass" for case in regression["results"]):
+    if any(case["status"] != "pass" and not (
+            case["status"] == "not_applicable" and case["regression_case_id"] in inherited_unallocated_cases
+            and (case["activity_id"], case["evidence_fingerprint"]) not in seen)
+           for case in regression["results"]):
         raise WorkAccountingError("editorial correction regression failed")
     result["correction_regression"] = regression
     result["editorial_derivation"] = {"parent_artifacts": lineage["editorial_saved_artifacts"], "corrections_sha256": lineage["editorial_corrections_sha256"], "saved_allocation_preserved": True, "route_choices": route_choices, "posting_approval": False}

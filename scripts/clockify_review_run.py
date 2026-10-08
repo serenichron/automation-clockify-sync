@@ -2465,10 +2465,17 @@ def _validate_zero_allocation_wording_output(source: Path, output: Path, record:
 
 
 def _validate_zero_allocation_wording_run(run_dir: Path, corrections: Path) -> None:
+    try:
+        editorial = work_accounting_pipeline.editorial_saved_inputs(run_dir)
+        inherited = (review_corrections._read_log(run_dir / "editorial-source/review-corrections.jsonl")
+                     if editorial is not None else [])
+    except (OSError, ValueError, work_accounting_pipeline.WorkAccountingError) as exc:
+        raise ReviewRunError("zero-allocation wording editorial history differs") from exc
     for record in review_corrections._read_log(corrections):
         if record.get("record_type") == review_corrections.ZERO_ALLOCATION_WORDING:
             source = _run_child(RUNS / record["prior_run_id"], label="zero-allocation wording source")
-            _validate_zero_allocation_wording_output(source, run_dir, record)
+            output = run_dir / "editorial-source" if record in inherited else run_dir
+            _validate_zero_allocation_wording_output(source, output, record)
 
 
 def _validate_repair_credit_transition(
