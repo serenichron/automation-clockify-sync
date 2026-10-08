@@ -12,6 +12,7 @@ from unittest import mock
 
 from scripts import clockify_sheet_publish as publisher
 from scripts import evidence_ledger, work_accounting_pipeline as pipeline
+from scripts import clockify_pending_review_selection as consumer
 from test_sheet_publish import StatefulGateway
 
 
@@ -420,6 +421,147 @@ class PendingSelectionTests(unittest.TestCase):
         self.assertEqual(expected, consumer.digest(receipt))
         self.assertEqual(34, receipt["saved_credit_rows"])
         self.assertEqual("saved_native_pending_credits", receipt["verification_basis"])
+
+
+class SavedNativePlacementTests(unittest.TestCase):
+    """Saved placement, not union-time semantic effort, owns pool borrowing."""
+
+    def fixture(self, *, estimated=False, result_only=False):
+        events = []
+        def event(role, minute, content):
+            value = evidence_ledger.evidence_event(
+                "codex_sessions_event", {"source_type": "codex_sessions", "machine": "test", "session_id": "saved-placement"},
+                observed_at=f"2026-08-01T09:{minute:02d}:00+00:00",
+                attributes={"role": role, "kind": "message", "content": content})
+            events.append(value.document())
+            return value.evidence_id
+        first = event("user", 0, "Start the local work.")
+        middle = event("user", 20, "Check the second result.")
+        last = event("user", 28, "Check the first result.")
+        a1 = event("assistant", 31 if not estimated else 27, "First result checked.")
+        a2 = event("assistant", 21, "Second result checked.")
+        records, demands = [], []
+        for name, start, end, ids, request, native in (
+            ("first", 28 if not estimated else 0, 31 if not estimated else 3,
+             [last, a1] if not result_only else [event("assistant", 28, "First result started."), a1], 6, 3),
+            ("second", 20 if not estimated else 3, 21 if not estimated else 4,
+             [a2] if estimated else [middle, a2], 2, 1)):
+            lo = dt.datetime(2026, 8, 1, 9, start, tzinfo=dt.timezone.utc)
+            hi = dt.datetime(2026, 8, 1, 9, end, tzinfo=dt.timezone.utc)
+            proposal = pipeline._proposal({"activity_id": name, "workstream_id": name, "semantic_confidence": "high",
+                "effort": {"minimum_minutes": native, "recommended_minutes": native if estimated else request, "maximum_minutes": request}},
+                {"project_name": "Serenichron", "project_suffix": "abc123", "tag_names": [], "tag_suffixes": []},
+                "SC — " + name, lo, hi, ids, 1)
+            if estimated:
+                proposal["provenance"].update(timing_placement="estimated", timing_context_evidence_ids=sorted([first, middle, last]),
+                    timing_context_intervals=[{"start": "2026-08-01T12:00:00+03:00", "end": "2026-08-01T12:28:00+03:00"}])
+            demands.append({"activity_id": name, "workstream_id": name,
+                "effort": {"min": native, "recommended": native, "max": native},
+                "allowed_intervals": [["2026-08-01T09:00:00+00:00", "2026-08-01T09:28:00+00:00"]] if estimated else [[lo.isoformat(), hi.isoformat()]],
+                "evidence_spans": [] if estimated else [{"evidence_id": ids[0], "start": lo.isoformat(), "end": hi.isoformat()}]})
+            records.append({"review_id": publisher.stable_review_id(proposal), "proposal": proposal})
+        source = {"ledger": {"events": events}, "accounting": {"allocation": {"evidence": demands}}}
+        for record in records:
+            record.update(source=source, atoms={consumer._atom(e) for e in events if e["evidence_id"] in record["proposal"]["provenance"]["evidence_ids"]})
+        return records, {"native": source}
+
+    def test_saved_capped_observed_span_is_not_reclassified_as_pool_borrowing(self):
+        records, sources = self.fixture()
+        before = copy.deepcopy((records, sources))
+        try:
+            normalized, proof = consumer._credits(records, sources)
+        except ValueError as error:
+            self.fail(f"saved observed3-minute native demand wrongly became a borrower: {error}")
+        self.assertEqual(4, proof["saved_credit_minutes"])
+        self.assertEqual([], proof["shared_pool_debits"])
+        self.assertEqual(3, proof["native_credit_checks"][0]["native_requested_minutes"])
+        self.assertEqual(before, (records, sources))
+        self.assertEqual({record["proposal"]["candidate_key"]: record["proposal"] for record in records},
+                         {proposal["candidate_key"]: proposal for proposal in normalized})
+
+    def test_saved_estimated_placement_keeps_pool_debit_when_local_capacity_reaches_effort(self):
+        records, sources = self.fixture(estimated=True)
+        aliases = copy.deepcopy(sources["native"]["ledger"]["events"])
+        for event in aliases:
+            if event["attributes"]["role"] == "assistant":
+                # Same exact session atom, different historical envelope.
+                # The saved source's estimated placement must remain authoritative.
+                event["raw_source_span"] = {"timestamp": event["observed_at"],
+                    "start": "2026-08-01T09:00:00+00:00", "end": "2026-08-01T09:28:00+00:00"}
+        sources = {"historical-alias": {"ledger": {"events": aliases}}, **sources}
+        _, proof = consumer._credits(records, sources)
+        self.assertEqual(4, proof["saved_credit_minutes"])
+        self.assertEqual(1, len(proof["shared_pool_debits"]))
+        self.assertEqual(4, proof["shared_pool_debits"][0]["debited_minutes"])
+        self.assertEqual(28, proof["shared_pool_debits"][0]["capacity_minutes"])
+
+    def test_result_only_context_alias_does_not_replace_saved_positive_observed_span(self):
+        records, sources = self.fixture(result_only=True)
+        try:
+            _, proof = consumer._credits(records, sources)
+        except ValueError as error:
+            self.fail(f"result-only alias wrongly replaced saved positive native spans: {error}")
+        self.assertEqual([], proof["shared_pool_debits"])
+
+    def test_actual_saved_borrowers_cannot_overspend_shared_pool(self):
+        records, sources = self.fixture(estimated=True)
+        for record, start in zip(records, (0, 12), strict=True):
+            proposal = record["proposal"]
+            proposal.update(start=f"2026-08-01T09:{start:02d}:00+00:00", end=f"2026-08-01T09:{start+16:02d}:00+00:00",
+                            duration_minutes=16, duration_seconds=960)
+            proposal["effort"] = {"minimum_minutes": 16, "recommended_minutes": 16, "maximum_minutes": 16}
+        for demand in sources["native"]["accounting"]["allocation"]["evidence"]:
+            demand["effort"] = {"min": 16, "recommended": 16, "max": 16}
+        with self.assertRaisesRegex(ValueError, "shared human-pool debit"):
+            consumer._credits(records, sources)
+
+    def test_actual_saved_borrower_cannot_leave_original_pool_envelope(self):
+        records, sources = self.fixture(estimated=True)
+        records[0]["proposal"].update(start="2026-08-01T09:27:00+00:00", end="2026-08-01T09:30:00+00:00")
+        with self.assertRaisesRegex(ValueError, "original native envelope"):
+            consumer._credits(records, sources)
+
+    def test_estimated_placement_cannot_contradict_native_observed_spans(self):
+        records, sources = self.fixture(estimated=True)
+        demand = sources["native"]["accounting"]["allocation"]["evidence"][0]
+        demand["evidence_spans"] = [{"evidence_id": records[0]["proposal"]["provenance"]["evidence_ids"][0],
+                                    "start": records[0]["proposal"]["start"], "end": records[0]["proposal"]["end"]}]
+        with self.assertRaisesRegex(ValueError, "saved native placement"):
+            consumer._credits(records, sources)
+
+    def test_estimated_placement_requires_exact_original_human_context_proof(self):
+        for drift in ("human-id", "interval", "missing-marker", "native-allowed-interval"):
+            with self.subTest(drift=drift):
+                records, sources = self.fixture(estimated=True)
+                provenance = records[0]["proposal"]["provenance"]
+                if drift == "human-id":
+                    provenance["timing_context_evidence_ids"].append("uncaptured-human")
+                elif drift == "interval":
+                    provenance["timing_context_intervals"][0]["end"] = "2026-08-01T09:29:00+00:00"
+                elif drift == "missing-marker":
+                    provenance.pop("timing_placement")
+                else:
+                    sources["native"]["accounting"]["allocation"]["evidence"][0]["allowed_intervals"][0][1] = "2026-08-01T09:29:00+00:00"
+                with self.assertRaisesRegex(ValueError, "saved native placement"):
+                    consumer._credits(records, sources)
+
+    def test_saved_estimated_proof_excludes_unpaired_cited_user_only_context(self):
+        records, sources = self.fixture(estimated=True)
+        for minute in (5, 15):
+            event = evidence_ledger.evidence_event("codex_sessions_event",
+                {"source_type": "codex_sessions", "machine": "test", "session_id": "unpaired-session"},
+                observed_at=f"2026-08-01T09:{minute:02d}:00+00:00",
+                attributes={"role": "user", "kind": "message", "content": "Review a separate workstream."}).document()
+            sources["native"]["ledger"]["events"].append(event)
+            if minute == 5:
+                records[0]["proposal"]["provenance"]["evidence_ids"].append(event["evidence_id"])
+                records[0]["atoms"].add(consumer._atom(event))
+        try:
+            _, proof = consumer._credits(records, sources)
+        except ValueError as error:
+            self.fail(f"source proof included an unpaired user-only context excluded by the producer: {error}")
+        self.assertEqual(1, len(proof["shared_pool_debits"]))
+        self.assertEqual(4, proof["shared_pool_debits"][0]["debited_minutes"])
 
 
 if __name__ == "__main__":

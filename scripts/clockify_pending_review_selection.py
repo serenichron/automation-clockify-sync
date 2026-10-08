@@ -130,6 +130,24 @@ def _source(record: Mapping[str, Any], cache: dict) -> dict[str, Any]:
     return {**record, **originals, "by_review_id": by_id}
 
 
+def _cited_timing_contexts(cited, timing):
+    contexts = {}
+    for event in cited:
+        context = timing.get(event["evidence_id"])
+        if context is None:
+            continue
+        if event.get("source_type") in {"claude_bursts_event", "codex_sessions_event"} and not any(
+            other.get("source_type") == event.get("source_type")
+            and pipeline.semantic_analyzer._semantic_context_key(other) == pipeline.semantic_analyzer._semantic_context_key(event)
+            and pipeline._attributes(other).get("role") == "assistant"
+            and pipeline._attributes(other).get("kind", "message") == "message"
+            and not pipeline._attributes(other).get("tool_name")
+            and str(pipeline._attributes(other).get("content") or "").strip() for other in cited):
+            continue
+        contexts[context["pool_id"]] = context
+    return contexts
+
+
 def _credits(selected: list[dict[str, Any]], all_sources: Mapping[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Re-execute native final helpers on saved commitments, not reallocate."""
     union = {}
@@ -198,32 +216,39 @@ def _credits(selected: list[dict[str, Any]], all_sources: Mapping[str, Any]) -> 
                        "native_residual_minutes": residual, "recoverable_minutes": recoverable})
     timing = pipeline._session_timing_contexts(union.values())
     borrowers = {}
+    source_timing = {}
     for activity, items in members.items():
         atoms = set().union(*(item["atoms"] for item in items))
         cited = [union[key] for key in atoms]
-        contexts = {}
-        for event in cited:
-            context = timing.get(event["evidence_id"])
-            if context is None:
-                continue
-            if event.get("source_type") in {"claude_bursts_event", "codex_sessions_event"} and not any(
-                other.get("source_type") == event.get("source_type")
-                and pipeline.semantic_analyzer._semantic_context_key(other) == pipeline.semantic_analyzer._semantic_context_key(event)
-                and pipeline._attributes(other).get("role") == "assistant"
-                and pipeline._attributes(other).get("kind", "message") == "message"
-                and not pipeline._attributes(other).get("tool_name")
-                and str(pipeline._attributes(other).get("content") or "").strip() for other in cited):
-                continue
-            contexts[context["pool_id"]] = context
-        observed = pipeline._activity_observed_intervals(cited)
-        local_capacity = pipeline._interval_capacity_minutes(observed)
-        pool_capacity = pipeline._interval_capacity_minutes(c["interval"] for c in contexts.values())
-        requested = int(items[0]["proposal"].get("effort", {}).get("recommended_minutes", 0)) if items[0]["proposal"].get("effort") else 0
-        borrowing = bool(contexts) and (not observed or (bool(cited) and all(e.get("source_type") == "codex_sessions_event" for e in cited)
-                                                       and requested > local_capacity and pool_capacity > local_capacity))
-        if borrowing:
-            for key, context in contexts.items():
-                borrowers.setdefault(key, {"interval": context["interval"], "activities": set()})["activities"].add(activity)
+        contexts = _cited_timing_contexts(cited, timing)
+        demand = allocator._as_activity(demands[activity])
+        estimated = [item["proposal"]["provenance"].get("timing_placement") == "estimated" for item in items]
+        # The saved native demand owns placement. Uncapped semantic effort or
+        # a richer union alias must neither turn observed spans into borrowing
+        # nor erase a genuine estimated placement's shared-pool debit.
+        if not any(estimated):
+            if contexts and not demand.evidence_spans:
+                raise ValueError("pending selection saved native placement proof is absent")
+            continue
+        if not all(estimated) or demand.evidence_spans or not contexts:
+            raise ValueError("pending selection saved native placement contradicts original demand")
+        for item in items:
+            source = item["source"]
+            source_key = id(source)
+            if source_key not in source_timing:
+                source_timing[source_key] = pipeline._session_timing_contexts(source["ledger"]["events"])
+            original_contexts = _cited_timing_contexts(adoptions._source_events(item["proposal"], source["ledger"]), source_timing[source_key])
+            intervals = [original_contexts[key]["interval"] for key in sorted(original_contexts)]
+            evidence_ids = sorted({value for context in original_contexts.values() for value in context["evidence_ids"]})
+            provenance = item["proposal"]["provenance"]
+            native_intervals = tuple(sorted((_time(pipeline._iso(_time(interval["start"]))),
+                                            _time(pipeline._iso(_time(interval["end"])))) for interval in intervals))
+            if (not original_contexts or provenance.get("timing_context_intervals") != intervals
+                    or provenance.get("timing_context_evidence_ids") != evidence_ids
+                    or demand.allowed_intervals != native_intervals):
+                raise ValueError("pending selection saved native placement context differs")
+        for key, context in contexts.items():
+            borrowers.setdefault(key, {"interval": context["interval"], "activities": set()})["activities"].add(activity)
     pool_checks = []
     for key, pool in borrowers.items():
         if len(pool["activities"]) < 2:
