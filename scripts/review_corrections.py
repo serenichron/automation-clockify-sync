@@ -32,6 +32,7 @@ PATCH_FIELDS = {
 }
 VERIFIED_POSTED_CREDIT = "verified_posted_credit"
 WORDING_AMENDMENT = "wording_amendment"
+ZERO_ALLOCATION_WORDING = "zero_allocation_wording"
 MAX_CAPTURED_PRIOR_PROPOSALS_BYTES = 16 * 1024 * 1024
 _SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _EVIDENCE_FINGERPRINT_RE = re.compile(r"evfp:sha256:[0-9a-f]{64}\Z")
@@ -453,6 +454,89 @@ def append_wording_amendment(path: Path, record: Mapping[str, Any], *, item: Map
     return True
 
 
+def validate_zero_allocation_wording(record: Mapping[str, Any]) -> dict[str, Any]:
+    """An exact source-only description correction, never a decision or vote."""
+    required = {
+        "schema_version", "record_type", "correction_id", "review_item_id", "activity_id",
+        "evidence_fingerprint", "prior_run_id", "parent_semantic_sha256", "parent_accounting_sha256",
+        "parent_proposals_sha256", "parent_description", "requested_minutes", "allocated_minutes",
+        "unallocated_minutes", "field_patch", "reviewer", "reviewed_at", "rationale",
+    }
+    result = _without_integrity(record)
+    if set(result) != required or result.get("schema_version") != SCHEMA_VERSION or result.get("record_type") != ZERO_ALLOCATION_WORDING:
+        raise ReviewDecisionError("unsupported zero-allocation wording schema or fields")
+    for field in ("review_item_id", "activity_id", "prior_run_id", "parent_description", "reviewer", "reviewed_at", "rationale"):
+        _one_line(result[field], field)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", result["prior_run_id"]):
+        raise ReviewDecisionError("zero-allocation wording prior run ID is invalid")
+    for field in ("parent_semantic_sha256", "parent_accounting_sha256", "parent_proposals_sha256"):
+        if not isinstance(result[field], str) or not _SHA256_RE.fullmatch(result[field]):
+            raise ReviewDecisionError("zero-allocation wording source digest is invalid")
+    if not isinstance(result["evidence_fingerprint"], str) or not _EVIDENCE_FINGERPRINT_RE.fullmatch(result["evidence_fingerprint"]):
+        raise ReviewDecisionError("zero-allocation wording evidence fingerprint is invalid")
+    if (any(type(result[field]) is not int for field in ("requested_minutes", "allocated_minutes", "unallocated_minutes"))
+        or result["requested_minutes"] <= 0 or result["allocated_minutes"] != 0
+        or result["unallocated_minutes"] != result["requested_minutes"]):
+        raise ReviewDecisionError("zero-allocation wording must retain positive unallocated demand and zero allocation")
+    patch = _normal_patch(result["field_patch"], "modify")
+    if set(patch) != {"description"}:
+        raise ReviewDecisionError("zero-allocation wording may replace description only")
+    value = _one_line(patch["description"]["value"], "description")
+    if not value.isprintable() or value == result["parent_description"]:
+        raise ReviewDecisionError("zero-allocation wording must change printable client wording")
+    from scripts.caveman_renderer import validate_client_description_hygiene, CavemanValidationError
+    try:
+        validate_client_description_hygiene(value)
+    except CavemanValidationError as exc:
+        raise ReviewDecisionError("zero-allocation wording fails client description hygiene") from exc
+    result["field_patch"] = patch
+    unsigned = {k: v for k, v in result.items() if k != "correction_id"}
+    if result["correction_id"] != "zwrd-" + canonical_digest(unsigned)[7:31]:
+        raise ReviewDecisionError("zero-allocation wording ID does not match canonical content")
+    return result
+
+
+def build_zero_allocation_wording(item: Mapping[str, Any], *, prior_run_id: str,
+                                  parent_semantic_sha256: str, parent_accounting_sha256: str,
+                                  parent_proposals_sha256: str, requested_minutes: int,
+                                  description: str, reviewer: str, reviewed_at: str,
+                                  rationale: str) -> dict[str, Any]:
+    current = item.get("current") if isinstance(item.get("current"), Mapping) else item
+    record = {"schema_version": SCHEMA_VERSION, "record_type": ZERO_ALLOCATION_WORDING,
+              **review_target(item), "prior_run_id": prior_run_id,
+              "parent_semantic_sha256": parent_semantic_sha256,
+              "parent_accounting_sha256": parent_accounting_sha256,
+              "parent_proposals_sha256": parent_proposals_sha256,
+              "parent_description": current.get("rendered_description"),
+              "requested_minutes": requested_minutes, "allocated_minutes": 0,
+              "unallocated_minutes": requested_minutes,
+              "field_patch": {"description": {"op": "replace", "value": description}},
+              "reviewer": reviewer, "reviewed_at": reviewed_at, "rationale": rationale}
+    record["correction_id"] = "zwrd-" + canonical_digest(record)[7:31]
+    return validate_zero_allocation_wording(record)
+
+
+def _unclaimed_zero_allocation_target(record: Mapping[str, Any], records: Iterable[Mapping[str, Any]]) -> None:
+    target = (record["activity_id"], record["evidence_fingerprint"])
+    if any(row.get("record_type") != VERIFIED_POSTED_CREDIT and
+           (row["activity_id"], row["evidence_fingerprint"]) == target for row in records):
+        raise ReviewDecisionError("zero-allocation wording cannot mix with an existing correction or vote")
+
+
+def append_zero_allocation_wording(path: Path, record: Mapping[str, Any]) -> bool:
+    normalized = validate_zero_allocation_wording(record)
+    existing = _read_log(path)
+    if any(_without_integrity(row) == normalized for row in existing):
+        return False
+    _unclaimed_zero_allocation_target(normalized, existing)
+    line = dict(normalized, previous_digest=existing[-1]["canonical_digest"] if existing else None)
+    line["canonical_digest"] = canonical_digest(_without_integrity(line))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(canonical_json(line) + "\n")
+    return True
+
+
 def _read_log(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -465,14 +549,17 @@ def _read_log(path: Path) -> list[dict[str, Any]]:
             record = json.loads(line)
         except json.JSONDecodeError as exc:
             raise ReviewDecisionError(f"invalid decision JSON at line {number}") from exc
-        if isinstance(record, Mapping) and record.get("record_type") == WORDING_AMENDMENT:
+        if isinstance(record, Mapping) and record.get("record_type") == ZERO_ALLOCATION_WORDING:
+            normalized = validate_zero_allocation_wording(record)
+            _unclaimed_zero_allocation_target(normalized, records)
+        elif isinstance(record, Mapping) and record.get("record_type") == WORDING_AMENDMENT:
             normalized = validate_wording_amendment(record)
             _validate_wording_head(normalized, records)
         elif isinstance(record, Mapping) and record.get("record_type") == VERIFIED_POSTED_CREDIT:
             normalized = validate_verified_posted_credit(record)
         else:
             normalized = validate_decision(record)
-            if any(row.get("record_type") == WORDING_AMENDMENT and (
+            if any(row.get("record_type") in {WORDING_AMENDMENT, ZERO_ALLOCATION_WORDING} and (
                 row["activity_id"], row["evidence_fingerprint"]
             ) == (normalized["activity_id"], normalized["evidence_fingerprint"]) for row in records):
                 raise ReviewDecisionError("ordinary decision cannot follow an amended evidence target")
@@ -488,7 +575,7 @@ def _read_log(path: Path) -> list[dict[str, Any]]:
 
 def load_decisions(path: Path) -> list[dict[str, Any]]:
     """Read and integrity-check an immutable correction JSONL file."""
-    return [record for record in _read_log(path) if record.get("record_type") not in {VERIFIED_POSTED_CREDIT, WORDING_AMENDMENT}]
+    return [record for record in _read_log(path) if record.get("record_type") not in {VERIFIED_POSTED_CREDIT, WORDING_AMENDMENT, ZERO_ALLOCATION_WORDING}]
 
 
 def load_verified_posted_credits(path: Path) -> list[dict[str, Any]]:
@@ -582,7 +669,7 @@ def append_decision(path: Path, record: Mapping[str, Any], *, item: Mapping[str,
     for prior in existing:
         if prior.get("record_type") == VERIFIED_POSTED_CREDIT:
             continue
-        if prior.get("record_type") == WORDING_AMENDMENT and (
+        if prior.get("record_type") in {WORDING_AMENDMENT, ZERO_ALLOCATION_WORDING} and (
             prior["activity_id"], prior["evidence_fingerprint"]
         ) == (normalized["activity_id"], normalized["evidence_fingerprint"]):
             raise ReviewDecisionError("ordinary decision cannot follow an amended evidence target")
@@ -662,10 +749,21 @@ def derive_regression_cases(decisions: Iterable[Mapping[str, Any]]) -> list[dict
     return sorted(cases, key=lambda value: value["regression_case_id"])
 
 
+def zero_allocation_wording_case(record: Mapping[str, Any]) -> dict[str, Any]:
+    record = validate_zero_allocation_wording(record)
+    case = {"schema_version": SCHEMA_VERSION, "local_only": True,
+            "activity_id": record["activity_id"], "evidence_fingerprint": record["evidence_fingerprint"],
+            "decision": "modify", "correction_categories": ["wording"], "expected_presence": False,
+            "expected_field_patch": copy.deepcopy(record["field_patch"]),
+            "zero_allocation_wording_id": record["correction_id"]}
+    case["regression_case_id"] = "rcase-" + canonical_digest(case)[7:31]
+    return case
+
+
 def load_regression_cases(path: Path) -> list[dict[str, Any]]:
     """Apply amendment chains only to exact local expectations, not decisions."""
     records = _read_log(path)
-    decisions = [row for row in records if row.get("record_type") not in {VERIFIED_POSTED_CREDIT, WORDING_AMENDMENT}]
+    decisions = [row for row in records if row.get("record_type") not in {VERIFIED_POSTED_CREDIT, WORDING_AMENDMENT, ZERO_ALLOCATION_WORDING}]
     amended = {(row["activity_id"], row["evidence_fingerprint"]): row
                for row in records if row.get("record_type") == WORDING_AMENDMENT}
     cases = []
@@ -677,6 +775,9 @@ def load_regression_cases(path: Path) -> list[dict[str, Any]]:
             del case["regression_case_id"]
             case["regression_case_id"] = "rcase-" + canonical_digest(case)[7:31]
         cases.append(case)
+    for record in records:
+        if record.get("record_type") == ZERO_ALLOCATION_WORDING:
+            cases.append(zero_allocation_wording_case(record))
     return sorted(cases, key=lambda value: value["regression_case_id"])
 
 
@@ -780,7 +881,10 @@ def evaluate_regression_cases(
         decision = str(case.get("decision") or "")
         failures: list[str] = []
         is_split = "split" in case.get("correction_categories", ())
-        if is_split:
+        if case.get("zero_allocation_wording_id") and rows:
+            failures.append("zero-allocation wording cannot produce a proposal")
+            status = "fail"
+        elif is_split:
             failures.extend(_split_failures(case, proposal_rows))
             status = "pass" if not failures else "fail"
         elif decision == "skip":

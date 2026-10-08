@@ -2343,6 +2343,124 @@ def _validate_wording_amendment_source(source: Path, record: Mapping[str, Any],
     review_corrections.validate_wording_amendment(record, item={"id": items[0].get("id"), "current": matches[0]})
 
 
+def _validate_zero_allocation_wording_source(source: Path, record: Mapping[str, Any]) -> None:
+    """Authenticate untimed wording against one exact completed accounting source."""
+    try:
+        review_corrections.validate_zero_allocation_wording(record)
+        collector_receipts.load_completion_bundle(source / "completion-bundle.json", run_dir=source)
+        if record["prior_run_id"] != source.name:
+            raise ReviewRunError("zero-allocation wording source run differs")
+        documents = {}
+        for name, field in (("semantic-analysis.json", "parent_semantic_sha256"),
+                            ("work-accounting-result.json", "parent_accounting_sha256"),
+                            ("proposals.json", "parent_proposals_sha256")):
+            value, _, digest = _read_snapshot_json(source / name, label="zero-allocation wording " + name)
+            if digest != record[field]:
+                raise ReviewRunError("zero-allocation wording sealed preimage digest differs")
+            documents[name] = value
+        semantic = documents["semantic-analysis.json"]
+        accounting = documents["work-accounting-result.json"]
+        proposals = documents["proposals.json"]
+        target = (record["activity_id"], record["evidence_fingerprint"])
+        activities = semantic.get("activities") if isinstance(semantic, Mapping) else None
+        if not isinstance(activities, list) or not all(isinstance(row, Mapping) for row in activities):
+            raise ReviewRunError("zero-allocation wording semantic activities are invalid")
+        matches = [row for row in activities if row.get("activity_id") == target[0]]
+        if (len(matches) != 1 or review_corrections.proposal_target(matches[0]) != target
+            or matches[0].get("rendered_description") != record["parent_description"]
+            or matches[0].get("effort", {}).get("recommended_minutes") != record["requested_minutes"]):
+            raise ReviewRunError("zero-allocation wording semantic preimage differs")
+        activity = matches[0]
+        if (not isinstance(accounting, Mapping) or accounting.get("schema_version") != 1
+            or accounting.get("allocation_mode") != "non_overlapping_v1"
+            or not isinstance(accounting.get("semantic_analysis"), Mapping)
+            or accounting["semantic_analysis"].get("activity_count") != len(activities)
+            or accounting["semantic_analysis"].get("prompt_version") != semantic.get("prompt_version")
+            or accounting["semantic_analysis"].get("exception_count") != len(semantic.get("exceptions", []))
+            or accounting["semantic_analysis"].get("omission_count") != len(semantic.get("omissions", []))
+            or not isinstance(proposals, list) or not all(isinstance(row, Mapping) for row in proposals)
+            or accounting.get("proposals") != proposals
+            or any(row.get("activity_id") == target[0] for row in proposals)):
+            raise ReviewRunError("zero-allocation wording accounting or absent proposal preimage differs")
+        _, events = work_accounting_pipeline.load_ledger(source / "evidence/evidence-ledger.json")
+        if not set(activity["evidence_ids"]) <= {event["evidence_id"] for event in events}:
+            raise ReviewRunError("zero-allocation wording lacks authenticated ledger evidence")
+        allocation = accounting.get("allocation")
+        def rows(container: Any, field: str) -> list[Mapping[str, Any]]:
+            values = container.get(field) if isinstance(container, Mapping) else None
+            if not isinstance(values, list) or not all(isinstance(row, Mapping) for row in values):
+                raise ReviewRunError("zero-allocation wording accounting preimage is missing")
+            return [row for row in values if row.get("activity_id") == target[0]]
+        evidence = rows(allocation, "evidence")
+        contested = rows(allocation, "contested_time")
+        ambiguity = rows(accounting, "ambiguous")
+        if (rows(allocation, "allocations") or len(evidence) != 1 or len(contested) != 1 or len(ambiguity) != 1
+            or evidence[0].get("effort") != activity.get("effort")
+            or evidence[0].get("workstream_id") != activity.get("workstream_id")
+            or not evidence[0].get("allowed_intervals")
+            or contested[0].get("workstream_id") != activity.get("workstream_id")
+            or ambiguity[0].get("exception_kind") != "contested_time"
+            or review_corrections.proposal_target(ambiguity[0]) != target
+            or any(row.get(field) != record[field] for row in (contested[0], ambiguity[0])
+                   for field in ("requested_minutes", "allocated_minutes", "unallocated_minutes"))):
+            raise ReviewRunError("zero-allocation wording lacks exact untimed contested accounting")
+        snapshot, _, _ = _read_snapshot_json(source / "review-snapshot.json", label="zero-allocation wording review item")
+        categories = snapshot.get("categories") if isinstance(snapshot, Mapping) else None
+        if not isinstance(categories, Mapping) or not all(isinstance(group, list) and
+            all(isinstance(row, Mapping) for row in group) for group in categories.values()):
+            raise ReviewRunError("zero-allocation wording review snapshot is invalid")
+        items = [row for group in categories.values() for row in group if row.get("activity_id") == target[0]]
+        if (len(items) != 1 or review_corrections.proposal_target(items[0]) != target
+            or items[0].get("id") != record["review_item_id"]
+            or items[0].get("disposition") != "ambiguous" or items[0].get("allocation_segments") != []
+            or items[0].get("description") is not None):
+            raise ReviewRunError("zero-allocation wording lacks one exact unallocated review item")
+        review_corrections._unclaimed_zero_allocation_target(record, review_corrections._read_log(source / "review-corrections.jsonl"))
+    except (collector_receipts.CollectorReceiptError, review_corrections.ReviewDecisionError,
+            OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise ReviewRunError("zero-allocation wording source authentication failed: " + str(exc)) from exc
+
+
+def _validate_zero_allocation_wording_output(source: Path, output: Path, record: Mapping[str, Any]) -> None:
+    """Allow exactly the rendered-description delta; preserve all accounted facts."""
+    _validate_zero_allocation_wording_source(source, record)
+    if _read_snapshot_source(source / "proposals.json", label="zero-allocation source proposals") != _read_snapshot_source(
+        output / "proposals.json", label="zero-allocation output proposals"):
+        raise ReviewRunError("zero-allocation wording changed proposal bytes")
+    for name in ("semantic-analysis.json", "work-accounting-result.json"):
+        original, _, _ = _read_snapshot_json(source / name, label="zero-allocation source output preimage")
+        derived, _, _ = _read_snapshot_json(output / name, label="zero-allocation derived output")
+        if name == "semantic-analysis.json":
+            matches = [row for row in derived.get("activities", []) if row.get("activity_id") == record["activity_id"]]
+            if len(matches) != 1 or matches[0].get("rendered_description") != record["field_patch"]["description"]["value"]:
+                raise ReviewRunError("zero-allocation wording replacement differs")
+            matches[0]["rendered_description"] = record["parent_description"]
+        if name == "work-accounting-result.json":
+            regression = review_corrections.evaluate_regression_cases(
+                [review_corrections.zero_allocation_wording_case(record)], [])
+            prior = original.get("correction_regression")
+            if not isinstance(prior, Mapping) or not isinstance(prior.get("results"), list):
+                raise ReviewRunError("zero-allocation wording source regression bookkeeping is invalid")
+            results = sorted([*prior["results"], *regression["results"]],
+                             key=lambda row: str(row.get("regression_case_id") or ""))
+            expected = {**prior, "results": results, "summary": {
+                status: sum(row["status"] == status for row in results)
+                for status in ("pass", "fail", "not_applicable")}}
+            if derived.get("correction_regression") != expected:
+                raise ReviewRunError("zero-allocation wording changed regression bookkeeping beyond its absent target")
+            original.pop("correction_regression", None)
+            derived.pop("correction_regression", None)
+        if original != derived:
+            raise ReviewRunError("zero-allocation wording changed non-description accounting or semantics")
+
+
+def _validate_zero_allocation_wording_run(run_dir: Path, corrections: Path) -> None:
+    for record in review_corrections._read_log(corrections):
+        if record.get("record_type") == review_corrections.ZERO_ALLOCATION_WORDING:
+            source = _run_child(RUNS / record["prior_run_id"], label="zero-allocation wording source")
+            _validate_zero_allocation_wording_output(source, run_dir, record)
+
+
 def _validate_repair_credit_transition(
     source: Path, proposed: Path, *, runs_root: Path,
     routing_snapshot: Path | None = None,
@@ -2381,6 +2499,12 @@ def _validate_repair_credit_transition(
             if record.get("record_type") == review_corrections.VERIFIED_POSTED_CREDIT:
                 continue
             target = (record.get("activity_id"), record.get("evidence_fingerprint"))
+            if record.get("record_type") == review_corrections.ZERO_ALLOCATION_WORDING:
+                if target in prior_decision_targets or target in appended_decision_targets:
+                    raise ReviewRunError("repair zero-allocation wording must bind one unclaimed source target")
+                _validate_zero_allocation_wording_source(source, record)
+                appended_decision_targets.add(target)
+                continue
             if record.get("record_type") == review_corrections.WORDING_AMENDMENT:
                 if target not in prior_decision_targets or target in appended_decision_targets:
                     raise ReviewRunError("repair wording amendment must advance one existing source target")
@@ -3447,6 +3571,17 @@ def _process_run(
         _write_json(result_path, result)
         write_summary(summary_path, result)
         return accounted.returncode or 2, result_path
+
+    try:
+        _validate_zero_allocation_wording_run(run_dir, Path(args.corrections))
+    except (OSError, ValueError, review_corrections.ReviewDecisionError) as exc:
+        quality = {"status": "blocked", "summary": {"zero_allocation_wording": "failed", "reason": str(exc)}}
+        _write_json(run_dir / "quality_report.json", quality)
+        result = build_result(run_dir, quality, None, review_mode=args.review_mode, acceptance_gate=acceptance_gate)
+        result_path = run_dir / "autopilot-result.json"
+        _write_json(result_path, result)
+        write_summary(run_dir / "autopilot-summary.md", result)
+        return 2, result_path
 
     if replay_source is not None:
         try:
