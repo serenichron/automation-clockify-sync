@@ -3539,6 +3539,10 @@ def run_accounting(
             # Cached/replayed wording cannot invoke inference here. Keep the
             # complete source activity pending for evidence-bound wording repair,
             # not an omission or a claim that the work did not happen.
+            # A rejected derived rendering is not valid rendering metadata.
+            # Canonicalize before snapshotting so retained historical strings
+            # and fixture-normalized nulls produce identical diagnostics.
+            activity["rendered_description"] = None
             ambiguous.append({
                 "id": activity_id,
                 "reason": f"client description hygiene: {exc}",
