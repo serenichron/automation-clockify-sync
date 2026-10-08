@@ -94,6 +94,41 @@ class HistoricalAdoptionCliTests(unittest.TestCase):
             self.assertEqual(before, [(path.read_bytes(), path.stat().st_mtime_ns)
                                      for path in [state_path, *receipts]])
 
+    def test_native_v2_external_graph_cli_preserves_operational_config_without_providers(self) -> None:
+        """Catches CLI scoping overriding persistent runs or invoking collection/publication."""
+        config, request, source, _collector = self.proof._external_graph_request()
+        write_json(self.config_path, config)
+        write_json(self.request_path, request)
+        config_bytes = self.config_path.read_bytes()
+        graph = {path: (path.read_bytes(), path.stat().st_mtime_ns)
+                 for path in self.proof.runs.rglob("*") if path.is_file()}
+        operational_runs = Path(config["runs_dir"])
+        with mock.patch.object(review, "RUNS", review.ROOT / "runs"):
+            code, result, error = self.invoke()
+            self.assertEqual(0, code, error)
+            self.assertEqual("delivered", result["status"])
+            self.assertEqual(operational_runs, review.RUNS)
+            state_path = self.proof.state_dir / "review-cycle-state.json"
+            state = json.loads(state_path.read_bytes())
+            record = state["slices"][self.proof.since]
+            self.assertEqual(str(source), record["source"]["run_dir"])
+            durable = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in (
+                state_path, Path(record["delivery_receipt"]),
+                Path(record["historical_adoption_receipt"]),
+            )}
+            cycle._validate_delivered_state(config, state)
+            review.RUNS = review.ROOT / "runs"
+            repeat_code, repeated, repeat_error = self.invoke()
+            self.assertEqual(0, repeat_code, repeat_error)
+            self.assertEqual(result, repeated)
+            self.assertEqual(operational_runs, review.RUNS)
+            self.assertEqual(durable, {path: (path.read_bytes(), path.stat().st_mtime_ns)
+                                      for path in durable})
+        self.assertEqual(config_bytes, self.config_path.read_bytes())
+        self.assertEqual([], list(operational_runs.iterdir()))
+        self.assertEqual(graph, {path: (path.read_bytes(), path.stat().st_mtime_ns)
+                                for path in graph})
+
     def test_selected_adoption_cli_starts_from_release_default_without_providers(self) -> None:
         """Catches startup binding breaking selected graph context or repeat."""
         self.proof = selected_fixtures.SelectedHistoricalDeliveryTests()

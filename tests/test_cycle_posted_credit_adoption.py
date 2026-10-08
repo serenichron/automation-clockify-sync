@@ -111,6 +111,42 @@ class PostedCreditAdoptionTests(unittest.TestCase):
             self.assertEqual(first, second)
             self.assertEqual(adopted, second["adopted_snapshot_digests"])
 
+    def test_native_v2_receipt_scopes_credit_ancestry_before_stage_validation(self):
+        """Catches early correction verification using the operational runs root."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runs, source, child, _bundle, config = self.fixture(root)
+            frozen = {name: cycle._digest(source / name) for name in (
+                "period-manifest.json", "routing.json", "review-corrections.jsonl",
+                "review-acceptance.jsonl",
+            )}
+            adopted = {name: cycle._digest(child / name) for name in frozen}
+            since, until = "2026-09-11", "2026-09-13"
+            state_dir = root / "persistent-state"
+            receipt_path = state_dir / "historical-adoption-receipts" / f"{since}.json"
+            receipt_path.parent.mkdir(parents=True)
+            unsigned = {
+                "schema_version": cycle.DERIVED_ADOPTION_SCHEMA_VERSION,
+                "since": since, "until": until, "runs_root": str(runs),
+                "frozen_snapshot_digests": frozen,
+                "adopted_snapshot_digests": adopted,
+                "source": {"run_dir": str(child)},
+            }
+            digest = cycle._value_digest(unsigned)
+            receipt_path.write_text(json.dumps({**unsigned, "receipt_digest": digest}) + "\n")
+            record = {
+                "expected_snapshot_digests": frozen,
+                "historical_adoption_receipt": str(receipt_path),
+                "historical_adoption_receipt_digest": digest,
+            }
+            operational = root / "operational-runs"
+            operational.mkdir()
+            config.update(state_dir=str(state_dir), runs_dir=str(operational))
+            with mock.patch.object(run, "RUNS", operational):
+                document = cycle._historical_adoption_document(config, record, since, until)
+                self.assertEqual(operational, run.RUNS)
+            self.assertEqual(adopted, document["adopted_snapshot_digests"])
+
 
 if __name__ == "__main__":
     unittest.main()

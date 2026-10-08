@@ -44,8 +44,8 @@ class HistoricalAdoptionTests(unittest.TestCase):
         runs_patch = mock.patch.object(clockify_review_run, "RUNS", self.runs)
         runs_patch.start()
         self.addCleanup(runs_patch.stop)
-        self.since = "2026-09-07"
-        self.until = "2026-09-09"
+        self.since = getattr(self, "fixture_since", "2026-09-07")
+        self.until = getattr(self, "fixture_until", "2026-09-09")
         manifest = cycle._ensure_period(
             self.config, self.state_dir, self.since, self.until, bind_inputs=True
         )
@@ -68,10 +68,12 @@ class HistoricalAdoptionTests(unittest.TestCase):
         }
         self.source_result = make_run(
             self.root, "historical-source", replay=False,
+            since=dt.date.fromisoformat(self.since), until=dt.date.fromisoformat(self.until),
             snapshot_overrides={"routing.json": new_routing},
         )
         self.replay_result = make_run(
             self.root, "historical-replay", replay=True,
+            since=dt.date.fromisoformat(self.since), until=dt.date.fromisoformat(self.until),
             source_name="historical-source", snapshots_from=self.source_result.parent,
         )
         self.external_checkpoint = self.root / "external-checkpoints"
@@ -376,6 +378,183 @@ class HistoricalAdoptionTests(unittest.TestCase):
             repeated = cycle.adopt_historical_slice(self.config, request)
         self.assertEqual("delivered", result["status"])
         self.assertEqual(result, repeated)
+
+    def _external_graph_request(self):
+        request, derived, collector = self._derived_adoption_request()
+        request["runs_root"] = str(self.runs)
+        operational_runs = self.root / "operational-runs"
+        operational_runs.mkdir()
+        config = {**self.config, "runs_dir": str(operational_runs)}
+        return config, request, derived, collector
+
+    def test_native_v2_external_graph_is_durable_without_rebinding_operational_config(self):
+        """Catches graph validation reverting to operational runs after sealing adoption."""
+        config, request, derived, _collector = self._external_graph_request()
+        original_config = dict(config)
+        immutable = {path: (path.read_bytes(), path.stat().st_mtime_ns)
+                     for path in self.runs.rglob("*") if path.is_file()}
+        operational_runs = Path(config["runs_dir"])
+        with mock.patch.object(clockify_review_run, "RUNS", operational_runs):
+            first = cycle.adopt_historical_slice(config, request)
+            self.assertEqual(operational_runs, clockify_review_run.RUNS)
+            state_path = self.state_dir / "review-cycle-state.json"
+            state = json.loads(state_path.read_bytes())
+            record = state["slices"][self.since]
+            adoption = json.loads(Path(record["historical_adoption_receipt"]).read_bytes())
+            self.assertEqual(str(self.runs), adoption["runs_root"])
+            self.assertEqual(str(derived), record["source"]["run_dir"])
+            self.assertEqual(self.until, state["completed_through"])
+            durable = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in (
+                state_path, Path(record["delivery_receipt"]),
+                Path(record["historical_adoption_receipt"]),
+            )}
+            cycle._validate_delivered_state(config, state)
+            self.assertEqual(first, cycle.adopt_historical_slice(config, request))
+            self.assertEqual(operational_runs, clockify_review_run.RUNS)
+            self.assertEqual(durable, {path: (path.read_bytes(), path.stat().st_mtime_ns)
+                                      for path in durable})
+        self.assertEqual(original_config, config)
+        self.assertEqual("delivered", first["status"])
+        self.assertEqual([], list(operational_runs.iterdir()))
+        self.assertEqual(immutable, {path: (path.read_bytes(), path.stat().st_mtime_ns)
+                                     for path in immutable})
+
+    def test_native_v2_external_graph_rejects_missing_altered_and_uncontrolled_roots(self):
+        """Catches root selection becoming discovery or escaping owner-controlled containment."""
+        config, request, _derived, _collector = self._external_graph_request()
+        wrong = self.root / "wrong-runs"
+        wrong.mkdir()
+        uncontrolled = self.root / "shared-runs"
+        uncontrolled.mkdir(mode=0o777)
+        uncontrolled.chmod(0o777)
+        linked = self.root / "linked-runs"
+        linked.symlink_to(self.runs, target_is_directory=True)
+        state_path = self.state_dir / "review-cycle-state.json"
+        before = state_path.read_bytes()
+        for root in (None, "relative-runs", str(self.root / "missing-runs"),
+                     str(wrong), str(uncontrolled), str(linked)):
+            with self.subTest(root=root), mock.patch.object(
+                clockify_review_run, "RUNS", Path(config["runs_dir"]),
+            ):
+                changed = {**request, "runs_root": root}
+                with self.assertRaises(cycle.CycleError):
+                    cycle.adopt_historical_slice(config, changed)
+                self.assertEqual(Path(config["runs_dir"]), clockify_review_run.RUNS)
+                self.assertEqual(before, state_path.read_bytes())
+                self.assertFalse((self.state_dir / "delivery-receipts").exists())
+        unscoped = {key: value for key, value in request.items() if key != "runs_root"}
+        with self.assertRaisesRegex(cycle.CycleError, "escapes its bounded run"):
+            cycle.adopt_historical_slice(config, unscoped)
+
+    def test_native_v2_external_graph_rejects_out_of_root_artifacts_and_provenance(self):
+        """Catches scoping only the source while admitting an unbounded replay, publisher or ancestor."""
+        config, request, _derived, _collector = self._external_graph_request()
+        before = (self.state_dir / "review-cycle-state.json").read_bytes()
+        for key in ("source_result", "replay_result", "publication_result"):
+            with self.subTest(key=key):
+                outside = self.root / key / Path(request[key]).name
+                outside.parent.mkdir()
+                shutil.copyfile(request[key], outside)
+                changed = {**request, key: str(outside)}
+                with self.assertRaisesRegex(cycle.CycleError, "escapes its bounded run"):
+                    cycle.adopt_historical_slice(config, changed)
+                self.assertEqual(before, (self.state_dir / "review-cycle-state.json").read_bytes())
+        changed = {**request, "source_provenance": {
+            **request["source_provenance"], "derivation_run_dir": str(self.root / "ancestor"),
+        }}
+        with self.assertRaisesRegex(cycle.CycleError, "derivation provenance"):
+            cycle.adopt_historical_slice(config, changed)
+
+    def test_native_v2_external_graph_revalidates_source_and_publication_drift(self):
+        """Catches receipt-scoped adoption trusting sealed metadata after graph bytes change."""
+        config, request, _derived, collector = self._external_graph_request()
+        cycle.adopt_historical_slice(config, request)
+        state = json.loads((self.state_dir / "review-cycle-state.json").read_bytes())
+        publication = Path(request["publication_result"])
+        original_publication = publication.read_bytes()
+        write_json(publication, {"status": "tampered"})
+        with self.assertRaisesRegex(cycle.CycleError, "publication result identity"):
+            cycle._validate_delivered_state(config, state)
+        publication.write_bytes(original_publication)
+        write_json(collector / "evidence" / "clockify-existing.json", {
+            "status": "complete", "entries": [{"tampered": True}],
+        })
+        with self.assertRaisesRegex(cycle.CycleError, "collector derivation provenance"):
+            cycle._validate_delivered_state(config, state)
+
+    def test_native_v2_delivered_receipt_rejects_missing_graph_and_changed_root_identity(self):
+        """Catches a durable delivery silently falling back when its pinned graph disappears."""
+        config, request, _derived, _collector = self._external_graph_request()
+        cycle.adopt_historical_slice(config, request)
+        state_path = self.state_dir / "review-cycle-state.json"
+        before = state_path.read_bytes()
+        state = json.loads(before)
+        record = state["slices"][self.since]
+        path = Path(record["historical_adoption_receipt"])
+        document = json.loads(path.read_bytes())
+        detached = self.root / "detached-runs"
+        self.runs.rename(detached)
+        try:
+            with self.assertRaisesRegex(cycle.CycleError, "runs root"):
+                cycle._validate_delivered_state(config, state)
+        finally:
+            detached.rename(self.runs)
+        document["runs_root"] = str(Path(config["runs_dir"]))
+        write_json(path, document)
+        with self.assertRaisesRegex(cycle.CycleError, "receipt identity differs"):
+            cycle._validate_delivered_state(config, state)
+        # Even rehashing both stored claims cannot admit paths outside the
+        # replacement graph's containment boundary.
+        unsigned = {key: value for key, value in document.items() if key != "receipt_digest"}
+        document["receipt_digest"] = cycle._value_digest(unsigned)
+        record["historical_adoption_receipt_digest"] = document["receipt_digest"]
+        write_json(path, document)
+        with self.assertRaisesRegex(cycle.CycleError, "escapes its bounded run"):
+            cycle._validate_delivered_state(config, state)
+        self.assertEqual(before, state_path.read_bytes())
+
+    def test_native_v2_external_graph_preserves_publication_target_validation(self):
+        """Catches a scoped graph overriding the operational spreadsheet destination."""
+        config, request, _derived, _collector = self._external_graph_request()
+        cycle.adopt_historical_slice(config, request)
+        state = json.loads((self.state_dir / "review-cycle-state.json").read_bytes())
+        with self.assertRaisesRegex(cycle.CycleError, "readbacks differ"):
+            cycle._validate_delivered_state({**config, "spreadsheet_id": "wrong-sheet"}, state)
+
+    def test_native_v2_repeat_does_not_leak_external_graph_to_legacy_native_slice(self):
+        """Catches an outer adoption scope contaminating another receipt's native ancestry."""
+        request, _derived, _collector = self._derived_adoption_request()
+        request["runs_root"] = str(self.runs)
+        cycle.adopt_historical_slice(self.config, request)
+        second = HistoricalAdoptionTests()
+        second.fixture_since = self.until
+        second.fixture_until = "2026-09-11"
+        second.setUp()
+        self.addCleanup(second.doCleanups)
+        second_request, _second_derived, _second_collector = second._derived_adoption_request()
+        state_path = self.state_dir / "review-cycle-state.json"
+        state = json.loads(state_path.read_bytes())
+        second_state = json.loads((second.state_dir / "review-cycle-state.json").read_bytes())
+        second_record = second_state["slices"][second.since]
+        for source, destination in zip(
+            cycle._period_paths(second.state_dir, second.since),
+            cycle._period_paths(self.state_dir, second.since),
+        ):
+            shutil.copyfile(source, destination)
+        second_record["period_manifest"] = str(cycle._period_paths(self.state_dir, second.since)[1])
+        state["slices"][second.since] = second_record
+        write_json(state_path, state)
+        # The current config's operational graph owns the legacy v2 receipt;
+        # the earlier receipt explicitly owns its different historical graph.
+        config = {**second.config, "state_dir": str(self.state_dir)}
+        cycle.adopt_historical_slice(config, second_request)
+        state = json.loads(state_path.read_bytes())
+        self.assertEqual(second.until, state["completed_through"])
+        with mock.patch.object(clockify_review_run, "RUNS", second.runs):
+            cycle._validate_delivered_state(config, state)
+            repeated = cycle.adopt_historical_slice(config, request)
+            self.assertEqual(second.runs, clockify_review_run.RUNS)
+        self.assertEqual("delivered", repeated["status"])
 
     def test_derived_adoption_rejects_rewritten_lineage(self):
         """Catches trusting a matching request digest instead of verifying ancestry."""

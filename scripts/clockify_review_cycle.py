@@ -14,7 +14,7 @@ import hashlib
 import importlib.util
 import json
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 import stat
 import string
@@ -4005,11 +4005,12 @@ def _historical_adoption_document(
         source = document.get("source")
         if not isinstance(source, Mapping):
             raise CycleError("historical credit adoption source is invalid")
-        _verify_credit_adoption_transition(
-            config, Path(str(source.get("run_dir") or "")),
-            document["frozen_snapshot_digests"]["review-corrections.jsonl"],
-            adopted["review-corrections.jsonl"],
-        )
+        with _native_adoption_runs_config(config, document) as validation:
+            _verify_credit_adoption_transition(
+                validation, Path(str(source.get("run_dir") or "")),
+                document["frozen_snapshot_digests"]["review-corrections.jsonl"],
+                adopted["review-corrections.jsonl"],
+            )
     return document
 
 
@@ -4108,57 +4109,60 @@ def _validate_delivered_state(config: Mapping[str, Any], state: Mapping[str, Any
             _verify_delivery_receipt(Path(str(raw_record.get("delivery_receipt"))), config,
                 since, until, source, replay, sheet_title=_sheet_title(config["monthly_sheet_title_template"],since=since))
             continue
-        expected_snapshots = _stored_snapshot_digests(raw_record)
-        if "fresh_input_binding" in raw_record:
-            expected_snapshots = _fresh_input_binding(config, dict(raw_record), since, until, manifest_path)
-        if "routing_transition" in raw_record:
-            transitioned = _routing_transition_source(config, dict(raw_record), since, until, manifest_path)
-            if transitioned is None:
-                raise CycleError("delivered routing transition source is missing")
-            expected_snapshots = transitioned["snapshot_digests"]
-        adoption = _historical_adoption_document(config, raw_record, since, until)
-        stage_config = config
-        if adoption is not None:
-            expected_snapshots = dict(adoption["adopted_snapshot_digests"])
-            stage_config = dict(config)
-            stage_config.setdefault(
-                "_runtime_identity",
-                clockify_review_run.clockify_sync_collect.collector_runtime_identity(),
+        # Scope each sealed graph independently; never let one historical
+        # receipt change the root used to validate another delivered slice.
+        scope = _native_adoption_runs_config(config, adoption) if adoption is not None else nullcontext(config)
+        with scope as graph_config:
+            expected_snapshots = _stored_snapshot_digests(raw_record)
+            if "fresh_input_binding" in raw_record:
+                expected_snapshots = _fresh_input_binding(graph_config, dict(raw_record), since, until, manifest_path)
+            if "routing_transition" in raw_record:
+                transitioned = _routing_transition_source(graph_config, dict(raw_record), since, until, manifest_path)
+                if transitioned is None:
+                    raise CycleError("delivered routing transition source is missing")
+                expected_snapshots = transitioned["snapshot_digests"]
+            stage_config = graph_config
+            if adoption is not None:
+                expected_snapshots = dict(adoption["adopted_snapshot_digests"])
+                stage_config = dict(graph_config)
+                stage_config.setdefault(
+                    "_runtime_identity",
+                    clockify_review_run.clockify_sync_collect.collector_runtime_identity(),
+                )
+            verified_manifest = _ensure_period(
+                config, _path(config, "state_dir"), since, until, bind_inputs=False
             )
-        verified_manifest = _ensure_period(
-            config, _path(config, "state_dir"), since, until, bind_inputs=False
-        )
-        if raw_record.get("period_manifest") != str(verified_manifest):
-            raise CycleError("delivered slice period manifest identity has drifted")
-        source = _stage_from_state(
-            stage_config, raw_record, "source", since, until, replay=False,
-            expected_snapshot_digests=expected_snapshots,
-        )
-        if source is None:
-            raise CycleError("delivered slice has no verified source stage")
-        if "fresh_input_binding" in raw_record:
-            _verify_fresh_native_source(config, raw_record, source)
-        replay = _stage_from_state(
-            stage_config, raw_record, "replay", since, until, replay=True,
-            expected_snapshot_digests=source["snapshot_digests"],
-            source_run_id=str(source["run_id"]), source_run_dir=str(source["run_dir"]),
-        )
-        if replay is None:
-            raise CycleError("delivered slice has no verified replay stage")
-        if adoption is not None:
-            _verify_historical_adoption(
-                stage_config, raw_record, adoption, since, until, source, replay,
+            if raw_record.get("period_manifest") != str(verified_manifest):
+                raise CycleError("delivered slice period manifest identity has drifted")
+            source = _stage_from_state(
+                stage_config, raw_record, "source", since, until, replay=False,
+                expected_snapshot_digests=expected_snapshots,
             )
-        partial = raw_record.get("status") == "published_with_source_gaps"
-        if partial != (source["coverage"].get("status") != "complete"):
-            raise CycleError("publication status differs from source coverage")
-        receipt = raw_record.get("publication_receipt" if partial else "delivery_receipt")
-        if not isinstance(receipt, str):
-            raise CycleError("delivered slice has no delivery receipt")
-        title = _sheet_title(config["monthly_sheet_title_template"], since=since)
-        _verify_delivery_receipt(
-            Path(receipt), config, since, until, source, replay, sheet_title=title
-        )
+            if source is None:
+                raise CycleError("delivered slice has no verified source stage")
+            if "fresh_input_binding" in raw_record:
+                _verify_fresh_native_source(graph_config, raw_record, source)
+            replay = _stage_from_state(
+                stage_config, raw_record, "replay", since, until, replay=True,
+                expected_snapshot_digests=source["snapshot_digests"],
+                source_run_id=str(source["run_id"]), source_run_dir=str(source["run_dir"]),
+            )
+            if replay is None:
+                raise CycleError("delivered slice has no verified replay stage")
+            if adoption is not None:
+                _verify_historical_adoption(
+                    stage_config, raw_record, adoption, since, until, source, replay,
+                )
+            partial = raw_record.get("status") == "published_with_source_gaps"
+            if partial != (source["coverage"].get("status") != "complete"):
+                raise CycleError("publication status differs from source coverage")
+            receipt = raw_record.get("publication_receipt" if partial else "delivery_receipt")
+            if not isinstance(receipt, str):
+                raise CycleError("delivered slice has no delivery receipt")
+            title = _sheet_title(config["monthly_sheet_title_template"], since=since)
+            _verify_delivery_receipt(
+                Path(receipt), graph_config, since, until, source, replay, sheet_title=title
+            )
 
 
 def _attempt_id(debt_id: str, ordinal: int) -> str:
@@ -5231,6 +5235,29 @@ def _selected_runs_config(config: Mapping[str, Any], runs_root: str) -> Iterator
         clockify_review_run.RUNS = previous
 
 
+@contextmanager
+def _native_adoption_runs_config(
+    config: Mapping[str, Any], document: Mapping[str, Any] | None,
+) -> Iterator[Mapping[str, Any]]:
+    """Use only the native v2 receipt's pinned graph, preserving durable state."""
+    if document is None or "runs_root" not in document:
+        # An outer native import may currently own another graph. Legacy
+        # receipts still belong to the operational root, not that outer scope.
+        previous = clockify_review_run.RUNS
+        clockify_review_run.RUNS = _runs_dir(config)
+        try:
+            yield config
+        finally:
+            clockify_review_run.RUNS = previous
+        return
+    if (document.get("schema_version") not in {
+        DERIVED_ADOPTION_REQUEST_SCHEMA_VERSION, DERIVED_ADOPTION_SCHEMA_VERSION,
+    } or not isinstance(document["runs_root"], str) or not document["runs_root"]):
+        raise CycleError("native historical runs root is invalid")
+    with _selected_runs_config(config, document["runs_root"]) as validation:
+        yield validation
+
+
 def _selected_stages(config: Mapping[str,Any], request: Mapping[str,Any]) -> tuple[dict[str,Any],dict[str,Any]]:
     frozen, adopted = request["frozen_snapshot_digests"], request["adopted_snapshot_digests"]
     if (not isinstance(frozen,Mapping) or not isinstance(adopted,Mapping) or set(frozen) != set(adopted)
@@ -5415,7 +5442,10 @@ def adopt_historical_slice(
     derived = (
         isinstance(request, Mapping)
         and request.get("schema_version") == DERIVED_ADOPTION_REQUEST_SCHEMA_VERSION
-        and set(request) == common_required | {"source_provenance"}
+        and set(request) in (
+            common_required | {"source_provenance"},
+            common_required | {"source_provenance", "runs_root"},
+        )
     )
     if not (legacy or derived):
         raise CycleError("historical adoption request is invalid")
@@ -5433,7 +5463,10 @@ def adopt_historical_slice(
     state_dir = _path(config, "state_dir")
     state_path = state_dir / "review-cycle-state.json"
     debt_path = state_dir / "source-coverage.json"
-    with single_instance(state_dir / "review-cycle.lock") as acquired:
+    with (
+        _native_adoption_runs_config(config, request) as validation_config,
+        single_instance(state_dir / "review-cycle.lock") as acquired,
+    ):
         if not acquired:
             return {"status": "locked", "slice": {"since": since, "until": until}}
         state = _state(state_path, recovery_since=str(config["recovery_since"]))
@@ -5442,10 +5475,11 @@ def adopt_historical_slice(
             raise CycleError("historical adoption requires an existing exact slice")
         record = dict(raw_record)
         if record.get("status") in {"delivered", "delivered_with_exceptions"}:
-            adoption = _historical_adoption_document(config, record, since, until)
-            if adoption is None or adoption.get("request_digest") != _value_digest(dict(request)):
-                raise CycleError("delivered slice has different adoption identity")
-            _validate_delivered_state(config, state)
+            with _native_adoption_runs_config(config, None):
+                adoption = _historical_adoption_document(config, record, since, until)
+                if adoption is None or adoption.get("request_digest") != _value_digest(dict(request)):
+                    raise CycleError("delivered slice has different adoption identity")
+                _validate_delivered_state(config, state)
             return {"status": str(record["status"]), "slice": {"since": since, "until": until}}
         if any(record.get(key) is not None for key in (
             "source", "replay", "delivery_receipt", "historical_adoption_receipt",
@@ -5468,19 +5502,19 @@ def adopt_historical_slice(
             ):
                 raise CycleError("historical adoption changed non-routing frozen inputs")
         source_path = _safe_run_file(
-            _runs_dir(config), request["source_result"], "historical source result"
+            _runs_dir(validation_config), request["source_result"], "historical source result"
         )
         if adopted["review-corrections.jsonl"] != frozen["review-corrections.jsonl"]:
             _verify_credit_adoption_transition(
-                config, source_path.parent,
+                validation_config, source_path.parent,
                 frozen["review-corrections.jsonl"],
                 adopted["review-corrections.jsonl"],
             )
         replay_path = _safe_run_file(
-            _runs_dir(config), request["replay_result"], "historical replay result"
+            _runs_dir(validation_config), request["replay_result"], "historical replay result"
         )
         publication_path = _safe_run_file(
-            _runs_dir(config), request["publication_result"], "historical publication result"
+            _runs_dir(validation_config), request["publication_result"], "historical publication result"
         )
         for name, path in (
             ("source_result_digest", source_path),
@@ -5489,7 +5523,7 @@ def adopt_historical_slice(
         ):
             if _digest(path) != request[name]:
                 raise CycleError(f"historical adoption {name} differs")
-        validation_config = dict(config)
+        validation_config = dict(validation_config)
         validation_config.setdefault(
             "_runtime_identity",
             clockify_review_run.clockify_sync_collect.collector_runtime_identity(),
@@ -5516,7 +5550,7 @@ def adopt_historical_slice(
         title = _sheet_title(config["monthly_sheet_title_template"], since=since)
         publication_document = _json_file(publication_path, "publisher result")
         publication_profile = publication_document.get("publication_profile")
-        publication_config = _receipt_publication_config(config, publication_document)
+        publication_config = _receipt_publication_config(validation_config, publication_document)
         expected_publications = _expected_publication_receipts(
             publication_config, source, sheet_title=title, publication_profile=publication_profile,
         )
@@ -5556,6 +5590,8 @@ def adopt_historical_slice(
             unsigned["publication_alias_proof"] = publication_document["publication_alias_proof"]
         if derived:
             unsigned["source_provenance"] = dict(request["source_provenance"])
+            if "runs_root" in request:
+                unsigned["runs_root"] = request["runs_root"]
         else:
             unsigned.update({
                 "checkpoint_root": request["checkpoint_root"],
