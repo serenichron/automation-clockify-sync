@@ -123,6 +123,267 @@ class ClockifyCheckpointSnapshotTests(unittest.TestCase):
     def identity_directory_name(self):
         return self.store._directory_for(self.identity).name
 
+    def stopped_observation_variance(self, *, entry=None, observed="2026-10-01T12:00:00.625Z"):
+        entry = copy.deepcopy(entry or ENTRY)
+        entry["timeInterval"] = {
+            "start": "2026-09-10T09:00:00Z", "end": "2026-09-10T09:50:38Z",
+            "duration": "PT50M38S",
+        }
+        evidence = copy.deepcopy(EVIDENCE)
+        evidence["entries"][0].update(end="2026-09-10 12:50", duration="PT50M38S")
+        self.source_evidence.write_text(json.dumps(evidence, indent=2) + "\n")
+        return self.checkpoint([[entry]], metadata={"snapshot_at": observed}), entry
+
+    def test_stopped_observation_variance_requires_opt_in_and_replays_original_bytes(self):
+        manifest, entry = self.stopped_observation_variance()
+        original = {"manifest.json": manifest.read_bytes(),
+                    "pages/000001.json": (manifest.parent / "pages/000001.json").read_bytes(),
+                    "evidence": self.source_evidence.read_bytes()}
+        with self.assertRaisesRegex(ValueError, "projection"):
+            self.capture(manifest)
+        self.assertFalse(self.destination.exists())
+        with patch.object(collector, "clockify_get", side_effect=AssertionError("network forbidden")):
+            try:
+                captured = self.capture(manifest, allow_stopped_only_legacy_observation_variance=True)
+            except (TypeError, ValueError) as error:
+                self.fail(f"explicit stopped-only observation compatibility must capture: {error}")
+            manifest.write_text("source no longer available")
+            self.source_evidence.write_text("source no longer available")
+            loaded = self.load(captured)
+        self.assertEqual([entry], loaded.entries)
+        self.assertEqual("2026-10-01T12:00:00.625000Z", loaded.manifest["snapshot_at"])
+        self.assertEqual("clockify-native-checkpoint-snapshot/v2", loaded.manifest["schema_version"])
+        self.assertEqual({
+            "mode": "stopped-only-legacy-observation-variance/v1",
+            "checkpoint_observed_at": "2026-10-01T12:00:00.625Z",
+            "source_observed_at": OBSERVED,
+        }, loaded.manifest["observation_compatibility"])
+        prefix = f"checkpoint/{self.identity_directory_name()}"
+        self.assertEqual(original["manifest.json"], loaded.verified_artifact_bytes[f"{prefix}/manifest.json"])
+        self.assertEqual(original["pages/000001.json"], loaded.verified_artifact_bytes[f"{prefix}/pages/000001.json"])
+        self.assertEqual(original["evidence"], loaded.verified_artifact_bytes["clockify-existing.json"])
+
+    def test_opt_in_does_not_version_existing_exact_legacy_proofs(self):
+        captured = self.capture(allow_stopped_only_legacy_observation_variance=True)
+        self.assertEqual("clockify-native-checkpoint-snapshot/v1", captured.manifest["schema_version"])
+        self.assertNotIn("observation_compatibility", captured.manifest)
+        self.assertEqual([ENTRY], self.load(captured).entries)
+
+    def test_stopped_variance_internal_strict_validator_remains_strict(self):
+        manifest, entry = self.stopped_observation_variance()
+        files = {"manifest.json": manifest.read_bytes(),
+                 "pages/000001.json": (manifest.parent / "pages/000001.json").read_bytes()}
+        _, request = snapshot._request("workspace-one", "user-one", SINCE, UNTIL)
+        arguments = dict(identity=self.identity, request=request, since=SINCE, until=UNTIL)
+        with self.assertRaisesRegex(ValueError, "projection"):
+            snapshot._validate(manifest.parent, files, self.source_evidence.read_bytes(), **arguments)
+        entries, observed, legacy_match, compatibility = snapshot._validate_with_compatibility(
+            manifest.parent, files, self.source_evidence.read_bytes(), **arguments,
+            allow_stopped_only_legacy_observation_variance=True,
+        )
+        self.assertEqual([entry], entries)
+        self.assertEqual("2026-10-01T12:00:00.625000Z", observed)
+        self.assertFalse(legacy_match, "observation variance must not unlock legacy proof rounding")
+        self.assertEqual(OBSERVED, compatibility["source_observed_at"])
+
+    def test_stopped_variance_rejects_any_other_frozen_value_key_count_or_order_difference(self):
+        manifest, _ = self.stopped_observation_variance()
+        original = json.loads(self.source_evidence.read_bytes())
+        changes = [
+            ((), "status", "partial"), ((), "complete", False),
+            ((), "running_entry_count", 1), ((), "running_entry_snapshot_count", 1),
+            ((), "running_entry_count", False), ((), "pages_fetched", True),
+            ((), "unknown_field", "extra"), ((), "entries", []),
+            ((), "entries", original["entries"] * 2),
+            (("entries", 0), "running", True), (("entries", 0), "running", 0),
+            (("entries", 0), "running_snapshot", {}),
+            (("entries", 0), "description", "Different work"),
+            (("entries", 0), "billable", 0), (("entries", 0), "unknown_field", "extra"),
+            (("entries", 0), "start", "2026-09-10T09:00:00Z"),
+            (("entries", 0), "end", "2026-09-10T09:50:38Z"),
+            (("collection_snapshot",), "unknown_field", "extra"),
+            (("collection_snapshot",), "boundary", "2026-10-01T00:00:01Z"),
+            (("collection_snapshot",), "requested_until", "2026-10-01T00:00:01Z"),
+        ]
+        for path, field, value in changes:
+            with self.subTest(path=path, field=field, value=value):
+                evidence = copy.deepcopy(original)
+                target = evidence
+                for key in path:
+                    target = target[key]
+                target[field] = value
+                self.source_evidence.write_text(json.dumps(evidence))
+                with self.assertRaises(ValueError):
+                    self.capture(manifest, allow_stopped_only_legacy_observation_variance=True)
+                self.assertFalse(self.destination.exists())
+        for path, field in [(("entries", 0), "running_snapshot"),
+                            (("entries", 0), "duration"), ((), "complete")]:
+            with self.subTest(missing=field):
+                evidence = copy.deepcopy(original)
+                target = evidence
+                for key in path:
+                    target = target[key]
+                del target[field]
+                self.source_evidence.write_text(json.dumps(evidence))
+                with self.assertRaises(ValueError):
+                    self.capture(manifest, allow_stopped_only_legacy_observation_variance=True)
+                self.assertFalse(self.destination.exists())
+
+    def test_stopped_variance_rejects_reordered_full_entry_projection(self):
+        second = copy.deepcopy(ENTRY)
+        second.update(id="fedcba987654321001234568", description="Second work")
+        manifest = self.checkpoint([[ENTRY, second]], metadata={"snapshot_at": "2026-10-01T12:00:00Z"})
+        evidence = copy.deepcopy(EVIDENCE)
+        second_projection = copy.deepcopy(evidence["entries"][0])
+        second_projection.update(id_suffix="01234568", description="Second work")
+        evidence["entries"] = [second_projection, evidence["entries"][0]]
+        self.source_evidence.write_text(json.dumps(evidence))
+        with self.assertRaisesRegex(ValueError, "projection"):
+            self.capture(manifest, allow_stopped_only_legacy_observation_variance=True)
+        self.assertFalse(self.destination.exists())
+
+    def test_stopped_variance_rejects_source_observation_before_end_equal_earlier_naive_or_malformed(self):
+        manifest, _ = self.stopped_observation_variance()
+        evidence = json.loads(self.source_evidence.read_bytes())
+        for observed in ("2026-09-30T23:59:59Z", "2026-10-01T12:00:00.625Z",
+                         "2026-10-01T12:00:00.624Z", "2026-10-02T12:00:00", "bad", None):
+            with self.subTest(observed=observed):
+                evidence["collection_snapshot"]["observed_at"] = observed
+                self.source_evidence.write_text(json.dumps(evidence))
+                with self.assertRaises(ValueError):
+                    self.capture(manifest, allow_stopped_only_legacy_observation_variance=True)
+                self.assertFalse(self.destination.exists())
+
+    def test_stopped_variance_rejects_checkpoint_observation_before_end_later_naive_or_malformed(self):
+        for index, observed in enumerate(("2026-09-30T23:59:59Z", "2026-10-02T12:00:01Z",
+                                          "2026-10-01T12:00:00", "bad")):
+            with self.subTest(observed=observed):
+                self.store = checkpoints.PageCheckpointStore(self.root / f"observation-{index}")
+                manifest, _ = self.stopped_observation_variance(observed=observed)
+                with self.assertRaises(ValueError):
+                    self.capture(manifest, allow_stopped_only_legacy_observation_variance=True)
+                self.assertFalse(self.destination.exists())
+
+    def test_stopped_variance_rejects_invalid_native_bounds_even_with_matching_legacy_entries(self):
+        cases = [
+            ("2026-09-10T09:00:00Z", "2026-10-03T10:00:00Z", "2026-09-10 12:00", "2026-10-03 13:00"),
+            ("2026-09-10T09:00:00Z", "2026-10-01T00:00:01Z", "2026-09-10 12:00", "2026-10-01 03:00"),
+            ("2026-09-10T09:00:00Z", "2026-09-10T08:59:59Z", "2026-09-10 12:00", "2026-09-10 11:59"),
+            ("2026-09-10T09:00:00Z", "2026-09-10T09:00:00Z", "2026-09-10 12:00", "2026-09-10 12:00"),
+            ("2026-08-31T23:59:59Z", "2026-09-10T10:00:00Z", "2026-09-01 02:59", "2026-09-10 13:00"),
+            ("2026-09-10T09:00:00", "2026-09-10T10:00:00Z", "2026-09-10 12:00", "2026-09-10 13:00"),
+            ("2026-09-10T09:00:00Z", "2026-09-10T10:00:00", "2026-09-10 12:00", "2026-09-10 13:00"),
+            ("2026-09-10T09:00:00Z", "bad", "2026-09-10 12:00", None),
+            ("2026-09-10T09:00:00Z", "", "2026-09-10 12:00", None),
+        ]
+        for index, (start, end, frozen_start, frozen_end) in enumerate(cases):
+            with self.subTest(start=start, end=end):
+                self.store = checkpoints.PageCheckpointStore(self.root / f"interval-{index}")
+                entry = copy.deepcopy(ENTRY)
+                entry["timeInterval"].update(start=start, end=end)
+                manifest = self.checkpoint([[entry]], metadata={"snapshot_at": "2026-10-01T12:00:00Z"})
+                evidence = copy.deepcopy(EVIDENCE)
+                evidence["entries"][0].update(start=frozen_start, end=frozen_end)
+                self.source_evidence.write_text(json.dumps(evidence))
+                with self.assertRaises(ValueError):
+                    self.capture(manifest, allow_stopped_only_legacy_observation_variance=True)
+                self.assertFalse(self.destination.exists())
+
+    def test_stopped_variance_rejects_native_running_end_even_with_matching_running_snapshot(self):
+        entry = copy.deepcopy(ENTRY)
+        entry["timeInterval"].update(end=None, duration=None)
+        manifest = self.checkpoint([[entry]], metadata={"snapshot_at": "2026-10-01T12:00:00Z"})
+        evidence = copy.deepcopy(EVIDENCE)
+        evidence.update(running_entry_count=1, running_entry_snapshot_count=1)
+        evidence["entries"][0].update(end="2026-10-01 03:00", running=True, duration=None,
+            running_snapshot={"observed_at": "2026-10-01T12:00:00Z", "boundary": "2026-10-01T00:00:00Z",
+                              "basis": "collection_snapshot_boundary"})
+        self.source_evidence.write_text(json.dumps(evidence))
+        with self.assertRaisesRegex(ValueError, "projection"):
+            self.capture(manifest, allow_stopped_only_legacy_observation_variance=True)
+        self.assertFalse(self.destination.exists())
+
+    def test_stopped_variance_retains_identity_and_checkpoint_integrity_requirements(self):
+        for index, field in enumerate(("workspaceId", "userId", "id", "taskId", "duplicate", "incomplete", "page", "manifest")):
+            with self.subTest(field=field):
+                self.store = checkpoints.PageCheckpointStore(self.root / f"integrity-{index}")
+                entry = copy.deepcopy(ENTRY)
+                if field in ("workspaceId", "userId"):
+                    entry[field] = "foreign"
+                elif field == "id":
+                    entry[field] = ""
+                elif field == "taskId":
+                    del entry[field]
+                manifest = self.checkpoint([[entry, entry] if field == "duplicate" else [entry]],
+                    complete=field != "incomplete", metadata={"snapshot_at": "2026-10-01T12:00:00Z"})
+                if field == "page":
+                    page = manifest.parent / "pages/000001.json"
+                    corrupted = json.loads(page.read_bytes())
+                    corrupted["payload"][0]["description"] = "corrupted page"
+                    page.write_text(json.dumps(corrupted))
+                elif field == "manifest":
+                    manifest.write_text("{}")
+                with self.assertRaises(ValueError):
+                    self.capture(manifest, allow_stopped_only_legacy_observation_variance=True)
+                self.assertFalse(self.destination.exists())
+
+    def test_stopped_variance_proof_metadata_schema_and_observation_are_rederived_not_trusted(self):
+        manifest, _ = self.stopped_observation_variance()
+        captured = self.capture(manifest, allow_stopped_only_legacy_observation_variance=True)
+        original = copy.deepcopy(captured.manifest)
+        mutations = [
+            ("mode", "unsupported"), ("checkpoint_observed_at", "2026-10-01T12:00:00.625000Z"),
+            ("source_observed_at", "2026-10-02T12:00:01Z"), ("unknown", "extra"),
+            ("snapshot_at", "2026-10-01T12:00:00Z"), ("snapshot_at", OBSERVED),
+            ("schema_version", "clockify-native-checkpoint-snapshot/v1"),
+            ("missing", None), ("downgrade", None),
+        ]
+        for field, value in mutations:
+            with self.subTest(field=field, value=value):
+                proof = copy.deepcopy(original)
+                if field in ("schema_version", "snapshot_at"):
+                    proof[field] = value
+                elif field == "missing":
+                    del proof["observation_compatibility"]
+                elif field == "downgrade":
+                    proof["schema_version"] = "clockify-native-checkpoint-snapshot/v1"
+                    del proof["observation_compatibility"]
+                else:
+                    proof["observation_compatibility"][field] = value
+                raw = (json.dumps(proof) + "\n").encode()
+                (self.destination / "snapshot.json").write_bytes(raw)
+                with self.assertRaises(ValueError):
+                    self.load(captured, expected_manifest_sha256=hashlib.sha256(raw).hexdigest())
+
+    def test_stopped_variance_replay_rechecks_pinned_source_predicate_and_artifact_hashes(self):
+        manifest, _ = self.stopped_observation_variance()
+        captured = self.capture(manifest, allow_stopped_only_legacy_observation_variance=True)
+        evidence_path = self.destination / "clockify-existing.json"
+        evidence_raw = evidence_path.read_bytes()
+        evidence_path.write_bytes(evidence_raw + b" ")
+        with self.assertRaisesRegex(ValueError, "hash"):
+            self.load(captured)
+        for field, value in (("unknown", "extra"), ("running_entry_count", 1)):
+            with self.subTest(field=field):
+                evidence = json.loads(evidence_raw)
+                evidence[field] = value
+                changed = json.dumps(evidence).encode()
+                evidence_path.write_bytes(changed)
+                proof = copy.deepcopy(captured.manifest)
+                proof["files"]["clockify-existing.json"] = hashlib.sha256(changed).hexdigest()
+                proof_raw = json.dumps(proof).encode()
+                (self.destination / "snapshot.json").write_bytes(proof_raw)
+                with self.assertRaisesRegex(ValueError, "projection"):
+                    self.load(captured, expected_manifest_sha256=hashlib.sha256(proof_raw).hexdigest())
+
+    def test_observation_opt_in_requires_boolean_not_truthy_configuration(self):
+        manifest, _ = self.stopped_observation_variance()
+        for value in ("true", 1, None):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "boolean"):
+                    self.capture(manifest, allow_stopped_only_legacy_observation_variance=value)
+                self.assertFalse(self.destination.exists())
+
     def test_exact_precision_snapshot_retains_fractional_observation_and_native_bytes(self):
         entry = copy.deepcopy(ENTRY)
         entry["timeInterval"] = {"start": "2026-09-10T09:00:00.125Z", "end": "2026-09-10T09:50:38.875Z", "duration": "PT50M38.75S"}

@@ -25,6 +25,8 @@ except ModuleNotFoundError:  # direct script execution
 
 
 SCHEMA_VERSION = "clockify-native-checkpoint-snapshot/v1"
+SCHEMA_VERSION_V2 = "clockify-native-checkpoint-snapshot/v2"
+STOPPED_ONLY_LEGACY_OBSERVATION_VARIANCE = "stopped-only-legacy-observation-variance/v1"
 _NATIVE_FIELDS = {
     "id", "workspaceId", "userId", "description", "projectId", "tagIds",
     "taskId", "billable", "timeInterval",
@@ -133,6 +135,64 @@ def _legacy_minute_projection(projection: dict) -> dict:
 
 def _validate(directory: Path, files: dict[str, bytes], evidence: bytes, *, identity,
               request: dict, since: datetime, until: datetime):
+    """Existing strict validation and its exact legacy-rounding status."""
+    entries, observed, legacy_match, _ = _validate_with_compatibility(
+        directory, files, evidence, identity=identity, request=request, since=since, until=until,
+    )
+    return entries, observed, legacy_match
+
+
+def _stopped_only_observation_compatibility(entries, legacy_projection, bound_projection, *,
+                                           checkpoint_observed_at, observed, since, until):
+    """Admit different observations, never different evidence or native bounds."""
+    for entry in entries:
+        interval = entry["timeInterval"]
+        if interval["end"] is None:
+            return None
+        start = _timestamp(interval["start"], "native interval start")
+        end = _timestamp(interval["end"], "native interval end")
+        if not since <= start < end <= until:
+            return None
+    for document in (legacy_projection, bound_projection):
+        if document.get("status") != "ok" or document.get("complete") is not True:
+            return None
+        for field in ("running_entry_count", "running_entry_snapshot_count"):
+            if type(document.get(field)) is not int or document[field] != 0:
+                return None
+        rows = document.get("entries")
+        if not isinstance(rows, list) or len(rows) != len(entries):
+            return None
+        if any(not isinstance(row, dict) or row.get("running") is not False
+               or "running_snapshot" not in row or row["running_snapshot"] is not None for row in rows):
+            return None
+        collection = document.get("collection_snapshot")
+        if not isinstance(collection, dict):
+            return None
+        for field in ("boundary", "requested_until"):
+            if _timestamp(collection.get(field), f"collection {field}") != until:
+                return None
+    source_observed_at = bound_projection["collection_snapshot"].get("observed_at")
+    source_observed = _timestamp(source_observed_at, "source collection observation")
+    if not until <= observed < source_observed:
+        return None
+    comparison = copy.deepcopy(legacy_projection)
+    comparison["collection_snapshot"]["observed_at"] = source_observed_at
+    # Canonical full documents preserve keys, ordering of rows, and JSON types;
+    # no unknown fields are dropped and False is not treated as numeric zero.
+    if checkpoints._canonical(comparison) != checkpoints._canonical(bound_projection):
+        return None
+    return {
+        "mode": STOPPED_ONLY_LEGACY_OBSERVATION_VARIANCE,
+        "checkpoint_observed_at": checkpoint_observed_at,
+        "source_observed_at": source_observed_at,
+    }
+
+
+def _validate_with_compatibility(directory: Path, files: dict[str, bytes], evidence: bytes, *, identity,
+                                 request: dict, since: datetime, until: datetime,
+                                 allow_stopped_only_legacy_observation_variance: bool = False):
+    if not isinstance(allow_stopped_only_legacy_observation_variance, bool):
+        raise checkpoints.CheckpointError("stopped-only observation compatibility requires an explicit boolean")
     store = _CapturedStore(directory, files)
     state = store.open(identity)
     observed = _timestamp(state.metadata.get("snapshot_at"), "snapshot_at")
@@ -178,13 +238,22 @@ def _validate(directory: Path, files: dict[str, bytes], evidence: bytes, *, iden
         snapshot_at=observed, checkpoint_store=store,
     )
     bound_projection = _document(evidence)
-    legacy_match = bound_projection == _legacy_minute_projection(projection)
+    legacy_projection = _legacy_minute_projection(projection)
+    legacy_match = bound_projection == legacy_projection
+    compatibility = None
     if projection != bound_projection and not legacy_match:
-        raise checkpoints.CheckpointError("checkpoint projection does not match bound source-run evidence")
+        if allow_stopped_only_legacy_observation_variance:
+            compatibility = _stopped_only_observation_compatibility(
+                entries, legacy_projection, bound_projection,
+                checkpoint_observed_at=state.metadata["snapshot_at"], observed=observed,
+                since=since, until=until,
+            )
+        if compatibility is None:
+            raise checkpoints.CheckpointError("checkpoint projection does not match bound source-run evidence")
     # JSON round-trip converts the existing immutable checkpoint views to the
     # native JSON shape without dropping or shortening any fields.
     full_entries = [json.loads(checkpoints._canonical(_plain(entry))) for entry in entries]
-    return full_entries, collector._clockify_timestamp(observed.astimezone(timezone.utc)), legacy_match
+    return full_entries, collector._clockify_timestamp(observed.astimezone(timezone.utc)), legacy_match, compatibility
 
 
 def _plain(value):
@@ -197,7 +266,8 @@ def _plain(value):
 
 def capture_checkpoint_snapshot(*, checkpoint_manifest: Path, clockify_evidence: Path,
                                 destination: Path, workspace_id: str, user_id: str,
-                                since: datetime, until: datetime) -> ClockifyCheckpointSnapshot:
+                                since: datetime, until: datetime,
+                                allow_stopped_only_legacy_observation_variance: bool = False) -> ClockifyCheckpointSnapshot:
     """Validate an exact completed locator, then copy bytes into a fresh directory."""
     identity, request = _request(workspace_id, user_id, since, until)
     destination = _safe_path(destination)
@@ -225,7 +295,10 @@ def capture_checkpoint_snapshot(*, checkpoint_manifest: Path, clockify_evidence:
             raise checkpoints.CheckpointError("checkpoint page locator is invalid")
         files[relative] = _read(directory / relative)
     evidence = _read(clockify_evidence)
-    entries, observed, _ = _validate(directory, files, evidence, identity=identity, request=request, since=since, until=until)
+    entries, observed, _, compatibility = _validate_with_compatibility(
+        directory, files, evidence, identity=identity, request=request, since=since, until=until,
+        allow_stopped_only_legacy_observation_variance=allow_stopped_only_legacy_observation_variance,
+    )
     checkpoint_relative = f"checkpoint/{directory.name}"
     artifacts = {f"{checkpoint_relative}/{relative}": raw for relative, raw in files.items()}
     artifacts["clockify-existing.json"] = evidence
@@ -235,6 +308,9 @@ def capture_checkpoint_snapshot(*, checkpoint_manifest: Path, clockify_evidence:
         source_checkpoint_manifest=str(checkpoint_manifest), source_clockify_evidence=str(clockify_evidence),
         files={relative: _hash(raw) for relative, raw in artifacts.items()},
     )
+    if compatibility is not None:
+        proof["schema_version"] = SCHEMA_VERSION_V2
+        proof["observation_compatibility"] = compatibility
     proof_raw = checkpoints._canonical(proof) + b"\n"
     destination.mkdir(parents=True, exist_ok=False)
     for relative, raw in artifacts.items():
@@ -261,7 +337,10 @@ def load_checkpoint_snapshot(snapshot_dir: Path | None, *, workspace_id: str, us
     proof = _document(proof_raw)
     expected_keys = {"schema_version", "request", "checkpoint_identity", "snapshot_at", "entry_count",
                      "page_count", "source_checkpoint_manifest", "source_clockify_evidence", "files"}
-    if set(proof) != expected_keys or proof["schema_version"] != SCHEMA_VERSION:
+    version = proof.get("schema_version")
+    if version == SCHEMA_VERSION_V2:
+        expected_keys.add("observation_compatibility")
+    if set(proof) != expected_keys or version not in (SCHEMA_VERSION, SCHEMA_VERSION_V2):
         raise checkpoints.CheckpointError("snapshot manifest schema is unsupported")
     if proof["request"] != request or proof["checkpoint_identity"] != identity.document():
         raise checkpoints.CheckpointError("snapshot identity does not match trusted request")
@@ -282,8 +361,13 @@ def load_checkpoint_snapshot(snapshot_dir: Path | None, *, workspace_id: str, us
         artifacts[relative] = raw
     files = {relative.removeprefix(checkpoint_relative + "/"): raw for relative, raw in artifacts.items()
              if relative.startswith(checkpoint_relative + "/")}
-    entries, observed, legacy_match = _validate(snapshot_dir / checkpoint_relative, files, artifacts["clockify-existing.json"],
-                                 identity=identity, request=request, since=since, until=until)
+    entries, observed, legacy_match, compatibility = _validate_with_compatibility(
+        snapshot_dir / checkpoint_relative, files, artifacts["clockify-existing.json"],
+        identity=identity, request=request, since=since, until=until,
+        allow_stopped_only_legacy_observation_variance=version == SCHEMA_VERSION_V2,
+    )
+    if version == SCHEMA_VERSION_V2 and (compatibility is None or proof["observation_compatibility"] != compatibility):
+        raise checkpoints.CheckpointError("snapshot observation compatibility metadata does not match pinned evidence")
     observed_matches = proof["snapshot_at"] == observed or (
         legacy_match and proof["snapshot_at"] == collector.iso_utc(_timestamp(observed, "snapshot_at"))
     )

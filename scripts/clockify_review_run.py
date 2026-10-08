@@ -1070,14 +1070,20 @@ def _prepare_collector_derivation_run(
     executor_runtime_identity: Mapping[str, Any] | None = None,
     environment: Mapping[str, str] | None = None,
     pending_checkpoint_root: Path | None = None,
+    allow_stopped_only_legacy_observation_variance: bool = False,
 ) -> Path:
     """Create a write-once executor attempt from one immutable collector source."""
     source = _run_child(source, label="collector source")
     # Pending admission is explicit. A missing historical seal must not relax
     # ordinary completed-source derivation callers into a different contract.
     pending_source = pending_checkpoint_root is not None
+    if type(allow_stopped_only_legacy_observation_variance) is not bool or (
+        allow_stopped_only_legacy_observation_variance and not pending_source
+    ):
+        raise ReviewRunError("stopped-only observation compatibility requires explicit pending derivation")
     identity = (
-        collector_receipts.load_pending_collector_source(source, checkpoint_root=pending_checkpoint_root)
+        collector_receipts.load_pending_collector_source(source, checkpoint_root=pending_checkpoint_root,
+            allow_stopped_only_legacy_observation_variance=allow_stopped_only_legacy_observation_variance)
         if pending_source else collector_receipts.load_collector_source_bundle(source / "completion-bundle.json", run_dir=source)
     )
     executor = dict(
@@ -1339,8 +1345,12 @@ def _verified_collector_derivation(
         pending_binding = lineage["pending_source_binding"]
         if not isinstance(pending_binding, Mapping):
             raise ReviewRunError("pending derivation ancestor binding is invalid")
+        allow_variance = pending_binding.get("allow_stopped_only_legacy_observation_variance", False)
+        if type(allow_variance) is not bool:
+            raise ReviewRunError("pending derivation observation compatibility intent is invalid")
         identity = collector_receipts.load_pending_collector_source(
-            source, checkpoint_root=Path(str(pending_binding.get("checkpoint_root", "")))
+            source, checkpoint_root=Path(str(pending_binding.get("checkpoint_root", ""))),
+            allow_stopped_only_legacy_observation_variance=allow_variance,
         )
         if dict(identity.pending_binding) != pending_binding:
             raise ReviewRunError("pending derivation ancestor binding drifted")
@@ -3215,6 +3225,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--derive-pending-from", type=Path,
                         help="Derive one verified complete pending raw source into a new actor-bound child without collection.")
+    parser.add_argument("--allow-stopped-only-legacy-observation-variance", action="store_true",
+                        help="Explicitly admit different stopped-only legacy observations for --derive-pending-from; preserve and bind both original timestamps.")
     parser.add_argument("--repair-from", type=Path, help="Re-derive accounting in a distinct run from a completed source's exact snapshots and validated cache.")
     parser.add_argument(
         "--materialize-frozen-from", type=Path,
@@ -3648,6 +3660,9 @@ def _adopt_completed_recovery(source: Path) -> Path | None:
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(raw_argv)
+    if args.allow_stopped_only_legacy_observation_variance and args.derive_pending_from is None:
+        print("clockify review run: stopped-only observation compatibility requires --derive-pending-from", file=sys.stderr)
+        return 2
     if args.derive_pending_from is not None and (
         args.replay_from or args.resume_from or args.repair_from or args.materialize_frozen_from
         or args.recover_source_debt_from or args.since or args.until or args.no_enrich or args.calendly_optional
@@ -3789,7 +3804,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise ReviewRunError("pending derivation cannot accept a sealed source")
             snapshots["routing.json"] = args.routing
             child = _prepare_collector_derivation_run(source, snapshots,
-                pending_checkpoint_root=clockify_sync_collect.collector_checkpoint_root())
+                pending_checkpoint_root=clockify_sync_collect.collector_checkpoint_root(),
+                allow_stopped_only_legacy_observation_variance=args.allow_stopped_only_legacy_observation_variance)
             existing = _adopt_completed_collector_derivation(child)
             if existing is not None:
                 print(existing)

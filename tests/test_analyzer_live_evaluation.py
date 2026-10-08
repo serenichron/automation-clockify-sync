@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import stat
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -57,6 +59,112 @@ def _activity(members: list[dict], index: int, concepts: list[str]) -> dict:
 
 
 class AnalyzerLiveEvaluationTests(unittest.TestCase):
+    def test_invalid_probe_json_records_synthetic_response_and_stage(self) -> None:
+        raw = {"choices": [{"message": {"content": "not-json"}}]}
+        endpoint = semantic_analyzer.AnalyzerEndpoint(
+            name="synthetic-test",
+            url="https://example.invalid/v1/chat",
+            model="fixture-model",
+            revision="a" * 64,
+            reasoning_effort="none",
+        )
+
+        try:
+            live.capture_evaluation(
+                endpoint,
+                tier="primary",
+                transport=lambda _endpoint, _body: raw,
+            )
+        except Exception as exc:  # The diagnostic contract is asserted below.
+            failure = exc
+        else:
+            self.fail("invalid probe JSON must fail qualification")
+
+        capture = getattr(failure, "failure_capture", None)
+        self.assertIsInstance(capture, dict)
+        self.assertEqual("failed", capture["status"])
+        self.assertEqual("probe", capture["failure"]["stage"])
+        self.assertIsNone(capture["failure"]["case_id"])
+        self.assertIsNone(capture["failure"]["replay"])
+        self.assertEqual(raw, capture["failure"]["response"])
+        self.assertEqual("analyzer returned invalid JSON", capture["failure"]["error"])
+        self.assertEqual("fixture-model", capture["route"]["model"])
+        self.assertEqual("a" * 64, capture["route"]["revision"])
+
+    def test_transport_failure_does_not_reuse_prior_probe_response(self) -> None:
+        endpoint = semantic_analyzer.AnalyzerEndpoint(
+            name="synthetic-test",
+            url="https://example.invalid/v1/chat",
+            model="fixture-model",
+            revision="a" * 64,
+        )
+        calls = 0
+
+        def transport(_endpoint, _body):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return {"probe": "ok"}
+            raise semantic_analyzer.AnalyzerError("synthetic route failure")
+
+        try:
+            live.capture_evaluation(endpoint, tier="primary", transport=transport)
+        except Exception as exc:  # The diagnostic contract is asserted below.
+            failure = exc
+        else:
+            self.fail("analysis transport failure must stop qualification")
+
+        capture = getattr(failure, "failure_capture", None)
+        self.assertIsInstance(capture, dict)
+        self.assertEqual("analysis", capture["failure"]["stage"])
+        self.assertEqual("synthetic.atomic", capture["failure"]["case_id"])
+        self.assertEqual(1, capture["failure"]["replay"])
+        self.assertIsNone(capture["failure"]["response"])
+
+    def test_main_writes_attached_failure_capture_before_blocked_exit(self) -> None:
+        endpoint = semantic_analyzer.AnalyzerEndpoint(
+            name="synthetic-test",
+            url="https://example.invalid/v1/chat",
+            model="fixture-model",
+            revision="a" * 64,
+        )
+        expected = {
+            "schema_version": "clockify-analyzer-live-evaluation-failure/v1",
+            "status": "failed",
+            "failure": {
+                "stage": "probe",
+                "case_id": None,
+                "replay": None,
+                "response": {"choices": [{"message": {"content": "not-json"}}]},
+                "error": "analyzer returned invalid JSON",
+            },
+        }
+        failure = analyzer_evaluation.EvaluationError("analyzer returned invalid JSON")
+        failure.failure_capture = expected
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            semantic_analyzer.AnalyzerEndpoint,
+            "from_env",
+            return_value=endpoint,
+        ), mock.patch.object(
+            live,
+            "capture_evaluation",
+            side_effect=failure,
+        ):
+            capture_path = Path(directory) / "capture.json"
+            scorecard_path = Path(directory) / "scorecard.json"
+            status = live.main([
+                "--tier", "primary",
+                "--capture-output", str(capture_path),
+                "--scorecard-output", str(scorecard_path),
+            ])
+
+            self.assertEqual(2, status)
+            self.assertTrue(capture_path.exists())
+            self.assertEqual(0o600, stat.S_IMODE(capture_path.stat().st_mode))
+            self.assertEqual(expected, json.loads(capture_path.read_text()))
+            self.assertFalse(scorecard_path.exists())
+
     def test_synthetic_merge_accepts_captured_atomic_provider_response(self) -> None:
         case = next(
             item for item in live.synthetic_cases()

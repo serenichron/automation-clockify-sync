@@ -24,7 +24,7 @@ except ModuleNotFoundError:
 
 INPUT_SCHEMA_VERSION = "clockify-analyzer-evaluation-input/v1"
 SCORECARD_SCHEMA_VERSION = "clockify-analyzer-evaluation-scorecard/v1"
-EVALUATOR_VERSION = "clockify-analyzer-evaluator/v6"
+EVALUATOR_VERSION = "clockify-analyzer-evaluator/v7"
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 _CASE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _REQUIRED_ROUTE_FIELDS = frozenset({"route_id", "model", "tier"})
@@ -419,18 +419,33 @@ def _nonactivity_dispositions_are_valid(
         )
         for value in result["omissions"]
     }
-    return (
-        set(actual_exceptions) == set(expected_exceptions)
-        and all(
-            actual_exceptions[group] in expected_exceptions[group]
-            for group in actual_exceptions
-        )
-        and set(actual_omissions) == set(expected_omissions)
-        and all(
-            actual_omissions[group] in expected_omissions[group]
-            for group in actual_omissions
-        )
-    )
+    if set(actual_exceptions) & set(actual_omissions):
+        return False
+    if set(expected_exceptions) & set(expected_omissions):
+        return False
+    if any(
+        actual_exceptions.get(group) not in allowed_kinds
+        for group, allowed_kinds in expected_exceptions.items()
+    ):
+        return False
+    if any(
+        group not in expected_omissions
+        or lifecycle not in expected_omissions[group]
+        for group, lifecycle in actual_omissions.items()
+    ):
+        return False
+
+    conservative_noise_groups = {
+        group
+        for group, allowed_lifecycles in expected_omissions.items()
+        if group not in actual_omissions
+        and "noise" in allowed_lifecycles
+        and not result["activities"]
+        and actual_exceptions.get(group) == "insufficient_evidence"
+    }
+    if set(actual_omissions) | conservative_noise_groups != set(expected_omissions):
+        return False
+    return set(actual_exceptions) == set(expected_exceptions) | conservative_noise_groups
 
 
 def _case_score(

@@ -988,12 +988,15 @@ def load_collector_source_bundle(path: Path, *, run_dir: Path) -> CollectorSourc
     )
 
 
-def load_pending_collector_source(run_dir: Path, *, checkpoint_root: Path) -> PendingCollectorSource:
+def load_pending_collector_source(run_dir: Path, *, checkpoint_root: Path,
+                                  allow_stopped_only_legacy_observation_variance: bool = False) -> PendingCollectorSource:
     """Admit exact complete raw bytes and existing native proof without any writes."""
     from scripts import clockify_sync_collect as collector, collector_slices as slices
     from scripts import collector_checkpoints as checkpoints, clockify_checkpoint_snapshot as native
     from scripts import reconciliation_manifest
 
+    if type(allow_stopped_only_legacy_observation_variance) is not bool:
+        raise CollectorReceiptError("pending observation compatibility requires an explicit boolean")
     run_dir = _safe_path(Path(run_dir))
     checkpoint_root = _safe_path(Path(checkpoint_root))
     if (run_dir / "completion-bundle.json").exists() or (run_dir / "completion-bundle.json").is_symlink():
@@ -1085,8 +1088,9 @@ def load_pending_collector_source(run_dir: Path, *, checkpoint_root: Path) -> Pe
                 raise ValueError("pending native locator differs")
             page_files[relative] = native._read(directory / relative)
         evidence = contents["evidence/clockify-existing.json"]
-        entries, observed, _ = native._validate(directory, page_files, evidence,
-            identity=ci, request=request, since=since, until=until)
+        entries, observed, _, compatibility = native._validate_with_compatibility(directory, page_files, evidence,
+            identity=ci, request=request, since=since, until=until,
+            allow_stopped_only_legacy_observation_variance=allow_stopped_only_legacy_observation_variance)
         checkpoint_relative = f"checkpoint/{directory.name}"
         native_files = {f"{checkpoint_relative}/{name}": value for name, value in page_files.items()}
         native_files["clockify-existing.json"] = evidence
@@ -1094,6 +1098,9 @@ def load_pending_collector_source(run_dir: Path, *, checkpoint_root: Path) -> Pe
             snapshot_at=observed, entry_count=len(entries), page_count=len(page_manifest["pages"]),
             source_checkpoint_manifest=str(checkpoint_path), source_clockify_evidence=str(run_dir / "evidence/clockify-existing.json"),
             files={name: native._hash(value) for name, value in native_files.items()})
+        if compatibility is not None:
+            proof["schema_version"] = native.SCHEMA_VERSION_V2
+            proof["observation_compatibility"] = compatibility
         proof_bytes = checkpoints._canonical(proof) + b"\n"
         native_files["snapshot.json"] = proof_bytes
         native_metadata = {"manifest_sha256": native._hash(proof_bytes), "request": request}
@@ -1116,6 +1123,9 @@ def load_pending_collector_source(run_dir: Path, *, checkpoint_root: Path) -> Pe
             "original_artifact_digests": dict(sorted(digests.items())),
             "native_checkpoint_digests": {name: "sha256:" + native._hash(value) for name, value in sorted(page_files.items())},
         }
+        if allow_stopped_only_legacy_observation_variance:
+            binding["allow_stopped_only_legacy_observation_variance"] = True
+            binding["observation_compatibility"] = compatibility
         # Existing derivation consumes raw artifacts only; original snapshots and
         # pending metadata are bound separately, never installed as child completion.
         for name in (*original_inputs, "slice-finalization.json", "run-report.md"):

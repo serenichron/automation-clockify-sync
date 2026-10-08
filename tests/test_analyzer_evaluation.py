@@ -84,7 +84,7 @@ class AnalyzerEvaluationTests(unittest.TestCase):
     def test_produces_digest_bound_passing_scorecard(self) -> None:
         scorecard = evaluation.evaluate(document())
         self.assertTrue(scorecard["passed"])
-        self.assertEqual("clockify-analyzer-evaluator/v6", scorecard["evaluator_version"])
+        self.assertEqual("clockify-analyzer-evaluator/v7", scorecard["evaluator_version"])
         self.assertEqual("deepseek-v4-flash:0731-cloud", scorecard["route"]["model"])
         self.assertEqual(64, len(scorecard["input_corpus_digest"]))
         self.assertEqual(scorecard, evaluation.verify_scorecard(scorecard))
@@ -164,6 +164,127 @@ class AnalyzerEvaluationTests(unittest.TestCase):
 
         self.assertTrue(scorecard["passed"])
         self.assertTrue(scorecard["results"][0]["checks"]["stable_replay"])
+
+    def test_noise_omission_accepts_conservative_insufficient_evidence_exception(self) -> None:
+        source = document()
+        case = source["cases"][0]
+        evidence = case["evidence_ids"][0]
+        case["expected_activity_partitions"] = []
+        case["expected_activity_concepts"] = []
+        case["expected_omissions"] = [{
+            "evidence_ids": [evidence],
+            "lifecycles": ["noise", "planned"],
+        }]
+        conservative = {
+            "activities": [],
+            "exceptions": [{
+                "kind": "insufficient_evidence",
+                "evidence_ids": [evidence],
+                "reason": "waiting for approval and no work performed",
+            }],
+            "omissions": [],
+        }
+        case["replays"] = [conservative, copy.deepcopy(conservative)]
+
+        scorecard = evaluation.evaluate(source)
+
+        self.assertTrue(
+            scorecard["results"][0]["checks"]["nonactivity_dispositions_valid"]
+        )
+        self.assertTrue(scorecard["passed"])
+        self.assertEqual("clockify-analyzer-evaluator/v7", scorecard["evaluator_version"])
+
+    def test_insufficient_evidence_does_not_replace_planned_only_omission(self) -> None:
+        source = document()
+        case = source["cases"][0]
+        evidence = case["evidence_ids"][0]
+        case["expected_activity_partitions"] = []
+        case["expected_activity_concepts"] = []
+        case["expected_omissions"] = [{
+            "evidence_ids": [evidence],
+            "lifecycles": ["planned"],
+        }]
+        conservative = {
+            "activities": [],
+            "exceptions": [{
+                "kind": "insufficient_evidence",
+                "evidence_ids": [evidence],
+                "reason": "no completed work proven",
+            }],
+            "omissions": [],
+        }
+        case["replays"] = [conservative, copy.deepcopy(conservative)]
+
+        scorecard = evaluation.evaluate(source)
+
+        self.assertFalse(scorecard["passed"])
+        self.assertFalse(
+            scorecard["results"][0]["checks"]["nonactivity_dispositions_valid"]
+        )
+
+    def test_noise_omission_does_not_accept_arbitrary_exception_kind(self) -> None:
+        source = document()
+        case = source["cases"][0]
+        evidence = case["evidence_ids"][0]
+        case["expected_activity_partitions"] = []
+        case["expected_activity_concepts"] = []
+        case["expected_omissions"] = [{
+            "evidence_ids": [evidence],
+            "lifecycles": ["noise", "planned"],
+        }]
+        wrong = {
+            "activities": [],
+            "exceptions": [{
+                "kind": "conflicting_evidence",
+                "evidence_ids": [evidence],
+                "reason": "arbitrary exception kind",
+            }],
+            "omissions": [],
+        }
+        case["replays"] = [wrong, copy.deepcopy(wrong)]
+
+        scorecard = evaluation.evaluate(source)
+
+        self.assertFalse(scorecard["passed"])
+        self.assertFalse(
+            scorecard["results"][0]["checks"]["nonactivity_dispositions_valid"]
+        )
+
+    def test_noise_exception_and_omission_replays_remain_unstable(self) -> None:
+        source = document()
+        case = source["cases"][0]
+        evidence = case["evidence_ids"][0]
+        case["expected_activity_partitions"] = []
+        case["expected_activity_concepts"] = []
+        case["expected_omissions"] = [{
+            "evidence_ids": [evidence],
+            "lifecycles": ["noise", "planned"],
+        }]
+        case["replays"] = [
+            {
+                "activities": [],
+                "exceptions": [{
+                    "kind": "insufficient_evidence",
+                    "evidence_ids": [evidence],
+                    "reason": "no completed work proven",
+                }],
+                "omissions": [],
+            },
+            {
+                "activities": [],
+                "exceptions": [],
+                "omissions": [{
+                    "lifecycle": "noise",
+                    "evidence_ids": [evidence],
+                    "reason": "no work performed",
+                }],
+            },
+        ]
+
+        scorecard = evaluation.evaluate(source)
+
+        self.assertFalse(scorecard["passed"])
+        self.assertFalse(scorecard["results"][0]["checks"]["stable_replay"])
 
     def test_forbidden_description_content_is_rejected_by_production_renderer(self) -> None:
         source = document()

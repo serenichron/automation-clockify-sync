@@ -2993,6 +2993,35 @@ def run_accounting(
         raise WorkAccountingError(f"ledger member identities are invalid: {exc}") from exc
     analysis_events, noise = _analysis_events(all_events, member_identities)
     routing = _read_json(routing_path or (root / "routing.json"))
+    retry_actor_contract = None
+    if failed_review_retry_cache_only:
+        from scripts import clockify_review_run as review_run
+        try:
+            lineage = _read_json(run_dir / "repair-source.json")
+            source_name = lineage.get("source_run_id")
+            if (not isinstance(source_name, str) or not source_name or source_name in {".", ".."}
+                    or Path(source_name).name != source_name):
+                raise WorkAccountingError("cache-only retry source identity is invalid")
+            source_dir = run_dir.parent / source_name
+            if source_dir.is_symlink() or source_dir.resolve().parent != run_dir.parent.resolve():
+                raise WorkAccountingError("cache-only retry source must be an original sibling")
+            verified = review_run._scoped_repair_inputs(run_dir, source_dir=source_dir)
+            if verified is None:
+                raise WorkAccountingError("cache-only retry lacks immutable recovery inputs")
+            if (
+                failed_review_retry_source is None
+                or failed_review_retry_source.read_bytes() != verified["files"]["source-semantic-analysis.json"]
+                or _canonical_retry_digests(failed_review_retry_digest) != verified["target_digests"]
+                or sorted(failed_review_retry_selected_evidence_ids or []) != verified["selected_evidence_ids"]
+                or failed_review_retry_scoped_mode != verified["mode"]
+                or analyzer_cache_path is None
+                or analyzer_cache_path.read_bytes() != verified["files"]["analyzer-response-cache.jsonl"]
+                or routing != _read_json(source_dir / "routing.json")
+            ):
+                raise WorkAccountingError("cache-only retry differs from immutable recovery inputs")
+            retry_actor_contract = verified["analysis"]["failed_review_retry"].get("actor_contract")
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise WorkAccountingError(f"cache-only retry recovery binding is invalid: {exc}") from exc
     corrections = _load_corrections(corrections_path)
     regression_cases = _load_regression_cases(corrections_path)
     verified_posted_credits = _load_verified_posted_credits(corrections_path)
@@ -3013,6 +3042,7 @@ def run_accounting(
         failed_review_retry_selected_evidence_ids=failed_review_retry_selected_evidence_ids,
         failed_review_retry_cache_only=failed_review_retry_cache_only,
         failed_review_retry_scoped_mode=failed_review_retry_scoped_mode,
+        failed_review_retry_actor_contract=retry_actor_contract,
     )
     if analysis_fixture is None and analyzer_cache_path is not None:
         analysis["analyzer_cache"]["snapshot"] = _seal_analyzer_cache_snapshot(

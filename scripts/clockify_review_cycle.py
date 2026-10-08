@@ -2111,6 +2111,10 @@ def _verify_delivery_receipt(
     if path.is_symlink() or not path.is_file():
         raise CycleError("delivery receipt is missing or unsafe")
     document = _json_file(path, "delivery receipt")
+    from scripts import clockify_selected_delivery_adoption as selected
+    if document.get("schema_version") == selected.DELIVERY_SCHEMA:
+        _verify_selected_delivery(config, document, since, until, source, replay)
+        return
     config = _receipt_publication_config(config, document)
     try:
         expected = _delivery_document(
@@ -3835,6 +3839,17 @@ def _historical_adoption_document(
     document = _json_file(expected_path, "historical adoption receipt")
     if not isinstance(document, dict):
         raise CycleError("historical adoption receipt is invalid")
+    from scripts import clockify_selected_delivery_adoption as selected
+    if document.get("schema_version") == selected.ADOPTION_SCHEMA:
+        unsigned = {key:value for key,value in document.items() if key != "receipt_digest"}
+        if (document.get("receipt_digest") != _value_digest(unsigned)
+            or record.get("historical_adoption_receipt_digest") != document.get("receipt_digest")
+            or document.get("since") != since or document.get("until") != until
+            or document.get("frozen_snapshot_digests") != _stored_snapshot_digests(record)
+            or document.get("prior_record_digest") != _value_digest(document.get("superseded_record"))
+            or document.get("request_digest") != _value_digest(document.get("request"))):
+            raise CycleError("selected historical adoption receipt identity differs")
+        return document
     digest = document.get("receipt_digest")
     unsigned = {key: value for key, value in document.items() if key != "receipt_digest"}
     if (
@@ -3871,6 +3886,12 @@ def _verify_historical_adoption(
     config: Mapping[str, Any], record: Mapping[str, Any], document: Mapping[str, Any],
     since: str, until: str, source: Mapping[str, Any], replay: Mapping[str, Any],
 ) -> None:
+    from scripts import clockify_selected_delivery_adoption as selected
+    if document.get("schema_version") == selected.ADOPTION_SCHEMA:
+        if document.get("source") != dict(source) or document.get("replay") != dict(replay):
+            raise CycleError("selected historical adoption stages differ")
+        _verify_selected_adoption(config, document)
+        return
     if (
         document.get("source") != dict(source)
         or document.get("replay") != dict(replay)
@@ -3934,6 +3955,28 @@ def _validate_delivered_state(config: Mapping[str, Any], state: Mapping[str, Any
         events_path, manifest_path = _period_paths(_path(config, "state_dir"), since)
         if not events_path.is_file() or not manifest_path.is_file():
             raise CycleError("delivered slice period evidence is missing")
+        adoption = _historical_adoption_document(config, raw_record, since, until)
+        from scripts import clockify_selected_delivery_adoption as selected
+        if adoption is not None and adoption.get("schema_version") == selected.ADOPTION_SCHEMA:
+            source, replay, _delivery = _verify_selected_adoption(config, adoption)
+            if raw_record.get("source") != source or raw_record.get("replay") != replay:
+                raise CycleError("selected delivered state stage identity differs")
+            expected_metadata = {
+                "status": "delivered_with_exceptions" if source["exception_ids"] else "delivered",
+                "source_completeness": source["coverage"],
+                "source_run_id": source["run_id"], "replay_run_id": replay["run_id"],
+                "review_ids": source["review_ids"], "exception_ids": source["exception_ids"],
+                "exceptions_complete": not source["exception_ids"],
+                "expected_snapshot_digests": adoption["frozen_snapshot_digests"],
+            }
+            if any(raw_record.get(key) != value for key, value in expected_metadata.items()):
+                raise CycleError("selected delivered state metadata differs from sealed source")
+            if raw_record.get("period_manifest") != str(_ensure_period(
+                config, _path(config,"state_dir"), since, until, bind_inputs=False)):
+                raise CycleError("selected delivered period manifest differs")
+            _verify_delivery_receipt(Path(str(raw_record.get("delivery_receipt"))), config,
+                since, until, source, replay, sheet_title=_sheet_title(config["monthly_sheet_title_template"],since=since))
+            continue
         expected_snapshots = _stored_snapshot_digests(raw_record)
         if "fresh_input_binding" in raw_record:
             expected_snapshots = _fresh_input_binding(config, dict(raw_record), since, until, manifest_path)
@@ -5040,10 +5083,190 @@ def _run_slice(
     }
 
 
+@contextmanager
+def _selected_runs_config(config: Mapping[str, Any], runs_root: str) -> Iterator[dict[str, Any]]:
+    """Scope read-only native ancestry to one pinned graph, never global discovery."""
+    path = _canonical_runtime_path(runs_root, label="selected historical runs root")
+    if (path.is_symlink() or not path.is_dir() or path.stat().st_uid != os.getuid()
+        or stat.S_IMODE(path.stat().st_mode) & 0o022):
+        raise CycleError("selected historical runs root is not owner controlled")
+    validation = {**config,"runs_dir":str(path)}
+    validation.setdefault("_runtime_identity", clockify_review_run.clockify_sync_collect.collector_runtime_identity())
+    previous = clockify_review_run.RUNS
+    clockify_review_run.RUNS = path
+    try:
+        yield validation
+    finally:
+        clockify_review_run.RUNS = previous
+
+
+def _selected_stages(config: Mapping[str,Any], request: Mapping[str,Any]) -> tuple[dict[str,Any],dict[str,Any]]:
+    frozen, adopted = request["frozen_snapshot_digests"], request["adopted_snapshot_digests"]
+    if (not isinstance(frozen,Mapping) or not isinstance(adopted,Mapping) or set(frozen) != set(adopted)
+        or any(not _valid_digest(adopted[name]) or (name not in {"routing.json","review-corrections.jsonl"}
+            and adopted[name] != frozen[name]) for name in frozen)):
+        raise CycleError("selected historical snapshot transition differs")
+    source_path = _safe_run_file(_runs_dir(config),request["source_result"],"selected source")
+    replay_path = _safe_run_file(_runs_dir(config),request["replay_result"],"selected replay")
+    if (_digest(source_path) != request["source_result_digest"] or _digest(replay_path) != request["replay_result_digest"]):
+        raise CycleError("selected historical result digest differs")
+    if adopted["review-corrections.jsonl"] != frozen["review-corrections.jsonl"]:
+        _verify_credit_adoption_transition(config,source_path.parent,frozen["review-corrections.jsonl"],adopted["review-corrections.jsonl"])
+    source = _validate_stage(config,source_path,request["since"],request["until"],replay=False,
+        expected_snapshot_digests=adopted,expected_runtime_digest=request["runtime_identity_digest"],historical_state_validation=True)
+    replay = _validate_stage(config,replay_path,request["since"],request["until"],replay=True,
+        expected_snapshot_digests=adopted,expected_runtime_digest=request["runtime_identity_digest"],historical_state_validation=True,
+        source_run_id=source["run_id"],source_run_dir=source["run_dir"])
+    if (source["coverage"].get("status") != "complete" or source["coverage"].get("incomplete_sources") != []
+        or source["accounting_digest"] != replay["accounting_digest"]):
+        raise CycleError("selected historical source coverage or replay differs")
+    _interval_from_derived_stage(config,request["since"],request["until"],source,request["source_provenance"])
+    return source,replay
+
+
+def _selected_delivery_document(config: Mapping[str,Any], since: str, until: str,
+    source: Mapping[str,Any], replay: Mapping[str,Any], delivery: Mapping[str,Any]) -> dict[str,Any]:
+    from scripts import clockify_selected_delivery_adoption as selected
+    body = {"schema_version":selected.DELIVERY_SCHEMA,"since":since,"until":until,
+        "spreadsheet_id":str(config["spreadsheet_id"]),"source":dict(source),"replay":dict(replay),"selected_delivery":dict(delivery)}
+    return {**body,"receipt_digest":_value_digest(body)}
+
+
+def _verify_selected_delivery(config: Mapping[str,Any], document: Mapping[str,Any], since: str, until: str,
+    source: Mapping[str,Any], replay: Mapping[str,Any]) -> None:
+    from scripts import clockify_selected_delivery_adoption as selected
+    try:
+        delivery = selected.validate(config,source,replay,document["selected_delivery"]["proofs"],
+            title=_sheet_title(config["monthly_sheet_title_template"],since=since))
+        expected = _selected_delivery_document(config,since,until,source,replay,delivery)
+    except (OSError,ValueError,TypeError,KeyError,IndexError) as exc:
+        raise CycleError("selected historical delivery proof drifted or is missing") from exc
+    if document != expected or delivery["diagnostics"]["status"] != "complete":
+        raise CycleError("selected historical delivery identity or diagnostic proof differs")
+
+
+def _verify_selected_adoption(config: Mapping[str,Any], document: Mapping[str,Any]) -> tuple[dict[str,Any],dict[str,Any],dict[str,Any]]:
+    from scripts import clockify_selected_delivery_adoption as selected
+    request = document["request"]
+    if (request.get("schema_version") != selected.REQUEST_SCHEMA
+        or document.get("prior_record_digest") != request.get("prior_record_digest")
+        or document.get("prior_record_digest") != _value_digest(document.get("superseded_record"))
+        or document.get("request_digest") != _value_digest(request)):
+        raise CycleError("selected historical predecessor binding differs")
+    with _selected_runs_config(config,request["runs_root"]) as validation:
+        source,replay = _selected_stages(validation,request)
+        if document.get("source") != source or document.get("replay") != replay:
+            raise CycleError("selected historical adoption stage drifted")
+        try:
+            delivery = selected.validate(validation,source,replay,request["selected_delivery_proofs"],
+                title=_sheet_title(config["monthly_sheet_title_template"],since=request["since"]))
+        except (OSError,ValueError,TypeError,KeyError,IndexError) as exc:
+            raise CycleError("selected historical adoption proof drifted or is missing") from exc
+        if document.get("selected_delivery") != delivery or delivery["diagnostics"]["status"] != "complete":
+            raise CycleError("selected historical adoption delivery differs")
+    return source,replay,delivery
+
+
+def _adopt_selected_historical_slice(config: Mapping[str,Any], request: Mapping[str,Any]) -> dict[str,Any]:
+    from scripts import clockify_selected_delivery_adoption as selected
+    required = {"schema_version","since","until","source_result","replay_result","source_provenance",
+        "frozen_snapshot_digests","adopted_snapshot_digests","runtime_identity_digest",
+        "source_result_digest","replay_result_digest","runs_root","prior_record_digest","selected_delivery_proofs"}
+    if set(request) != required or _date(request["since"],"selected since") >= _date(request["until"],"selected until"):
+        raise CycleError("selected historical request is invalid")
+    since,until = request["since"],request["until"]
+    state_dir = _path(config,"state_dir"); state_path = state_dir/"review-cycle-state.json"
+    with single_instance(state_dir/"review-cycle.lock") as acquired:
+        if not acquired:
+            return {"status":"locked","slice":{"since":since,"until":until}}
+        state = _state(state_path,recovery_since=str(config["recovery_since"]))
+        prior = state["slices"].get(since)
+        if not isinstance(prior,Mapping) or prior.get("until") != until:
+            raise CycleError("selected historical recovery requires an existing exact slice")
+        if prior.get("status") in {"delivered","delivered_with_exceptions"}:
+            adoption = _historical_adoption_document(config,prior,since,until)
+            if adoption is None or adoption.get("schema_version") != selected.ADOPTION_SCHEMA or adoption.get("request_digest") != _value_digest(dict(request)):
+                raise CycleError("delivered selected slice has different adoption identity")
+            _validate_delivered_state(config,state)
+            return {"status":prior["status"],"slice":{"since":since,"until":until}}
+        if (_value_digest(dict(prior)) != request["prior_record_digest"]
+            or _stored_snapshot_digests(prior) != request["frozen_snapshot_digests"]):
+            raise CycleError("selected historical prior slice binding is stale")
+        manifest = Path(str(prior.get("period_manifest")))
+        events_path, expected_manifest = _period_paths(state_dir,since)
+        if manifest != expected_manifest or not events_path.is_file() or _digest(manifest) != request["frozen_snapshot_digests"]["period-manifest.json"]:
+            raise CycleError("selected historical frozen period proof differs")
+        # Existing delivery is never silently overwritten; this path supersedes
+        # an incomplete source/attempt, not another completed publication.
+        if any(prior.get(k) is not None for k in ("replay","delivery_receipt","historical_adoption_receipt")):
+            raise CycleError("selected historical recovery cannot overwrite delivery history")
+        with _selected_runs_config(config,request["runs_root"]) as validation:
+            source,replay = _selected_stages(validation,request)
+            try:
+                delivery = selected.validate(validation,source,replay,request["selected_delivery_proofs"],
+                    title=_sheet_title(config["monthly_sheet_title_template"],since=since))
+            except (OSError,ValueError,TypeError,KeyError,IndexError) as exc:
+                raise CycleError("selected historical delivery proof is invalid") from exc
+        if delivery["diagnostics"]["status"] != "complete":
+            return {"status":"diagnostic_proof_missing","slice":{"since":since,"until":until},"selected_delivery":delivery}
+        debt_path = state_dir/"source-coverage.json"
+        raw_debt = _json_file(debt_path,"selected source coverage")
+        try:
+            store = source_coverage.SourceDebtStore.from_document(raw_debt)
+            warnings = raw_debt.get("migration_warnings",[])
+            if not isinstance(warnings,list):
+                raise ValueError("source coverage warnings differ")
+        except (ValueError,TypeError,KeyError) as exc:
+            raise CycleError("selected historical source coverage state is invalid") from exc
+        old_gaps = set(prior.get("source",{}).get("coverage",{}).get("incomplete_sources",[]))
+        resolved = []
+        bundle = collector_receipts.load_completion_bundle(Path(source["run_dir"])/"completion-bundle.json",run_dir=Path(source["run_dir"]))
+        for item in tuple(store.active()):
+            interval = item.interval
+            if (interval.since_utc,interval.until_utc,interval.slice_id) != (bundle.since_utc,bundle.until_utc,bundle.slice_id):
+                continue
+            categories = {"sessions/"+interval.source.removeprefix("peer/"),"repositories/"+interval.source.removeprefix("peer/")}
+            inventory = source["coverage"].get("sources",{})
+            covered_peer = interval.source.startswith("peer/") and bool(categories & old_gaps) and all(inventory.get(k,{}).get("status") == "complete" for k in categories & old_gaps)
+            if interval.source != "runner/unclassified" and not covered_peer:
+                continue
+            if interval.compatibility_version == source_coverage.LEGACY_COMPATIBILITY_VERSION:
+                continue
+            resolved.append(item.debt_id)
+            store.record_complete(interval,completion_bundle_digest=source["bundle_digest"],completed_at=_attempted_at())
+        unsigned = {"schema_version":selected.ADOPTION_SCHEMA,"since":since,"until":until,
+            "request":dict(request),"request_digest":_value_digest(dict(request)),
+            "prior_record_digest":request["prior_record_digest"],"superseded_record":dict(prior),
+            "frozen_snapshot_digests":dict(request["frozen_snapshot_digests"]),
+            "adopted_snapshot_digests":dict(request["adopted_snapshot_digests"]),
+            "source":source,"replay":replay,"selected_delivery":delivery}
+        adoption = {**unsigned,"receipt_digest":_value_digest(unsigned)}
+        receipt_path = state_dir/"delivery-receipts"/f"{since}.json"
+        adoption_path = state_dir/"historical-adoption-receipts"/f"{since}.json"
+        _write_delivery_receipt(receipt_path,_selected_delivery_document(config,since,until,source,replay,delivery))
+        _write_delivery_receipt(adoption_path,adoption)
+        if resolved:
+            source_coverage.write(debt_path,store.document(migration_warnings=warnings))
+        status = "delivered_with_exceptions" if source["exception_ids"] else "delivered"
+        record = {key:prior[key] for key in ("until","period_manifest","expected_snapshot_digests") if key in prior}
+        record.update(status=status,source=source,replay=replay,source_completeness=source["coverage"],
+            source_run_id=source["run_id"],replay_run_id=replay["run_id"],review_ids=source["review_ids"],
+            exception_ids=source["exception_ids"],exceptions_complete=not source["exception_ids"],
+            delivery_receipt=str(receipt_path),historical_adoption_receipt=str(adoption_path),
+            historical_adoption_receipt_digest=adoption["receipt_digest"])
+        state["slices"][since]=record
+        _recompute_completed_through(config,state)
+        _atomic(state_path,state)
+        return {"status":status,"slice":{"since":since,"until":until}}
+
+
 def adopt_historical_slice(
     config: Mapping[str, Any], request: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Import one already-published, sealed slice without invoking any child."""
+    from scripts import clockify_selected_delivery_adoption as selected
+    if isinstance(request,Mapping) and request.get("schema_version") == selected.REQUEST_SCHEMA:
+        return _adopt_selected_historical_slice(config,request)
     common_required = {
         "schema_version", "since", "until", "source_result", "replay_result",
         "publication_result",

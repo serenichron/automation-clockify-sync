@@ -26,6 +26,14 @@ Transport = Callable[
 ]
 
 
+class LiveEvaluationCaptureError(analyzer_evaluation.EvaluationError):
+    """Carry a synthetic-only failed response to the CLI artifact boundary."""
+
+    def __init__(self, message: str, *, failure_capture: dict[str, Any]):
+        super().__init__(message)
+        self.failure_capture = failure_capture
+
+
 def _evidence_id(case_id: str, index: int) -> str:
     value = f"{case_id}:{index}".encode("utf-8")
     return "ev-" + hashlib.sha256(value).hexdigest()
@@ -249,7 +257,48 @@ def capture_evaluation(
         raise analyzer_evaluation.EvaluationError("tier must be primary or fallback")
     if replay_count < 2:
         raise analyzer_evaluation.EvaluationError("live evaluation requires at least two replays")
-    semantic_analyzer.probe_endpoint(endpoint, transport=transport)
+    context: dict[str, Any] = {
+        "stage": "probe",
+        "case_id": None,
+        "replay": None,
+    }
+    last_response: dict[str, Any] | None = None
+
+    def diagnostic_transport(
+        candidate: semantic_analyzer.AnalyzerEndpoint,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        nonlocal last_response
+        last_response = None
+        last_response = transport(candidate, body)
+        return last_response
+
+    def fail_with_capture(exc: BaseException) -> None:
+        raise LiveEvaluationCaptureError(
+            str(exc),
+            failure_capture={
+                "schema_version": "clockify-analyzer-live-evaluation-failure/v1",
+                "status": "failed",
+                "route": {
+                    "model": endpoint.model,
+                    "revision": endpoint.revision,
+                    "reasoning_effort": endpoint.reasoning_effort,
+                    "tier": tier,
+                },
+                "prompt_version": semantic_analyzer.PROMPT_VERSION,
+                "failure": {
+                    **context,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    "response": last_response,
+                },
+            },
+        ) from exc
+
+    try:
+        semantic_analyzer.probe_endpoint(endpoint, transport=diagnostic_transport)
+    except (ValueError, semantic_analyzer.AnalyzerError) as exc:
+        fail_with_capture(exc)
 
     def qualified_transport(
         candidate: semantic_analyzer.AnalyzerEndpoint,
@@ -262,7 +311,7 @@ def capture_evaluation(
             payload = {}
         if payload.get("probe"):
             return {"probe": "ok"}
-        return transport(candidate, body)
+        return diagnostic_transport(candidate, body)
 
     corpus: list[dict[str, Any]] = []
     captured_cases: list[dict[str, Any]] = []
@@ -277,15 +326,19 @@ def capture_evaluation(
                 )
             corpus.append({"evidence_id": event["evidence_id"], "time_span": span})
         replays: list[dict[str, Any]] = []
-        for _ in range(replay_count):
-            analysis = semantic_analyzer.analyze_tiered(
-                events,
-                primary=endpoint,
-                transport=qualified_transport,
-                max_workers=1,
-                max_events_per_chunk=max(1, len(events)),
-                private_text_approved=True,
-            )
+        for replay in range(1, replay_count + 1):
+            context.update(stage="analysis", case_id=case["case_id"], replay=replay)
+            try:
+                analysis = semantic_analyzer.analyze_tiered(
+                    events,
+                    primary=endpoint,
+                    transport=qualified_transport,
+                    max_workers=1,
+                    max_events_per_chunk=max(1, len(events)),
+                    private_text_approved=True,
+                )
+            except (ValueError, semantic_analyzer.AnalyzerError) as exc:
+                fail_with_capture(exc)
             replays.append({
                 key: analysis[key]
                 for key in ("activities", "exceptions", "omissions")
@@ -364,6 +417,14 @@ def main(argv: list[str] | None = None) -> int:
         semantic_analyzer.AnalyzerError,
         analyzer_evaluation.EvaluationError,
     ) as exc:
+        failure_capture = getattr(exc, "failure_capture", None)
+        if isinstance(failure_capture, dict):
+            try:
+                _write_json(args.capture_output, failure_capture)
+                args.capture_output.chmod(0o600)
+            except OSError as write_error:
+                print(f"analyzer live evaluation blocked: {write_error}")
+                return 2
         print(f"analyzer live evaluation blocked: {exc}")
         return 2
     print(

@@ -1,13 +1,18 @@
 """Scoped quarantine recovery must remain reproducible without inference."""
 import copy
+import contextlib
+import io
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
 
 from scripts import semantic_analyzer, work_accounting_pipeline as pipeline
+from scripts import clockify_scoped_semantic_recovery as recovery
 import test_review_run as fixtures
 from test_review_run_chained_repair_replay import validate_repair
 
@@ -15,6 +20,95 @@ review = fixtures.review_run
 
 
 class ScopedRecoveryReplayTests(unittest.TestCase):
+    def test_actor_bound_cached_recovery_is_consumed_by_accounting_cli_offline(self):
+        self.assert_cached_recovery_cli(actor_contract=True)
+
+    def test_actorless_cached_recovery_remains_consumable_by_accounting_cli(self):
+        self.assert_cached_recovery_cli(actor_contract=False)
+
+    def test_copied_actor_recovery_tamper_is_rejected_without_transport(self):
+        self.assert_cached_recovery_cli(actor_contract=True, tamper='provenance')
+
+    def test_injected_actor_routing_is_rejected_without_transport(self):
+        self.assert_cached_recovery_cli(actor_contract=True, tamper='routing')
+
+    def assert_cached_recovery_cli(self, *, actor_contract, tamper=False):
+        # Catches dropping sealed actor context at the accounting CLI boundary.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runs = root / 'runs'
+            source = fixtures.ReviewRunResultTests._write_real_offline_replay_source(
+                runs, root, failed_review=True, actor_contract=actor_contract,
+            )
+            original = {p: p.read_bytes() for p in source.rglob('*') if p.is_file()}
+            analysis = json.loads((source / 'semantic-analysis.json').read_text())
+            failure = next(row for row in analysis['exceptions'] if row['kind'] == 'analyzer_review_failure')
+            digest = semantic_analyzer.stable_digest('frt-', failure['evidence_ids'], length=64)
+            scope = root / 'scope.json'
+            scope.write_text(json.dumps({'evidence_ids': failure['evidence_ids']}))
+            endpoint = semantic_analyzer.AnalyzerEndpoint(
+                'clockify_analyzer_primary', 'https://offline.invalid/v1/chat/completions',
+                semantic_analyzer.DEFAULT_PRIMARY_MODEL,
+                revision=semantic_analyzer.DEFAULT_PRIMARY_REVISION,
+            )
+            output = root / 'recovery'
+            with (
+                mock.patch.object(semantic_analyzer.AnalyzerEndpoint, 'from_env', return_value=endpoint),
+                mock.patch.object(semantic_analyzer, 'http_transport', side_effect=lambda _endpoint, body:
+                                  fixtures.analyzer_provider_response(json.loads(body['messages'][-1]['content']))),
+                mock.patch.dict(os.environ, {'CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED': 'approved'}),
+            ):
+                recovery.run(recovery.parse_args([str(source), '--scope-file', str(scope),
+                             '--output-dir', str(output), '--failed-review-digest', digest]))
+            with (
+                mock.patch.object(review, 'RUNS', runs),
+                mock.patch.object(semantic_analyzer, 'http_transport', side_effect=AssertionError('cache consume inferred')),
+                mock.patch.dict(os.environ, {'CLOCKIFY_ANALYZER_PRIMARY_URL': '', 'CLOCKIFY_ANALYZER_FALLBACK_URL': ''}),
+            ):
+                verified = recovery.validate_cached_recovery(source, output, [digest])
+                child = review._prepare_repair_run(source, scoped_recovery=verified)
+                cache = child / 'analyzer-cache-retry.jsonl'
+                cache.write_bytes(verified['files']['analyzer-response-cache.jsonl'])
+                argv = [str(child), '--root', str(fixtures.ROOT), '--routing', str(child / 'routing.json'),
+                        '--corrections', str(child / 'review-corrections.jsonl'), '--analyzer-cache', str(cache),
+                        '--failed-review-retry-source', str(review._repair_analysis_fixture(child)),
+                        '--failed-review-retry-digest', digest, '--failed-review-retry-cache-only',
+                        '--failed-review-retry-scoped-mode', verified['mode']]
+                for identity in verified['selected_evidence_ids']:
+                    argv += ['--failed-review-retry-selected-evidence-id', identity]
+                if tamper == 'provenance':
+                    copied = child / 'scoped-recovery/semantic-analysis.json'
+                    document = json.loads(copied.read_text())
+                    document['failed_review_retry'].pop('actor_contract')
+                    copied.write_text(json.dumps(document))
+                elif tamper == 'routing':
+                    path = child / 'routing.json'
+                    document = json.loads(path.read_text())
+                    document['semantic_subject_binding'] = {'injected': True}
+                    path.write_text(json.dumps(document))
+                else:
+                    # Exercise the actual standalone child entrypoint, not only main().
+                    result = subprocess.run([sys.executable, str(Path(pipeline.__file__).resolve()), *argv],
+                                            cwd=root, capture_output=True, text=True)
+                    self.assertEqual(0, result.returncode, result.stderr)
+                stderr = io.StringIO()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+                    code = pipeline.main(argv)
+                if tamper:
+                    self.assertEqual(2, code)
+                    self.assertIn('immutable input changed' if tamper == 'provenance' else
+                                  'differs from immutable recovery inputs', stderr.getvalue())
+                    self.assertFalse((child / 'work-accounting-result.json').exists())
+                    return
+                self.assertEqual(0, code, stderr.getvalue())
+                recovered = json.loads((child / 'semantic-analysis.json').read_text())
+                self.assertEqual(semantic_analyzer.ACTOR_CONTRACT if actor_contract else None,
+                                 recovered['failed_review_retry'].get('actor_contract'))
+                self.assertEqual([row['evidence_ids'] for row in verified['analysis']['activities']],
+                                 [row['evidence_ids'] for row in recovered['activities']])
+                self.assertEqual([], recovered['exceptions'])
+                self.assertEqual(original, {p: p.read_bytes() for p in original})
+
     def test_recovered_quarantine_replays_with_no_network_and_unchanged_parent(self):
         self.assert_recovered_quarantine_replay(actor_contract=False)
 
