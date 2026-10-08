@@ -1353,13 +1353,17 @@ def publish_monthly_unresolved(
 
 
 def _pending_plan_preserving_review_humans(gateway: SheetsGateway, *, spreadsheet_id: str,
-        sheet_title: str, selection: Mapping[str, Any]) -> dict[str, Any]:
-    """Retried accepted rows keep human cells; transition targets stay exact."""
+        sheet_title: str, selection: Mapping[str, Any],
+        presented_rows: Sequence[Sequence[Any]] | None = None) -> dict[str, Any]:
+    """Use authenticated display rows; human retries and transitions stay exact."""
     from scripts import clockify_pending_review_selection as pending
     metadata = gateway.spreadsheet(spreadsheet_id)
     positions, existing = _scan_rows(gateway, spreadsheet_id, _a1_title(sheet_title), _sheet_row_count(metadata, sheet_title))
+    presented = {row[0]: row for row in presented_rows} if presented_rows is not None else {}
     def reviewed(row: Sequence[Any]) -> list[Any]:
         expected = list(row)
+        if row[0] in presented:
+            expected[12] = presented[row[0]][12]
         if row[0] in positions:
             live = list(existing[positions[row[0]]]) + [""] * (len(HEADER) - len(existing[positions[row[0]]]))
             for index in HUMAN_COLUMNS:
@@ -1407,9 +1411,6 @@ def publish_proposal_partitions(
             selection = pending.verify(bindings_path=pending_selection, source_dir=source_dir, proposals=proposals,
                                        spreadsheet_id=spreadsheet_id, sheet_title=sheet_title, run_id=run_id,
                                        project_allowlist=project_allowlist)
-            selection_plan = (_pending_plan_preserving_review_humans(gateway, spreadsheet_id=spreadsheet_id,
-                sheet_title=sheet_title, selection=selection) if "reason_projection" in selection["receipt"] or existing_publication is not None
-                else pending.plan(gateway, spreadsheet_id=spreadsheet_id, sheet_title=sheet_title, selection=selection))
         except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
             raise PublicationError("pending review selection is invalid") from exc
     proposal_partitions: tuple[tuple[str, list[Mapping[str, Any]]], ...] = (
@@ -1481,6 +1482,15 @@ def publish_proposal_partitions(
                     presentation_proofs[title] = proof
         except (OSError, ValueError, TypeError, KeyError) as exc:
             raise PublicationError("immutable publication presentation is invalid") from exc
+    if selection is not None:
+        try:
+            selection_plan = (_pending_plan_preserving_review_humans(gateway, spreadsheet_id=spreadsheet_id,
+                sheet_title=sheet_title, selection=selection,
+                presented_rows=dict(partitions)[sheet_title] if sheet_title in presentation_proofs else None)
+                if "reason_projection" in selection["receipt"] or existing_publication is not None or sheet_title in presentation_proofs
+                else pending.plan(gateway, spreadsheet_id=spreadsheet_id, sheet_title=sheet_title, selection=selection))
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            raise PublicationError("pending review selection is invalid") from exc
     ids = [str(row[0]) for _destination, rows in partitions for row in rows]
     if len(ids) != len(set(ids)):
         raise PublicationError("proposal input contains duplicate stable review IDs")

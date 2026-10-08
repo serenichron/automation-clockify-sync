@@ -166,7 +166,15 @@ def verify_existing(proof: Mapping[str, Any], receipt: Mapping[str, Any]) -> Non
             pending_runtime.verify_recorded(acceptance, selection["receipt"])
         except ValueError as exc:
             raise ValueError("existing publication pending selection differs") from exc
+        presented_rows = None
+        if "presentation" in receipt:
+            presentation = receipt["presentation"]
+            presented_rows, reconstructed = project(path=Path(presentation["manifest"]["path"]),
+                source_dir=source_dir, run_id=source_dir.name, spreadsheet_id=receipt["spreadsheet_id"],
+                sheet_title=receipt["sheet_title"], rows=selection["rows"], kind="primary")
+            if reconstructed != presentation or presented_rows != rows:
+                raise ValueError("existing publication pending presentation differs")
         plan = publisher._pending_plan_preserving_review_humans(gateway, spreadsheet_id=receipt["spreadsheet_id"],
-            sheet_title=receipt["sheet_title"], selection=selection)
+            sheet_title=receipt["sheet_title"], selection=selection, presented_rows=presented_rows)
         if plan["updates"]:
             raise ValueError("existing publication supersession is incomplete")
