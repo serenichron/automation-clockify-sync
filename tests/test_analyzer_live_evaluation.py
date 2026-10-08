@@ -57,6 +57,65 @@ def _activity(members: list[dict], index: int, concepts: list[str]) -> dict:
 
 
 class AnalyzerLiveEvaluationTests(unittest.TestCase):
+    def test_synthetic_merge_accepts_captured_atomic_provider_response(self) -> None:
+        case = next(
+            item for item in live.synthetic_cases()
+            if item["case_id"] == "synthetic.merge"
+        )
+        evidence_calls = 0
+
+        def transport(
+            _endpoint: semantic_analyzer.AnalyzerEndpoint,
+            body: dict,
+        ) -> dict:
+            nonlocal evidence_calls
+            payload = json.loads(body["messages"][-1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            evidence_calls += 1
+            members = [
+                {"bundle_ref": bundle["bundle_ref"], **member}
+                for bundle in payload["bundles"]
+                for member in bundle["members"]
+            ]
+            activity = _activity(
+                members,
+                1,
+                ["review", "identity", "allocation"],
+            )
+            activity.update({
+                "action": "Implemented stable review identity",
+                "object": "review identity from activity evidence fingerprints",
+                "outcome": "same identity survives allocation movement",
+            })
+            return {"activities": [activity], "exceptions": [], "omissions": []}
+
+        result = semantic_analyzer.analyze_tiered(
+            case["events"],
+            primary=semantic_analyzer.AnalyzerEndpoint(
+                "primary",
+                "http://primary",
+                "fixture",
+            ),
+            transport=transport,
+            max_workers=1,
+            max_events_per_chunk=len(case["events"]),
+            private_text_approved=True,
+        )
+
+        self.assertEqual(1, evidence_calls)
+        self.assertEqual(1, len(result["activities"]))
+        self.assertEqual(
+            sorted(case["expected_activity_partitions"][0]),
+            sorted(result["activities"][0]["evidence_ids"]),
+        )
+        rendered = " ".join(
+            result["activities"][0][field]
+            for field in ("action", "object", "outcome")
+        ).casefold()
+        for term in ("review", "identity", "allocation"):
+            self.assertIn(term, rendered)
+
     def test_reviewable_synthetic_partitions_pair_intent_with_result(self) -> None:
         for case in live.synthetic_cases():
             events_by_id = {event["evidence_id"]: event for event in case["events"]}

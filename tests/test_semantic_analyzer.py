@@ -1072,12 +1072,9 @@ class SemanticAnalyzerTests(unittest.TestCase):
                 analyzer_tier="primary",
             )
 
-    def test_rejects_activity_parts_that_cannot_render_as_caveman_text(self):
+    def test_rejects_activity_parts_with_forbidden_caveman_content(self):
         response = valid_response("ev-1")
-        response["activities"][0]["object"] = "Clockify descriptions and allocations"
-        response["activities"][0]["outcome"] = (
-            "removed transcript fragments while preserving every evidence reference without truncation"
-        )
+        response["activities"][0]["outcome"] = "removed transcript fragments deadbeef"
 
         with self.assertRaisesRegex(semantic.AnalyzerError, "Caveman render contract"):
             semantic.validate_result(
@@ -1220,6 +1217,28 @@ class SemanticAnalyzerTests(unittest.TestCase):
                 provider_model="model-a",
                 analyzer_tier="primary",
             )
+
+    def test_accepts_semantically_atomic_action_longer_than_three_words(self):
+        """Catches treating an action's style length as proof of compound work."""
+        response = valid_response("ev-1")
+        response["activities"][0].update({
+            "action": "Implemented stable review identity",
+            "object": "review identity from activity evidence fingerprints",
+            "outcome": "same identity survives allocation movement",
+        })
+
+        result = semantic.validate_result(
+            response,
+            known_evidence_ids={"ev-1"},
+            provider_model="model-a",
+            analyzer_tier="primary",
+        )
+
+        self.assertEqual(
+            "Implemented stable review identity",
+            result["activities"][0]["action"],
+        )
+        self.assertEqual(["ev-1"], result["activities"][0]["evidence_ids"])
 
     def test_chunking_never_truncates_events_and_prefers_days(self):
         events = [event("ev-a", "2026-07-10"), event("ev-b", "2026-07-11")]
@@ -3515,6 +3534,21 @@ class SemanticAnalyzerTests(unittest.TestCase):
         with self.assertRaisesRegex(semantic.AnalyzerError, "atomicity rationale"):
             semantic.validate_result(
                 missing,
+                known_evidence_ids={"ev-1"},
+                provider_model="model",
+                analyzer_tier="primary",
+            )
+
+    def test_rejects_empty_action(self):
+        response = valid_response("ev-1")
+        response["activities"][0]["action"] = ""
+
+        with self.assertRaisesRegex(
+            semantic.AnalyzerError,
+            "requires action, object, and outcome",
+        ):
+            semantic.validate_result(
+                response,
                 known_evidence_ids={"ev-1"},
                 provider_model="model",
                 analyzer_tier="primary",

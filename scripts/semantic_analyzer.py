@@ -2506,7 +2506,7 @@ def _validate_atomic_parts(action: str, obj: str, outcome: str, split_rationale:
             "activity split rationale contains multiple accomplishment clauses"
         )
     action_words = re.findall(r"[\w'-]+", action, flags=re.UNICODE)
-    if not action_words or len(action_words) > 3 or _COMPOUND_ACTION_RE.search(action):
+    if not action_words or _COMPOUND_ACTION_RE.search(action):
         raise AnalyzerError("activity action must express one atomic verb phrase")
     for name, value in (("action", action), ("object", obj), ("outcome", outcome)):
         if (

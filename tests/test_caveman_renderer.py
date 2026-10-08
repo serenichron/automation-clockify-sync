@@ -64,7 +64,7 @@ class CavemanRendererTests(unittest.TestCase):
                 self.assertEqual(description, renderer.validate_description(description))
 
     def test_fewer_than_five_words_is_rejected(self):
-        with self.assertRaisesRegex(renderer.CavemanValidationError, "hard bounds 5–14"):
+        with self.assertRaisesRegex(renderer.CavemanValidationError, "at least 5 words"):
             renderer.validate_description("SC — Fixed clock sync")
 
     def test_adversarial_forbidden_content_fails_closed(self):
@@ -117,15 +117,20 @@ class CavemanRendererTests(unittest.TestCase):
             with self.subTest(description=description):
                 self.assertEqual(description, renderer.validate_description(description))
 
-    def test_long_result_is_rejected_not_truncated(self):
+    def test_long_atomic_result_is_preserved_without_truncation(self):
         parts = {
             "prefix": "SC",
-            "action": "Documented",
-            "object": "new customer onboarding requirements and implementation decisions",
-            "outcome": "for coordinated cross-functional delivery planning this quarter",
+            "action": "Implemented stable review identity",
+            "object": "review identity from activity evidence fingerprints",
+            "outcome": "same identity survives allocation movement",
         }
-        with self.assertRaises(renderer.CavemanValidationError):
-            renderer.render_caveman_description(parts)
+        self.assertEqual(
+            (
+                "SC — Implemented stable review identity review identity from activity "
+                "evidence fingerprints same identity survives allocation movement"
+            ),
+            renderer.render_caveman_description(parts),
+        )
 
     def test_adjacent_repeated_words_are_rejected(self):
         with self.assertRaisesRegex(renderer.CavemanValidationError, "repeated words"):
