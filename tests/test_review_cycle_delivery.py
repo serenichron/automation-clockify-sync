@@ -922,6 +922,62 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
             "max_slices": 1,
         }
 
+    def test_stage_validation_performs_only_loader_and_coverage_bundle_verification(self):
+        """Catches a redundant full bundle pass between two existing real verifiers."""
+        manifest = cycle._ensure_period(
+            self.config, self.state_dir, "2026-09-07", "2026-09-09", bind_inputs=True,
+        )
+        result = make_run(self.root, "source-run", replay=False, record_checkpoint=False)
+        verifications = []
+        real_verify = collector_receipts.verify_completion_bundle
+
+        def counted_verify(bundle):
+            verifications.append(bundle.bundle_digest)
+            return real_verify(bundle)
+
+        with mock.patch.object(collector_receipts, "verify_completion_bundle", side_effect=counted_verify):
+            stage = cycle._validate_stage(
+                self.config, result, "2026-09-07", "2026-09-09", replay=False,
+                expected_snapshot_digests=cycle._expected_snapshot_digests(self.config, manifest),
+            )
+        self.assertEqual(["wka-alpha-s01"], stage["review_ids"])
+        self.assertEqual({"status": "complete", "incomplete_sources": []}, stage["coverage"])
+        self.assertEqual(2, len(verifications))
+
+    def test_stage_validation_rejects_artifact_and_coverage_drift_after_bundle_load(self):
+        """Catches removing the coverage verifier's independent post-load drift check."""
+        manifest = cycle._ensure_period(
+            self.config, self.state_dir, "2026-09-07", "2026-09-09", bind_inputs=True,
+        )
+        expected = cycle._expected_snapshot_digests(self.config, manifest)
+        for name, relative in (
+            ("quality", "quality_report.json"),
+            ("coverage", "evidence/evidence-ledger.json"),
+        ):
+            with self.subTest(mutated=name):
+                result = make_run(self.root, name + "-source", replay=False, record_checkpoint=False)
+                real_load = collector_receipts.load_completion_bundle
+
+                def load_then_mutate(*args, **kwargs):
+                    bundle = real_load(*args, **kwargs)
+                    artifact = result.parent / relative
+                    document = json.loads(artifact.read_text())
+                    if name == "coverage":
+                        document["manifest"]["source_completeness"] = {
+                            "status": "incomplete", "incomplete_sources": ["sessions/macbook"],
+                        }
+                    else:
+                        document["summary"]["total_proposals"] = 99
+                    write_json(artifact, document)
+                    return bundle
+
+                with mock.patch.object(collector_receipts, "load_completion_bundle", side_effect=load_then_mutate):
+                    with self.assertRaisesRegex(cycle.CycleError, "completion bundle is invalid"):
+                        cycle._validate_stage(
+                            self.config, result, "2026-09-07", "2026-09-09", replay=False,
+                            expected_snapshot_digests=expected,
+                        )
+
     def test_configured_durable_runs_root_is_used_by_real_replay_consumer(self):
         """Catches the service consumer retaining immutable-release/runs internally."""
         self.runs_patch.stop()

@@ -1113,7 +1113,6 @@ def _validate_stage(
         bundle = collector_receipts.load_completion_bundle(
             run_dir / "completion-bundle.json", run_dir=run_dir
         )
-        collector_receipts.verify_completion_bundle(bundle)
         coverage = collector_receipts.completion_coverage(bundle)
     except collector_receipts.CollectorReceiptError as exc:
         raise CycleError("review completion bundle is invalid") from exc
