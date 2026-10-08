@@ -520,6 +520,16 @@ def _validate_review_warning(
         if suffix in projects:
             sanitized["counterpart_project"] = projects[suffix]
         return sanitized
+    elif warning_type == "pending_review_replacement":
+        if set(warning) != {"type", "superseded_review_ids", "selection_sha256"}:
+            raise PublicationError("pending replacement warning fields differ")
+        ids = warning["superseded_review_ids"]
+        if (not isinstance(ids, list) or not ids or len(set(ids)) != len(ids)
+                or any(not isinstance(value, str) or not re.fullmatch(r"wka-[a-f0-9]{24}-s[0-9]{2,}", value) for value in ids)
+                or not isinstance(warning["selection_sha256"], str)
+                or not re.fullmatch(r"sha256:[a-f0-9]{64}", warning["selection_sha256"])):
+            raise PublicationError("pending replacement warning identity differs")
+        return dict(warning)
     elif warning_type == "semantic_meeting_fallback":
         if warning != {
             "type": "semantic_meeting_fallback",
@@ -1358,7 +1368,20 @@ def publish_proposal_partitions(
     meeting_bindings: Path | None = None,
     source_dir: Path | None = None,
     monthly_historical_sources: Path | None = None,
+    pending_selection: Path | None = None,
 ) -> dict[str, Any]:
+    selection = selection_plan = None
+    if pending_selection is not None:
+        if source_dir is None or meeting_bindings is not None or tombstones:
+            raise PublicationError("pending selection requires its native source and no competing portfolio projection")
+        try:
+            from scripts import clockify_pending_review_selection as pending
+            selection = pending.verify(bindings_path=pending_selection, source_dir=source_dir, proposals=proposals,
+                                       spreadsheet_id=spreadsheet_id, sheet_title=sheet_title, run_id=run_id,
+                                       project_allowlist=project_allowlist)
+            selection_plan = pending.plan(gateway, spreadsheet_id=spreadsheet_id, sheet_title=sheet_title, selection=selection)
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            raise PublicationError("pending review selection is invalid") from exc
     proposal_partitions: tuple[tuple[str, list[Mapping[str, Any]]], ...] = (
         (sheet_title, [
             proposal for proposal in proposals
@@ -1381,6 +1404,8 @@ def publish_proposal_partitions(
         if members and (monthly_rows is None or destination != "unresolved-evidence")
     ]
     meeting_aliases: dict[str, list[dict[str, Any]]] = {}
+    if selection is not None:
+        partitions = [(sheet_title, selection["rows"]), *[(title, rows) for title, rows in partitions if title != sheet_title]]
     if meeting_bindings is not None:
         if source_dir is None or Path(source_dir).name != run_id:
             raise PublicationError("meeting representation current source run differs")
@@ -1449,6 +1474,8 @@ def publish_proposal_partitions(
             **_apply_monthly_unresolved(gateway, spreadsheet_id=spreadsheet_id, plan=monthly_plan),
         })
     terminal_updates = 0
+    if selection_plan is not None:
+        terminal_updates += pending.apply(gateway, spreadsheet_id=spreadsheet_id, plan=selection_plan)
     for destination, members in (
         (
             sheet_title,
@@ -1476,6 +1503,7 @@ def publish_proposal_partitions(
         "publications": publications,
         "terminal_updates": terminal_updates,
         "clockify_writes": 0,
+        **({"pending_selection": selection["receipt"]} if selection is not None else {}),
     }
 
 
@@ -1516,6 +1544,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--monthly-unresolved-alias-proof", type=Path)
     parser.add_argument("--monthly-unresolved-historical-sources", type=Path)
     parser.add_argument("--meeting-publication-bindings", type=Path)
+    parser.add_argument("--pending-review-selection", type=Path)
     args = parser.parse_args(argv)
     if args.monthly_unresolved_historical_sources is not None and not (args.monthly_unresolved and args.proposals is not None):
         parser.error("monthly historical sources require --monthly-unresolved and --proposals")
@@ -1523,6 +1552,8 @@ def main(argv: list[str] | None = None) -> int:
     quality = _json(args.quality_report)
     replay = _json(args.replay_integrity)
     if args.portfolio_repair is not None:
+        if args.pending_review_selection is not None:
+            parser.error("pending review selection requires --proposals")
         if args.meeting_publication_bindings is not None:
             parser.error("meeting publication bindings require --proposals")
         portfolio = _json(args.portfolio_repair)
@@ -1571,6 +1602,17 @@ def main(argv: list[str] | None = None) -> int:
             except (OSError, KeyError, TypeError, ValueError) as exc:
                 raise PublicationError("monthly unresolved source/replay projection is invalid") from exc
     meeting_preview_aliases = []
+    selection_preview = None
+    if args.pending_review_selection is not None:
+        if args.meeting_publication_bindings is not None or tombstones:
+            raise PublicationError("pending selection conflicts with another portfolio projection")
+        try:
+            from scripts import clockify_pending_review_selection as pending
+            selection_preview = pending.verify(bindings_path=args.pending_review_selection, source_dir=args.proposals.parent,
+                                               proposals=proposals, spreadsheet_id=args.spreadsheet_id,
+                                               sheet_title=args.sheet_title, run_id=args.run_id, project_allowlist=projects)
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            raise PublicationError("pending review selection is invalid") from exc
     meeting_binding_handle = None
     if args.meeting_publication_bindings is not None:
         try:
@@ -1591,6 +1633,7 @@ def main(argv: list[str] | None = None) -> int:
             "external_writes": False,
             "sheet_title": args.sheet_title,
             "rows": len(rows),
+            **({"pending_selection": selection_preview["receipt"], "selected_rows": len(selection_preview["rows"])} if selection_preview is not None else {}),
             **({"meeting_aliases": len(meeting_preview_aliases)} if meeting_binding_handle is not None else {}),
         }, sort_keys=True))
         return 0
@@ -1611,6 +1654,7 @@ def main(argv: list[str] | None = None) -> int:
             meeting_bindings=args.meeting_publication_bindings,
             source_dir=args.proposals.parent,
             monthly_historical_sources=args.monthly_unresolved_historical_sources,
+            pending_selection=args.pending_review_selection,
         )
     else:
         result = publish(
@@ -1653,7 +1697,7 @@ def main(argv: list[str] | None = None) -> int:
                     for item in document["publications"]
                 ],
             }
-            for field in ("publication_profile", "publication_alias_proof", "meeting_publication_bindings"):
+            for field in ("publication_profile", "publication_alias_proof", "meeting_publication_bindings", "pending_selection"):
                 if field in document:
                     stable_document[field] = document[field]
         _write_result(args.result_output, stable_document)
