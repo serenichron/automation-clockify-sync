@@ -145,7 +145,9 @@ def _credits(selected: list[dict[str, Any]], all_sources: Mapping[str, Any]) -> 
                 key = ("other", digest(event))
             previous = union.get(key)
             canonical = copy.deepcopy(event)
-            canonical["evidence_id"] = "canonical-" + digest(key)[7:]
+            # Clockify comparison warnings must cite the immutable native
+            # evidence ID, not a synthetic session-pool atom identifier.
+            canonical["evidence_id"] = event["evidence_id"] if event.get("source_type") == "clockify" else "canonical-" + digest(key)[7:]
             if previous is not None:
                 # Session envelope serialization and transport flags differ
                 # across native captures. Neither is canonical event identity
@@ -160,6 +162,9 @@ def _credits(selected: list[dict[str, Any]], all_sources: Mapping[str, Any]) -> 
     segments, demands, members = [], {}, {}
     for item in selected:
         proposal, source = item["proposal"], item["source"]
+        if any(event.get("source_type") in {"clockify", "existing_clockify"}
+               for event in adoptions._source_events(proposal, source["ledger"])):
+            raise ValueError("pending selection cannot reuse posted Clockify credit")
         activity = proposal["activity_id"]
         matches = [d for d in source["accounting"]["allocation"]["evidence"] if d["activity_id"] == activity]
         if len(matches) != 1 or (activity in demands and matches[0] != demands[activity]):
@@ -234,8 +239,9 @@ def _credits(selected: list[dict[str, Any]], all_sources: Mapping[str, Any]) -> 
                             "debited_minutes": sum(s.duration_minutes for s in own), "activities": sorted(pool["activities"])})
     skipped = []
     existing = pipeline._existing_blocks(union.values())
-    if any(block.get("kind") == "existing_clockify" for block in existing):
-        raise ValueError("pending selection cannot reuse posted Clockify credit")
+    # Captured Clockify blocks are comparison context, never accepted credit.
+    # Keep every block in native normalization: exact posted matches must still
+    # trim/drop a saved proposal and therefore fail the unchanged-credit gate.
     normalized = pipeline._normalize_postable_proposals([copy.deepcopy(item["proposal"]) for item in selected], existing, skipped)
     originals = {p["candidate_key"]: p for p in (item["proposal"] for item in selected)}
     if len(originals) != len(selected) or len(normalized) != len(selected) or skipped:

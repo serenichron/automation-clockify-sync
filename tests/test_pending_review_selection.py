@@ -98,6 +98,79 @@ class PendingSelectionTests(unittest.TestCase):
                 "evidence_ids": proposal["provenance"]["evidence_ids"], "effort": {"min": 1, "recommended": 1, "max": 1},
                 "allowed_intervals": [{"start": proposal["start"], "end": proposal["end"]}]}
 
+    def add_clockify_context(self, *, matching=False, cite_as_source=False, overlapping=True):
+        proposal = self.current[0]
+        event = evidence_ledger.evidence_event("clockify", {"source_id": "posted-entry", "machine": "clockify"},
+            observed_at=proposal["start"], raw_source_span={
+                "start": proposal["start"] if overlapping else "2026-08-01T15:00:00+00:00",
+                "end": proposal["end"] if overlapping else "2026-08-01T15:01:00+00:00"},
+            attributes={"project_id_suffix": "abc123", "description": proposal["description"] if matching else "A different accomplishment"})
+        if cite_as_source:
+            proposal["provenance"]["evidence_ids"].append(event.evidence_id)
+        ledger = evidence_ledger.EvidenceLedger((*self.events, event), timezone="UTC")
+        document = {"schema_version": "evidence-ledger/v1", "manifest": ledger.manifest.document(),
+                    "events": [e.document() for e in ledger.events]}
+        for name, source in self.binding["sources"].items():
+            artifacts = source["artifacts"]
+            artifacts["ledger"] = write(Path(artifacts["ledger"]["path"]), document)
+            if cite_as_source and name == "current":
+                artifacts["proposals"] = write(Path(artifacts["proposals"]["path"]), self.current)
+                accounting = json.loads(Path(artifacts["accounting"]["path"]).read_text())
+                accounting["proposals"] = self.current
+                accounting["allocation"]["evidence"] = [self.demand(p) for p in self.current]
+                artifacts["accounting"] = write(Path(artifacts["accounting"]["path"]), accounting)
+                artifacts["replay_proposals"] = write(Path(artifacts["replay_proposals"]["path"]), self.current)
+                artifacts["replay_accounting"] = write(Path(artifacts["replay_accounting"]["path"]), accounting)
+            receipt = json.loads(Path(artifacts["receipt"]["path"]).read_text())
+            receipt["input_hashes"]["evidence-ledger.private.json"] = artifacts["ledger"]["sha256"][7:]
+            for filename, key in (("proposals.json", "proposals"), ("work-accounting-result.json", "accounting")):
+                receipt["deterministic_accounting_replay"][filename] = {"byte_equal": True,
+                    "primary_sha256": artifacts[key]["sha256"][7:], "replay_sha256": artifacts[key]["sha256"][7:]}
+            artifacts["receipt"] = write(Path(artifacts["receipt"]["path"]), receipt)
+        write(self.binding_path, self.binding)
+        return event
+
+    def test_nonoverlapping_native_clockify_fixed_blocks_are_context_not_credit(self):
+        self.add_clockify_context(overlapping=False)
+        gateway = SelectionGateway([publisher.HEADER, *self.baseline])
+        result = self.publish(gateway)
+        self.assertEqual(13, result["publications"][0]["appended"])
+        self.assertEqual(34, result["pending_selection"]["saved_credit_minutes"])
+        self.assertEqual(0, result["clockify_writes"])
+        self.assertFalse(any(w.get("type") == "existing_clockify_overlap" for row in gateway.rows[-13:]
+                             for w in json.loads(row[12] or "[]")))
+
+    def test_distinct_work_overlap_warns_new_rows_and_preserves_retained_cells(self):
+        event = self.add_clockify_context()
+        gateway = SelectionGateway([publisher.HEADER, *self.baseline])
+        result = self.publish(gateway)
+        warning = next(w for w in json.loads(gateway.rows[-13][12]) if w["type"] == "existing_clockify_overlap")
+        self.assertEqual(60, warning["overlap_duration_seconds"])
+        self.assertEqual(event.evidence_id, warning["counterpart_id"])
+        self.assertEqual("2026-08-01T09:00:00+00:00", warning["overlap_start"])
+        self.assertEqual(self.baseline[16:37], gateway.rows[17:38])
+        self.assertEqual(34, result["pending_selection"]["saved_credit_minutes"])
+
+    def test_exact_posted_accomplishment_credit_is_rejected_before_publication(self):
+        self.add_clockify_context(matching=True)
+        gateway = SelectionGateway([publisher.HEADER, *self.baseline])
+        before = copy.deepcopy(gateway.rows)
+        with self.assertRaises(publisher.PublicationError) as rejected:
+            self.publish(gateway)
+        self.assertEqual("pending selection native normalization changed saved credits", str(rejected.exception.__cause__))
+        self.assertEqual(before, gateway.rows)
+        self.assertEqual([], gateway.prepared)
+
+    def test_selected_clockify_source_cannot_be_reused_as_pending_credit(self):
+        self.add_clockify_context(cite_as_source=True)
+        gateway = SelectionGateway([publisher.HEADER, *self.baseline])
+        before = copy.deepcopy(gateway.rows)
+        with self.assertRaises(publisher.PublicationError) as rejected:
+            self.publish(gateway)
+        self.assertEqual("pending selection cannot reuse posted Clockify credit", str(rejected.exception.__cause__))
+        self.assertEqual(before, gateway.rows)
+        self.assertEqual([], gateway.prepared)
+
     def publish(self, gateway, **overrides):
         kwargs = dict(spreadsheet_id="sheet", sheet_title="August 2026 review", template_title="Proposals",
                       proposals=self.current, run_id=self.current_dir.name, project_allowlist={},
