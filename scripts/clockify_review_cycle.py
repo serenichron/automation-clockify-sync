@@ -1963,7 +1963,7 @@ def _expected_publication_receipts(
             selection = pending.verify(bindings_path=pending_path, source_dir=source_dir, proposals=proposals,
                 spreadsheet_id=str(config["spreadsheet_id"]), sheet_title=sheet_title,
                 run_id=str(source["run_id"]), project_allowlist=projects)
-            partition_rows[sheet_title] = selection["rows"]
+            partition_rows = {sheet_title: selection["rows"]}
         except (OSError, ValueError, TypeError, KeyError) as exc:
             raise CycleError("pending selection native projection differs") from exc
     presentation = _source_publication_input(config, source, sheet_title=sheet_title, key="publication_presentation")

@@ -223,6 +223,82 @@ def _covered_posted_row(proof: Mapping[str, Any], declaration: Mapping[str, Any]
     return row
 
 
+def _legacy_serialization_graph(graph: Mapping[str, Any], proposal: Mapping[str, Any],
+                                ledger: Mapping[str, Any], source_path: str, cache: dict) -> None:
+    """Observe one pinned native graph without adoption or durable effects."""
+    from scripts import collector_receipts, clockify_review_cycle as cycle, clockify_review_run as review
+    fields = {"runs_root", "semantic_completion", "raw_completion", "raw_ancestor", "observer_stage"}
+    run = Path(source_path).parent
+    if (not isinstance(graph, dict) or set(graph) != fields
+            or Path(graph["semantic_completion"]["path"]) != run / "completion-bundle.json"):
+        raise ValueError("pending selection legacy serialization native graph differs")
+    adoptions._capture(graph["semantic_completion"], cache)
+    bundle = collector_receipts.load_completion_bundle(run / "completion-bundle.json", run_dir=run)
+    documents = {artifact.kind: json.loads(adoptions._capture({"path": str(artifact.path), "sha256": artifact.digest}, cache))
+                 for artifact in bundle.artifacts if artifact.kind in {"evidence_ledger", "accounting_result"}}
+    if (bundle.replay or documents["evidence_ledger"] != ledger
+            or documents["accounting_result"]["proposals"].count(proposal) != 1):
+        raise ValueError("pending selection legacy serialization saved source differs")
+    try:
+        with cycle._selected_runs_config({}, graph["runs_root"]):
+            ancestor = review._verified_replay_inference_context(run)
+            stage = graph["observer_stage"]
+            if (str(ancestor) != graph["raw_ancestor"] or not isinstance(stage, dict)
+                    or stage.get("run_dir") != str(ancestor)
+                    or Path(graph["raw_completion"]["path"]) != ancestor / "completion-bundle.json"):
+                raise ValueError("pending selection legacy serialization raw ancestry differs")
+            adoptions._capture(graph["raw_completion"], cache)
+            cycle._audit_bundle(stage)
+    except (cycle.CycleError, review.ReviewRunError) as exc:
+        raise ValueError("pending selection legacy serialization native graph proof failed") from exc
+
+
+def _legacy_serialization(witness: Mapping[str, Any], current: Mapping[str, Any],
+                          proof: Mapping[str, Any], events: Sequence[Mapping[str, Any]], cache: dict) -> dict[str, Any]:
+    """Authenticate an explicitly reviewed serialization, never tolerant atoms."""
+    from zoneinfo import ZoneInfo
+    mapping = witness["legacy_serialization"]
+    if not isinstance(mapping, dict) or set(mapping) != {"current_graph", "prior_graph", "event_pairs", "interval_offsets_seconds"}:
+        raise ValueError("pending selection legacy serialization witness differs")
+    prior, proposal = proof["prior_proposal"], current["proposal"]
+    offsets = {key: (_time(proposal[key]) - _time(prior[key])).total_seconds() for key in ("start", "end")}
+    saved_offsets = mapping["interval_offsets_seconds"]
+    if (not isinstance(saved_offsets, dict) or set(saved_offsets) != {"start", "end"}
+            or any(type(value) not in {int, float} for value in saved_offsets.values())
+            or saved_offsets != offsets or offsets["start"] != offsets["end"]):
+        raise ValueError("pending selection legacy serialization saved interval offset differs")
+    current_by_id = {e["evidence_id"]: e for e in events}
+    prior_by_id = {e["evidence_id"]: e for e in proof["source_events"]}
+    pairs = mapping["event_pairs"]
+    fields = {"current_evidence_id", "prior_evidence_id", "current_event_sha256", "prior_event_sha256", "current_observed_at", "prior_observed_at"}
+    if (not isinstance(pairs, list) or not pairs or len(pairs) != len(current_by_id) or len(pairs) != len(prior_by_id)
+            or any(not isinstance(pair, dict) or set(pair) != fields for pair in pairs)
+            or len({p["current_evidence_id"] for p in pairs}) != len(pairs)
+            or len({p["prior_evidence_id"] for p in pairs}) != len(pairs)
+            or {p["current_evidence_id"] for p in pairs} != current_by_id.keys()
+            or {p["prior_evidence_id"] for p in pairs} != prior_by_id.keys()):
+        raise ValueError("pending selection legacy serialization complete event pairs differ")
+    for pair in pairs:
+        event, old = current_by_id[pair["current_evidence_id"]], prior_by_id[pair["prior_evidence_id"]]
+        attrs, old_attrs = event["attributes"], old["attributes"]
+        ref = event["source_ref"]
+        if (pair["current_event_sha256"] != digest(event) or pair["prior_event_sha256"] != digest(old)
+                or pair["current_observed_at"] != event["observed_at"] or pair["prior_observed_at"] != old["observed_at"]
+                or not all(ref.get(key) for key in ("machine", "session_id", "source_id"))
+                or type(ref.get("ordinal")) is not int or ref != old["source_ref"]
+                or event["source_type"] not in {"codex_sessions_event", "claude_bursts_event", "hermes_sessions_event", "hermes_db_sessions_event"}
+                or event["source_type"] != old["source_type"]
+                or any(attrs.get(key) != old_attrs.get(key) for key in ("role", "kind", "content", "tool_name"))
+                or old["observed_at"] != _time(event["observed_at"]).astimezone(ZoneInfo("Europe/Bucharest")).strftime("%Y-%m-%d %H:%M")):
+            raise ValueError("pending selection legacy serialization exact source/minute mapping differs")
+    _legacy_serialization_graph(mapping["current_graph"], proposal, current["source"]["ledger"],
+                                 current["source"]["artifacts"]["proposals"]["path"], cache)
+    prior_ledger = json.loads(adoptions._capture(proof["artifact_handles"]["source_ledger"], cache))
+    _legacy_serialization_graph(mapping["prior_graph"], prior, prior_ledger,
+                                 proof["artifact_handles"]["prior_proposals"]["path"], cache)
+    return {"legacy_serialization_interval_offsets_seconds": offsets, "legacy_serialization_event_pair_count": len(pairs)}
+
+
 def _covered_accomplishment(declaration: Mapping[str, Any], current: Mapping[str, Any],
                             captured: Mapping[str, list[Any]], cache: dict) -> dict[str, Any]:
     """A coordinator-reviewed exact native outcome, never semantic inference."""
@@ -236,28 +312,31 @@ def _covered_accomplishment(declaration: Mapping[str, Any], current: Mapping[str
         raise ValueError("pending selection covered accomplishment cannot replace recording proof")
     proof, entry = _covered_native_evidence(declaration, cache)
     prior = proof["prior_proposal"]
+    witness = json.loads(adoptions._capture(declaration["semantic_adjudication"], cache))
+    legacy = witness.get("schema_version") == "pending-covered-legacy-serialization-adjudication/v1"
     if (prior.get("provenance", {}).get("canonical_meeting_id")
             or type(proposal.get("duration_seconds")) is not int or proposal["duration_seconds"] <= 0
             or proposal["duration_seconds"] != prior["duration_seconds"]
             or proposal["duration_seconds"] != adoptions._seconds(proof["payload"])
             or (_time(proposal["end"]) - _time(proposal["start"])).total_seconds() != proposal["duration_seconds"]
-            or any(_time(proposal[key]) != _time(prior[key]) or _time(proposal[key]) != _time(proof["payload"][key])
+            or any((not legacy and _time(proposal[key]) != _time(prior[key])) or _time(prior[key]) != _time(proof["payload"][key])
                    for key in ("start", "end"))):
         raise ValueError("pending selection covered accomplishment whole interval differs")
     source_events = adoptions._source_events(proposal, current["source"]["ledger"])
     atoms = {_atom(event) for event in source_events}
     prior_atoms = {_atom(event) for event in proof["source_events"]}
-    if (not atoms or atoms != prior_atoms or atoms != current["atoms"]
+    if (not atoms or (not legacy and atoms != prior_atoms) or atoms != current["atoms"]
             or len(source_events) != len(atoms) or len(proof["source_events"]) != len(prior_atoms)
             or any(event.get("source_type") in {"clockify", "existing_clockify", "fathom"} for event in source_events)):
         raise ValueError("pending selection covered accomplishment complete source atoms differ")
-    witness = json.loads(adoptions._capture(declaration["semantic_adjudication"], cache))
     witness_fields = {"schema_version", "current_review_id", "prior_review_id", "current_proposal_sha256",
                       "prior_proposal_sha256", "current_semantic", "prior_semantic", "canonical_atoms_sha256",
                       "same_bounded_accomplishment", "basis", "operation_anchor", "normalized_accomplishment",
                       "adjudication_rationale"}
+    if legacy:
+        witness_fields.add("legacy_serialization")
     normalized = witness.get("normalized_accomplishment")
-    if (set(witness) != witness_fields or witness["schema_version"] != "pending-covered-accomplishment-adjudication/v1"
+    if (set(witness) != witness_fields or witness["schema_version"] not in {"pending-covered-accomplishment-adjudication/v1", "pending-covered-legacy-serialization-adjudication/v1"}
             or witness["current_review_id"] != current["review_id"] or witness["prior_review_id"] != proof["prior_review_id"]
             or witness["current_proposal_sha256"] != digest(proposal) or witness["prior_proposal_sha256"] != digest(prior)
             or witness["canonical_atoms_sha256"] != digest(sorted(digest(atom) for atom in atoms))
@@ -267,6 +346,7 @@ def _covered_accomplishment(declaration: Mapping[str, Any], current: Mapping[str
             or any(not isinstance(witness[name], str) or not witness[name].strip()
                    for name in ("operation_anchor", "adjudication_rationale"))):
         raise ValueError("pending selection covered accomplishment adjudication differs")
+    serialization = _legacy_serialization(witness, current, proof, source_events, cache) if legacy else {}
     current_handles = current["source"]["artifacts"]
     for name, saved, source_path in (
             ("current_semantic", proposal, current_handles["proposals"]["path"]),
@@ -310,7 +390,7 @@ def _covered_accomplishment(declaration: Mapping[str, Any], current: Mapping[str
             "historical_approved_project_id": proof["payload"]["projectId"], "observed_current_project": observed,
             "current_project_authorized_by_historical_approval": observed["project_id"] == proof["payload"]["projectId"],
             "authority_boundary": "trusted_coordinator_source_adjudication_not_human_financial_or_project_approval",
-            "new_pending_rows": 0, "accounting_credit_mutations": 0, "clockify_writes": 0}
+            "new_pending_rows": 0, "accounting_credit_mutations": 0, "clockify_writes": 0, **serialization}
 
 
 def _covered_source_outcome(declaration: Mapping[str, Any], current: Mapping[str, Any],

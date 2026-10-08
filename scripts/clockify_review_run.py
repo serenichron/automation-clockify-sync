@@ -2122,6 +2122,16 @@ def _prepare_replay_run(source: Path) -> Path:
                 "analyzer_cache_sha256": cache_sha256,
                 "analyzer_cache_reused_records": reused_cache_records,
             })
+        editorial = work_accounting_pipeline.editorial_saved_inputs(source)
+        if editorial is not None:
+            lineage, saved = editorial
+            for filename, content in saved.items():
+                path = target / "editorial-source" / filename
+                path.parent.mkdir(parents=True, exist_ok=True)
+                _write_snapshot(path, content, label="replay saved editorial input")
+            provenance.update({key: lineage[key] for key in (
+                "editorial_saved_artifacts", "editorial_corrections_sha256", "editorial_ledger_sha256",
+            )})
         _write_json(target / "replay-source.json", provenance)
         if _ledger_identity(target) != source_identity:
             raise ValueError("replay ledger copy does not match its immutable source")
@@ -2700,6 +2710,7 @@ def _prepare_repair_run(
     source: Path, *, routing_override: Path | None = None,
     corrections_override: Path | None = None,
     scoped_recovery: Mapping[str, Any] | None = None,
+    preserve_editorial_allocations: bool = False,
 ) -> Path:
     """Derive a new accounting run without recollection or changing its source."""
     source, snapshots = _resume_source(source)
@@ -2724,11 +2735,35 @@ def _prepare_repair_run(
             "source_corrections_sha256": parent_digest,
             "repair_corrections_sha256": child_digest,
         }
+    editorial_provenance: dict[str, Any] = {}
+    if preserve_editorial_allocations:
+        if corrections_override is None or routing_override is not None or scoped_recovery is not None:
+            raise ReviewRunError("saved editorial allocation requires only exact appended corrections")
+        parent_records = review_corrections._read_log(source / "review-corrections.jsonl")
+        tail = review_corrections._read_log(corrections_override)[len(parent_records):]
+        if any(record.get("record_type") is not None or record.get("decision") != "modify"
+               or not set(record.get("field_patch", {}))
+               or set(record["field_patch"]) - {"description", "client_project", "tag_names"}
+               for record in tail):
+            raise ReviewRunError("saved editorial allocation permits only routing and wording")
     target = Path(tempfile.mkdtemp(
         prefix=dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ") + "-repair-",
         dir=RUNS.resolve(),
     ))
     _copy_native_checkpoint_artifacts(target, native_artifacts)
+    if preserve_editorial_allocations:
+        handles = {}
+        for filename in sorted(work_accounting_pipeline.EDITORIAL_SAVED_FILES):
+            content = _read_snapshot_source(source / filename, label="saved editorial parent input")
+            path = target / "editorial-source" / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _write_snapshot(path, content, label="saved editorial immutable input")
+            handles[filename] = "sha256:" + hashlib.sha256(content).hexdigest()
+        editorial_provenance = {
+            "editorial_saved_artifacts": handles,
+            "editorial_corrections_sha256": correction_provenance["repair_corrections_sha256"],
+            "editorial_ledger_sha256": _file_sha256(source / "evidence/evidence-ledger.json", label="saved editorial ledger"),
+        }
     # All source reads are verified before a destination is eligible for resume.
     for filename in ("run-report.md", "evidence/evidence-ledger.json", *_RECONCILIATION_INPUTS.values()):
         input_path = (
@@ -2820,6 +2855,7 @@ def _prepare_repair_run(
             target / "routing.json", label="repair routing"
         ),
         **correction_provenance,
+        **editorial_provenance,
         **cache_provenance,
         **_native_checkpoint_provenance(source_report, native_artifacts),
     }, sort_keys=True).encode("utf-8") + b"\n", label="repair provenance")
@@ -2919,6 +2955,12 @@ def _finalize_repair_completion(run_dir: Path) -> collector_receipts.SliceComple
         raise ReviewRunError("repair posted credit provenance is incomplete")
     source = _run_child(RUNS / str(lineage.get("source_run_id", "")), label="repair source")
     _verified_native_checkpoint_copy(source, run_dir, lineage)
+    editorial = work_accounting_pipeline.editorial_saved_inputs(run_dir)
+    if editorial is not None:
+        _editorial_lineage, saved = editorial
+        if any(_read_snapshot_source(source / name, label="editorial completed parent input") != content
+               for name, content in saved.items()):
+            raise ReviewRunError("editorial saved fixtures differ from completed parent")
     source_bundle_path = source / "completion-bundle.json"
     if _file_sha256(source_bundle_path, label="repair source completion") != lineage.get("source_completion_sha256"):
         raise ReviewRunError("repair source completion changed")
@@ -3321,7 +3363,18 @@ def _replay_source_provenance_matches(
         known_digests = {
             "ledger_file_sha256", "semantic_analysis_sha256",
             "work_accounting_result_sha256", "analyzer_cache_sha256",
+            "editorial_corrections_sha256", "editorial_ledger_sha256",
         }
+        source_editorial = work_accounting_pipeline.editorial_saved_inputs(source)
+        replay_editorial = work_accounting_pipeline.editorial_saved_inputs(replay)
+        if (source_editorial is None) != (replay_editorial is None):
+            return False
+        if source_editorial is not None:
+            source_lineage, source_saved = source_editorial
+            replay_lineage, replay_saved = replay_editorial
+            if source_saved != replay_saved or any(source_lineage[key] != replay_lineage[key] for key in (
+                    "editorial_saved_artifacts", "editorial_corrections_sha256", "editorial_ledger_sha256")):
+                return False
         if any(
             key.endswith("sha256") and key not in known_digests
             for key in provenance
@@ -3449,6 +3502,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--allow-stopped-only-legacy-observation-variance", action="store_true",
                         help="Explicitly admit different stopped-only legacy observations for --derive-pending-from; preserve and bind both original timestamps.")
     parser.add_argument("--repair-from", type=Path, help="Re-derive accounting in a distinct run from a completed source's exact snapshots and validated cache.")
+    parser.add_argument("--preserve-editorial-allocations", action="store_true", help="Apply only exact source-bound routing/wording corrections to the completed parent's immutable saved allocations.")
     parser.add_argument(
         "--materialize-frozen-from", type=Path,
         help="Complete a verified captured source offline in a distinct private review run.",
@@ -3892,6 +3946,10 @@ def _adopt_completed_recovery(source: Path) -> Path | None:
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(raw_argv)
+    if args.preserve_editorial_allocations and (args.repair_from is None or args.retry_failed_reviews
+            or args.scoped_recovery_from is not None or not _option_was_supplied(raw_argv, "--corrections")):
+        print("clockify review run: saved editorial allocations require repair-from and explicit corrections only", file=sys.stderr)
+        return 2
     if args.allow_stopped_only_legacy_observation_variance and args.derive_pending_from is None:
         print("clockify review run: stopped-only observation compatibility requires --derive-pending-from", file=sys.stderr)
         return 2
@@ -4099,6 +4157,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.repair_from, args.scoped_recovery_from, args.retry_review_digest)
             repair = _prepare_repair_run(
                 args.repair_from,
+                preserve_editorial_allocations=args.preserve_editorial_allocations,
                 routing_override=(
                     args.routing
                     if "--routing" in supplied_reconciliation_overrides

@@ -3031,6 +3031,114 @@ def _accounting_collection_snapshot(run_dir: Path, events: list[dict[str, Any]])
         return None
 
 
+EDITORIAL_SAVED_FILES = frozenset({
+    "proposals.json", "work-accounting-result.json", "semantic-analysis.json",
+    "review-corrections.jsonl", "routing.json",
+})
+
+
+def editorial_saved_inputs(run_dir: Path) -> tuple[dict[str, Any], dict[str, bytes]] | None:
+    """Read only pinned, copied parent inputs; never consult a live parent."""
+    for name in ("repair-source.json", "replay-source.json"):
+        path = run_dir / name
+        if not path.is_file():
+            continue
+        lineage = _read_json(path)
+        handles = lineage.get("editorial_saved_artifacts")
+        if handles is None:
+            continue
+        if not isinstance(handles, dict) or set(handles) != EDITORIAL_SAVED_FILES:
+            raise WorkAccountingError("editorial saved input inventory differs")
+        contents = {}
+        for filename, expected in handles.items():
+            source = run_dir / "editorial-source" / filename
+            if source.is_symlink() or source.parent.is_symlink() or not source.is_file():
+                raise WorkAccountingError("editorial saved input is missing or unsafe")
+            content = source.read_bytes()
+            if "sha256:" + hashlib.sha256(content).hexdigest() != expected:
+                raise WorkAccountingError("editorial saved input hash differs")
+            contents[filename] = content
+        if "sha256:" + hashlib.sha256((run_dir / "review-corrections.jsonl").read_bytes()).hexdigest() != lineage.get("editorial_corrections_sha256"):
+            raise WorkAccountingError("editorial correction snapshot differs")
+        if "sha256:" + hashlib.sha256((run_dir / "evidence/evidence-ledger.json").read_bytes()).hexdigest() != lineage.get("editorial_ledger_sha256"):
+            raise WorkAccountingError("editorial source ledger differs")
+        if (run_dir / "routing.json").read_bytes() != contents["routing.json"]:
+            raise WorkAccountingError("editorial configured routing snapshot differs")
+        return lineage, contents
+    return None
+
+
+def _derive_saved_editorial_accounting(
+    run_dir: Path, routing: Mapping[str, Any], corrections_path: Path,
+    inputs: tuple[dict[str, Any], dict[str, bytes]],
+) -> dict[str, Any]:
+    """Apply only exact route/wording edits to authenticated saved credits."""
+    lineage, contents = inputs
+    original = json.loads(contents["work-accounting-result.json"])
+    original_proposals = json.loads(contents["proposals.json"])
+    analysis = json.loads(contents["semantic-analysis.json"])
+    if original.get("proposals") != original_proposals:
+        raise WorkAccountingError("editorial parent proposals/accounting differ")
+    parent_bytes = contents["review-corrections.jsonl"]
+    child_bytes = corrections_path.read_bytes()
+    if "sha256:" + hashlib.sha256(child_bytes).hexdigest() != lineage["editorial_corrections_sha256"]:
+        raise WorkAccountingError("editorial correction snapshot differs")
+    if not child_bytes.startswith(parent_bytes) or child_bytes == parent_bytes:
+        raise WorkAccountingError("editorial corrections are not an exact parent extension")
+    parent_records = review_corrections._read_log(run_dir / "editorial-source/review-corrections.jsonl")
+    records = review_corrections._read_log(corrections_path)
+    tail = records[len(parent_records):]
+    cases = review_corrections.derive_regression_cases(records)
+    result = copy.deepcopy(original)
+    seen = set()
+    route_choices = []
+    for record in tail:
+        patch = record.get("field_patch", {})
+        fields = set(patch)
+        if (record.get("record_type") is not None or record.get("decision") != "modify"
+                or not fields or fields - {"description", "client_project", "tag_names"}
+                or bool(fields & {"client_project", "tag_names"}) and not {"client_project", "tag_names"} <= fields):
+            raise WorkAccountingError("editorial preservation permits only routing and wording")
+        target = (record["activity_id"], record["evidence_fingerprint"])
+        if target in seen:
+            raise WorkAccountingError("editorial source target repeats")
+        seen.add(target)
+        matches = [p for p in result["proposals"] if review_corrections.proposal_target(p) == target]
+        activities = [a for a in analysis["activities"] if review_corrections.proposal_target(a) == target]
+        if not matches or len(activities) != 1:
+            raise WorkAccountingError("editorial source target is absent or ambiguous")
+        activity = activities[0]
+        route = _route_from_review_correction(activity, cases, routing) if "client_project" in fields else None
+        if "client_project" in fields and route is None:
+            raise WorkAccountingError("editorial route must select configured project and task")
+        description = _description_from_review_correction(activity, cases) if "description" in fields else None
+        if "description" in fields:
+            if description is None:
+                raise WorkAccountingError("editorial wording is ambiguous")
+            caveman_renderer.validate_client_description_hygiene(description)
+            activity["rendered_description"] = description
+        for proposal in matches:
+            if route is not None:
+                route_choices.append({"candidate_key": proposal["candidate_key"], "prior_billable": proposal.get("billable"), "pending_billable": bool(route.get("billable", True)), "posting_approval": False})
+                for field, route_field in (("client_project", "project_name"), ("clockify_project_suffix", "project_suffix"), ("tag_names", "tag_names"), ("tag_suffixes", "tag_suffixes")):
+                    proposal[field] = copy.deepcopy(route[route_field])
+                proposal["billable"] = bool(route.get("billable", True))
+                proposal.pop("routing_disposition", None)
+                proposal["review_warnings"] = [w for w in proposal.get("review_warnings", []) if w.get("type") != "unresolved_routing"]
+            if description is not None:
+                proposal["description"] = proposal["rendered_description"] = description
+    regression = review_corrections.evaluate_regression_cases(cases, result["proposals"])
+    if any(case["status"] != "pass" for case in regression["results"]):
+        raise WorkAccountingError("editorial correction regression failed")
+    result["correction_regression"] = regression
+    result["editorial_derivation"] = {"parent_artifacts": lineage["editorial_saved_artifacts"], "corrections_sha256": lineage["editorial_corrections_sha256"], "saved_allocation_preserved": True, "route_choices": route_choices, "posting_approval": False}
+    _write_json(run_dir / "semantic-analysis.json", analysis)
+    for filename, value in (("allocation-report.json", result["allocation"]), ("fathom-reconciliation.json", result["fathom_reconciliation"]), ("review-regression-results.json", regression), ("proposals.json", result["proposals"]), ("ambiguous.json", result["ambiguous"]), ("skipped.json", result["skipped"]), ("review-tombstones.json", result.get("review_tombstones", []))):
+        _write_json(run_dir / filename, value)
+    _write_json(run_dir / "work-accounting-result.json", result)
+    return result
+
+
 def run_accounting(
     run_dir: Path,
     *,
@@ -3076,6 +3184,13 @@ def run_accounting(
         raise WorkAccountingError(f"ledger member identities are invalid: {exc}") from exc
     analysis_events, noise = _analysis_events(all_events, member_identities)
     routing = _read_json(routing_path or (root / "routing.json"))
+    editorial = editorial_saved_inputs(run_dir)
+    if editorial is not None:
+        if (routing_path or root / "routing.json").read_bytes() != editorial[1]["routing.json"]:
+            raise WorkAccountingError("editorial configured routing snapshot differs")
+        if failed_review_retry_source is not None or failed_review_retry_digest is not None:
+            raise WorkAccountingError("editorial saved allocation cannot infer or retry")
+        return _derive_saved_editorial_accounting(run_dir, routing, corrections_path or run_dir / "review-corrections.jsonl", editorial)
     retry_actor_contract = None
     if failed_review_retry_cache_only:
         from scripts import clockify_review_run as review_run
