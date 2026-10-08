@@ -263,6 +263,66 @@ class PendingSelectionTests(unittest.TestCase):
         self.publish(gateway)
         self.assertEqual(unrelated, gateway.rows[45])
 
+    def test_readable_reason_projection_preserves_other14_cells_and_repeat_is_zero(self):
+        from scripts import clockify_pending_review_selection as consumer
+        verified = consumer.verify(bindings_path=self.binding_path, source_dir=self.current_dir, proposals=self.current,
+                                   spreadsheet_id="sheet", sheet_title="August 2026 review", run_id=self.current_dir.name,
+                                   project_allowlist={})
+        native_rows = {row[0]: row for row in verified["rows"]}
+        reasons = {review_id: "Revizuire necesară: alocare nativă, neînregistrată."
+                   for review_id in self.binding["selected_current_ids"]}
+        self.binding["reason_projection"] = write(self.root / "readable-reasons.json", reasons)
+        write(self.binding_path, self.binding)
+        gateway = SelectionGateway([publisher.HEADER, *self.baseline])
+        try:
+            first = self.publish(gateway)
+        except publisher.PublicationError as exc:
+            self.fail(f"native consumer cannot yet accept the immutable readable reason projection: {exc.__cause__}")
+        for row in gateway.rows[-13:]:
+            self.assertEqual(reasons[row[0]], row[12])
+            self.assertEqual([native_rows[row[0]][i] for i in range(15) if i != 12],
+                             [row[i] for i in range(15) if i != 12])
+        receipt = first["pending_selection"]
+        self.assertEqual(self.binding["reason_projection"], receipt["reason_projection"])
+        self.assertEqual(set(reasons), set(receipt["native_review_warnings"]))
+        self.assertTrue(all(receipt["native_review_warnings"].values()))
+        before = copy.deepcopy(gateway.rows)
+        again = self.publish(gateway)
+        self.assertEqual(before, gateway.rows)
+        self.assertEqual(first["pending_selection"], again["pending_selection"])
+        self.assertEqual(0, again["publications"][0]["appended"])
+        self.assertEqual(0, again["publications"][0]["updated"])
+        self.assertEqual(0, again["terminal_updates"])
+
+    def test_reason_projection_requires_exact_ids_nonempty_text_and_immutable_bytes(self):
+        ids = self.binding["selected_current_ids"]
+        for mode in ("missing", "extra", "empty", "nonstring", "changed-bytes"):
+            with self.subTest(mode=mode):
+                reasons = {review_id: "Revizuire necesară." for review_id in ids}
+                if mode == "missing":
+                    reasons.pop(ids[0])
+                elif mode == "extra":
+                    reasons["unselected"] = "Nu este selectată."
+                elif mode == "empty":
+                    reasons[ids[0]] = " "
+                elif mode == "nonstring":
+                    reasons[ids[0]] = {"text": "Nu este șir."}
+                binding = copy.deepcopy(self.binding)
+                reasons_path = self.root / "readable-reasons.json"
+                binding["reason_projection"] = write(reasons_path, reasons)
+                write(self.binding_path, binding)
+                if mode == "changed-bytes":
+                    reasons[ids[0]] = "Schimbată după legare."
+                    write(reasons_path, reasons)
+                gateway = SelectionGateway([publisher.HEADER, *self.baseline])
+                before = copy.deepcopy(gateway.rows)
+                with self.assertRaises(publisher.PublicationError):
+                    self.publish(gateway)
+                self.assertEqual(before, gateway.rows)
+                self.assertEqual([], gateway.prepared)
+                self.assertEqual([], gateway.updated)
+        write(self.binding_path, self.binding)
+
     def test_cli_verifies_full_source_then_seals_optional_consumer_receipt(self):
         args = ["--spreadsheet-id", "sheet", "--sheet-title", "August 2026 review",
                 "--proposals", str(self.current_dir / "proposals.json"),

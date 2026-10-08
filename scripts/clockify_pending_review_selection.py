@@ -255,7 +255,8 @@ def verify(*, bindings_path: Path, source_dir: Path, proposals: Sequence[Mapping
     cache = {}
     handle = artifact_handle(bindings_path)
     document = json.loads(adoptions._capture(handle, cache))
-    if (set(document) != {"schema_version", "spreadsheet_id", "sheet_title", "current_source", "sources", "selected_current_ids", "prior_rows", "sheet_capture"}
+    required_fields = {"schema_version", "spreadsheet_id", "sheet_title", "current_source", "sources", "selected_current_ids", "prior_rows", "sheet_capture"}
+    if (not required_fields <= document.keys() or document.keys() - required_fields - {"reason_projection"}
             or document["schema_version"] != SCHEMA or (document["spreadsheet_id"], document["sheet_title"]) != (spreadsheet_id, sheet_title)):
         raise ValueError("pending selection schema or destination differs")
     sources = {name: _source(record, cache) for name, record in document["sources"].items()}
@@ -296,6 +297,12 @@ def verify(*, bindings_path: Path, source_dir: Path, proposals: Sequence[Mapping
     ids = document["selected_current_ids"]
     if not isinstance(ids, list) or not ids or len(set(ids)) != len(ids) or not set(ids) <= current_items.keys():
         raise ValueError("pending selection current selection is invalid")
+    reasons = None
+    if "reason_projection" in document:
+        reasons = json.loads(adoptions._capture(document["reason_projection"], cache))
+        if (not isinstance(reasons, dict) or set(reasons) != set(ids)
+                or any(not isinstance(value, str) or not value.strip() for value in reasons.values())):
+            raise ValueError("pending selection readable reasons require exact selected IDs and nonempty strings")
     selected = [current_items[review_id] for review_id in ids]
     prior, seen = [], set(ids)
     for declaration in document["prior_rows"]:
@@ -369,6 +376,16 @@ def verify(*, bindings_path: Path, source_dir: Path, proposals: Sequence[Mapping
                                             "selection_sha256": handle["sha256"]}]
         rows.append(publisher.proposal_row(proposal, run_id, project_allowlist=project_allowlist))
     rows.extend(record["row"] for record in prior if record["disposition"] == "retain")
+    reason_binding = {}
+    if reasons is not None:
+        # Explicit immutable presentation only: source proposals and all native
+        # warnings remain bound. Only M on selected NEW rows is projected.
+        reason_binding = {"reason_projection": document["reason_projection"],
+                          "native_projection_rows_sha256": digest(rows),
+                          "native_review_warnings": {row[0]: json.loads(row[12]) if row[12] else [] for row in rows if row[0] in reasons}}
+        for row in rows:
+            if row[0] in reasons:
+                row[12] = reasons[row[0]]
     receipt = {"schema_version": "pending-review-selection-acceptance/v1", "verification_basis": "saved_native_pending_credits",
                "selection": handle, "spreadsheet_id": spreadsheet_id, "sheet_title": sheet_title,
                "current_source_artifacts": current["artifacts"], "sources": document["sources"],
@@ -383,7 +400,7 @@ def verify(*, bindings_path: Path, source_dir: Path, proposals: Sequence[Mapping
                "runtime_artifacts": {"consumer": artifact_handle(Path(__file__).resolve()),
                                      "pipeline": artifact_handle(Path(pipeline.__file__).resolve()),
                                      "allocator": artifact_handle(Path(allocator.__file__).resolve())},
-               **acceptance, "clockify_writes": 0}
+               **acceptance, **reason_binding, "clockify_writes": 0}
     receipt["acceptance_sha256"] = digest(receipt)
     return {"rows": rows, "prior": prior, "receipt": receipt, "new_ids": ids}
 
