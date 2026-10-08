@@ -2237,6 +2237,40 @@ def _write_delivery_receipt(path: Path, document: Mapping[str, Any]) -> None:
 def _verify_delivery_receipt(
     path: Path, config: Mapping[str, Any], since: str, until: str,
     source: Mapping[str, Any], replay: Mapping[str, Any], *, sheet_title: str,
+    record: Mapping[str, Any] | None = None,
+) -> None:
+    # Only the already-validated native state record supplies historical
+    # authority. Neither an inner self-hash nor a digest inferred from this
+    # receipt can authorize an admission clock.
+    if record is None or "delivery_result_digest" not in record:
+        return _verify_delivery_receipt_unscoped(path, config, since, until, source, replay, sheet_title=sheet_title)
+    receipt_key = "publication_receipt" if record.get("status") == "published_with_source_gaps" else "delivery_receipt"
+    if (record.get("status") not in {"delivered", "delivered_with_exceptions", "published_with_source_gaps"}
+            or record.get("until") != until or record.get(receipt_key) != str(path)
+            or record.get("source") != dict(source) or record.get("replay") != dict(replay)
+            or record.get("source_run_id") != source["run_id"] or record.get("replay_run_id") != replay["run_id"]
+            or record.get("review_ids") != source["review_ids"]):
+        raise CycleError("historical delivery native state identity differs")
+    with _native_pending_graph(path, record["delivery_result_digest"], config, source, sheet_title):
+        _verify_delivery_receipt_unscoped(path, config, since, until, source, replay, sheet_title=sheet_title)
+
+
+@contextmanager
+def _native_pending_graph(path: Path, pinned_digest: str, config: Mapping[str, Any],
+                          source: Mapping[str, Any], sheet_title: str):
+    from scripts import clockify_pending_runtime_proof as pending_runtime
+    try:
+        with pending_runtime._authenticated_graph(path, pinned_digest=pinned_digest,
+                source_dir=Path(str(source["run_dir"])), spreadsheet_id=str(config["spreadsheet_id"]),
+                sheet_title=sheet_title):
+            yield
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        raise CycleError("historical pending native receipt graph has drifted") from exc
+
+
+def _verify_delivery_receipt_unscoped(
+    path: Path, config: Mapping[str, Any], since: str, until: str,
+    source: Mapping[str, Any], replay: Mapping[str, Any], *, sheet_title: str,
 ) -> None:
     if path.is_symlink() or not path.is_file():
         raise CycleError("delivery receipt is missing or unsafe")
@@ -4296,10 +4330,11 @@ def _verify_historical_adoption(
         raise CycleError("historical publication result identity differs")
     title = _sheet_title(config["monthly_sheet_title_template"], since=since)
     config = _receipt_publication_config(config, document)
-    expected = _expected_publication_receipts(config, source, sheet_title=title,
-        publication_profile=document.get("publication_profile"))
-    validated = _validated_publication_document(_json_file(path, "publisher result"), expected,
-        source_dir=Path(str(source["run_dir"])))
+    with _native_pending_graph(path, document["publication_result_digest"], config, source, title):
+        expected = _expected_publication_receipts(config, source, sheet_title=title,
+            publication_profile=document.get("publication_profile"))
+        validated = _validated_publication_document(_json_file(path, "publisher result"), expected,
+            source_dir=Path(str(source["run_dir"])))
     if document.get("publication_receipts") != validated:
         raise CycleError("historical publication row identity differs")
 
@@ -4393,7 +4428,7 @@ def _validate_delivered_state(config: Mapping[str, Any], state: Mapping[str, Any
                 raise CycleError("delivered slice has no delivery receipt")
             title = _sheet_title(config["monthly_sheet_title_template"], since=since)
             _verify_delivery_receipt(
-                Path(receipt), graph_config, since, until, source, replay, sheet_title=title
+                Path(receipt), graph_config, since, until, source, replay, sheet_title=title, record=raw_record
             )
 
 
@@ -5005,6 +5040,7 @@ def _recovery_source_history(
             _verify_delivery_receipt(
                 Path(str(record[key])), config, since, until, source, replay,
                 sheet_title=_sheet_title(config["monthly_sheet_title_template"], since=since),
+                record=record,
             )
     if record.get("historical_adoption_receipt") is not None:
         adoption = _historical_adoption_document(config, record, since, until)
@@ -5672,7 +5708,7 @@ def _run_slice(
     if receipt_path.exists():
         _verify_delivery_receipt(
             receipt_path, config, since, until, source, replay,
-            sheet_title=sheet_title,
+            sheet_title=sheet_title, record=record,
         )
     else:
         receipt = _delivery_document(
@@ -5731,6 +5767,7 @@ def _run_slice(
         "exceptions_complete": not source["exception_ids"],
     })
     record["publication_receipt" if partial_publication else "delivery_receipt"] = str(receipt_path.resolve())
+    record["delivery_result_digest"] = _digest(receipt_path)
     _persist_state(state_path, state, since, record)
     return {
         "status": record["status"],
@@ -6085,11 +6122,12 @@ def adopt_historical_slice(
         publication_document = _json_file(publication_path, "publisher result")
         publication_profile = publication_document.get("publication_profile")
         publication_config = _receipt_publication_config(validation_config, publication_document)
-        expected_publications = _expected_publication_receipts(
-            publication_config, source, sheet_title=title, publication_profile=publication_profile,
-        )
-        expected_publications = _validated_publication_document(publication_document, expected_publications,
-            source_dir=Path(str(source["run_dir"])))
+        with _native_pending_graph(publication_path, request["publication_result_digest"], publication_config, source, title):
+            expected_publications = _expected_publication_receipts(
+                publication_config, source, sheet_title=title, publication_profile=publication_profile,
+            )
+            expected_publications = _validated_publication_document(publication_document, expected_publications,
+                source_dir=Path(str(source["run_dir"])))
         checkpoint_capture: dict[str, str] = {}
         if derived:
             original_snapshots: dict[str, str] = {}
@@ -6145,10 +6183,11 @@ def adopt_historical_slice(
         _verify_historical_adoption(
             validation_config, record, adoption, since, until, source, replay,
         )
-        delivery = _delivery_document(
-            publication_config, since, until, source, replay, sheet_title=title, publication_profile=publication_profile,
-            publication_readbacks=expected_publications,
-        )
+        with _native_pending_graph(publication_path, request["publication_result_digest"], publication_config, source, title):
+            delivery = _delivery_document(
+                publication_config, since, until, source, replay, sheet_title=title, publication_profile=publication_profile,
+                publication_readbacks=expected_publications,
+            )
         receipt_path = state_dir / "delivery-receipts" / f"{since}.json"
         adoption_path = state_dir / "historical-adoption-receipts" / f"{since}.json"
         raw_debt = _json_file(debt_path, "source coverage")
@@ -6174,6 +6213,7 @@ def adopt_historical_slice(
             "source_completeness": source["coverage"],
             "source_run_id": source["run_id"], "replay_run_id": replay["run_id"],
             "delivery_receipt": str(receipt_path),
+            "delivery_result_digest": _digest(receipt_path),
             "historical_adoption_receipt": str(adoption_path),
             "historical_adoption_receipt_digest": adoption["receipt_digest"],
             "review_ids": source["review_ids"],

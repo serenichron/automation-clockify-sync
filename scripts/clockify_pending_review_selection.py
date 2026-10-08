@@ -7,6 +7,7 @@ inference or provider access occurs here. All input paths are explicit handles.
 from __future__ import annotations
 
 import copy
+from contextvars import ContextVar
 import datetime as dt
 import hashlib
 import json
@@ -18,6 +19,56 @@ from scripts import clockify_source_adoptions as adoptions
 from scripts import work_accounting_pipeline as pipeline, work_allocator as allocator
 
 SCHEMA = "pending-review-selection/v1"
+_RECORDED_ADMISSIONS: ContextVar[Mapping[str, Any]] = ContextVar("pending_recorded_admissions", default={})
+_VERIFY_ADMISSION: ContextVar[Any] = ContextVar("pending_verify_admission", default=None)
+
+
+def _admission_key(selection: Mapping[str, Any], source_dir: Path, spreadsheet_id: str,
+                   sheet_title: str) -> str:
+    return digest([dict(selection), str(source_dir), spreadsheet_id, sheet_title])
+
+
+def _admission_bindings(receipt: Mapping[str, Any]) -> str:
+    return digest({**{key: value for key, value in receipt.items()
+                      if key not in {"native_admission", "acceptance_sha256", "runtime_artifacts"}},
+                   "runtime_role_sha256": {role: handle["sha256"]
+                                            for role, handle in receipt["runtime_artifacts"].items()}})
+
+
+def _admission_gets(receipt: Mapping[str, Any]) -> list[dict[str, Any]]:
+    handles = {digest(item["fresh_clockify_capture"]): item["fresh_clockify_capture"]
+               for item in receipt["covered_source_outcomes"]}
+    return [{"artifact": handles[key], "finished_utc": json.loads(
+        adoptions._capture(handles[key], {}))["finished_utc"]} for key in sorted(handles)]
+
+
+def _validate_native_admission(receipt: Mapping[str, Any]) -> dt.datetime:
+    try:
+        return _validated_native_admission(receipt)
+    except (OSError, TypeError, KeyError, AttributeError) as exc:
+        raise ValueError("pending native admission witness differs") from exc
+
+
+def _validated_native_admission(receipt: Mapping[str, Any]) -> dt.datetime:
+    admission = receipt.get("native_admission")
+    if (not isinstance(admission, Mapping) or set(admission) != {
+            "schema_version", "observed_utc", "acceptance_bindings_sha256", "fresh_clockify_gets", "sha256"}
+            or admission["schema_version"] != "pending-native-admission/v1"
+            or not isinstance(admission["observed_utc"], str)
+            or admission["sha256"] != digest({key: value for key, value in admission.items() if key != "sha256"})
+            or admission["acceptance_bindings_sha256"] != _admission_bindings(receipt)
+            or receipt.get("acceptance_sha256") != digest({key: value for key, value in receipt.items()
+                                                           if key != "acceptance_sha256"})
+            or not receipt.get("covered_source_outcomes")
+            or admission["fresh_clockify_gets"] != _admission_gets(receipt)):
+        raise ValueError("pending native admission witness differs")
+    observed = _time(admission["observed_utc"])
+    if observed.isoformat() != admission["observed_utc"] or observed > dt.datetime.now(dt.timezone.utc):
+        raise ValueError("pending native admission clock differs")
+    if any(not dt.timedelta(0) <= observed - _time(item["finished_utc"]) <= dt.timedelta(hours=1)
+           for item in admission["fresh_clockify_gets"]):
+        raise ValueError("pending native admission GET freshness differs")
+    return observed
 
 
 def digest(value: Any) -> str:
@@ -190,7 +241,10 @@ def _covered_native_evidence(declaration: Mapping[str, Any], cache: dict) -> tup
     live = json.loads(adoptions._capture(declaration["fresh_clockify_capture"], cache))
     target = live.get("verified_target", {})
     finished = _time(live["finished_utc"])
-    age = dt.datetime.now(dt.timezone.utc) - finished
+    admission = _VERIFY_ADMISSION.get()
+    if admission is not None and admission[1] is not None and declaration["fresh_clockify_capture"] not in admission[1]:
+        raise ValueError("pending historical admission exact GET differs")
+    age = (admission[0] if admission is not None else dt.datetime.now(dt.timezone.utc)) - finished
     if (not re.fullmatch(r"clockify(?:-[a-z]+)?-live-readonly/v1", str(live.get("schema") or ""))
             or live.get("all_pages_returned") is not True or live.get("external_mutations") is not False
             or live.get("cache_mutations") is not False or not live.get("get_requests")
@@ -697,6 +751,35 @@ def _reviewed_routing_correction(binding: Mapping[str, Any], *, source: Mapping[
 
 def verify(*, bindings_path: Path, source_dir: Path, proposals: Sequence[Mapping[str, Any]],
            spreadsheet_id: str, sheet_title: str, run_id: str, project_allowlist: Mapping[str, str]) -> dict[str, Any]:
+    """Fresh admission, unless this exact graph is already authenticated by the cycle."""
+    handle = artifact_handle(bindings_path)
+    recorded = _RECORDED_ADMISSIONS.get().get(_admission_key(handle, source_dir, spreadsheet_id, sheet_title))
+    observed = dt.datetime.now(dt.timezone.utc)
+    gets = None
+    if recorded is not None:
+        observed = _validate_native_admission(recorded)
+        gets = [item["artifact"] for item in recorded["native_admission"]["fresh_clockify_gets"]]
+    token = _VERIFY_ADMISSION.set((observed, gets))
+    try:
+        result = _verify(bindings_path=bindings_path, source_dir=source_dir, proposals=proposals,
+            spreadsheet_id=spreadsheet_id, sheet_title=sheet_title, run_id=run_id, project_allowlist=project_allowlist)
+        receipt = result["receipt"]
+        if receipt.get("covered_source_outcomes"):
+            admission = {"schema_version": "pending-native-admission/v1", "observed_utc": observed.isoformat(),
+                         "acceptance_bindings_sha256": _admission_bindings(receipt),
+                         "fresh_clockify_gets": _admission_gets(receipt)}
+            receipt["native_admission"] = {**admission, "sha256": digest(admission)}
+            receipt["acceptance_sha256"] = digest({key: value for key, value in receipt.items() if key != "acceptance_sha256"})
+            _validate_native_admission(receipt)
+            if recorded is not None and receipt["native_admission"] != recorded["native_admission"]:
+                raise ValueError("pending historical admission source binding differs")
+        return result
+    finally:
+        _VERIFY_ADMISSION.reset(token)
+
+
+def _verify(*, bindings_path: Path, source_dir: Path, proposals: Sequence[Mapping[str, Any]],
+            spreadsheet_id: str, sheet_title: str, run_id: str, project_allowlist: Mapping[str, str]) -> dict[str, Any]:
     from scripts import clockify_sheet_publish as publisher
     cache = {}
     handle = artifact_handle(bindings_path)
