@@ -421,6 +421,11 @@ def review_proposal(
     description = str(proposal.get("description") or "")
     flash_reviewed = bool(_provenance(proposal).get("semantic_reviewer_model"))
     recorded_attendance = _recorded_attendance_contract(proposal)
+    if not recorded_attendance:
+        try:
+            caveman_renderer.validate_client_description_hygiene(description)
+        except caveman_renderer.CavemanValidationError as exc:
+            issues.append(f"Client description hygiene: {exc}")
     if _provenance(proposal).get("source_type") == "recorded_meeting" and not recorded_attendance:
         issues.append("Recorded attendance fallback contract is invalid")
 

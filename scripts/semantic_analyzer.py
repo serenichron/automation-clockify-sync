@@ -264,6 +264,7 @@ _CONTRACT_FAILURE_PATTERNS: tuple[tuple[str, str], ...] = (
     ("compound_field", "multiple accomplishment clauses"),
     ("unsupported_human_work", "human accomplishment support"),
     ("description_contract", "caveman render contract"),
+    ("client_description_hygiene", "client description hygiene"),
     ("missing_evidence_span", "nonempty evidence_spans"),
     ("invalid_evidence_span", "valid start and end timestamps"),
     ("unsupported_evidence_span", "not supported by cited evidence"),
@@ -335,6 +336,14 @@ def _repair_instruction(failure_code: str) -> str:
             "'SC — action object outcome' is 5-14 words, targets 8-14 words, "
             "and contains no slash, underscore, Markdown, path, URL, hash, "
             "first-person wording, status prose, or truncation."
+        ),
+        "client_description_hygiene": (
+            "Preserve the supported accomplishment, evidence classification, citations, "
+            "project, task type, and effort. Rewrite only its action/object/outcome wording "
+            "for the client: no commit hashes, test/check pass counts, or build-status "
+            "verification telemetry. Retain genuine test authoring, testing work, and "
+            "meaningful business quantities. Do not truncate, omit, or mark work as noise "
+            "merely to repair wording."
         ),
         "omitted_evidence": "Account for every supplied bundle member exactly once with ranges.",
         "duplicate_evidence": "Keep member ranges disjoint across the full result.",
@@ -2656,6 +2665,7 @@ def validate_result(
     evidence_time_spans: dict[str, dict[str, str]] | None = None,
     evidence_support: Mapping[str, Mapping[str, str]] | None = None,
     semantic_validation: bool = True,
+    client_description_hygiene: bool = False,
 ) -> dict[str, Any]:
     activities = result.get("activities", [])
     exceptions = result.get("exceptions", [])
@@ -2702,6 +2712,13 @@ def validate_result(
             raise AnalyzerError("reviewable activity requires action, object, and outcome")
         if lifecycle not in {"planned", "noise"} and not workstream:
             raise AnalyzerError("reviewable activity requires a workstream")
+        if client_description_hygiene and lifecycle not in {"planned", "noise"}:
+            try:
+                caveman_renderer.validate_client_description_hygiene(
+                    f"SC — {action} {obj} {outcome}"
+                )
+            except caveman_renderer.CavemanValidationError as exc:
+                raise AnalyzerError(f"activity violates client description hygiene: {exc}") from exc
         if semantic_validation and lifecycle not in {"planned", "noise"}:
             _validate_atomic_parts(action, obj, outcome, split_rationale)
             try:
@@ -3928,6 +3945,7 @@ def _call_semantic_review_once(
                 provider_revision=reviewer_revision,
                 evidence_time_spans=evidence_time_spans,
                 semantic_validation=False,
+                client_description_hygiene=True,
             )
         except AnalyzerError as exc:
             if not (
@@ -3974,6 +3992,7 @@ def _call_semantic_review_once(
                 provider_revision=reviewer_revision,
                 evidence_time_spans=evidence_time_spans,
                 semantic_validation=False,
+                client_description_hygiene=True,
             )
         _validate_review_taxonomy(result, taxonomy)
     except (AnalyzerTimeoutError, AnalyzerTransportError):

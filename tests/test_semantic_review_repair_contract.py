@@ -29,6 +29,59 @@ class RepairContractTests(unittest.TestCase):
             model=self.endpoint.model, **kwargs,
         )
 
+    def test_client_telemetry_rejection_retries_wording_without_rerunning_extraction(self):
+        calls = []
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][1]["content"])
+            calls.append(payload)
+            response = provider_response(payload)
+            if len(calls) == 1:
+                response["activities"][0].update({
+                    "action": "Built",
+                    "object": "Speech demonstration module",
+                    "outcome": "desktop English Speech module in Alex’s tester 47 tests, passing build and 32 browser checks with local commit 799a44e",
+                })
+            else:
+                response["activities"][0].update({
+                    "action": "Built",
+                    "object": "Speech demonstration module",
+                    "outcome": "for English lesson practice",
+                })
+            return response
+        result = self.review(transport)
+        self.assertEqual(2, len(calls))
+        self.assertEqual("contract_rejected_client_description_hygiene",
+                         calls[1]["repair_feedback"]["failure_code"])
+        self.assertEqual(["ev-1"], result["activities"][0]["evidence_ids"])
+        self.assertEqual("for English lesson practice", result["activities"][0]["outcome"])
+        self.assertEqual([], result["exceptions"])
+        self.assertEqual([], result["omissions"])
+
+    def test_real_technical_work_does_not_trigger_wording_repair(self):
+        for action, obj, outcome in (
+            ("Built", "a test harness", "for reliable payment validation"),
+            ("Verified", "payment rules", "for reliable client checkout"),
+            ("Created", "47 regression tests", "for payment validation"),
+            ("Built", "32 assessment tests", "for student practice"),
+            ("Processed", "1000000 orders", "for accurate account reconciliation"),
+            ("Documented", "defaced image", "for client remediation planning"),
+            ("Fixed and verified", "Sol/Terra routing", "scheduled Friday follow-up one-to-one"),
+        ):
+            with self.subTest(action=action, object=obj):
+                calls = []
+                def transport(_endpoint, body):
+                    payload = json.loads(body["messages"][1]["content"])
+                    calls.append(payload)
+                    response = provider_response(payload)
+                    response["activities"][0].update({"action": action, "object": obj, "outcome": outcome})
+                    return response
+                result = self.review(transport)
+                self.assertEqual(1, len(calls))
+                self.assertEqual(action, result["activities"][0]["action"])
+                self.assertEqual(obj, result["activities"][0]["object"])
+                self.assertEqual(outcome, result["activities"][0]["outcome"])
+
+
     def test_duplicate_repair_feedback_identifies_exact_alias_ranges_and_replays(self):
         events = []
         for bundle, count in ((1, 11), (2, 11), (3, 36)):

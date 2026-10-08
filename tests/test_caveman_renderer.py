@@ -15,6 +15,48 @@ SPEC.loader.exec_module(renderer)
 
 
 class CavemanRendererTests(unittest.TestCase):
+    def test_verification_telemetry_is_not_client_description_content(self):
+        for description in (
+            "SC — Repaired payment checkout with 47 tests passing",
+            "SC — Repaired payment checkout after passing build",
+            "SC — Repaired payment checkout with build status successful",
+            "SC — Repaired payment checkout with 32 browser checks passed",
+            "SC — Repaired payment checkout after 47 passing tests",
+            "SC — Repaired payment checkout after tests passed: 47",
+            "SC — Repaired payment checkout with all checks passed",
+        ):
+            with self.subTest(description=description):
+                with self.assertRaisesRegex(renderer.CavemanValidationError, "verification telemetry"):
+                    renderer.validate_description(description)
+
+    def test_real_testing_work_and_business_quantities_remain_client_content(self):
+        for description in (
+            "SC — Built a test harness for reliable payment validation",
+            "SC — Verified payment rules for reliable client checkout",
+            "SC — Created 47 regression tests for payment validation",
+            "SC — Built 32 assessment tests for student practice",
+            "SC — Built assessment module with 32 tests for student practice",
+            "SC — Rewrote 33 internal links across priority service pages",
+        ):
+            with self.subTest(description=description):
+                self.assertEqual(description, renderer.validate_description(description))
+
+    def test_hard_hygiene_preserves_business_numbers_and_ordinary_hex_words(self):
+        for description in (
+            "SC — Processed 1000000 orders for accurate account reconciliation",
+            "SC — Documented defaced image for client remediation planning",
+        ):
+            with self.subTest(description=description):
+                self.assertEqual(description, renderer.validate_client_description_hygiene(description))
+
+    def test_hard_hygiene_rejects_mixed_and_explicit_numeric_or_alphabetic_commit_ids(self):
+        for token in ("799a44e", "commit 1234567", "SHA deadbee", "commit deadbee"):
+            with self.subTest(token=token):
+                with self.assertRaisesRegex(renderer.CavemanValidationError, "hash"):
+                    renderer.validate_client_description_hygiene(
+                        f"SC — Repaired payment checkout with {token}"
+                    )
+
     def test_portfolio_mode_allows_named_technical_slashes_but_not_paths(self):
         self.assertEqual(
             "SC — Configured Sol/Terra routing for reliable delegated execution",

@@ -3400,6 +3400,24 @@ def run_accounting(
                     })
                 continue
             description = str(rendered.description)
+        try:
+            caveman_renderer.validate_client_description_hygiene(description)
+        except caveman_renderer.CavemanValidationError as exc:
+            # Cached/replayed wording cannot invoke inference here. Keep the
+            # complete source activity pending for evidence-bound wording repair,
+            # not an omission or a claim that the work did not happen.
+            ambiguous.append({
+                "id": activity_id,
+                "reason": f"client description hygiene: {exc}",
+                "exception_kind": "description_contract",
+                "evidence_ids": evidence_ids,
+                "activity": dict(activity),
+                "review_status": "pending",
+                "wording_repair_required": True,
+            })
+            if attempt is not None:
+                attempt["failures"].append(str(exc))
+            continue
         activity["rendered_description"] = description
         if attempt is not None:
             assert meeting_id is not None

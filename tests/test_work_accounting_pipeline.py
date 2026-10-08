@@ -1512,6 +1512,31 @@ class WorkAccountingPipelineTests(unittest.TestCase):
             )
         )
 
+    def test_cached_reviewed_bad_wording_retains_complete_pending_activity(self):
+        first = session_event("session-1:event:wording-hygiene", "2026-07-10T09:00:00+03:00",
+                              span_end="2026-07-10T10:00:00+03:00")
+        analysis = analysis_for([first.evidence_id], recommended=30)
+        activity = analysis["activities"][0]
+        activity.update({
+            "action": "Built", "object": "Speech demonstration module",
+            "outcome": "desktop English Speech module in Alex’s tester 47 tests, passing build and 32 browser checks with local commit 799a44e",
+            "semantic_reviewer_model": "deepseek-v4.1-flash:cloud",
+            "semantic_reviewer_revision": "a" * 64,
+            "review_prompt_version": "clockify-semantic-review-v7",
+        })
+        run_dir, result = self.make_run([first], analysis)
+        diagnostics = [row for row in result["ambiguous"] if row.get("exception_kind") == "description_contract"]
+        self.assertEqual(1, len(diagnostics))
+        diagnostic = diagnostics[0]
+        self.assertTrue(diagnostic["wording_repair_required"])
+        self.assertEqual("pending", diagnostic["review_status"])
+        self.assertEqual([first.evidence_id], diagnostic["evidence_ids"])
+        retained = json.loads((run_dir / "semantic-analysis.json").read_text())["activities"][0]
+        self.assertEqual(retained, diagnostic["activity"])
+        self.assertEqual([], result["skipped"])
+        self.assertEqual([], result["proposals"])
+        self.assertEqual(diagnostic, json.loads((run_dir / "ambiguous.json").read_text())[0])
+
     def test_completed_analysis_fixture_preserves_replay_identity_metadata(self):
         first = session_event("session-1:event:1", "2026-07-10T09:00:00+03:00")
         analysis = analysis_for([first.evidence_id], recommended=30)

@@ -56,6 +56,24 @@ _COMPACT_TECHNICAL_SLASH_RE = re.compile(
     r"\b(?:[A-Za-z0-9][A-Za-z0-9_-]*)(?:/[A-Za-z0-9][A-Za-z0-9_-]*)+\b"
 )
 _COMPACT_TECHNICAL_UNDERSCORE_RE = re.compile(r"(?<=\w)_(?=\w)")
+_CLIENT_COMMIT_HASH_RE = re.compile(
+    r"\b(?=[0-9a-f]{7,}\b)(?=[0-9a-f]*[a-f])(?=[0-9a-f]*[0-9])[0-9a-f]+\b|"
+    r"\b(?:commit|sha(?:-?(?:1|256))?)\s*[:=#]?\s*(?:hash\s+)?[0-9a-f]{7,}\b",
+    re.I,
+)
+_VERIFICATION_TELEMETRY_RE = re.compile(
+    r"\b(?:\d+(?:/\d+)?\s+(?:(?:unit|integration|browser|regression|automated|e2e)\s+)?"
+    r"(?:tests?|checks?|assertions?)\s+(?:pass(?:ed|ing)?|succeeded|successful|green)|"
+    r"pass(?:ed|ing)?\s+\d+(?:/\d+)?\s+(?:(?:unit|integration|browser|regression|automated|e2e)\s+)?"
+    r"(?:tests?|checks?|assertions?)|"
+    r"\d+(?:/\d+)?\s+(?:passing|successful|green)\s+(?:(?:unit|integration|browser|regression|automated|e2e)\s+)?"
+    r"(?:tests?|checks?|assertions?)|"
+    r"(?:tests?|checks?|assertions?)\s+passed\s*[:=-]?\s*\d+(?:/\d+)?|"
+    r"all\s+(?:tests?|checks?|assertions?)\s+(?:passed|passing|successful|green)|"
+    r"(?:passing|successful|green)\s+build|"
+    r"build\s+(?:status\s*[:=-]?\s*)?(?:passed|passing|succeeded|successful|green))\b",
+    re.I,
+)
 
 _FORBIDDEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("NEEDS REVIEW marker", re.compile(r"\bneeds[\s\u00a0\u2000-\u200b\u202f\u205f\u3000_-]+review\b", re.I)),
@@ -72,6 +90,22 @@ _FORBIDDEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("agent status", _STATUS_DUMP_RE),
     ("evidence dump", _EVIDENCE_DUMP_RE),
 )
+
+
+def validate_client_description_hygiene(description: str) -> str:
+    """Reject objective evidence telemetry, not model-owned grammar or semantics.
+
+    Test authoring and meaningful business quantities remain accomplishments.
+    Verification counts/build status and commit identifiers belong in evidence,
+    never the final client wording. Nothing is rewritten or length-limited here.
+    """
+    if not isinstance(description, str) or not description:
+        raise CavemanValidationError("description must be a non-empty string")
+    if _CLIENT_COMMIT_HASH_RE.search(description):
+        raise CavemanValidationError("description contains forbidden hash")
+    if _VERIFICATION_TELEMETRY_RE.search(description):
+        raise CavemanValidationError("description contains verification telemetry")
+    return description
 
 
 def _part(value: Any, name: str) -> str:
@@ -114,6 +148,7 @@ def validate_description(
         raise CavemanValidationError("prefix contains unsupported characters")
     if not body or not re.match(r"^[A-Z]", body):
         raise CavemanValidationError("body must begin with a capitalized verb")
+    validate_client_description_hygiene(description)
     for label, pattern in _FORBIDDEN_PATTERNS:
         inspected = (
             _COMPACT_TECHNICAL_SLASH_RE.sub("TechnicalPair", description)

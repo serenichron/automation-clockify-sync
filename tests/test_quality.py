@@ -74,6 +74,27 @@ def recorded_meeting_proposal(row_id, meeting_id, start, end, evidence_id):
 
 
 class QualityMatchingTests(unittest.TestCase):
+    def test_reviewed_hash_and_verification_telemetry_are_blocking(self):
+        descriptions = (
+            "TSTP — Built Speech demonstration module desktop English Speech module in Alex’s tester 47 tests, passing build and 32 browser checks with local commit 799a44e",
+            "SC — Repaired checkout with 47 tests passing and passing build",
+        )
+        for description in descriptions:
+            for reviewed in (False, True):
+                with self.subTest(description=description, reviewed=reviewed):
+                    row = proposal(
+                        description=description, rendered_description=description,
+                        activity_id="act-one", workstream_id="ws-one",
+                        review_activity_key="wka-one", allocation_segment=1,
+                        allocation_mode="non_overlapping_v1",
+                        provenance={"source_type": "semantic_activity", "evidence_ids": ["ev-one"]},
+                    )
+                    if reviewed:
+                        row["provenance"]["semantic_reviewer_model"] = "deepseek-v4.1-flash:cloud"
+                    review = quality.review_proposal(row, {}, [])
+                    self.assertTrue(any("client description hygiene" in issue.lower()
+                                        for issue in review["issues"]), review)
+
     def test_stable_project_identity_wins_over_misleading_label_text(self):
         routes = [
             {
