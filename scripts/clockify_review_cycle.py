@@ -2915,6 +2915,7 @@ def _interval_from_derived_stage(
     config: Mapping[str, Any], since: str, until: str,
     stage: Mapping[str, Any], provenance: Mapping[str, Any],
     *, source_name: str = "runner/unclassified",
+    original_snapshot_capture: dict[str, str] | None = None,
 ) -> source_coverage.SourceInterval:
     """Bind a review stage to a genuine collector derivation, not old backlog state."""
     if not isinstance(provenance, Mapping) or set(provenance) != {
@@ -2998,7 +2999,14 @@ def _interval_from_derived_stage(
         or collector_stage["compatibility_version"] != backlog_identity.compatibility_version
     ):
         raise CycleError("historical collector derivation slice differs")
-    return _interval_from_stage(config, source_name, collector_stage)
+    interval = _interval_from_stage(config, source_name, collector_stage)
+    if original_snapshot_capture is not None and isinstance(
+        identity, collector_receipts.PendingCollectorSource,
+    ):
+        # Expose only authentic original inputs, after all selected/repair/raw
+        # ancestry and collector interval/backlog checks have succeeded.
+        original_snapshot_capture.update(identity.pending_binding["original_snapshot_digests"])
+    return interval
 
 
 def _same_active_failure(
@@ -4046,9 +4054,13 @@ def _verify_historical_adoption(
             "checkpoint_root", "checkpoint_manifest_digest", "checkpoint_manifest_text",
         )):
             raise CycleError("derived adoption cannot claim a checkpoint proof")
+        original_snapshots: dict[str, str] = {}
         _interval_from_derived_stage(
             config, since, until, source, document.get("source_provenance"),
+            original_snapshot_capture=original_snapshots,
         )
+        if original_snapshots and original_snapshots != document.get("frozen_snapshot_digests"):
+            raise CycleError("historical adoption frozen input proof differs")
     else:
         checkpoint_root = _canonical_runtime_path(
             str(document.get("checkpoint_root")), label="historical checkpoint root"
@@ -5493,11 +5505,24 @@ def adopt_historical_slice(
             "source", "replay", "delivery_receipt", "historical_adoption_receipt",
         )):
             raise CycleError("historical adoption cannot replace an existing stage")
-        manifest_path = _ensure_period(config, state_dir, since, until, bind_inputs=False)
         frozen = _stored_snapshot_digests(record)
+        routing_transition = derived and frozen["routing.json"] != _digest(
+            _path(config, "routing", file=True)
+        )
+        if routing_transition:
+            # This new pending-only transition must never recreate absent
+            # historical inputs before the authentic raw anchor is verified.
+            events_path, expected_manifest = _period_paths(state_dir, since)
+            if record.get("period_manifest") != str(expected_manifest) or not (
+                events_path.is_file() and expected_manifest.is_file()
+            ):
+                raise CycleError("historical adoption frozen input proof differs")
+        manifest_path = _ensure_period(config, state_dir, since, until, bind_inputs=False)
+        current_snapshots = _expected_snapshot_digests(config, manifest_path)
         if record.get("period_manifest") != str(manifest_path) or (
             frozen != request["frozen_snapshot_digests"]
-            or frozen != _expected_snapshot_digests(config, manifest_path)
+            or any(current_snapshots[name] != digest for name, digest in frozen.items()
+                   if name != "routing.json" or not routing_transition)
         ):
             raise CycleError("historical adoption frozen input proof differs")
         adopted = request["adopted_snapshot_digests"]
@@ -5566,10 +5591,19 @@ def adopt_historical_slice(
             source_dir=Path(str(source["run_dir"])))
         checkpoint_capture: dict[str, str] = {}
         if derived:
+            original_snapshots: dict[str, str] = {}
             _interval_from_derived_stage(
                 validation_config, since, until, source,
                 request["source_provenance"],
+                original_snapshot_capture=original_snapshots,
             )
+            if original_snapshots and original_snapshots != frozen:
+                raise CycleError("historical adoption frozen input proof differs")
+            if routing_transition:
+                if not original_snapshots:
+                    raise CycleError("historical adoption frozen input proof differs")
+                if current_snapshots["routing.json"] != adopted["routing.json"]:
+                    raise CycleError("historical adoption routing input proof differs")
         else:
             _interval_from_stage(
                 validation_config, "runner/unclassified", source,
