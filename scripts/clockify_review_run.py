@@ -366,13 +366,16 @@ def write_current_review_csv(path: Path, snapshot: dict[str, Any]) -> None:
                 elif " - " in raw_time:
                     start, end = raw_time.split(" - ", 1)
             duration = item.get("duration_minutes")
-            if not duration and start and end:
+            seconds = item.get("duration_seconds")
+            if seconds is None and not duration and start and end:
                 try:
                     start_dt = dt.datetime.fromisoformat(str(start).replace("Z", "+00:00"))
                     end_dt = dt.datetime.fromisoformat(str(end).replace("Z", "+00:00"))
-                    duration = max(1, int((end_dt - start_dt).total_seconds() / 60))
+                    seconds = (end_dt - start_dt).total_seconds()
                 except ValueError:
                     duration = None
+            if seconds is not None:
+                duration = int(seconds // 60) if seconds % 60 == 0 else seconds / 60
             source = item.get("source")
             if isinstance(source, list):
                 source = ", ".join(str(value) for value in source)
