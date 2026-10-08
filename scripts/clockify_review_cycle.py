@@ -5762,7 +5762,9 @@ def main(argv: list[str] | None = None) -> int:
     except (CycleError, OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"clockify review cycle blocked: {exc}", file=sys.stderr)
         return 2
-    if result.get("status") in {"incomplete", "failed", "recovery_blocked"}:
+    if result.get("status") in {
+        "incomplete", "failed", "recovery_blocked", "published_with_source_gaps",
+    }:
         return 75
     if result.get("status") in {
         "idle", "locked", "delivered", "delivered_with_exceptions", "plan",

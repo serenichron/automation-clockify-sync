@@ -465,6 +465,37 @@ class ReviewCycleEntrypointTests(unittest.TestCase):
             {Path(command[1]).name for command in commands},
         )
 
+    def test_partial_publication_exits_seventy_five_without_claiming_complete_coverage(self) -> None:
+        """Catches a legitimate partial publication being rejected as an unknown status."""
+        coverage = {
+            "status": "incomplete",
+            "incomplete_sources": ["sessions/macbook"],
+            "sources": {
+                "clockify": {"status": "complete", "observed_count": 0},
+                "sessions/macbook": {"status": "unavailable", "observed_count": 0},
+            },
+        }
+        commands: list[list[str]] = []
+        with mock.patch.object(
+            cycle, "run_child_bounded",
+            side_effect=self.child_for_runs(commands, coverage=coverage),
+        ):
+            code, result, error = self.call_main(enable_write=True)
+
+        self.assertEqual("published_with_source_gaps", result["status"])
+        self.assertEqual(75, code, error)
+        self.assertNotIn("unsupported result status", error)
+        state = json.loads((self.state_dir / "review-cycle-state.json").read_text())
+        self.assertIsNone(state["completed_through"])
+        record = state["slices"]["2026-09-07"]
+        self.assertEqual("published_with_source_gaps", record["status"])
+        self.assertEqual(["sessions/macbook"], record["source_completeness"]["incomplete_sources"])
+        self.assertNotIn("delivery_receipt", record)
+        receipt = json.loads(Path(record["publication_receipt"]).read_text())
+        self.assertEqual("clockify-review-partial-publication/v1", receipt["schema_version"])
+        self.assertEqual(coverage, receipt["source_completeness"])
+        self.assertTrue(receipt["publication_receipts"][0]["row_ids"])
+
     def test_incomplete_failed_and_recovery_blocked_exit_seventy_five(self) -> None:
         """Catches logical non-delivery being hidden behind process success."""
         with self.subTest(status="incomplete"):
