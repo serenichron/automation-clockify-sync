@@ -20,6 +20,7 @@ import stat
 import string
 import subprocess
 import sys
+import tempfile
 from typing import Any, Iterator, Mapping
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -3194,6 +3195,184 @@ def _audit_debt_covers_gap(
     )
 
 
+def _audit_recovered_source(
+    config: Mapping[str, Any], record: Mapping[str, Any], stage: Mapping[str, Any],
+    selected: collector_receipts.SliceCompletionBundle,
+    store: source_coverage.SourceDebtStore, since: str, until: str,
+) -> dict[str, Any] | None:
+    """Read historical recovery under its authenticated immutable native runtime."""
+    run_dir = Path(str(stage["run_dir"]))
+    report = _json_file(_safe_run_file(run_dir, str(run_dir / "run-report.json"), "recovery report"), "recovery report")
+    transition = report.get("source_debt_recovery")
+    if transition is None:
+        return None
+    if not isinstance(transition, Mapping):
+        raise CycleError("coverage audit recovery transition is invalid")
+    attempts = record.get("recovery_attempts")
+    if not isinstance(attempts, Mapping):
+        raise CycleError("coverage audit recovery attempts are missing")
+    matching = [(key, value) for key, value in attempts.items()
+                if isinstance(value, Mapping) and value.get("result_path") == stage["result_path"]]
+    if len(matching) != 1:
+        raise CycleError("coverage audit recovery attempt is ambiguous or missing")
+    debt_id, attempt = matching[0]
+    parent = _stored_recovery_parents(record).get(debt_id)
+    debt = store.get(debt_id)
+    if parent is None or debt is None:
+        raise CycleError("coverage audit recovery parent or debt is missing")
+    checked_attempt = _validate_recovery_attempt(attempt, debt_id=debt_id, parent=parent)
+    if (
+        checked_attempt["phase"] != "finished_complete"
+        or checked_attempt["requested_source_outcome"] != "complete"
+        or checked_attempt["result_digest"] != stage["result_digest"]
+        or checked_attempt["returned_bundle_digest"] != selected.bundle_digest
+        or debt.status != "resolved" or debt.completion_bundle_digest != selected.bundle_digest
+        or transition.get("schema_version") != "source-debt-recovery/v1"
+        or transition.get("source") != debt.interval.source
+        or transition.get("parent_run_id") != Path(str(parent["run_dir"])).name
+        or transition.get("parent_bundle_digest") != parent["bundle_digest"]
+        or transition.get("attempt_id") != checked_attempt["attempt_id"]
+        or transition.get("transition_digest") != _value_digest({
+            key: value for key, value in transition.items() if key != "transition_digest"})
+    ):
+        raise CycleError("coverage audit recovery state binding differs")
+    parent_checked = _validate_stage(
+        config, Path(str(parent["result_path"])), since, until, replay=False,
+        expected_snapshot_digests=parent["snapshot_digests"], allow_historical_runtime=True,
+        historical_state_validation=True, expected_runtime_digest=parent.get("runtime_identity_digest"),
+    )
+    if "runtime_identity_digest" not in parent:
+        parent_checked.pop("runtime_identity_digest", None)
+    if parent_checked != parent or not _recovery_parent_matches_debt(parent, debt):
+        raise CycleError("coverage audit recovery parent identity differs")
+    interval = _interval_from_stage(config, debt.interval.source, parent)
+    if interval != debt.interval:
+        raise CycleError("coverage audit recovery exact interval differs")
+    checkpoint_root = _collector_checkpoint_root(config, os.environ)
+    try:
+        helper_path = Path(__file__).resolve().parents[1] / "ops/systemd/user/clockify_review_cycle_release.py"
+        spec = importlib.util.spec_from_file_location("clockify_audit_recovery_release", helper_path)
+        if spec is None or spec.loader is None:
+            raise ValueError("release identity validator is unavailable")
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        recovery = clockify_source_debt_recover
+        locator = transition.get("attempt_locator")
+        if not isinstance(locator, str):
+            raise ValueError("external recovery receipt locator is invalid")
+        prefix, separator, locator_digest = locator.partition("/")
+        if prefix != "source-debt-recovery-attempt" or not separator or not _valid_digest("sha256:" + locator_digest):
+            raise ValueError("external recovery receipt locator is invalid")
+        receipt_root = helper._secure_directory(checkpoint_root / "source-debt-recovery-receipts",
+                                               "external recovery receipt root", exact_mode=0o700)
+        receipt_path = receipt_root / f"{locator_digest}.json"
+        receipt = recovery._read_secure_receipt(receipt_path)
+        runtime = receipt.get("runtime_identity")
+        if (
+            str(receipt_path) != checked_attempt["recovery_receipt_path"]
+            or receipt.get("receipt_digest") != checked_attempt["recovery_receipt_digest"]
+            or receipt.get("receipt_digest") != _value_digest({
+                key: value for key, value in receipt.items() if key != "receipt_digest"})
+            or receipt.get("schema_version") != "source-debt-recovery-receipt/v1"
+            or receipt.get("derived_run_path") != str(run_dir)
+            or receipt.get("derived_run_id") != run_dir.name
+            or receipt.get("receipt_path") != str(receipt_path)
+            or receipt.get("transition") != {
+                **{key: transition.get(key) for key in ("schema_version", "transition_digest", "source", "attempt_id", "attempt_locator")},
+                "debt_id": debt_id}
+            or not isinstance(runtime, Mapping) or runtime != report.get("runtime_identity")
+            or receipt.get("runtime_identity_digest") != selected.runtime_identity_digest
+            or _value_digest(dict(runtime)) != selected.runtime_identity_digest
+            or transition.get("current_runtime_identity_digest") != selected.runtime_identity_digest
+            or receipt.get("compatibility_version") != interval.compatibility_version
+            or receipt.get("parent") != {
+                "run_id": Path(str(parent["run_dir"])).name, "bundle_digest": parent["bundle_digest"],
+                "bundle_file_sha256": _digest(Path(str(parent["run_dir"])) / "completion-bundle.json"),
+                "ledger_sha256": _digest(Path(str(parent["run_dir"])) / "evidence/evidence-ledger.json")}
+            or not isinstance(receipt.get("artifacts"), Mapping)
+            or receipt["artifacts"].get("completion_bundle_digest") != selected.bundle_digest
+            or receipt["artifacts"].get("completion_bundle_sha256") != _digest(run_dir / "completion-bundle.json")
+            or receipt["artifacts"].get("result_sha256") != stage["result_digest"]
+        ):
+            raise ValueError("external receipt state binding differs")
+        release = _canonical_runtime_path(str(runtime.get("canonical_root") or ""), label="recovery release")
+        current_root = _canonical_runtime_path(_path(config, "root"), label="configured release")
+        if release.parent != current_root.parent:
+            raise ValueError("captured runtime is outside the configured release store")
+        identity = helper._identity(release, release.name)
+        if current_root != release:
+            helper._identity(current_root, current_root.name)
+        if (
+            runtime != {"canonical_root": str(release), "collector_path": str(release / "scripts/clockify_sync_collect.py"),
+                        "git_sha": None, "git_dirty": None}
+            or identity["root"] != str(release)
+            or any(transition.get(key) != _digest(release / relative) for key, relative in (
+                ("recovery_adapter_sha256", "scripts/clockify_source_debt_recover.py"),
+                ("current_collector_sha256", "scripts/clockify_sync_collect.py"),
+                ("current_routing_sha256", "routing.json"), ("current_fleet_sha256", "fleet.json")))
+        ):
+            raise ValueError("captured immutable runtime pins differ")
+        command = _recovery_command({**config, "root": str(release)}, Path(str(parent["run_dir"])),
+                                    debt.interval.source, checked_attempt["attempt_id"],
+                                    _recovery_parent_routing_digest(parent))
+        command[0] = "/usr/bin/python3"
+        _validate_recovery_attempt(attempt, debt_id=debt_id, parent=parent, command=command,
+                                  legacy_command=_legacy_recovery_command_for_parent(
+                                      {**config, "root": str(release)}, parent, command))
+        request = {"child": str(run_dir), "parent": str(parent["run_dir"]), "runs_root": str(_runs_dir(config)),
+                   "source": debt.interval.source, "attempt_id": checked_attempt["attempt_id"]}
+        # This is a fixed read-only native proof, not a historical execution API.
+        proof = '''import json,os,sys
+class NoNativeOutput:
+    def write(self,value):
+        if value: raise RuntimeError("historical native proof emitted unexpected output")
+    def flush(self): pass
+sys.stdout=NoNativeOutput()
+def guard(event,args):
+    if event.startswith("socket.") or event in {"subprocess.Popen","os.system","os.posix_spawn"}:
+        raise RuntimeError("historical proof forbids network and children")
+    if event == "open" and args[2] & (os.O_WRONLY|os.O_RDWR|os.O_CREAT|os.O_TRUNC|os.O_APPEND):
+        raise RuntimeError("historical proof forbids writes")
+    if event in {"os.remove","os.rename","os.mkdir","os.rmdir","os.chmod","os.chown","os.utime","os.link","os.symlink","os.truncate"}:
+        raise RuntimeError("historical proof forbids mutations")
+sys.addaudithook(guard)
+from pathlib import Path
+phase="import"
+try:
+    from scripts import clockify_review_run as review, clockify_source_debt_recover as recovery
+    request=json.load(sys.stdin)
+    review._configure_runs_root(Path(request["runs_root"]))
+    phase="completion"
+    bundle,status=review.verify_source_debt_recovery_completion(Path(request["child"]),parent_run_dir=Path(request["parent"]),source=request["source"],attempt_id=request["attempt_id"])
+    phase="receipt"
+    receipt=recovery.verify_recovery_receipt(Path(request["child"]))
+    result={"status":status,"bundle_digest":bundle.bundle_digest,"receipt_path":str(receipt.path),"receipt_digest":receipt.digest}
+except Exception as exc:
+    result={"error_type":type(exc).__name__,"proof_phase":phase}
+payload=json.dumps(result).encode()
+if len(payload)>4096: raise RuntimeError("historical proof identity output exceeds bound")
+os.write(1,payload)
+'''
+        completed = subprocess.run(["/usr/bin/python3", "-B", "-c", proof], cwd=release,
+            env={"PATH": "/usr/bin:/bin", "CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT": str(checkpoint_root),
+                 "CLOCKIFY_AUTOPILOT_COORDINATOR": str(config.get("coordinator") or "omarchy-precision")},
+            input=json.dumps(request), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=30)
+        expected = {"status": "complete", "bundle_digest": selected.bundle_digest,
+                    "receipt_path": str(receipt_path), "receipt_digest": checked_attempt["recovery_receipt_digest"]}
+        if completed.returncode or len(completed.stdout) > 4096:
+            raise ValueError("historical native recovery proof failed")
+        returned = json.loads(completed.stdout)
+        if isinstance(returned, dict) and set(returned) == {"error_type", "proof_phase"}:
+            raise ValueError(f"historical native {returned['proof_phase']} proof failed ({returned['error_type']})")
+        if returned != expected:
+            raise ValueError("historical native recovery proof binding differs")
+        collector = collector_receipts.load_collector_source_bundle(run_dir / "completion-bundle.json", run_dir=run_dir)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        raise CycleError("coverage audit historical recovery proof is invalid") from exc
+    return {"run_dir": str(run_dir), "bundle_digest": collector.source_bundle_digest,
+            **{field: getattr(interval, field) for field in SOURCE_INTERVAL_FIELDS if field != "source"}}
+
+
 def source_interval_coverage_audit(config: Mapping[str, Any]) -> dict[str, Any]:
     """Derive a transient observer report from verified bundles and debt state."""
     state_dir = _path(config, "state_dir")
@@ -3209,8 +3388,22 @@ def source_interval_coverage_audit(config: Mapping[str, Any]) -> dict[str, Any]:
     for since, raw in state["slices"].items():
         if not isinstance(raw, Mapping):
             raise CycleError("cycle state slice is invalid")
-        stage = raw.get("source") or raw.get("source_parent")
-        if isinstance(stage, Mapping):
+        until = raw.get("until")
+        adoption = _historical_adoption_document(config, raw, str(since), until)
+        from scripts import clockify_selected_delivery_adoption as selected_adoption
+        if adoption is not None and adoption.get("schema_version") == selected_adoption.ADOPTION_SCHEMA:
+            source, replay, _delivery = _verify_selected_adoption(config, adoption)
+            if raw.get("source") != source or raw.get("replay") != replay:
+                raise CycleError("selected coverage audit stage identity differs")
+            scope = _selected_runs_config(config, adoption["request"]["runs_root"])
+        else:
+            scope = _native_adoption_runs_config(config, adoption)
+        # Keep stage validation, collector lineage and inventory projection in
+        # the same authenticated graph; restore RUNS even if projection fails.
+        with scope as stage_config:
+            stage = raw.get("source") or raw.get("source_parent")
+            if not isinstance(stage, Mapping):
+                continue
             identity_fields = {"slice_id", "since_utc", "until_utc", "compatibility_version"}
             if "artifact_digests" in stage or not identity_fields.intersection(stage):
                 # Delivered downstream stages predate the collector-stage shape.
@@ -3221,7 +3414,7 @@ def source_interval_coverage_audit(config: Mapping[str, Any]) -> dict[str, Any]:
                 if not isinstance(until, str) or not isinstance(snapshots, Mapping):
                     raise CycleError("coverage audit delivered source identity is invalid")
                 checked = _validate_stage(
-                    config, Path(str(stage.get("result_path"))), str(since), until,
+                    stage_config, Path(str(stage.get("result_path"))), str(since), until,
                     replay=False, expected_snapshot_digests=snapshots,
                     allow_historical_runtime=True, historical_state_validation=True,
                     expected_runtime_digest=stage.get("runtime_identity_digest"),
@@ -3239,22 +3432,41 @@ def source_interval_coverage_audit(config: Mapping[str, Any]) -> dict[str, Any]:
                     checked.pop("runtime_identity_digest", None)
                 if dict(stage) != checked:
                     raise CycleError("coverage audit stored source identity drifted")
+                recovered = _audit_recovered_source(stage_config, raw, stage, selected, store, str(since), until)
+                if recovered is not None:
+                    verified.append(_audit_bundle(recovered))
+                    continue
                 interval = _interval_from_stage(
-                    config, "runner/unclassified", stage, allow_verified_derivation=True,
+                    stage_config, "runner/unclassified", stage, allow_verified_derivation=True,
                 )
-                ancestor, _ = _collector_ancestor_from_repair(config, run_dir, selected)
+                ancestor, _ = _collector_ancestor_from_repair(stage_config, run_dir, selected)
+                pending_derivation = None
+                collector = None
                 if (ancestor / "collector-source.json").exists():
-                    ancestor, _, _ = clockify_review_run._verified_collector_derivation(ancestor)
-                try:
-                    collector = collector_receipts.load_collector_source_bundle(
-                        ancestor / "completion-bundle.json", run_dir=ancestor,
-                    )
-                except collector_receipts.CollectorReceiptError as exc:
-                    raise CycleError("coverage audit collector ancestor is invalid") from exc
+                    derived = ancestor
+                    ancestor, identity, lineage = clockify_review_run._verified_collector_derivation(derived)
+                    if lineage["schema_version"] == "collector-derivation/pending-v1":
+                        # Pending raw evidence has no completed downstream run.
+                        # Retain the verified executor locator and digest so the
+                        # inventory consumer reauthenticates its pending proof.
+                        collector = identity
+                        pending_derivation = {
+                            "derivation_run_dir": str(derived),
+                            "lineage_digest": _digest(derived / "collector-source.json"),
+                        }
+                if collector is None:
+                    try:
+                        collector = collector_receipts.load_collector_source_bundle(
+                            ancestor / "completion-bundle.json", run_dir=ancestor,
+                        )
+                    except collector_receipts.CollectorReceiptError as exc:
+                        raise CycleError("coverage audit collector ancestor is invalid") from exc
                 stage = {
                     "run_dir": str(ancestor), "bundle_digest": collector.source_bundle_digest,
                     **{field: getattr(interval, field) for field in identity_fields},
                 }
+                if pending_derivation is not None:
+                    stage["pending_derivation"] = pending_derivation
             verified.append(_audit_bundle(stage))
 
     intervals: dict[str, dict[str, Any]] = {}
@@ -4541,6 +4753,275 @@ def _resolve_interval_generics(
             _resolve_generic(store, item, source)
 
 
+_RECOVERY_DERIVED_FIELDS = (
+    "replay", "replay_return", "publication_receipt", "delivery_receipt",
+    "historical_adoption_receipt", "source_run_id", "replay_run_id", "review_ids",
+)
+
+_FINISHED_REPAIR_REQUEST = "review-cycle-finished-recovery-repair-request/v1"
+_FINISHED_REPAIR_RECEIPT = "review-cycle-finished-recovery-repair-receipt/v1"
+
+
+def _repair_state_digest(state: Mapping[str, Any]) -> str:
+    payload = (json.dumps(state, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+def _read_finished_repair_receipt(path: Path) -> dict[str, Any] | None:
+    if not path.parent.exists():
+        return None
+    for target, mode in ((path.parent, 0o700), (path, 0o444)):
+        if target == path and not target.exists() and not target.is_symlink():
+            return None
+        info = target.lstat()
+        expected_kind = stat.S_ISDIR if target == path.parent else stat.S_ISREG
+        if not expected_kind(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != mode:
+            raise CycleError("finished recovery repair receipt is unsafe")
+    receipt = _json_file(path, "finished recovery repair receipt")
+    if (not isinstance(receipt, dict) or receipt.get("schema_version") != _FINISHED_REPAIR_RECEIPT
+        or receipt.get("receipt_digest") != _value_digest({key: value for key, value in receipt.items() if key != "receipt_digest"})):
+        raise CycleError("finished recovery repair receipt integrity differs")
+    return receipt
+
+
+def _seal_finished_repair_receipt(path: Path, receipt: Mapping[str, Any]) -> None:
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    existing = _read_finished_repair_receipt(path)
+    if existing is not None:
+        if existing != receipt:
+            raise CycleError("finished recovery repair receipt differs from the authenticated plan")
+        # A prior process may have linked this sealed inode, then crashed
+        # before its directory fsync. Retry must finish durability first.
+        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        return
+    descriptor, temporary = tempfile.mkstemp(prefix=".repair-", dir=path.parent)
+    try:
+        payload = (json.dumps(receipt, sort_keys=True, indent=2) + "\n").encode("utf-8")
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fchmod(handle.fileno(), 0o444)
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            if _read_finished_repair_receipt(path) != receipt:
+                raise CycleError("finished recovery repair receipt differs from the authenticated plan")
+        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        os.unlink(temporary)
+
+
+def repair_finished_recovery(
+    config: Mapping[str, Any], request: Mapping[str, Any], *, apply: bool = False,
+) -> dict[str, Any]:
+    """Explicit CAS repair of one finished child retaining its parent's graph.
+
+    No scheduling, debt transition, publication or general state migration is
+    performed. Plan mode authenticates the same native graph without any write.
+    """
+    fields = {"schema_version", "since", "until", "attempt_id", "source_stage_digest",
+              "expected_state_sha256", "expected_debt_sha256"}
+    if (not isinstance(request, Mapping) or set(request) != fields
+        or request.get("schema_version") != _FINISHED_REPAIR_REQUEST
+        or any(not _valid_digest(request.get(key)) for key in fields - {"schema_version", "since", "until"})):
+        raise CycleError("finished recovery repair request is invalid")
+    since, until = request["since"], request["until"]
+    start, end = _date(since, "repair since"), _date(until, "repair until")
+    if not 0 < (end - start).days <= 2 or start.month != (end - dt.timedelta(days=1)).month:
+        raise CycleError("finished recovery repair interval is invalid")
+    local_config = dict(config)
+    if "_runtime_identity" not in local_config:
+        local_config["_runtime_identity"] = clockify_review_run.clockify_sync_collect.collector_runtime_identity()
+    state_dir = _path(local_config, "state_dir")
+    state_path, debt_path = state_dir / "review-cycle-state.json", state_dir / "source-coverage.json"
+    receipt_path = state_dir / "source-recovery-repair-receipts" / (_value_digest(dict(request))[7:] + ".json")
+    lock = single_instance(state_dir / "review-cycle.lock") if apply else nullcontext(True)
+    with lock as acquired:
+        if not acquired:
+            return {"status": "locked"}
+        state_sha, debt_sha = _digest(state_path), _digest(debt_path)
+        existing = _read_finished_repair_receipt(receipt_path)
+        repeated = state_sha != request["expected_state_sha256"]
+        if (debt_sha != request["expected_debt_sha256"] or repeated and (
+            existing is None or existing.get("request") != dict(request)
+            or existing.get("after_state_sha256") != state_sha)):
+            raise CycleError("finished recovery repair CAS differs")
+        state = _json_file(state_path, "finished recovery repair state")
+        # Unlike normal startup, this operation must never migrate a legacy state.
+        if state != _state(state_path, recovery_since=local_config["recovery_since"]):
+            raise CycleError("finished recovery repair cannot migrate cycle state")
+        record = state["slices"].get(since)
+        if (not isinstance(record, dict) or record.get("until") != until
+            or record.get("status") != "source_verified"
+            or not isinstance(record.get("source"), Mapping)
+            or _value_digest(record["source"]) != request["source_stage_digest"]):
+            raise CycleError("finished recovery repair source CAS differs")
+        if repeated:
+            if (any(key in record for key in _RECOVERY_DERIVED_FIELDS)
+                or not isinstance(existing.get("retired_fields"), dict)
+                or not isinstance(existing.get("history_was_present"), bool)
+                or not isinstance(record.get("source_recovery_history"), list)
+                or not record["source_recovery_history"]
+                or record["source_recovery_history"][-1] != existing.get("prior_history")):
+                raise CycleError("finished recovery repair repeat binding differs")
+            # Rebuild the exact pre-repair view, then authenticate it anew below.
+            record["source_recovery_history"] = record["source_recovery_history"][:-1]
+            if not existing["history_was_present"]:
+                record.pop("source_recovery_history")
+            record.update(existing["retired_fields"])
+            if _repair_state_digest(state) != request["expected_state_sha256"]:
+                raise CycleError("finished recovery repair repeat before-state CAS differs")
+        attempts = record.get("recovery_attempts")
+        matching = [(key, value) for key, value in attempts.items()
+                    if isinstance(value, Mapping) and value.get("attempt_id") == request["attempt_id"]] if isinstance(attempts, Mapping) else []
+        if len(matching) != 1:
+            raise CycleError("finished recovery repair attempt is ambiguous or missing")
+        debt_id, attempt = matching[0]
+        if attempt.get("phase") != "finished_complete" or attempt.get("result_path") != record["source"].get("result_path"):
+            raise CycleError("finished recovery repair attempt is not the current finished child")
+        with _native_adoption_runs_config(local_config, None):
+            source = _stage_from_state(local_config, record, "source", since, until, replay=False,
+                expected_snapshot_digests=record["source"]["snapshot_digests"], allow_historical_runtime=True)
+            selected = collector_receipts.load_completion_bundle(Path(source["run_dir"]) / "completion-bundle.json", run_dir=Path(source["run_dir"]))
+            store = source_coverage.SourceDebtStore.from_document(source_coverage.read(debt_path))
+            if _audit_recovered_source(local_config, record, source, selected, store, since, until) is None:
+                raise CycleError("finished recovery repair source has no native recovery proof")
+            parent = _stored_recovery_parents(record).get(debt_id)
+            if record.get("source_parent") != parent or parent == record["source"]:
+                raise CycleError("finished recovery repair source parent differs")
+            if not all(record.get(key) is not None for key in ("replay", "replay_return", "publication_receipt")):
+                raise CycleError("finished recovery repair has no retained prior publication graph")
+            # Only authentic parent metadata enters this historical view. Current
+            # child completeness/exceptions must never be relabeled as old facts.
+            prior_view = {"source": parent, **{key: record[key] for key in _RECOVERY_DERIVED_FIELDS if key in record}}
+            prior_history = _recovery_source_history(local_config, prior_view, since, until, source, attempt)
+            history = record.get("source_recovery_history", [])
+            if not isinstance(history, list):
+                raise CycleError("finished recovery repair stored history is invalid")
+            for entry in history:
+                if (not isinstance(entry, Mapping) or entry.get("schema_version") != "review-cycle-source-recovery-history/v1"
+                    or entry.get("history_digest") != _value_digest({key: value for key, value in entry.items() if key != "history_digest"})
+                    or not _valid_digest(entry.get("replacement_source_digest"))
+                    or not _valid_digest(entry.get("recovery_attempt_id"))):
+                    raise CycleError("finished recovery repair stored history integrity differs")
+                checked = _recovery_source_history(local_config, entry, since, until, source, {"attempt_id": entry["recovery_attempt_id"]})
+                checked["replacement_source_digest"] = entry["replacement_source_digest"]
+                checked["history_digest"] = _value_digest({key: value for key, value in checked.items() if key != "history_digest"})
+                if checked != entry or entry["recovery_attempt_id"] == attempt["attempt_id"]:
+                    raise CycleError("finished recovery repair stored history binding differs")
+        before_slice_digest = _value_digest(record)
+        retired = {key: record[key] for key in _RECOVERY_DERIVED_FIELDS if key in record}
+        history_was_present = "source_recovery_history" in record
+        record["source_recovery_history"] = [*history, prior_history]
+        for key in _RECOVERY_DERIVED_FIELDS:
+            record.pop(key, None)
+        body = {"schema_version": _FINISHED_REPAIR_RECEIPT, "request": dict(request),
+                "before_state_sha256": request["expected_state_sha256"], "after_state_sha256": _repair_state_digest(state),
+                "unchanged_debt_sha256": debt_sha, "source_stage_digest": request["source_stage_digest"],
+                "source_bundle_digest": selected.bundle_digest, "recovery_receipt_digest": attempt["recovery_receipt_digest"],
+                "before_slice_digest": before_slice_digest, "after_slice_digest": _value_digest(record),
+                "history_was_present": history_was_present, "prior_history": prior_history, "retired_fields": retired}
+        receipt = {**body, "receipt_digest": _value_digest(body)}
+        if existing is not None and existing != receipt:
+            raise CycleError("finished recovery repair receipt differs from the authenticated plan")
+        if _digest(state_path) != state_sha or _digest(debt_path) != debt_sha:
+            raise CycleError("finished recovery repair CAS changed during authentication")
+        if repeated:
+            return {"status": "already_repaired", "receipt": receipt, "receipt_path": str(receipt_path)}
+        if apply:
+            _seal_finished_repair_receipt(receipt_path, receipt)
+            if _digest(state_path) != state_sha or _digest(debt_path) != debt_sha:
+                raise CycleError("finished recovery repair CAS changed before commit")
+            _atomic(state_path, state)
+        return {"status": "repaired" if apply else "plan", "receipt": receipt, "receipt_path": str(receipt_path)}
+
+
+def _recovery_source_history(
+    config: Mapping[str, Any], record: Mapping[str, Any], since: str, until: str,
+    replacement: Mapping[str, Any], attempt: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Authenticate derivatives before their source is superseded, not after."""
+    if not any(record.get(key) is not None for key in _RECOVERY_DERIVED_FIELDS):
+        return None
+    stored = record.get("source")
+    if not isinstance(stored, Mapping) or not isinstance(stored.get("snapshot_digests"), Mapping):
+        raise CycleError("recovery publication history has no verified source")
+    source = _stage_from_state(
+        config, record, "source", since, until, replay=False,
+        expected_snapshot_digests=stored["snapshot_digests"],
+        allow_historical_runtime=True,
+    )
+    if source is None:
+        raise CycleError("recovery publication history has no verified source")
+    replay = _stage_from_state(
+        config, record, "replay", since, until, replay=True,
+        expected_snapshot_digests=source["snapshot_digests"],
+        source_run_id=str(source["run_id"]), source_run_dir=str(source["run_dir"]),
+        allow_historical_runtime=True,
+    )
+    returned = record.get("replay_return")
+    if returned is not None:
+        if not isinstance(returned, Mapping):
+            raise CycleError("stored recovery replay return is invalid")
+        body = {key: value for key, value in returned.items() if key != "return_digest"}
+        path = _safe_run_file(_runs_dir(config), str(body.get("result_path")), "replay return")
+        if (
+            set(body) != {"schema_version", "source_digest", "command_digest", "result_path", "result_digest"}
+            or body.get("schema_version") != "review-cycle-replay-return/v1"
+            or returned.get("return_digest") != _value_digest(body)
+            or body.get("source_digest") != _value_digest(source)
+            or not _valid_digest(body.get("command_digest"))
+            or body.get("result_digest") != _digest(path)
+            or replay is not None and str(path) != replay["result_path"]
+        ):
+            raise CycleError("stored recovery replay return binding has drifted")
+        if replay is None:
+            replay = _validate_stage(
+                config, path, since, until, replay=True,
+                expected_snapshot_digests=source["snapshot_digests"],
+                source_run_id=str(source["run_id"]), source_run_dir=str(source["run_dir"]),
+                allow_historical_runtime=True,
+            )
+    for key, expected in (
+        ("source_run_id", source["run_id"]),
+        ("replay_run_id", replay["run_id"] if replay is not None else None),
+        ("review_ids", source["review_ids"]),
+    ):
+        if key in record and record[key] != expected:
+            raise CycleError("recovery publication metadata differs from its source")
+    for key in ("publication_receipt", "delivery_receipt"):
+        if record.get(key) is not None:
+            if replay is None:
+                raise CycleError("recovery publication history has no verified replay")
+            _verify_delivery_receipt(
+                Path(str(record[key])), config, since, until, source, replay,
+                sheet_title=_sheet_title(config["monthly_sheet_title_template"], since=since),
+            )
+    if record.get("historical_adoption_receipt") is not None:
+        adoption = _historical_adoption_document(config, record, since, until)
+        if adoption is None or replay is None:
+            raise CycleError("recovery historical adoption is missing")
+        _verify_historical_adoption(config, record, adoption, since, until, source, replay)
+    body = {
+        "schema_version": "review-cycle-source-recovery-history/v1",
+        "recovery_attempt_id": attempt["attempt_id"],
+        "replacement_source_digest": _value_digest(dict(replacement)),
+        "source": source,
+        **{key: record[key] for key in _RECOVERY_DERIVED_FIELDS if key in record},
+        **{key: record[key] for key in ("status", "source_completeness", "exception_ids", "exceptions_complete") if key in record},
+    }
+    return {**body, "history_digest": _value_digest(body)}
+
+
 def _apply_verified_recovery(
     config: Mapping[str, Any], state: dict[str, Any], state_path: Path,
     record: dict[str, Any], debt_store: source_coverage.SourceDebtStore,
@@ -4570,6 +5051,19 @@ def _apply_verified_recovery(
         or checked["recovery_receipt_digest"] != stage["recovery_receipt_digest"]
     ):
         raise CycleError("verified recovery journal evidence has drifted")
+    promoted_stage = {
+        key: value for key, value in stage.items()
+        if key not in {"recovery_receipt_path", "recovery_receipt_digest"}
+    }
+    prior_history = None
+    if (
+        status == "complete"
+        and stage["coverage"].get("status") == "complete"
+        and stage["coverage"].get("incomplete_sources") == []
+        and not any(item.debt_id != debt.debt_id for item in _active_exact_for_interval(debt_store, debt.interval))
+        and record.get("source") != promoted_stage
+    ):
+        prior_history = _recovery_source_history(config, record, since, until, promoted_stage, checked)
     current = debt_store.get(debt.debt_id)
     if current is None:
         raise CycleError("verified recovery debt identity is missing")
@@ -4644,18 +5138,25 @@ def _apply_verified_recovery(
         and overall_complete
         and not _active_exact_for_interval(debt_store, debt.interval)
     ):
-        promoted_stage = {
-            key: value for key, value in stage.items()
-            if key not in {"recovery_receipt_path", "recovery_receipt_digest"}
-        }
-        if record.get("source_parent") is None:
-            record["source_parent"] = dict(parent)
-        record.update({
-            "status": "source_verified", "source": promoted_stage,
-            "source_completeness": stage["coverage"],
-            "exception_ids": stage["exception_ids"],
-            "exceptions_complete": not stage["exception_ids"],
-        })
+        if record.get("source") != promoted_stage:
+            history = record.get("source_recovery_history", [])
+            if not isinstance(history, list):
+                raise CycleError("stored recovery source history is invalid")
+            if prior_history is not None:
+                record["source_recovery_history"] = [*history, prior_history]
+            if record.get("source_parent") is None:
+                record["source_parent"] = dict(parent)
+            for key in _RECOVERY_DERIVED_FIELDS:
+                record.pop(key, None)
+            record.update({
+                "status": "source_verified", "source": promoted_stage,
+                "source_completeness": stage["coverage"],
+                "exception_ids": stage["exception_ids"],
+                "exceptions_complete": not stage["exception_ids"],
+            })
+            # History and source replacement are one durable graph transition.
+            # Retrying the same completed promotion must leave newer derivatives alone.
+            _persist_state(state_path, state, since, record)
     else:
         record["status"] = "recovery_blocked" if status == "complete" else "incomplete"
     return stage, status
@@ -5798,18 +6299,39 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--enable-sheet-write", action="store_true")
     parser.add_argument("--audit-coverage-output", type=Path)
+    parser.add_argument("--repair-finished-recovery-request", type=Path,
+                        help="Plan one exact finished-recovery lineage repair without scheduling.")
+    parser.add_argument("--apply-finished-recovery-repair", action="store_true")
     parser.add_argument(
         "--adopt-historical-request", type=Path,
         help="Adopt one exact, already-proven historical delivery without scheduling children.",
     )
     args = parser.parse_args(argv)
     try:
+        if args.apply_finished_recovery_repair and args.repair_finished_recovery_request is None:
+            raise CycleError("finished recovery repair apply requires an exact request")
+        if args.repair_finished_recovery_request is not None and (
+            args.enable_sheet_write or args.audit_coverage_output is not None
+            or args.adopt_historical_request is not None
+        ):
+            raise CycleError("finished recovery repair and scheduling/audit/adoption modes are mutually exclusive")
         if args.adopt_historical_request is not None and (
             args.enable_sheet_write or args.audit_coverage_output is not None
         ):
             raise CycleError("historical adoption and scheduling/audit modes are mutually exclusive")
         config = load_config(args.config)
         clockify_review_run._configure_runs_root(_runs_dir(config))
+        if args.repair_finished_recovery_request is not None:
+            request_path = _canonical_runtime_path(args.repair_finished_recovery_request, label="finished recovery repair request")
+            if not request_path.is_file() or request_path.is_symlink():
+                raise CycleError("finished recovery repair request is missing or unsafe")
+            if args.apply_finished_recovery_repair:
+                config["_runtime_identity"] = clockify_review_run.clockify_sync_collect.collector_runtime_identity()
+                _validate_runtime_root(config, os.environ)
+            result = repair_finished_recovery(config, _json_file(request_path, "finished recovery repair request"),
+                                             apply=args.apply_finished_recovery_repair)
+            print(json.dumps(result, sort_keys=True))
+            return 0
         if args.audit_coverage_output is not None:
             output = _coverage_audit_output_path(
                 config, args.audit_coverage_output,

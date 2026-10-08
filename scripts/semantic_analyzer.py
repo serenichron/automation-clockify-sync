@@ -45,6 +45,8 @@ ACTOR_CONTRACT = "clockify-semantic-actors/v1"
 ACTOR_PROMPT_VERSION = "clockify-semantic-v18"
 ACTOR_REVIEW_PROMPT_VERSION = "clockify-semantic-review-v7"
 ACTOR_BUNDLE_SCHEMA_VERSION = "clockify-semantic-evidence-bundle/v2"
+LEGACY_RESPONSE_VALIDATION_CONTRACT = "clockify-semantic-response-validation/v1"
+RESPONSE_VALIDATION_CONTRACT = "clockify-semantic-response-validation/v2:client-description-hygiene"
 ACTOR_INSTRUCTIONS = """
 
 ACTOR ATTRIBUTION: Account only for the configured reconciliation subject.
@@ -2992,6 +2994,15 @@ def require_current_live_flash_route(endpoint: AnalyzerEndpoint) -> None:
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class _SealedReplayResponseContract:
+    """Internal capability admitted only by source-authenticated native replay."""
+
+    version: str
+    cache_sha256: str
+    decisions: frozenset[tuple[str, str]]
+
+
 class AnalyzerResponseCache:
     """Append-only cache for validated semantic responses.
 
@@ -3008,7 +3019,27 @@ class AnalyzerResponseCache:
         self.hits = 0
         self.misses = 0
         self.used: dict[str, str] = {}
+        self._sealed_replay_response_contract: _SealedReplayResponseContract | None = None
         self._load()
+
+    def _bind_sealed_replay_response_contract(
+        self, version: str, *, cache_sha256: str, records: list[dict[str, str]],
+    ) -> None:
+        """Bind a read-only cache after the caller authenticates source artifacts.
+
+        This is not a cache-hit exemption or a public analyzer option. The native
+        replay boundary must verify completion, semantic, and cache provenance
+        before calling it. Every request and every decision remains validated.
+        """
+        decisions = frozenset((row["cache_key"], row["decision_digest"]) for row in records)
+        if (
+            version not in {LEGACY_RESPONSE_VALIDATION_CONTRACT, RESPONSE_VALIDATION_CONTRACT}
+            or len(decisions) != len(records)
+            or hashlib.sha256(self.path.read_bytes()).hexdigest() != cache_sha256
+            or decisions != frozenset((key, row["decision_digest"]) for key, row in self._records.items())
+        ):
+            raise AnalyzerError("sealed replay response contract differs from cache")
+        self._sealed_replay_response_contract = _SealedReplayResponseContract(version, cache_sha256, decisions)
 
     @staticmethod
     def _route_identity(endpoint: AnalyzerEndpoint) -> dict[str, str]:
@@ -3226,6 +3257,9 @@ class AnalyzerResponseCache:
 
     def lookup(self, endpoint: AnalyzerEndpoint, body: Mapping[str, Any]) -> dict[str, Any] | None:
         with self._lock:
+            sealed = self._sealed_replay_response_contract
+            if sealed is not None and hashlib.sha256(self.path.read_bytes()).hexdigest() != sealed.cache_sha256:
+                raise AnalyzerError("sealed replay analyzer cache changed")
             identity = self._request_identity(endpoint, body)
             matched_route = self._route_identity(endpoint)
             record = self._records.get(identity["cache_key"])
@@ -3270,6 +3304,8 @@ class AnalyzerResponseCache:
                         record = historical_record
                         break
             if record is None:
+                if sealed is not None:
+                    raise AnalyzerError("sealed replay analyzer cache misses the reconstructed request")
                 self.misses += 1
                 return None
             if record["body_digest"] != identity["body_digest"] or record["route_digest"] != identity["route_digest"]:
@@ -3284,6 +3320,8 @@ class AnalyzerResponseCache:
                 ).hexdigest() != record.get("route_digest")
             ):
                 raise AnalyzerError("analyzer cache route identity collision")
+            if sealed is not None and (record["cache_key"], record["decision_digest"]) not in sealed.decisions:
+                raise AnalyzerError("sealed replay analyzer decision is outside its source contract")
             self.hits += 1
             self.used[identity["cache_key"]] = str(record["decision_digest"])
             if record["status"] == "rejected":
@@ -3304,6 +3342,8 @@ class AnalyzerResponseCache:
 
     def _store_record(self, record: dict[str, Any]) -> None:
         with self._lock:
+            if self._sealed_replay_response_contract is not None:
+                raise AnalyzerError("sealed replay analyzer cache is read-only")
             key = str(record["cache_key"])
             prior = self._records.get(key)
             if prior is not None:
@@ -3396,6 +3436,8 @@ class AnalyzerResponseCache:
         response: Any,
     ) -> None:
         """Best-effort private citation ledger for a fresh rejected review only."""
+        if self._sealed_replay_response_contract is not None:
+            raise AnalyzerError("sealed replay analyzer cache is read-only")
         if not self.record_review_diagnostics:
             return
 
@@ -3945,7 +3987,11 @@ def _call_semantic_review_once(
                 provider_revision=reviewer_revision,
                 evidence_time_spans=evidence_time_spans,
                 semantic_validation=False,
-                client_description_hygiene=True,
+                client_description_hygiene=not (
+                    not cache_miss and cache is not None
+                    and cache._sealed_replay_response_contract is not None
+                    and cache._sealed_replay_response_contract.version == LEGACY_RESPONSE_VALIDATION_CONTRACT
+                ),
             )
         except AnalyzerError as exc:
             if not (
@@ -3992,7 +4038,11 @@ def _call_semantic_review_once(
                 provider_revision=reviewer_revision,
                 evidence_time_spans=evidence_time_spans,
                 semantic_validation=False,
-                client_description_hygiene=True,
+                client_description_hygiene=not (
+                    not cache_miss and cache is not None
+                    and cache._sealed_replay_response_contract is not None
+                    and cache._sealed_replay_response_contract.version == LEGACY_RESPONSE_VALIDATION_CONTRACT
+                ),
             )
         _validate_review_taxonomy(result, taxonomy)
     except (AnalyzerTimeoutError, AnalyzerTransportError):
@@ -5232,6 +5282,12 @@ def analyze_tiered(
         chunk_outcomes = [outcomes[index] for index in range(len(chunks))]
     results = [result for result, _metadata in chunk_outcomes]
     metadata = [chunk_metadata for _result, chunk_metadata in chunk_outcomes]
+    # Fresh validation is versioned independently of request/cache identity.
+    # Native sealed legacy replay alone preserves its absent historical marker.
+    sealed_contract = cache._sealed_replay_response_contract if cache is not None else None
+    if sealed_contract is None or sealed_contract.version == RESPONSE_VALIDATION_CONTRACT:
+        for chunk_metadata in metadata:
+            chunk_metadata["response_validation_contract"] = RESPONSE_VALIDATION_CONTRACT
     if (
         target_body_bytes != DEFAULT_CHUNK_BODY_BYTES
         or max_events_per_chunk != DEFAULT_MAX_EVENTS_PER_CHUNK

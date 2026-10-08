@@ -31,6 +31,7 @@ PATCH_FIELDS = {
     "billable",
 }
 VERIFIED_POSTED_CREDIT = "verified_posted_credit"
+WORDING_AMENDMENT = "wording_amendment"
 MAX_CAPTURED_PRIOR_PROPOSALS_BYTES = 16 * 1024 * 1024
 _SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _EVIDENCE_FINGERPRINT_RE = re.compile(r"evfp:sha256:[0-9a-f]{64}\Z")
@@ -350,6 +351,108 @@ def validate_verified_posted_credit(record: Mapping[str, Any]) -> dict[str, Any]
     }
 
 
+def validate_wording_amendment(record: Mapping[str, Any], *, item: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Validate a local description-only amendment, never a new human vote."""
+    required = {
+        "schema_version", "record_type", "amendment_id", "review_item_id", "activity_id",
+        "evidence_fingerprint", "predecessor_canonical_digest", "parent_proposals_sha256",
+        "parent_description", "field_patch", "reviewer", "reviewed_at", "rationale",
+    }
+    if not isinstance(record, Mapping) or set(_without_integrity(record)) != required or (
+        record.get("schema_version") != SCHEMA_VERSION or record.get("record_type") != WORDING_AMENDMENT
+    ):
+        raise ReviewDecisionError("unsupported wording amendment schema or fields")
+    result = _without_integrity(record)
+    for field in ("review_item_id", "activity_id", "parent_description", "reviewer", "reviewed_at", "rationale"):
+        _one_line(result[field], field)
+    for field in ("predecessor_canonical_digest", "parent_proposals_sha256"):
+        if not isinstance(result[field], str) or not _SHA256_RE.fullmatch(result[field]):
+            raise ReviewDecisionError(f"wording amendment {field} is not canonical")
+    if not isinstance(result["evidence_fingerprint"], str) or not _EVIDENCE_FINGERPRINT_RE.fullmatch(result["evidence_fingerprint"]):
+        raise ReviewDecisionError("wording amendment evidence fingerprint is not canonical")
+    patch = _normal_patch(result["field_patch"], "modify")
+    if set(patch) != {"description"}:
+        raise ReviewDecisionError("wording amendments may replace only description")
+    description = _one_line(patch["description"]["value"], "description")
+    if not description.isprintable() or description == result["parent_description"]:
+        raise ReviewDecisionError("wording amendment must change one printable description")
+    from scripts.caveman_renderer import validate_client_description_hygiene, CavemanValidationError
+    try:
+        validate_client_description_hygiene(description)
+    except CavemanValidationError as error:
+        raise ReviewDecisionError("wording amendment fails client description hygiene") from error
+    result["field_patch"] = patch
+    unsigned = {key: value for key, value in result.items() if key != "amendment_id"}
+    if result["amendment_id"] != "wamd-" + canonical_digest(unsigned)[7:31]:
+        raise ReviewDecisionError("wording amendment ID does not match canonical content")
+    if item is not None:
+        current = item.get("current") if isinstance(item.get("current"), Mapping) else item
+        target = review_target(item)
+        if target != {key: result[key] for key in target} or current.get("description") != result["parent_description"]:
+            raise ReviewDecisionError("wording amendment is stale for its source review item")
+    return result
+
+
+def _validate_wording_head(record: Mapping[str, Any], prior: list[dict[str, Any]]) -> None:
+    target = (record["activity_id"], record["evidence_fingerprint"])
+    matches = [row for row in prior if row.get("record_type") != VERIFIED_POSTED_CREDIT
+               and (row["activity_id"], row["evidence_fingerprint"]) == target]
+    decisions = [row for row in matches if row.get("record_type") != WORDING_AMENDMENT]
+    if len(decisions) != 1 or not matches:
+        raise ReviewDecisionError("wording amendment requires one unambiguous original decision")
+    original = decisions[0]
+    if original.get("decision") != "modify" or "wording" not in original["correction_categories"] or (
+        "split" in original["correction_categories"] or "description" not in original["field_patch"]
+    ):
+        raise ReviewDecisionError("wording amendment predecessor is not a wording replacement")
+    head = matches[-1]
+    if head["canonical_digest"] != record["predecessor_canonical_digest"] or (
+        head["field_patch"]["description"]["value"] != record["parent_description"]
+    ):
+        raise ReviewDecisionError("wording amendment predecessor or description preimage is stale")
+
+
+def build_wording_amendment(item: Mapping[str, Any], *, predecessor: Mapping[str, Any],
+                            parent_proposals_sha256: str, description: str, reviewer: str,
+                            reviewed_at: str, rationale: str) -> dict[str, Any]:
+    """Bind an accepted replacement to the exact current source and active head."""
+    current = item.get("current") if isinstance(item.get("current"), Mapping) else item
+    record = {"schema_version": SCHEMA_VERSION, "record_type": WORDING_AMENDMENT,
+              **review_target(item), "predecessor_canonical_digest": predecessor.get("canonical_digest"),
+              "parent_proposals_sha256": parent_proposals_sha256,
+              "parent_description": current.get("description"),
+              "field_patch": {"description": {"op": "replace", "value": description}},
+              "reviewer": reviewer, "reviewed_at": reviewed_at, "rationale": rationale}
+    record["amendment_id"] = "wamd-" + canonical_digest(record)[7:31]
+    normalized = validate_wording_amendment(record, item=item)
+    validator = validate_wording_amendment if predecessor.get("record_type") == WORDING_AMENDMENT else validate_decision
+    prior = validator(predecessor)
+    prior["canonical_digest"] = canonical_digest(_without_integrity(predecessor))
+    if predecessor.get("canonical_digest") != prior["canonical_digest"]:
+        raise ReviewDecisionError("wording amendment predecessor integrity is invalid")
+    if predecessor.get("record_type") == WORDING_AMENDMENT:
+        if (prior["activity_id"], prior["evidence_fingerprint"]) != (normalized["activity_id"], normalized["evidence_fingerprint"]):
+            raise ReviewDecisionError("wording amendment predecessor target differs")
+        if prior["field_patch"]["description"]["value"] != normalized["parent_description"]:
+            raise ReviewDecisionError("wording amendment description preimage is stale")
+    else:
+        _validate_wording_head(normalized, [prior])
+    return normalized
+
+
+def append_wording_amendment(path: Path, record: Mapping[str, Any], *, item: Mapping[str, Any]) -> bool:
+    normalized = validate_wording_amendment(record, item=item)
+    existing = _read_log(path)
+    if any(_without_integrity(row) == normalized for row in existing):
+        return False
+    _validate_wording_head(normalized, existing)
+    line = dict(normalized, previous_digest=existing[-1]["canonical_digest"])
+    line["canonical_digest"] = canonical_digest(_without_integrity(line))
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(canonical_json(line) + "\n")
+    return True
+
+
 def _read_log(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -362,11 +465,17 @@ def _read_log(path: Path) -> list[dict[str, Any]]:
             record = json.loads(line)
         except json.JSONDecodeError as exc:
             raise ReviewDecisionError(f"invalid decision JSON at line {number}") from exc
-        normalized = (
-            validate_verified_posted_credit(record)
-            if isinstance(record, Mapping) and record.get("record_type") == VERIFIED_POSTED_CREDIT
-            else validate_decision(record)
-        )
+        if isinstance(record, Mapping) and record.get("record_type") == WORDING_AMENDMENT:
+            normalized = validate_wording_amendment(record)
+            _validate_wording_head(normalized, records)
+        elif isinstance(record, Mapping) and record.get("record_type") == VERIFIED_POSTED_CREDIT:
+            normalized = validate_verified_posted_credit(record)
+        else:
+            normalized = validate_decision(record)
+            if any(row.get("record_type") == WORDING_AMENDMENT and (
+                row["activity_id"], row["evidence_fingerprint"]
+            ) == (normalized["activity_id"], normalized["evidence_fingerprint"]) for row in records):
+                raise ReviewDecisionError("ordinary decision cannot follow an amended evidence target")
         digest = canonical_digest(_without_integrity(record))
         if record.get("canonical_digest") != digest or record.get("previous_digest") != previous:
             raise ReviewDecisionError(f"decision log integrity failure at line {number}")
@@ -379,7 +488,7 @@ def _read_log(path: Path) -> list[dict[str, Any]]:
 
 def load_decisions(path: Path) -> list[dict[str, Any]]:
     """Read and integrity-check an immutable correction JSONL file."""
-    return [record for record in _read_log(path) if record.get("record_type") != VERIFIED_POSTED_CREDIT]
+    return [record for record in _read_log(path) if record.get("record_type") not in {VERIFIED_POSTED_CREDIT, WORDING_AMENDMENT}]
 
 
 def load_verified_posted_credits(path: Path) -> list[dict[str, Any]]:
@@ -473,6 +582,10 @@ def append_decision(path: Path, record: Mapping[str, Any], *, item: Mapping[str,
     for prior in existing:
         if prior.get("record_type") == VERIFIED_POSTED_CREDIT:
             continue
+        if prior.get("record_type") == WORDING_AMENDMENT and (
+            prior["activity_id"], prior["evidence_fingerprint"]
+        ) == (normalized["activity_id"], normalized["evidence_fingerprint"]):
+            raise ReviewDecisionError("ordinary decision cannot follow an amended evidence target")
         prior_target = tuple(prior[key] for key in ("review_item_id", "activity_id", "evidence_fingerprint"))
         if prior_target != target:
             continue
@@ -545,6 +658,24 @@ def derive_regression_cases(decisions: Iterable[Mapping[str, Any]]) -> list[dict
                 # than pretending that a generic split rule is executable.
                 case["split_contract_missing"] = True
         case["regression_case_id"] = "rcase-" + canonical_digest(case)[7:31]
+        cases.append(case)
+    return sorted(cases, key=lambda value: value["regression_case_id"])
+
+
+def load_regression_cases(path: Path) -> list[dict[str, Any]]:
+    """Apply amendment chains only to exact local expectations, not decisions."""
+    records = _read_log(path)
+    decisions = [row for row in records if row.get("record_type") not in {VERIFIED_POSTED_CREDIT, WORDING_AMENDMENT}]
+    amended = {(row["activity_id"], row["evidence_fingerprint"]): row
+               for row in records if row.get("record_type") == WORDING_AMENDMENT}
+    cases = []
+    for decision in decisions:
+        case = derive_regression_cases([decision])[0]
+        amendment = amended.get((decision["activity_id"], decision["evidence_fingerprint"]))
+        if amendment is not None:
+            case["expected_field_patch"]["description"] = copy.deepcopy(amendment["field_patch"]["description"])
+            del case["regression_case_id"]
+            case["regression_case_id"] = "rcase-" + canonical_digest(case)[7:31]
         cases.append(case)
     return sorted(cases, key=lambda value: value["regression_case_id"])
 

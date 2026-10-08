@@ -1569,6 +1569,39 @@ def _sealed_source_endpoint(
     raise ValueError(f"sealed analyzer cache has ambiguous {name} routes")
 
 
+def _bind_native_replay_response_contract(
+    origin: Path, source: Path, cache: semantic_analyzer.AnalyzerResponseCache,
+    analysis: dict[str, Any], contract: str,
+) -> None:
+    """Admit historical validation only for exact completed-source snapshots.
+
+    The cache alone is insufficient. Completion seals the semantic decisions,
+    runtime and evidence; semantic bytes seal every cache record and its digest.
+    The resulting private cache capability cannot infer, store or accept drift.
+    """
+    try:
+        collector_receipts.load_completion_bundle(origin / "completion-bundle.json", run_dir=origin)
+        original, _content, _digest = _read_snapshot_json(origin / "semantic-analysis.json", label="sealed replay source analysis")
+        content = _read_snapshot_source(cache.path, label="sealed replay cache")
+        summary = analysis.get("analyzer_cache")
+        snapshot = summary.get("snapshot") if isinstance(summary, Mapping) else None
+        records = [json.loads(line) for line in content.splitlines() if line.strip()]
+        digest = hashlib.sha256(content).hexdigest()
+        if (
+            original != analysis or _ledger_identity(source) != _ledger_identity(origin)
+            or not isinstance(snapshot, Mapping)
+            or set(snapshot) != {"path", "record_count", "sha256"}
+            or snapshot.get("path") != "analyzer-cache-used.jsonl"
+            or snapshot.get("record_count") != len(records) or snapshot.get("sha256") != digest
+            or sorted(({"cache_key": row["cache_key"], "decision_digest": row["decision_digest"]}
+                       for row in records), key=lambda row: row["cache_key"]) != _analysis_cache_records(analysis)
+        ):
+            raise ValueError("sealed replay response contract differs from source/cache provenance")
+        cache._bind_sealed_replay_response_contract(contract, cache_sha256=digest, records=_analysis_cache_records(analysis))
+    except collector_receipts.CollectorReceiptError as exc:
+        raise ValueError("sealed replay response contract requires authenticated source completion") from exc
+
+
 def _preflight_replay_analyzer_cache(
     source: Path, cache_path: Path, source_analysis: dict[str, Any],
     *, retry_origin: Path | None = None, inference_context: Path | None = None,
@@ -1697,6 +1730,24 @@ def _preflight_replay_analyzer_cache(
                       else source_analysis.get("actor_contract"))
     if actor_contract not in {None, semantic_analyzer.ACTOR_CONTRACT}:
         raise ValueError("replay semantic actor contract is unsupported")
+    recorded_contracts = [chunk.get("response_validation_contract") for chunk in chunks]
+    if any(value is not None for value in recorded_contracts):
+        if any(value != semantic_analyzer.RESPONSE_VALIDATION_CONTRACT for value in recorded_contracts):
+            raise ValueError("replay response validation contract is unsupported or mixed")
+        contract = semantic_analyzer.RESPONSE_VALIDATION_CONTRACT
+    else:
+        contract = semantic_analyzer.LEGACY_RESPONSE_VALIDATION_CONTRACT
+    origin = retry_origin or source
+    if retry_provenance is None and (
+        contract == semantic_analyzer.LEGACY_RESPONSE_VALIDATION_CONTRACT
+        or (origin / "completion-bundle.json").is_file()
+    ):
+        _bind_native_replay_response_contract(origin, source, cache, source_analysis, contract)
+    # Existing unsealed current-contract sources need no compatibility waiver;
+    # retain their ordinary strict cache-only replay validation. An unsealed
+    # legacy source can never take this path or inherit historical semantics.
+    # Scoped retry has its own verified recovery contract. It never inherits a
+    # legacy hygiene exemption from the failed source or an ordinary cache hit.
     hinted_events = work_accounting_pipeline._with_semantic_route_hints(
         events, routing, normalize_meeting_domains_type=actor_contract is not None,
     )
@@ -2255,6 +2306,43 @@ def _recorded_attendance_repair_target(
     return activity
 
 
+def _validate_wording_amendment_source(source: Path, record: Mapping[str, Any],
+                                     proposals: list[dict[str, Any]]) -> None:
+    """Prove a description-only amendment against this exact sealed parent."""
+    try:
+        collector_receipts.load_completion_bundle(source / "completion-bundle.json", run_dir=source)
+    except collector_receipts.CollectorReceiptError as exc:
+        raise ReviewRunError("wording amendments require a sealed source") from exc
+    content = _read_snapshot_source(source / "proposals.json", label="wording amendment parent proposals")
+    if record["parent_proposals_sha256"] != "sha256:" + hashlib.sha256(content).hexdigest():
+        raise ReviewRunError("wording amendment parent proposals digest differs")
+    accounting, _, _ = _read_snapshot_json(source / "work-accounting-result.json", label="wording amendment accounting")
+    if not isinstance(accounting, Mapping) or accounting.get("proposals") != proposals:
+        raise ReviewRunError("wording amendment parent proposals differ from sealed accounting")
+    target = (record["activity_id"], record["evidence_fingerprint"])
+    matches = [row for row in proposals if review_corrections.proposal_target(row) == target]
+    if not matches or any(row.get("description") != record["parent_description"] for row in matches):
+        raise ReviewRunError("wording amendment does not match every parent allocation preimage")
+    semantic, _, _ = _read_snapshot_json(source / "semantic-analysis.json", label="wording amendment semantic activity")
+    activities = semantic.get("activities") if isinstance(semantic, Mapping) else None
+    if not isinstance(activities, list) or not all(isinstance(row, Mapping) for row in activities) or len([
+        row for row in activities if review_corrections.proposal_target(row) == target
+    ]) != 1:
+        raise ReviewRunError("wording amendment lacks one sealed semantic activity")
+    snapshot, _, _ = _read_snapshot_json(source / "review-snapshot.json", label="wording amendment review item")
+    categories = snapshot.get("categories") if isinstance(snapshot, Mapping) else None
+    if not isinstance(categories, Mapping) or not all(
+        isinstance(group, list) and all(isinstance(row, Mapping) for row in group)
+        for group in categories.values()
+    ):
+        raise ReviewRunError("wording amendment review snapshot is invalid")
+    items = [row for group in categories.values() for row in group
+             if review_corrections.proposal_target(row) == target]
+    if len(items) != 1 or items[0].get("description") != record["parent_description"]:
+        raise ReviewRunError("wording amendment lacks one exact sealed review preimage")
+    review_corrections.validate_wording_amendment(record, item={"id": items[0].get("id"), "current": matches[0]})
+
+
 def _validate_repair_credit_transition(
     source: Path, proposed: Path, *, runs_root: Path,
     routing_snapshot: Path | None = None,
@@ -2293,6 +2381,12 @@ def _validate_repair_credit_transition(
             if record.get("record_type") == review_corrections.VERIFIED_POSTED_CREDIT:
                 continue
             target = (record.get("activity_id"), record.get("evidence_fingerprint"))
+            if record.get("record_type") == review_corrections.WORDING_AMENDMENT:
+                if target not in prior_decision_targets or target in appended_decision_targets:
+                    raise ReviewRunError("repair wording amendment must advance one existing source target")
+                _validate_wording_amendment_source(source, record, proposals)
+                appended_decision_targets.add(target)
+                continue
             if record.get("decision") == "skip":
                 if (
                     record.get("schema_version") != 1

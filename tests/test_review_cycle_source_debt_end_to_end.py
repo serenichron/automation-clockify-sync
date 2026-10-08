@@ -315,6 +315,194 @@ class ReviewCycleSourceDebtEndToEndTests(unittest.TestCase):
         collector_receipts.write_completion_bundle(replay_dir / "completion-bundle.json", bundle)
         return self._write_result(replay_dir, bundle, replay=True)
 
+    def _prepared_promotion(self, *, published: bool = True, complete: bool = True):
+        """Use real source/replay/publication and external recovery receipts."""
+        parent = self._seed_real_parent()
+        state_path = self.state_dir / "review-cycle-state.json"
+        debt_path = self.state_dir / "source-coverage.json"
+        state = json.loads(state_path.read_text())
+        record = state["slices"]["2026-09-07"]
+        source = record["source"]
+        if published:
+            replay_path = self._make_replay(parent, 1)
+            replay = cycle._validate_stage(
+                self.config, replay_path, "2026-09-07", "2026-09-09",
+                replay=True, expected_snapshot_digests=source["snapshot_digests"],
+                source_run_id=source["run_id"], source_run_dir=source["run_dir"],
+            )
+            command = cycle._replay_command(self.config, parent)
+            returned = {
+                "schema_version": "review-cycle-replay-return/v1",
+                "source_digest": cycle._value_digest(source),
+                "command_digest": cycle._value_digest(command),
+                "result_path": str(replay_path),
+                "result_digest": cycle._digest(replay_path),
+            }
+            returned["return_digest"] = cycle._value_digest(returned)
+            receipt = cycle._delivery_document(
+                self.config, "2026-09-07", "2026-09-09", source, replay,
+                sheet_title="September 2026 portfolio review",
+            )
+            receipt_path = self.state_dir / "partial-publication-receipts" / "prior.json"
+            cycle._write_delivery_receipt(receipt_path, receipt)
+            record.update({
+                "status": "published_with_source_gaps", "replay": replay,
+                "replay_return": returned, "source_run_id": source["run_id"],
+                "replay_run_id": replay["run_id"], "review_ids": source["review_ids"],
+                "publication_receipt": str(receipt_path),
+            })
+        # An unrelated slice must never be changed by this promotion.
+        state["slices"]["2026-09-09"] = {"until": "2026-09-11", "status": "incomplete", "untouched": [1, 2]}
+        store = source_coverage.SourceDebtStore.from_document(source_coverage.read(debt_path))
+        debt = store.active()[0]
+        attempt, _command = cycle._recovery_attempt(record, debt, source, self.config)
+        result = self._finish_real_recovery(
+            parent, debt.interval.source, attempt["attempt_id"],
+            peer=self.healthy_peer() if complete else self.repository_only_peer(),
+        )
+        stage, status = cycle._validate_recovery_stage(
+            self.config, result, "2026-09-07", "2026-09-09", parent=source,
+            debt=debt, attempt_id=attempt["attempt_id"],
+        )
+        attempt.update({
+            "phase": "verified_" + status, "result_path": stage["result_path"],
+            "result_digest": stage["result_digest"],
+            "returned_bundle_digest": stage["bundle_digest"],
+            "requested_source_outcome": status,
+            "recovery_receipt_path": stage["recovery_receipt_path"],
+            "recovery_receipt_digest": stage["recovery_receipt_digest"],
+        })
+        record["recovery_attempts"][debt.debt_id] = attempt
+        cycle._persist_state(state_path, state, "2026-09-07", record)
+        return state, record, store, debt, source, attempt, stage
+
+    def _apply_prepared_promotion(self, prepared):
+        state, record, store, debt, parent, attempt, _stage = prepared
+        return cycle._apply_verified_recovery(
+            self.config, state, self.state_dir / "review-cycle-state.json", record,
+            store, self.state_dir / "source-coverage.json", "2026-09-07",
+            "2026-09-09", debt, parent, attempt,
+        )
+
+    def test_promotion_replaces_foreign_replay_without_weakening_its_validator(self):
+        """Catches promoted source retaining a replay sealed for its old source."""
+        prepared = self._prepared_promotion()
+        state, record, _store, _debt, parent, _attempt, stage = prepared
+        prior_replay = dict(record["replay"])
+        self.assertEqual("pass", review.derive_replay_integrity(
+            Path(parent["run_dir"]), Path(prior_replay["run_dir"])
+        )["status"])
+        self.assertEqual("blocked", review.derive_replay_integrity(
+            Path(stage["run_dir"]), Path(prior_replay["run_dir"])
+        )["status"])
+        self._apply_prepared_promotion(prepared)
+        # The exact downstream validation must now see no active foreign replay.
+        try:
+            replay = cycle._stage_from_state(
+                self.config, record, "replay", "2026-09-07", "2026-09-09", replay=True,
+                expected_snapshot_digests=stage["snapshot_digests"],
+                source_run_id=stage["run_id"], source_run_dir=stage["run_dir"],
+            )
+        except cycle.CycleError as exc:
+            self.fail("promotion retained a foreign replay: " + str(exc))
+        self.assertIsNone(replay)
+        self.assertNotIn("replay_return", record)
+        self.assertEqual({"until": "2026-09-11", "status": "incomplete", "untouched": [1, 2]}, state["slices"]["2026-09-09"])
+
+    def test_promotion_atomically_preserves_authenticated_publication_history(self):
+        """Catches losing prior publication evidence or persisting a mixed graph."""
+        prepared = self._prepared_promotion()
+        _state, record, _store, _debt, parent, _attempt, stage = prepared
+        prior = json.loads(json.dumps(record))
+        receipt_path = Path(prior["publication_receipt"])
+        receipt_bytes = receipt_path.read_bytes()
+        self._apply_prepared_promotion(prepared)
+        persisted = json.loads((self.state_dir / "review-cycle-state.json").read_text())["slices"]["2026-09-07"]
+        self.assertEqual("source_verified", persisted["status"])
+        self.assertEqual(stage["run_id"], persisted["source"]["run_id"])
+        history = persisted["source_recovery_history"]
+        self.assertEqual(1, len(history))
+        for field in ("source", "replay", "replay_return", "publication_receipt", "source_run_id", "replay_run_id", "review_ids"):
+            self.assertEqual(prior[field], history[0][field])
+            if field != "source":
+                self.assertNotIn(field, persisted)
+        self.assertEqual(receipt_bytes, receipt_path.read_bytes())
+        cycle._verify_delivery_receipt(
+            receipt_path, self.config, "2026-09-07", "2026-09-09", parent,
+            history[0]["replay"], sheet_title="September 2026 portfolio review",
+        )
+
+    def test_promotion_write_crash_retries_once_and_retains_new_replay(self):
+        """Catches partial source/history writes or repeated promotion erasing new replay."""
+        prepared = self._prepared_promotion()
+        state_path = self.state_dir / "review-cycle-state.json"
+        original_bytes = state_path.read_bytes()
+        real_atomic = cycle._atomic
+        def interrupt_promotion(path, document):
+            if document["slices"]["2026-09-07"].get("status") == "source_verified":
+                raise RuntimeError("before atomic promotion")
+            return real_atomic(path, document)
+        with mock.patch.object(cycle, "_atomic", side_effect=interrupt_promotion):
+            with self.assertRaisesRegex(RuntimeError, "before atomic promotion"):
+                self._apply_prepared_promotion(prepared)
+        self.assertEqual(original_bytes, state_path.read_bytes())
+        _state, _record, _store, _debt, parent, attempt, stage = prepared
+        state = json.loads(state_path.read_text())
+        record = state["slices"]["2026-09-07"]
+        store = source_coverage.SourceDebtStore.from_document(source_coverage.read(self.state_dir / "source-coverage.json"))
+        debt = store.get(_debt.debt_id)
+        resumed = state, record, store, debt, parent, attempt, stage
+        self._apply_prepared_promotion(resumed)
+        replay_path = self._make_replay(Path(stage["run_dir"]), 2)
+        new_replay = cycle._validate_stage(
+            self.config, replay_path, "2026-09-07", "2026-09-09", replay=True,
+            expected_snapshot_digests=stage["snapshot_digests"],
+            source_run_id=stage["run_id"], source_run_dir=stage["run_dir"],
+        )
+        record.update(status="replay_verified", replay=new_replay)
+        cycle._persist_state(state_path, state, "2026-09-07", record)
+        before_retry = state_path.read_bytes()
+        self._apply_prepared_promotion(resumed)
+        self.assertEqual("replay_verified", record["status"])
+        self.assertEqual(new_replay, record["replay"])
+        self.assertEqual(1, len(record["source_recovery_history"]))
+        self.assertEqual(before_retry, state_path.read_bytes())
+
+    def test_promotion_rejects_unauthenticated_prior_publication(self):
+        """Catches sealing a forged publication as historical evidence."""
+        prepared = self._prepared_promotion()
+        record = prepared[1]
+        receipt_path = Path(record["publication_receipt"])
+        forged = json.loads(receipt_path.read_text())
+        forged["spreadsheet_id"] = "different-sheet"
+        write_json(receipt_path, forged)
+        state_path = self.state_dir / "review-cycle-state.json"
+        before = state_path.read_bytes()
+        with self.assertRaisesRegex(cycle.CycleError, "delivery receipt"):
+            self._apply_prepared_promotion(prepared)
+        self.assertEqual(before, state_path.read_bytes())
+
+    def test_source_only_promotion_does_not_invent_publication_history(self):
+        """Catches ordinary source-only recovery acquiring unrelated derivatives."""
+        prepared = self._prepared_promotion(published=False)
+        self._apply_prepared_promotion(prepared)
+        record = prepared[1]
+        self.assertEqual("source_verified", record["status"])
+        self.assertEqual(prepared[6]["run_id"], record["source"]["run_id"])
+        self.assertNotIn("source_recovery_history", record)
+        self.assertNotIn("replay", record)
+        self.assertNotIn("publication_receipt", record)
+
+    def test_incomplete_recovery_preserves_active_prior_publication(self):
+        """Catches invalidating a publication before recovery can replace its source."""
+        prepared = self._prepared_promotion(complete=False)
+        record = prepared[1]
+        prior = {key: record[key] for key in ("source", "replay", "replay_return", "publication_receipt")}
+        self._apply_prepared_promotion(prepared)
+        self.assertEqual("incomplete", record["status"])
+        self.assertEqual(prior, {key: record[key] for key in prior})
+        self.assertNotIn("source_recovery_history", record)
+
     def test_new_runtime_classifies_exhausted_generic_parent_once(self) -> None:
         """Persisted generic debt converges into exact recovery without retry loops."""
         old_runtime = {

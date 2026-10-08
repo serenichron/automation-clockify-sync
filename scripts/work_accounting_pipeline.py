@@ -803,9 +803,7 @@ def _load_regression_cases(path: Path | None) -> list[dict[str, Any]]:
     if path is None or not path.exists():
         return []
     try:
-        return review_corrections.derive_regression_cases(
-            review_corrections.load_decisions(path)
-        )
+        return review_corrections.load_regression_cases(path)
     except review_corrections.ReviewDecisionError as exc:
         raise WorkAccountingError(f"review correction log is invalid: {exc}") from exc
 
