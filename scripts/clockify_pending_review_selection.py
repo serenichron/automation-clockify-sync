@@ -356,6 +356,7 @@ def _covered_source_outcome(declaration: Mapping[str, Any], current: Mapping[str
 
 def _credits(selected: list[dict[str, Any]], all_sources: Mapping[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Re-execute native final helpers on saved commitments, not reallocate."""
+    selected_atoms = set().union(*(item["atoms"] for item in selected))
     union = {}
     for source in all_sources.values():
         for event in source["ledger"]["events"]:
@@ -376,11 +377,20 @@ def _credits(selected: list[dict[str, Any]], all_sources: Mapping[str, Any]) -> 
                 # Session envelope serialization and transport flags differ
                 # across native captures. Neither is canonical event identity
                 # nor human-pool capacity: exact human timestamp points are.
-                if (previous.get("source_type") != canonical.get("source_type")
-                        or previous["attributes"].get("tool_name") != canonical["attributes"].get("tool_name")
+                native_drift = (previous.get("source_type") != canonical.get("source_type")
                         or pipeline._parse_dt(previous.get("raw_source_span", {}).get("timestamp") or previous.get("observed_at"))
-                        != pipeline._parse_dt(canonical.get("raw_source_span", {}).get("timestamp") or canonical.get("observed_at"))):
-                    raise ValueError("pending selection canonical aliases disagree on native human timestamp/source")
+                        != pipeline._parse_dt(canonical.get("raw_source_span", {}).get("timestamp") or canonical.get("observed_at")))
+                if native_drift or previous["attributes"].get("tool_name") != canonical["attributes"].get("tool_name"):
+                    if key in selected_atoms or native_drift:
+                        raise ValueError("pending selection canonical aliases disagree on native human timestamp/source")
+                    # Broad ledgers can contain unrelated tool-result
+                    # placeholders with the same session/content/time atom.
+                    # Keep conflicting uncited records in native timing/block
+                    # context, without treating them as aliases or weakening
+                    # any selected atom's native source/timestamp checks.
+                    distinct_key = ("uncited-native-record", key, digest(event))
+                    canonical["evidence_id"] = "canonical-" + digest(distinct_key)[7:]
+                    union[distinct_key] = canonical
             else:
                 union[key] = canonical
     segments, demands, members, meeting_checks = [], {}, {}, []
@@ -410,7 +420,6 @@ def _credits(selected: list[dict[str, Any]], all_sources: Mapping[str, Any]) -> 
                                        or proposal["duration_minutes"] != seconds // 60))):
             raise ValueError("pending selection saved credit exact duration differs")
         segments.append(segment)
-    checks = []
     for activity, raw in demands.items():
         demand = allocator._as_activity(raw)
         own = [s for s in segments if s.activity_id == activity]
@@ -418,19 +427,12 @@ def _credits(selected: list[dict[str, Any]], all_sources: Mapping[str, Any]) -> 
             raise ValueError("pending selection credit exceeds original native envelope")
         if any(min(a.end, b.end) > max(a.start, b.start) for i, a in enumerate(own) for b in own[i + 1:]):
             raise ValueError("pending selection same-activity credits overlap")
-        credited = sum(s.duration_minutes for s in own)
-        residual = demand.effort.recommended_minutes - credited
-        if residual < 0:
+        if sum(s.duration_minutes for s in own) > demand.effort.recommended_minutes:
             raise ValueError("pending selection credit exceeds original native effort")
-        remaining = pipeline._capacity_recovery_slices(demand, segments, residual)
-        recoverable = sum(int((hi - lo).total_seconds()) // 60 for lo, hi in remaining)
-        if recoverable:
-            raise ValueError("pending selection leaves recoverable whole-minute capacity")
-        checks.append({"activity_id": activity, "credited_minutes": credited, "native_requested_minutes": demand.effort.recommended_minutes,
-                       "native_residual_minutes": residual, "recoverable_minutes": recoverable})
     timing = pipeline._session_timing_contexts(union.values())
     borrowers = {}
     source_timing = {}
+    estimated_activities = set()
     for activity, items in members.items():
         atoms = set().union(*(item["atoms"] for item in items))
         cited = [union[key] for key in atoms]
@@ -461,6 +463,7 @@ def _credits(selected: list[dict[str, Any]], all_sources: Mapping[str, Any]) -> 
                     or provenance.get("timing_context_evidence_ids") != evidence_ids
                     or demand.allowed_intervals != native_intervals):
                 raise ValueError("pending selection saved native placement context differs")
+        estimated_activities.add(activity)
         for key, context in contexts.items():
             borrowers.setdefault(key, {"interval": context["interval"], "activities": set()})["activities"].add(activity)
     pool_checks = []
@@ -476,6 +479,22 @@ def _credits(selected: list[dict[str, Any]], all_sources: Mapping[str, Any]) -> 
             raise ValueError("pending selection shared human-pool debit exceeds native capacity")
         pool_checks.append({"pool_id": key, "interval": pool["interval"], "capacity_minutes": capacity,
                             "debited_minutes": sum(s.duration_minutes for s in own), "activities": sorted(pool["activities"])})
+    checks = []
+    for activity, raw in demands.items():
+        demand = allocator._as_activity(raw)
+        credited = sum(s.duration_minutes for s in segments if s.activity_id == activity)
+        residual = demand.effort.recommended_minutes - credited
+        # Native accounting intentionally leaves estimated shared-pool effort
+        # contested: observed-only recovery excludes an activity's own slices,
+        # not its siblings, and would spend their human capacity again. Only
+        # the source-authenticated placement and pool debit above admit this
+        # distinction; a provenance flag alone cannot bypass recovery checks.
+        remaining = [] if activity in estimated_activities else pipeline._capacity_recovery_slices(demand, segments, residual)
+        recoverable = sum(int((hi - lo).total_seconds()) // 60 for lo, hi in remaining)
+        if recoverable:
+            raise ValueError("pending selection leaves recoverable whole-minute capacity")
+        checks.append({"activity_id": activity, "credited_minutes": credited, "native_requested_minutes": demand.effort.recommended_minutes,
+                       "native_residual_minutes": residual, "recoverable_minutes": recoverable})
     skipped = []
     existing = pipeline._existing_blocks(union.values())
     # Captured Clockify blocks are comparison context, never accepted credit.
