@@ -153,6 +153,7 @@ def verify_existing(proof: Mapping[str, Any], receipt: Mapping[str, Any]) -> Non
         raise ValueError("existing publication captured machine cells differ")
     if "pending_selection" in receipt:
         from scripts import clockify_pending_review_selection as pending
+        from scripts import clockify_pending_runtime_proof as pending_runtime
         acceptance = receipt["pending_selection"]
         source_artifacts = acceptance["current_source_artifacts"]
         proposals = json.loads(adoptions._capture(source_artifacts["proposals"], {}))
@@ -161,8 +162,10 @@ def verify_existing(proof: Mapping[str, Any], receipt: Mapping[str, Any]) -> Non
         selection = pending.verify(bindings_path=Path(acceptance["selection"]["path"]), source_dir=source_dir,
             proposals=proposals, spreadsheet_id=receipt["spreadsheet_id"], sheet_title=receipt["sheet_title"],
             run_id=source_dir.name, project_allowlist=publisher.project_allowlist(routing))
-        if selection["receipt"] != acceptance:
-            raise ValueError("existing publication pending selection differs")
+        try:
+            pending_runtime.verify_recorded(acceptance, selection["receipt"])
+        except ValueError as exc:
+            raise ValueError("existing publication pending selection differs") from exc
         plan = publisher._pending_plan_preserving_review_humans(gateway, spreadsheet_id=receipt["spreadsheet_id"],
             sheet_title=receipt["sheet_title"], selection=selection)
         if plan["updates"]:

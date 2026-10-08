@@ -2052,6 +2052,14 @@ def _validated_publication_document(
     if len(retained) != len(publications) or len(publications) != len(expected):
         raise CycleError("publisher result destinations or readbacks differ")
     for index, item in enumerate(publications):
+        if "pending_selection" in item and "pending_selection" in expected[index]:
+            try:
+                from scripts import clockify_pending_runtime_proof as pending_runtime
+                base_expected[index]["pending_selection"] = pending_runtime.verify_recorded(
+                    item["pending_selection"], expected[index]["pending_selection"],
+                )
+            except ValueError as exc:
+                raise CycleError("publisher pending selection proof differs") from exc
         if "monthly_layout" not in item and "monthly_target_readback" not in item:
             continue
         if item.get("monthly_layout") != clockify_monthly_unresolved.LEGACY_LAYOUT or source_dir is None:
