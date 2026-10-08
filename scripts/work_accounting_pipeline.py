@@ -3412,6 +3412,10 @@ def run_accounting(
         codex_under_capacity = (
             bool(cited) and bool(timing_contexts)
             and all(event.get("source_type") == "codex_sessions_event" for event in cited)
+            # New result-only aliases fill missing timing, not replace a
+            # positive cited interval. Existing paired human borrowing remains.
+            and any(str(event["evidence_id"]) in context["evidence_ids"]
+                    for context in timing_contexts.values() for event in cited)
             and requested_minutes > cited_capacity
             and _interval_capacity_minutes(context_intervals) > cited_capacity
         )

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import unittest
 
 from scripts import evidence_ledger
@@ -122,6 +123,39 @@ class CodexResultPoolIndexTests(unittest.TestCase):
         self.assertEqual([], result["allocation"]["capacity_recoveries"])
         self.assertEqual(15, sum(c["unallocated_minutes"] for c in result["allocation"]["contested_time"]))
         self.assertEqual("Estimated outcomes share one observed human window; remaining effort is not separately timed.", result["ambiguous"][0]["reason"])
+
+    def test_assistant_aliases_preserve_positive_cited_interval_and_reviewed_minute(self):
+        """New aliases must not replace real cited bounds and suppress recovery."""
+        humans = self.pool_events()
+        results = [codex_event("positive-first", "2026-07-10T09:05:00+03:00", role="assistant"),
+                   codex_event("positive-last", "2026-07-10T09:06:04+03:00", role="assistant")]
+        existing = fixtures.clockify_event("2026-07-10T09:00:00+03:00", "2026-07-10T09:15:00+03:00")
+        analysis = fixtures.analysis_for([e.evidence_id for e in results], recommended=35)
+        initial_run, initial = self.make_run(results + [existing], analysis)
+        self.assertEqual(1, initial["proposals"][0]["duration_minutes"])
+        correction_path = initial_run.parent / "review-corrections.jsonl"
+        fixtures.WorkAccountingPipelineTests.append_correction(
+            self, correction_path, initial["proposals"][0], "modify",
+            field_patch={"description": {"op": "replace", "value": "SC — Integrated reviewed fixture access"}},
+            categories=["wording"],
+        )
+        analysis["omissions"] = [{"lifecycle": "noise", "evidence_ids": [h.evidence_id],
+                                  "reason": "Human timing anchor only."} for h in humans]
+        run, result = fixtures.WorkAccountingPipelineTests.make_run(
+            self, humans + results + [existing], analysis, corrections_path=correction_path,
+        )
+        self.assertEqual(1, len(result["proposals"]))
+        proposal = result["proposals"][0]
+        self.assertEqual(initial["proposals"][0]["candidate_key"], proposal["candidate_key"])
+        self.assertEqual(("2026-07-10T09:05:00+03:00", "2026-07-10T09:06:00+03:00", 1),
+                         (proposal["start"], proposal["end"], proposal["duration_minutes"]))
+        self.assertEqual("SC — Integrated reviewed fixture access", proposal["description"])
+        self.assertNotIn("timing_placement", proposal["provenance"])
+        self.assertNotIn("estimated_session_placement", [w["type"] for w in proposal["review_warnings"]])
+        self.assertEqual(1, result["allocation"]["capacity_recoveries"][0]["recovered_minutes"])
+        self.assertEqual([], result["ambiguous"])
+        self.assertEqual("pass", result["correction_regression"]["results"][0]["status"])
+        self.assertEqual(35, json.loads((run / "semantic-analysis.json").read_text())["activities"][0]["effort"]["recommended_minutes"])
 
 
 if __name__ == "__main__":
