@@ -2682,6 +2682,58 @@ def _normalize_postable_proposals(
     )
 
 
+def _rebind_credited_proposal_overlaps(
+    originals: list[dict[str, Any]], survivors: list[dict[str, Any]],
+    replacements: dict[str, list[str]],
+) -> list[dict[str, Any]]:
+    """Rebind only exact pre-credit warnings to their surviving proposal spans."""
+    if not replacements:
+        return survivors
+    original_by_key: dict[str, list[dict[str, Any]]] = {}
+    surviving_by_key: dict[str, list[dict[str, Any]]] = {}
+    parent_by_key: dict[str, str] = {}
+    for row in originals:
+        original_by_key.setdefault(str(row.get("candidate_key") or ""), []).append(row)
+    for row in survivors:
+        surviving_by_key.setdefault(str(row.get("candidate_key") or ""), []).append(row)
+    for parent, children in replacements.items():
+        for child in children:
+            parent_by_key[child] = parent
+
+    def block(row: dict[str, Any]) -> dict[str, Any]:
+        return {"block_id": str(row.get("candidate_key") or ""),
+                "start": _parse_dt(row["start"]), "end": _parse_dt(row["end"]),
+                "project_id_suffix": row.get("clockify_project_suffix")}
+
+    rebound_rows = []
+    for row in survivors:
+        key = str(row.get("candidate_key") or "")
+        parent = parent_by_key.get(key, key)
+        owners = original_by_key.get(parent, [])
+        rebound = []
+        for warning in row.get("review_warnings", []):
+            kind = warning.get("type") if isinstance(warning, dict) else None
+            counterpart = str(warning.get("counterpart_id") or "") if isinstance(warning, dict) else ""
+            others = original_by_key.get(counterpart, [])
+            if (kind not in {"review_proposal_overlap", "meeting_proposal_overlap"}
+                    or (parent not in replacements and counterpart not in replacements)
+                    or len(owners) != 1 or len(others) != 1
+                    or type(warning.get("overlap_duration_seconds")) is not int
+                    or warning != _overlap_warning(_parse_dt(owners[0]["start"]),
+                        _parse_dt(owners[0]["end"]), block(others[0]), kind)):
+                # Invalid/unrecognized warnings must remain reviewable, not be
+                # silently rewritten into a valid quality-gate declaration.
+                rebound.append(warning)
+                continue
+            for new_key in replacements.get(counterpart, [counterpart]):
+                for other in surviving_by_key.get(new_key, []):
+                    updated = _overlap_warning(_parse_dt(row["start"]), _parse_dt(row["end"]), block(other), kind)
+                    if updated is not None and updated not in rebound:
+                        rebound.append(updated)
+        rebound_rows.append({**row, "review_warnings": rebound} if rebound != row.get("review_warnings", []) else row)
+    return rebound_rows
+
+
 def _apply_verified_posted_credits(
     proposals: list[dict[str, Any]],
     existing_blocks: list[dict[str, Any]],
@@ -2789,6 +2841,7 @@ def _apply_verified_posted_credits(
     recurring = [raw for raw in credits if raw.get("schema_version") == 2]
     survivors = list(proposals)
     skipped: list[dict[str, Any]] = []
+    proposal_replacements: dict[str, list[str]] = {}
     if recurring and collection_snapshot is not None:
         from scripts import clockify_source_adoptions as adoptions
         try:
@@ -2853,6 +2906,9 @@ def _apply_verified_posted_credits(
                                         rebound.append(warning)
                                     residual["review_warnings"] = rebound
                                 survivors.extend(sliced)
+                                proposal_replacements[str(row["candidate_key"])] = [
+                                    str(residual["candidate_key"]) for residual in sliced
+                                ]
                                 fully_credited_intersection = not sliced
                                 intersection_receipt = _credited_overlap_receipt(
                                     _parse_dt(row["start"]), _parse_dt(row["end"]),
@@ -2880,6 +2936,7 @@ def _apply_verified_posted_credits(
         except (ValueError, TypeError, KeyError, AttributeError):
             # An invalid recurring group must never hide a reviewable proposal.
             survivors, skipped = list(proposals), []
+            proposal_replacements = {}
     for raw in credits:
         if raw.get("schema_version") == 2:
             continue
@@ -2930,7 +2987,7 @@ def _apply_verified_posted_credits(
                 "posted_review_ids": [entry["sheet_row"][0] for entry in credit["posted_rows"]],
                 "clockify_block_ids": [entry["clockify_block_id"] for entry in credit["posted_rows"]],
             })
-    return survivors, skipped
+    return _rebind_credited_proposal_overlaps(proposals, survivors, proposal_replacements), skipped
 
 
 def _accounting_collection_snapshot(run_dir: Path, events: list[dict[str, Any]]) -> Any:

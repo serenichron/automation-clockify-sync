@@ -343,6 +343,106 @@ class RecurringNativeCreditTests(unittest.TestCase):
                 self.assertEqual(row["duration_seconds"], overlaps[0]["overlap_duration_seconds"])
                 self.assertIn(note, row["review_warnings"])
                 self.assertEqual(current[0]["billable"], row["billable"])
+
+    def test_native_intersection_tail_rebinds_both_proposal_overlap_warnings(self):
+        """A post-normalization credit must not retain the old 143-second warning."""
+        from scripts import clockify_sync_quality as quality
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            current, declaration, proof = self.fixture(root, prior_minutes=(14,), current_minutes=(14,),
+                kind="source_native_meeting_intersection", current_end_seconds=895)
+            meeting = current[0]
+            meeting.update(id="meeting", candidate_key="wks-" + "1" * 24)
+            meeting["provenance"].update(recorded_meeting_start=meeting["start"], recorded_meeting_end=meeting["end"])
+            counterpart = proposal_fixtures._proposal("semantic", [], "Independent activity",
+                (START + dt.timedelta(seconds=752)).isoformat(), 3)
+            counterpart.update(id="semantic", candidate_key="wks-" + "2" * 24)
+            def block(row):
+                return {"block_id": row["candidate_key"], "start": pipeline._parse_dt(row["start"]),
+                        "end": pipeline._parse_dt(row["end"]), "project_id_suffix": row["clockify_project_suffix"]}
+            note = {"type": "semantic_meeting_fallback", "reason": "Recorded attendance only"}
+            meeting["review_warnings"] = [note, pipeline._overlap_warning(
+                pipeline._parse_dt(meeting["start"]), pipeline._parse_dt(meeting["end"]), block(counterpart), "review_proposal_overlap")]
+            counterpart["review_warnings"] = [pipeline._overlap_warning(
+                pipeline._parse_dt(counterpart["start"]), pipeline._parse_dt(counterpart["end"]), block(meeting), "review_proposal_overlap")]
+            self.assertEqual(143, counterpart["review_warnings"][0]["overlap_duration_seconds"])
+            declaration["artifacts"]["current_proposals"] = adoption_fixtures.artifact(root / "current-with-proposal-warnings.json", current)
+            original = copy.deepcopy([meeting, counterpart])
+            rows, credited = self.apply([meeting, counterpart], [self.seal(declaration)], proof)
+            self.assertEqual([], quality.find_time_overlaps(rows))
+            tail = next(row for row in rows if row["id"] == "meeting")
+            semantic = next(row for row in rows if row["id"] == "semantic")
+            self.assertEqual((55, 0), (tail["duration_seconds"], tail["duration_minutes"]))
+            self.assertEqual(180, semantic["duration_seconds"])
+            for owner, other in ((tail, semantic), (semantic, tail)):
+                warning = next(w for w in owner["review_warnings"] if w["type"] == "review_proposal_overlap")
+                self.assertEqual(other["candidate_key"], warning["counterpart_id"])
+                self.assertEqual("2026-09-07T09:14:00+00:00", warning["overlap_start"])
+                self.assertEqual("2026-09-07T09:14:55+00:00", warning["overlap_end"])
+                self.assertEqual(55, warning["overlap_duration_seconds"])
+            self.assertIn(note, tail["review_warnings"])
+            self.assertEqual(meeting["start"], tail["provenance"]["recorded_meeting_start"])
+            self.assertEqual(meeting["end"], tail["provenance"]["recorded_meeting_end"])
+            self.assertEqual(837, credited[0]["verified_posted_credit"]["covered_seconds"])
+            self.assertEqual(original, [meeting, counterpart])
+
+    def test_native_intersection_split_rebinds_proposal_warning_to_each_new_candidate(self):
+        from scripts import clockify_sync_quality as quality
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            current, declaration, proof = self.fixture(root, prior_minutes=(3,), prior_offsets=(3,), current_minutes=(14,),
+                kind="source_native_meeting_intersection", prior_source_span_minutes=14)
+            meeting = current[0]
+            meeting.update(id="meeting", candidate_key="wks-" + "1" * 24)
+            counterpart = proposal_fixtures._proposal("semantic", [], "Independent activity", START.isoformat(), 15)
+            counterpart.update(id="semantic", candidate_key="wks-" + "2" * 24)
+            def block(row):
+                return {"block_id": row["candidate_key"], "start": pipeline._parse_dt(row["start"]),
+                        "end": pipeline._parse_dt(row["end"]), "project_id_suffix": row["clockify_project_suffix"]}
+            for owner, other in ((meeting, counterpart), (counterpart, meeting)):
+                owner["review_warnings"] = [pipeline._overlap_warning(pipeline._parse_dt(owner["start"]),
+                    pipeline._parse_dt(owner["end"]), block(other), "review_proposal_overlap")]
+            unrelated = {"type": "review_proposal_overlap", "counterpart_id": "unrecognized", "overlap_duration_seconds": 1}
+            meeting["review_warnings"].append(unrelated)
+            declaration["artifacts"]["current_proposals"] = adoption_fixtures.artifact(root / "current-with-proposal-warnings.json", current)
+            rows, _ = self.apply([meeting, counterpart], [self.seal(declaration)], proof)
+            self.assertEqual([], quality.find_time_overlaps(rows))
+            residuals = [row for row in rows if row["id"] == "meeting"]
+            semantic = next(row for row in rows if row["id"] == "semantic")
+            self.assertEqual([177, 484], [row["duration_seconds"] for row in residuals])
+            warnings = semantic["review_warnings"]
+            self.assertEqual([177, 484], [w["overlap_duration_seconds"] for w in warnings])
+            self.assertEqual([row["candidate_key"] for row in residuals], [w["counterpart_id"] for w in warnings])
+            self.assertNotEqual(meeting["candidate_key"], residuals[1]["candidate_key"])
+            for row in residuals:
+                self.assertIn(unrelated, row["review_warnings"])
+
+    def test_native_intersection_does_not_repair_invalid_numeric_overlap_duration(self):
+        """Float/bool equality must not turn an invalid declaration into gate proof."""
+        from scripts import clockify_sync_quality as quality
+        for seconds, invalid_duration in ((752, 143.0), (894, True)):
+            with self.subTest(duration=invalid_duration), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                current, declaration, proof = self.fixture(root, prior_minutes=(14,), current_minutes=(14,),
+                    kind="source_native_meeting_intersection", current_end_seconds=895)
+                meeting = current[0]
+                meeting.update(id="meeting", candidate_key="wks-" + "1" * 24)
+                counterpart = proposal_fixtures._proposal("semantic", [], "Independent activity",
+                    (START + dt.timedelta(seconds=seconds)).isoformat(), 3)
+                counterpart.update(id="semantic", candidate_key="wks-" + "2" * 24)
+                for owner, other in ((meeting, counterpart), (counterpart, meeting)):
+                    block = {"block_id": other["candidate_key"], "start": pipeline._parse_dt(other["start"]),
+                             "end": pipeline._parse_dt(other["end"]), "project_id_suffix": other["clockify_project_suffix"]}
+                    warning = pipeline._overlap_warning(pipeline._parse_dt(owner["start"]),
+                        pipeline._parse_dt(owner["end"]), block, "review_proposal_overlap")
+                    warning["overlap_duration_seconds"] = invalid_duration
+                    owner["review_warnings"] = [warning]
+                declaration["artifacts"]["current_proposals"] = adoption_fixtures.artifact(root / "current-invalid-warning.json", current)
+                rows, _ = self.apply([meeting, counterpart], [self.seal(declaration)], proof)
+                self.assertEqual(1, len(quality.find_time_overlaps(rows)))
+                for row in rows:
+                    self.assertIs(type(invalid_duration), type(row["review_warnings"][0]["overlap_duration_seconds"]))
+                    self.assertEqual(invalid_duration, row["review_warnings"][0]["overlap_duration_seconds"])
                 self.assertEqual(current[0]["clockify_project_suffix"], row["clockify_project_suffix"])
 
     def test_native_intersection_preserves_unknown_and_inexact_ledger_warnings(self):
