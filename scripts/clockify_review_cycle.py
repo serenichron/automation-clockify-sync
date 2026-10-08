@@ -5635,6 +5635,7 @@ def main(argv: list[str] | None = None) -> int:
         ):
             raise CycleError("historical adoption and scheduling/audit modes are mutually exclusive")
         config = load_config(args.config)
+        clockify_review_run._configure_runs_root(_runs_dir(config))
         if args.audit_coverage_output is not None:
             output = _coverage_audit_output_path(
                 config, args.audit_coverage_output,
