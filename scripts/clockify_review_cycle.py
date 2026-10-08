@@ -283,7 +283,7 @@ def load_config(path: Path) -> dict[str, Any]:
         raise CycleError("config must be valid JSON") from exc
     if not isinstance(config, dict) or not _REQUIRED.issubset(config):
         raise CycleError("config is missing required review-cycle fields")
-    if set(config) - (_REQUIRED | {"runs_dir", "catchup_until", "max_slices", "total_child_budget_seconds", "monthly_unresolved_alias_proof", "monthly_unresolved_historical_sources", "meeting_publication_bindings", "native_credit_input", "private_routing"}):
+    if set(config) - (_REQUIRED | {"runs_dir", "catchup_until", "max_slices", "total_child_budget_seconds", "monthly_unresolved_alias_proof", "monthly_unresolved_historical_sources", "meeting_publication_bindings", "native_credit_input", "private_routing", "publication_presentation", "pending_review_selection"}):
         raise CycleError("config contains unsupported review-cycle fields")
     if "native_credit_input" in config:
         handle = config["native_credit_input"]
@@ -293,6 +293,9 @@ def load_config(path: Path) -> dict[str, Any]:
         _canonical_runtime_path(handle["path"], label="native credit input")
     if "meeting_publication_bindings" in config:
         _canonical_runtime_path(config["meeting_publication_bindings"], label="meeting publication bindings")
+    for key in ("publication_presentation", "pending_review_selection"):
+        if key in config:
+            _canonical_runtime_path(config[key], label=key)
     if "monthly_unresolved_historical_sources" in config:
         _canonical_runtime_path(config["monthly_unresolved_historical_sources"], label="monthly historical sources")
     if not isinstance(config["calendly_optional"], bool):
@@ -1778,7 +1781,31 @@ def _publisher_command(
     meeting_bindings = _meeting_bindings_for_target(config, sheet_title)
     if meeting_bindings is not None:
         command.extend(["--meeting-publication-bindings", str(meeting_bindings)])
+    for key, flag in (("publication_presentation", "--publication-presentation"),
+                      ("pending_review_selection", "--pending-review-selection")):
+        optional = _source_publication_input(config, source, sheet_title=sheet_title, key=key)
+        if optional is not None:
+            command.extend([flag, str(optional)])
     return command
+
+
+def _source_publication_input(config: Mapping[str, Any], source: Mapping[str, Any], *, sheet_title: str, key: str) -> Path | None:
+    if not config.get(key):
+        return None
+    from scripts import clockify_publication_presentation as display, clockify_source_adoptions as adoptions
+    path = Path(str(config[key]))
+    try:
+        if key == "publication_presentation":
+            return display.for_source(path, source_dir=Path(str(source["run_dir"])), run_id=str(source["run_id"]),
+                spreadsheet_id=str(config["spreadsheet_id"]), sheet_title=sheet_title)
+        document = json.loads(adoptions._capture(display.artifact_handle(path), {}))
+        if document.get("schema_version") != "pending-review-selection/v1" or document["spreadsheet_id"] != config["spreadsheet_id"]:
+            raise ValueError("pending selection destination differs")
+        current = document["sources"][document["current_source"]]
+        return path if (document["sheet_title"] == sheet_title and current["run_id"] == source["run_id"]
+            and current["artifacts"]["proposals"]["path"] == str(Path(str(source["run_dir"])) / "proposals.json")) else None
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        raise CycleError("source-bound publication input is invalid") from exc
 
 
 def _meeting_bindings_for_target(config: Mapping[str, Any], sheet_title: str) -> Path | None:
@@ -1810,6 +1837,20 @@ def _publication_profile(config: Mapping[str, Any], profile: str | None) -> str 
 
 def _receipt_publication_config(config: Mapping[str, Any], document: Mapping[str, Any]) -> Mapping[str, Any]:
     records = document.get("publication_receipts", document.get("publications", []))
+    from scripts import clockify_source_adoptions as adoptions
+    for key, field, handle_field in (("publication_presentation", "presentation", "manifest"),
+                                      ("pending_review_selection", "pending_selection", "selection")):
+        handles = [item[field][handle_field] for item in records if isinstance(item, Mapping) and field in item] if isinstance(records, list) else []
+        if handles:
+            try:
+                if any(handle != handles[0] for handle in handles):
+                    raise ValueError("publication input handle is ambiguous")
+                adoptions._capture(handles[0], {})
+                config = {**config, key: handles[0]["path"]}
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                raise CycleError("delivery publication input artifact has drifted") from exc
+        elif key in config:
+            config = {name: value for name, value in config.items() if name != key}
     historical_handles = [item["historical_sources"] for item in records
                           if isinstance(item, Mapping) and "historical_sources" in item] if isinstance(records, list) else []
     if historical_handles:
@@ -1912,15 +1953,43 @@ def _expected_publication_receipts(
             destination = "unresolved-evidence" if unresolved and stable_review_id(proposal) not in aliased else sheet_title
             if publication_profile is None or destination != "unresolved-evidence":
                 partition_rows[destination].append(row)
+    pending_path = _source_publication_input(config, source, sheet_title=sheet_title, key="pending_review_selection")
+    selection = None
+    if pending_path is not None:
+        if meeting_bindings is not None:
+            raise CycleError("pending selection conflicts with meeting representation")
+        try:
+            from scripts import clockify_pending_review_selection as pending
+            selection = pending.verify(bindings_path=pending_path, source_dir=source_dir, proposals=proposals,
+                spreadsheet_id=str(config["spreadsheet_id"]), sheet_title=sheet_title,
+                run_id=str(source["run_id"]), project_allowlist=projects)
+            partition_rows[sheet_title] = selection["rows"]
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise CycleError("pending selection native projection differs") from exc
+    presentation = _source_publication_input(config, source, sheet_title=sheet_title, key="publication_presentation")
+    def present(title: str, rows: list[list[Any]], kind: str) -> tuple[list[list[Any]], dict[str, Any] | None]:
+        if presentation is None:
+            return rows, None
+        try:
+            from scripts import clockify_publication_presentation as display
+            return display.project(path=presentation, source_dir=source_dir, run_id=str(source["run_id"]),
+                spreadsheet_id=str(config["spreadsheet_id"]), sheet_title=title, rows=rows, kind=kind)
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise CycleError("publication presentation source projection differs") from exc
     receipts = []
     for title, rows in partition_rows.items():
         if not rows:
             continue
+        rows, presentation_proof = present(title, rows, "primary")
         receipt = _publication_receipt(
             spreadsheet_id=str(config["spreadsheet_id"]), sheet_title=title, rows=rows,
         )
         if aliases and title == sheet_title:
             receipt["meeting_aliases"] = aliases
+        if presentation_proof is not None:
+            receipt["presentation"] = presentation_proof
+        if selection is not None and title == sheet_title:
+            receipt["pending_selection"] = selection["receipt"]
         receipts.append(receipt)
     if publication_profile in (clockify_monthly_unresolved.PROFILE, clockify_monthly_unresolved.ALIAS_PROFILE):
         rows = clockify_monthly_unresolved.project_rows(source_dir)
@@ -1928,12 +1997,16 @@ def _expected_publication_receipts(
         if publication_profile == clockify_monthly_unresolved.ALIAS_PROFILE:
             aliases = clockify_monthly_unresolved.load_alias_proofs(Path(str(config["monthly_unresolved_alias_proof"])), source_dir)
         if rows:
+            title = clockify_monthly_unresolved.title_for_review(sheet_title)
+            rows, presentation_proof = present(title, rows, "monthly")
             receipt = _publication_receipt(
                 spreadsheet_id=str(config["spreadsheet_id"]),
                 sheet_title=clockify_monthly_unresolved.title_for_review(sheet_title), rows=rows,
             )
             if aliases:
                 receipt["source_aliases"] = clockify_monthly_unresolved.alias_metadata(rows, aliases)
+            if presentation_proof is not None:
+                receipt["presentation"] = presentation_proof
             if config.get("monthly_unresolved_historical_sources"):
                 try:
                     _, historical_handle = clockify_monthly_unresolved.load_historical_sources(
@@ -1952,10 +2025,11 @@ def _validated_publication_document(
     if not isinstance(document, Mapping):
         raise CycleError("publisher result contract is invalid")
     publications = document.get("publications")
+    existing = document.get("status") == "verified-existing"
     if (
         document.get("schema_version") != "sheet-publication-result/v1"
-        or document.get("status") != "published"
-        or document.get("external_writes") is not True
+        or document.get("status") not in {"published", "verified-existing"}
+        or document.get("external_writes") is not (False if existing else True)
         or document.get("clockify_writes") != 0
         or not isinstance(publications, list)
     ):
@@ -1969,6 +2043,7 @@ def _validated_publication_document(
          **({"source_aliases": item["source_aliases"]} if "source_aliases" in item else {}),
          **({"meeting_aliases": item["meeting_aliases"]} if "meeting_aliases" in item else {}),
          **({"historical_sources": item["historical_sources"]} if "historical_sources" in item else {}),
+         **({field: item[field] for field in ("presentation", "pending_selection") if field in item}),
          **({field: item.get(field) for field in ("monthly_layout", "monthly_target_readback")}
             if "monthly_layout" in item or "monthly_target_readback" in item else {})}
         for item in publications if isinstance(item, Mapping)
@@ -1984,6 +2059,14 @@ def _validated_publication_document(
             raise CycleError("publisher monthly legacy layout or source context differs")
         try:
             canonical_rows = clockify_monthly_unresolved.project_rows(source_dir)
+            if "presentation" in expected[index]:
+                from scripts import clockify_publication_presentation as display
+                proof = expected[index]["presentation"]
+                canonical_rows, reconstructed = display.project(path=Path(proof["manifest"]["path"]),
+                    source_dir=source_dir, run_id=source_dir.name, spreadsheet_id=expected[index]["spreadsheet_id"],
+                    sheet_title=expected[index]["sheet_title"], rows=canonical_rows, kind="monthly")
+                if reconstructed != proof:
+                    raise ValueError("legacy presentation projection differs")
             # The marker may adapt only the expected monthly evidence receipt,
             # never primary proposals or a different destination/source set.
             canonical_receipt = _publication_receipt(
@@ -2000,6 +2083,7 @@ def _validated_publication_document(
                     sheet_title=canonical_receipt["sheet_title"], rows=rows),
                 **({"source_aliases": expected[index]["source_aliases"]} if "source_aliases" in expected[index] else {}),
                 **({"historical_sources": expected[index]["historical_sources"]} if "historical_sources" in expected[index] else {}),
+                **({"presentation": expected[index]["presentation"]} if "presentation" in expected[index] else {}),
                 "monthly_layout": item["monthly_layout"],
                 "monthly_target_readback": item.get("monthly_target_readback"),
             }
@@ -2007,6 +2091,16 @@ def _validated_publication_document(
             raise CycleError("publisher monthly legacy source projection differs") from exc
     if retained != base_expected:
         raise CycleError("publisher result destinations or readbacks differ")
+    for index, item in enumerate(publications):
+        if existing != ("existing_publication" in item):
+            raise CycleError("publisher existing-publication verification is missing or misrepresented")
+        if existing:
+            try:
+                from scripts import clockify_publication_presentation as display
+                display.verify_existing(item["existing_publication"], retained[index])
+            except (OSError, KeyError, ValueError, TypeError) as exc:
+                raise CycleError("publisher immutable operator readback differs") from exc
+            retained[index]["existing_publication"] = item["existing_publication"]
     for index, item in enumerate(publications):
         if "canonical_source_aliases" not in item:
             if "canonical_source_aliases" in expected[index]:
@@ -2072,9 +2166,10 @@ def _delivery_document(
             timestamp_projection=timestamp_projection,
         )
         if publication_readbacks is not None:
+            existing = bool(publication_readbacks) and all("existing_publication" in item for item in publication_readbacks)
             publication_receipts = _validated_publication_document({
-                "schema_version": "sheet-publication-result/v1", "status": "published",
-                "external_writes": True, "clockify_writes": 0, "publications": publication_readbacks,
+                "schema_version": "sheet-publication-result/v1", "status": "verified-existing" if existing else "published",
+                "external_writes": not existing, "clockify_writes": 0, "publications": publication_readbacks,
             }, publication_receipts, source_dir=Path(str(source["run_dir"])))
     except (OSError, KeyError, TypeError, ValueError, RuntimeError) as exc:
         raise CycleError("proposal cannot produce the expected sheet row contract") from exc
@@ -2103,6 +2198,8 @@ def _delivery_document(
         "review_ids": list(source["review_ids"]),
         "publication_receipts": publication_receipts,
     }
+    if publication_receipts and all("existing_publication" in item for item in publication_receipts):
+        unsigned["publication_basis"] = "verified_existing_operator_readback"
     if source.get("coverage", {}).get("status") == "incomplete":
         unsigned["schema_version"] = PARTIAL_RECEIPT_SCHEMA_VERSION
         unsigned["source_completeness"] = dict(source["coverage"])

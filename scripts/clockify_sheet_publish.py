@@ -1352,6 +1352,25 @@ def publish_monthly_unresolved(
     return _apply_monthly_unresolved(gateway, spreadsheet_id=spreadsheet_id, plan=plan)
 
 
+def _pending_plan_preserving_review_humans(gateway: SheetsGateway, *, spreadsheet_id: str,
+        sheet_title: str, selection: Mapping[str, Any]) -> dict[str, Any]:
+    """Retried accepted rows keep human cells; transition targets stay exact."""
+    from scripts import clockify_pending_review_selection as pending
+    metadata = gateway.spreadsheet(spreadsheet_id)
+    positions, existing = _scan_rows(gateway, spreadsheet_id, _a1_title(sheet_title), _sheet_row_count(metadata, sheet_title))
+    def reviewed(row: Sequence[Any]) -> list[Any]:
+        expected = list(row)
+        if row[0] in positions:
+            live = list(existing[positions[row[0]]]) + [""] * (len(HEADER) - len(existing[positions[row[0]]]))
+            for index in HUMAN_COLUMNS:
+                expected[index] = live[index]
+        return expected
+    planning = {**selection, "rows": [reviewed(row) for row in selection["rows"]],
+                "prior": [{**record, "row": reviewed(record["row"])} if record["disposition"] == "retain" else record
+                          for record in selection["prior"]]}
+    return pending.plan(gateway, spreadsheet_id=spreadsheet_id, sheet_title=sheet_title, selection=planning)
+
+
 def publish_proposal_partitions(
     gateway: SheetsGateway,
     *,
@@ -1369,7 +1388,16 @@ def publish_proposal_partitions(
     source_dir: Path | None = None,
     monthly_historical_sources: Path | None = None,
     pending_selection: Path | None = None,
+    presentation: Path | None = None,
+    existing_publication: Path | None = None,
 ) -> dict[str, Any]:
+    if existing_publication is not None:
+        try:
+            from scripts import clockify_publication_presentation as display
+            gateway = display.OperatorReadbackGateway(existing_publication)
+            gateway.spreadsheet(spreadsheet_id)
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise PublicationError("operator publication readback is invalid") from exc
     selection = selection_plan = None
     if pending_selection is not None:
         if source_dir is None or meeting_bindings is not None or tombstones:
@@ -1379,7 +1407,9 @@ def publish_proposal_partitions(
             selection = pending.verify(bindings_path=pending_selection, source_dir=source_dir, proposals=proposals,
                                        spreadsheet_id=spreadsheet_id, sheet_title=sheet_title, run_id=run_id,
                                        project_allowlist=project_allowlist)
-            selection_plan = pending.plan(gateway, spreadsheet_id=spreadsheet_id, sheet_title=sheet_title, selection=selection)
+            selection_plan = (_pending_plan_preserving_review_humans(gateway, spreadsheet_id=spreadsheet_id,
+                sheet_title=sheet_title, selection=selection) if "reason_projection" in selection["receipt"] or existing_publication is not None
+                else pending.plan(gateway, spreadsheet_id=spreadsheet_id, sheet_title=sheet_title, selection=selection))
         except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
             raise PublicationError("pending review selection is invalid") from exc
     proposal_partitions: tuple[tuple[str, list[Mapping[str, Any]]], ...] = (
@@ -1429,6 +1459,28 @@ def publish_proposal_partitions(
         partitions = [(title, rows) for title, rows in selected.items() if rows]
         if aliases:
             meeting_aliases[sheet_title] = aliases
+    presentation_proofs = {}
+    if presentation is not None:
+        if source_dir is None:
+            raise PublicationError("presentation requires its native source")
+        try:
+            from scripts import clockify_publication_presentation as display
+            projected_partitions = []
+            for title, rows in partitions:
+                rows, proof = display.project(path=presentation, source_dir=source_dir, run_id=run_id,
+                    spreadsheet_id=spreadsheet_id, sheet_title=title, rows=rows, kind="primary")
+                projected_partitions.append((title, rows))
+                if proof is not None:
+                    presentation_proofs[title] = proof
+            partitions = projected_partitions
+            if monthly_rows:
+                title = monthly_unresolved.title_for_review(sheet_title)
+                monthly_rows, proof = display.project(path=presentation, source_dir=source_dir, run_id=run_id,
+                    spreadsheet_id=spreadsheet_id, sheet_title=title, rows=monthly_rows, kind="monthly")
+                if proof is not None:
+                    presentation_proofs[title] = proof
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise PublicationError("immutable publication presentation is invalid") from exc
     ids = [str(row[0]) for _destination, rows in partitions for row in rows]
     if len(ids) != len(set(ids)):
         raise PublicationError("proposal input contains duplicate stable review IDs")
@@ -1455,6 +1507,32 @@ def publish_proposal_partitions(
             historical_sources=monthly_historical_sources,
         )
     publications: list[dict[str, Any]] = []
+    if existing_publication is not None:
+        if (tombstones or any(plan["created"] or plan["updates"] or plan["appends"] for plan in plans)
+                or selection_plan is not None and selection_plan["updates"]
+                or monthly_plan is not None and monthly_plan["appends"]):
+            raise PublicationError("existing publication does not satisfy native readback contract")
+        for title, rows in partitions:
+            item = _publication_receipt(spreadsheet_id=spreadsheet_id, sheet_title=title, rows=rows)
+            if title in presentation_proofs:
+                item["presentation"] = presentation_proofs[title]
+            if selection is not None and title == sheet_title:
+                item["pending_selection"] = selection["receipt"]
+            item["existing_publication"] = {"verification_basis": "immutable_operator_readback",
+                "operator_receipt": gateway.handle, "rows": [list(row) for row in rows]}
+            display.verify_existing(item["existing_publication"], item)
+            publications.append(item)
+        if monthly_plan is not None:
+            item = _apply_monthly_unresolved(gateway, spreadsheet_id=spreadsheet_id, plan=monthly_plan)
+            title = monthly_plan["sheet_title"]
+            if title in presentation_proofs:
+                item["presentation"] = presentation_proofs[title]
+            item["existing_publication"] = {"verification_basis": "immutable_operator_readback",
+                "operator_receipt": gateway.handle, "rows": monthly_plan["rows"]}
+            display.verify_existing(item["existing_publication"], item)
+            publications.append(item)
+        return {"schema_version": "sheet-publication-result/v1", "status": "verified-existing",
+                "external_writes": False, "clockify_writes": 0, "terminal_updates": 0, "publications": publications}
     for (destination, rows), plan in zip(partitions, plans, strict=True):
         result = _apply_publish_plan(
             gateway, spreadsheet_id=spreadsheet_id, plan=plan,
@@ -1467,11 +1545,14 @@ def publish_proposal_partitions(
             ),
             **result,
             **({"meeting_aliases": meeting_aliases[destination]} if destination in meeting_aliases else {}),
+            **({"presentation": presentation_proofs[destination]} if destination in presentation_proofs else {}),
+            **({"pending_selection": selection["receipt"]} if selection is not None and destination == sheet_title else {}),
         })
     if monthly_plan is not None:
         publications.append({
             "sheet_title": monthly_plan["sheet_title"], "row_count": len(monthly_rows),
             **_apply_monthly_unresolved(gateway, spreadsheet_id=spreadsheet_id, plan=monthly_plan),
+            **({"presentation": presentation_proofs[monthly_plan["sheet_title"]]} if monthly_plan["sheet_title"] in presentation_proofs else {}),
         })
     terminal_updates = 0
     if selection_plan is not None:
@@ -1545,6 +1626,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--monthly-unresolved-historical-sources", type=Path)
     parser.add_argument("--meeting-publication-bindings", type=Path)
     parser.add_argument("--pending-review-selection", type=Path)
+    parser.add_argument("--publication-presentation", type=Path)
+    parser.add_argument("--verify-existing-publication", type=Path)
     args = parser.parse_args(argv)
     if args.monthly_unresolved_historical_sources is not None and not (args.monthly_unresolved and args.proposals is not None):
         parser.error("monthly historical sources require --monthly-unresolved and --proposals")
@@ -1552,6 +1635,10 @@ def main(argv: list[str] | None = None) -> int:
     quality = _json(args.quality_report)
     replay = _json(args.replay_integrity)
     if args.portfolio_repair is not None:
+        if args.verify_existing_publication is not None:
+            parser.error("existing publication verification requires --proposals")
+        if args.publication_presentation is not None:
+            parser.error("publication presentation requires --proposals")
         if args.pending_review_selection is not None:
             parser.error("pending review selection requires --proposals")
         if args.meeting_publication_bindings is not None:
@@ -1627,7 +1714,18 @@ def main(argv: list[str] | None = None) -> int:
             )
         except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
             raise PublicationError("meeting representation binding is invalid") from exc
-    if not args.enable_write:
+    if args.publication_presentation is not None:
+        try:
+            from scripts import clockify_publication_presentation as display
+            display_rows = selection_preview["rows"] if selection_preview is not None else rows
+            display.project(path=args.publication_presentation, source_dir=args.proposals.parent, run_id=args.run_id,
+                spreadsheet_id=args.spreadsheet_id, sheet_title=args.sheet_title, rows=display_rows, kind="primary")
+            if monthly_rows:
+                display.project(path=args.publication_presentation, source_dir=args.proposals.parent, run_id=args.run_id,
+                    spreadsheet_id=args.spreadsheet_id, sheet_title=monthly_unresolved.title_for_review(args.sheet_title), rows=monthly_rows, kind="monthly")
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise PublicationError("immutable publication presentation is invalid") from exc
+    if not args.enable_write and args.verify_existing_publication is None:
         print(json.dumps({
             "status": "dry_run",
             "external_writes": False,
@@ -1637,7 +1735,9 @@ def main(argv: list[str] | None = None) -> int:
             **({"meeting_aliases": len(meeting_preview_aliases)} if meeting_binding_handle is not None else {}),
         }, sort_keys=True))
         return 0
-    gateway = GwsSheetsGateway()
+    if args.enable_write and args.verify_existing_publication is not None:
+        parser.error("existing publication verification cannot enable writes")
+    gateway = None if args.verify_existing_publication is not None else GwsSheetsGateway()
     if args.proposals is not None:
         result = publish_proposal_partitions(
             gateway,
@@ -1655,6 +1755,8 @@ def main(argv: list[str] | None = None) -> int:
             source_dir=args.proposals.parent,
             monthly_historical_sources=args.monthly_unresolved_historical_sources,
             pending_selection=args.pending_review_selection,
+            presentation=args.publication_presentation,
+            existing_publication=args.verify_existing_publication,
         )
     else:
         result = publish(
@@ -1693,6 +1795,7 @@ def main(argv: list[str] | None = None) -> int:
                      **({"meeting_aliases": item["meeting_aliases"]} if "meeting_aliases" in item else {}),
                      **({"canonical_source_aliases": item["canonical_source_aliases"]} if "canonical_source_aliases" in item else {}),
                      **({"historical_sources": item["historical_sources"]} if "historical_sources" in item else {}),
+                     **({field: item[field] for field in ("presentation", "pending_selection", "existing_publication") if field in item}),
                      **({field: item[field] for field in ("monthly_layout", "monthly_target_readback")} if "monthly_layout" in item else {})}
                     for item in document["publications"]
                 ],
