@@ -1886,7 +1886,7 @@ def _verified_replay_inference_context(source: Path) -> Path:
                 if filename == "routing.json":
                     continue
                 if filename == "review-corrections.jsonl" and "source_corrections_sha256" in lineage:
-                    if _validate_repair_credit_transition(parent, current / filename, runs_root=RUNS, routing_snapshot=current / "routing.json") != (lineage.get("source_corrections_sha256"), lineage.get("repair_corrections_sha256")):
+                    if _validate_repair_credit_transition(parent, current / filename, runs_root=RUNS, routing_snapshot=current / "routing.json", historical_child=current) != (lineage.get("source_corrections_sha256"), lineage.get("repair_corrections_sha256")):
                         raise ReviewRunError("replay inference correction provenance changed")
                 elif _read_snapshot_source(parent / filename, label="inference original input") != _read_snapshot_source(current / filename, label="inference repair input"):
                     raise ReviewRunError("replay inference reconciliation snapshot changed")
@@ -2255,9 +2255,80 @@ def _recorded_attendance_repair_target(
     return activity
 
 
+def _validate_historical_timing_witness(
+    source: Path, child: Path, record: Mapping[str, Any], *, runs_root: Path,
+) -> None:
+    """Authenticate saved historical timing, never execute a fresh correction."""
+    root = runs_root.resolve()
+    if any(path != path.resolve() or path.parent != root for path in (source, child)):
+        raise ReviewRunError("historical timing witness is outside the runs root")
+    normalized = review_corrections.validate_source_bound_timing_correction(record)
+    if normalized["parent_run_id"] != source.name:
+        raise ReviewRunError("historical timing witness parent differs")
+    parent_bundle = collector_receipts.load_completion_bundle(source / "completion-bundle.json", run_dir=source)
+    child_bundle = collector_receipts.load_completion_bundle(child / "completion-bundle.json", run_dir=child)
+    lineage = _read_json(child / "repair-source.json")
+    if (
+        parent_bundle.replay or child_bundle.replay
+        or not isinstance(lineage, Mapping)
+        or lineage.get("source_run_id") != source.name
+        or lineage.get("source_completion_sha256") != _file_sha256(source / "completion-bundle.json", label="historical timing source completion")
+        or lineage.get("source_coverage") != collector_receipts.completion_coverage(parent_bundle)
+        or lineage.get("source_corrections_sha256") != _file_sha256(source / "review-corrections.jsonl", label="historical timing source corrections")
+        or lineage.get("repair_corrections_sha256") != _file_sha256(child / "review-corrections.jsonl", label="historical timing child corrections")
+        or _read_json(child / "quality_report.json").get("status") != "pass"
+    ):
+        raise ReviewRunError("historical timing completed lineage differs")
+    for filename, expected in normalized["parent_artifacts"].items():
+        if _file_sha256(source / filename, label="historical timing parent artifact") != expected:
+            raise ReviewRunError("historical timing parent artifact differs")
+    for filename in ("evidence/evidence-ledger.json", "semantic-analysis.json"):
+        if _read_snapshot_source(source / filename, label="historical timing source") != _read_snapshot_source(child / filename, label="historical timing child"):
+            raise ReviewRunError("historical timing source evidence or semantics changed")
+    if normalized not in [review_corrections._without_integrity(item) for item in review_corrections._read_log(child / "review-corrections.jsonl")]:
+        raise ReviewRunError("historical timing record is not sealed in the child")
+    target = (normalized["activity_id"], normalized["evidence_fingerprint"])
+    activities = [activity for activity in _read_json(source / "semantic-analysis.json").get("activities", [])
+                  if review_corrections.proposal_target(activity) == target]
+    proposals = _read_json(child / "proposals.json")
+    matches = [proposal for proposal in proposals if review_corrections.proposal_target(proposal) == target]
+    if len(activities) != 1 or len(matches) != 1 or _read_json(child / "work-accounting-result.json").get("proposals") != proposals:
+        raise ReviewRunError("historical timing activity or saved allocation differs")
+    ledger, _events = work_accounting_pipeline.load_ledger(source / "evidence/evidence-ledger.json")
+    indexed = {event.evidence_id: event for event in ledger.events}
+    request = indexed[normalized["request_evidence_id"]]
+    result = indexed[normalized["result_evidence_id"]]
+    if (
+        request.evidence_id not in activities[0].get("evidence_ids", [])
+        or result.evidence_id not in activities[0].get("evidence_ids", [])
+        or request.attributes.get("role") != "user" or result.attributes.get("role") != "assistant"
+        or not request.source_type.endswith("_sessions_event") or request.source_type != result.source_type
+        or any(not request.source_ref.get(key) or request.source_ref.get(key) != result.source_ref.get(key)
+               for key in ("session_id", "machine"))
+        or request.raw_source_span.get("timestamp_status") != "available"
+        or result.raw_source_span.get("timestamp_status") != "available"
+        or request.raw_source_span.get("timestamp") != request.observed_at
+        or result.raw_source_span.get("timestamp") != result.observed_at
+    ):
+        raise ReviewRunError("historical timing request/result witness differs")
+    start = dt.datetime.fromisoformat(normalized["start"].replace("Z", "+00:00"))
+    end = dt.datetime.fromisoformat(normalized["end"].replace("Z", "+00:00"))
+    requested = dt.datetime.fromisoformat(str(request.observed_at).replace("Z", "+00:00"))
+    finished = dt.datetime.fromisoformat(str(result.observed_at).replace("Z", "+00:00"))
+    duration = normalized["duration_seconds"]
+    if (
+        requested.tzinfo is None or finished.tzinfo is None or start != requested or end > finished
+        or duration != int((finished - requested).total_seconds() // 60) * 60
+        or any(matches[0].get(field) != normalized[field] for field in ("start", "end", "duration_seconds"))
+        or type(matches[0].get("duration_minutes")) is not int or matches[0]["duration_minutes"] * 60 != duration
+    ):
+        raise ReviewRunError("historical timing saved interval exceeds its exact source witness")
+
+
 def _validate_repair_credit_transition(
     source: Path, proposed: Path, *, runs_root: Path,
     routing_snapshot: Path | None = None,
+    historical_child: Path | None = None,
 ) -> tuple[str, str]:
     """Prove append-only posted credits and exact source-bound review corrections."""
     original = source / "review-corrections.jsonl"
@@ -2283,14 +2354,28 @@ def _validate_repair_credit_transition(
         prior_decision_targets = {
             (record["activity_id"], record["evidence_fingerprint"])
             for record in parent_records
-            if record.get("record_type") != review_corrections.VERIFIED_POSTED_CREDIT
+            if record.get("record_type") not in {
+                review_corrections.VERIFIED_POSTED_CREDIT, review_corrections.SOURCE_BOUND_TIMING_CORRECTION,
+            }
         }
         appended_decision_targets: set[tuple[str, str]] = set()
         skip_targets: set[tuple[str, str]] = set()
         source_activities: list[Mapping[str, Any]] | None = None
         selected_routing: Mapping[str, Any] | None = None
+        timing_targets = {
+            (record["activity_id"], record["evidence_fingerprint"])
+            for record in parent_records
+            if record.get("record_type") == review_corrections.SOURCE_BOUND_TIMING_CORRECTION
+        }
         for record in tail:
             if record.get("record_type") == review_corrections.VERIFIED_POSTED_CREDIT:
+                continue
+            if record.get("record_type") == review_corrections.SOURCE_BOUND_TIMING_CORRECTION:
+                target = (record["activity_id"], record["evidence_fingerprint"])
+                if historical_child is None or proposed != historical_child / "review-corrections.jsonl" or target in timing_targets:
+                    raise ReviewRunError("fresh timing metadata is not repair authority")
+                _validate_historical_timing_witness(source, historical_child, record, runs_root=runs_root)
+                timing_targets.add(target)
                 continue
             target = (record.get("activity_id"), record.get("evidence_fingerprint"))
             if record.get("decision") == "skip":

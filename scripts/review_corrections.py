@@ -8,6 +8,7 @@ reuse rather than silently altering the review record.
 from __future__ import annotations
 
 import copy
+import datetime as dt
 import base64
 import binascii
 import hashlib
@@ -31,6 +32,7 @@ PATCH_FIELDS = {
     "billable",
 }
 VERIFIED_POSTED_CREDIT = "verified_posted_credit"
+SOURCE_BOUND_TIMING_CORRECTION = "source_bound_timing_correction"
 MAX_CAPTURED_PRIOR_PROPOSALS_BYTES = 16 * 1024 * 1024
 _SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _EVIDENCE_FINGERPRINT_RE = re.compile(r"evfp:sha256:[0-9a-f]{64}\Z")
@@ -350,6 +352,46 @@ def validate_verified_posted_credit(record: Mapping[str, Any]) -> dict[str, Any]
     }
 
 
+def validate_source_bound_timing_correction(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Read immutable historical timing metadata, never execute credit/approval.
+
+    This typed record preserves the original source/request/result handles and
+    hash-chain. It is NOT a review decision or a verified posted-time credit.
+    Native completed sources/replays remain the authority for saved allocations.
+    """
+    fields = {"schema_version", "record_type", "correction_id", "activity_id", "review_item_id",
+              "evidence_fingerprint", "parent_run_id", "parent_artifacts", "request_evidence_id",
+              "result_evidence_id", "start", "end", "duration_seconds", "reviewer", "reviewed_at", "rationale"}
+    if (not isinstance(record, Mapping) or set(_without_integrity(record)) != fields
+            or type(record.get("schema_version")) is not int or record["schema_version"] != 1
+            or record.get("record_type") != SOURCE_BOUND_TIMING_CORRECTION):
+        raise ReviewDecisionError("source-bound timing metadata shape differs")
+    result = copy.deepcopy(_without_integrity(record))
+    for field in fields - {"schema_version", "duration_seconds", "parent_artifacts"}:
+        _one_line(result[field], field)
+    if (not _EVIDENCE_FINGERPRINT_RE.fullmatch(result["evidence_fingerprint"])
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", result["parent_run_id"])
+            or result["parent_run_id"] in {".", ".."}):
+        raise ReviewDecisionError("source-bound timing metadata source identity differs")
+    artifacts = result["parent_artifacts"]
+    if (not isinstance(artifacts, Mapping)
+            or set(artifacts) != {"evidence/evidence-ledger.json", "proposals.json", "semantic-analysis.json", "work-accounting-result.json"}
+            or any(not isinstance(value, str) or not _SHA256_RE.fullmatch(value) for value in artifacts.values())):
+        raise ReviewDecisionError("source-bound timing metadata parent hashes differ")
+    try:
+        start, end, reviewed = (dt.datetime.fromisoformat(result[field].replace("Z", "+00:00")) for field in ("start", "end", "reviewed_at"))
+    except ValueError as exc:
+        raise ReviewDecisionError("source-bound timing metadata timestamps differ") from exc
+    if (any(value.tzinfo is None for value in (start, end, reviewed))
+            or type(result["duration_seconds"]) is not int or result["duration_seconds"] <= 0
+            or (end - start).total_seconds() != result["duration_seconds"]):
+        raise ReviewDecisionError("source-bound timing metadata exact duration differs")
+    unsigned = {key: value for key, value in result.items() if key != "correction_id"}
+    if result["correction_id"] != "tcor-" + canonical_digest(unsigned)[7:31]:
+        raise ReviewDecisionError("source-bound timing metadata correction identity differs")
+    return result
+
+
 def _read_log(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -362,11 +404,12 @@ def _read_log(path: Path) -> list[dict[str, Any]]:
             record = json.loads(line)
         except json.JSONDecodeError as exc:
             raise ReviewDecisionError(f"invalid decision JSON at line {number}") from exc
-        normalized = (
-            validate_verified_posted_credit(record)
-            if isinstance(record, Mapping) and record.get("record_type") == VERIFIED_POSTED_CREDIT
-            else validate_decision(record)
-        )
+        if isinstance(record, Mapping) and record.get("record_type") == VERIFIED_POSTED_CREDIT:
+            normalized = validate_verified_posted_credit(record)
+        elif isinstance(record, Mapping) and record.get("record_type") == SOURCE_BOUND_TIMING_CORRECTION:
+            normalized = validate_source_bound_timing_correction(record)
+        else:
+            normalized = validate_decision(record)
         digest = canonical_digest(_without_integrity(record))
         if record.get("canonical_digest") != digest or record.get("previous_digest") != previous:
             raise ReviewDecisionError(f"decision log integrity failure at line {number}")
@@ -379,7 +422,8 @@ def _read_log(path: Path) -> list[dict[str, Any]]:
 
 def load_decisions(path: Path) -> list[dict[str, Any]]:
     """Read and integrity-check an immutable correction JSONL file."""
-    return [record for record in _read_log(path) if record.get("record_type") != VERIFIED_POSTED_CREDIT]
+    return [record for record in _read_log(path)
+            if record.get("record_type") not in {VERIFIED_POSTED_CREDIT, SOURCE_BOUND_TIMING_CORRECTION}]
 
 
 def load_verified_posted_credits(path: Path) -> list[dict[str, Any]]:
@@ -471,7 +515,7 @@ def append_decision(path: Path, record: Mapping[str, Any], *, item: Mapping[str,
     existing = _read_log(path)
     target = tuple(normalized[key] for key in ("review_item_id", "activity_id", "evidence_fingerprint"))
     for prior in existing:
-        if prior.get("record_type") == VERIFIED_POSTED_CREDIT:
+        if prior.get("record_type") in {VERIFIED_POSTED_CREDIT, SOURCE_BOUND_TIMING_CORRECTION}:
             continue
         prior_target = tuple(prior[key] for key in ("review_item_id", "activity_id", "evidence_fingerprint"))
         if prior_target != target:

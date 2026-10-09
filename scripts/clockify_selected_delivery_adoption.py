@@ -148,12 +148,216 @@ def _legacy_aliases(packet: Any, *, source: Path, expected: dict[str, list[Any]]
     return verified
 
 
+def _pending_acceptance(actual: Any, expected: Mapping[str, Any], raw) -> dict[str, Any]:
+    """Authenticate original authority without pretending newer runtime bytes existed."""
+    from scripts import clockify_pending_review_selection as pending
+    roles = {'consumer', 'pipeline', 'allocator'}
+    _require(isinstance(actual, Mapping)
+        and actual.get('schema_version') == 'pending-review-selection-acceptance/v1'
+        and isinstance(actual.get('runtime_artifacts'), Mapping)
+        and set(actual['runtime_artifacts']) == roles,
+        'native pending historical acceptance inventory differs')
+    _require(actual.get('acceptance_sha256') == pending.digest({
+        key:value for key,value in actual.items() if key != 'acceptance_sha256'}),
+        'native pending historical acceptance digest differs')
+    for handle in actual['runtime_artifacts'].values():
+        raw(handle)
+    ignored = {'runtime_artifacts', 'acceptance_sha256'}
+    _require(all(key in expected and value == expected[key]
+        for key,value in actual.items() if key not in ignored),
+        'native pending historical semantic proof differs')
+    added = set(expected) - set(actual)
+    _require(added <= {'fixed_recording_checks','fixed_recording_rows','saved_credit_seconds'},
+        'native pending unrecognized current validation field')
+    return {key:expected[key] for key in sorted(added)}
+
+
+def _pending_editorial(projection: Any, *, source: Path, expected: dict[str,list[Any]],
+                      current: dict[str,tuple[int,list[Any]]], by_review: Mapping[str,Any],
+                      source_handle: Mapping[str,Any], spreadsheet: str, title: str,
+                      sheet_id: int, published_at: dt.datetime, raw, load) -> list[str]:
+    """One explicit existing I-only chain; never a description preservation opt-out."""
+    from scripts import work_accounting_pipeline as pipeline
+    changed = sorted(identity for identity,row in expected.items()
+                     if current[identity][1][8] != row[8])
+    if projection is None:
+        _require(not changed, 'native pending current description lacks editorial proof')
+        return []
+    _require(isinstance(projection,Mapping) and set(projection) == {
+        'schema_version','review_ids','receipt','source_binding','decisions','review_snapshot','source_proposals'}
+        and projection['schema_version'] == 'selected-delivery-editorial-projection/v1'
+        and projection['review_ids'] == changed and changed,
+        'native pending editorial projection target differs')
+    _require(projection['source_proposals'] == source_handle
+        and Path(projection['review_snapshot']['path']) == source/'review-snapshot.json',
+        'native pending editorial original source locator differs')
+    load(projection['source_proposals'])
+    snapshot = load(projection['review_snapshot'])
+    receipt, binding = load(projection['receipt']), load(projection['source_binding'])
+    receipt_sha = projection['receipt']['sha256'].removeprefix('sha256:')
+    _require(receipt.get('schema') == 'clockify-description-editorial-correction-v1'
+        and (receipt.get('spreadsheet_id'),receipt.get('sheet'),receipt.get('sheet_id')) == (spreadsheet,title,sheet_id)
+        and receipt.get('scope') == 'Column I userEnteredValue only; pending/unposted rows'
+        and receipt.get('verified',{}).get('non_description_cells_unchanged') is True
+        and _time(receipt['utc']) >= published_at
+        and binding.get('schema') == 'clockify-editorial-source-binding-input-v1'
+        and binding.get('sheet_correction_receipt') == projection['receipt']['path']
+        and binding.get('receipt_sha256') == receipt_sha,
+        'native pending editorial receipt or source binding differs')
+    log_bytes = raw(projection['decisions'])
+    _require(log_bytes.startswith((source/'review-corrections.jsonl').read_bytes()),
+        'native pending editorial decision predecessor differs')
+    decisions = review_corrections.load_decisions(Path(projection['decisions']['path']))
+    for identity in changed:
+        before, after, proposal = expected[identity], current[identity][1], by_review[identity]
+        entries = [e for e in binding.get('entries',[]) if e.get('id') == identity]
+        corrections = [e for e in receipt.get('corrections',[]) if e.get('id') == identity]
+        _require(len(entries) == len(corrections) == 1, 'native pending editorial identity is ambiguous')
+        entry, correction = entries[0], corrections[0]
+        _require(entry.get('activity_id') == proposal['activity_id']
+            and entry.get('source_run_basename') == source.name
+            and entry.get('before') == correction.get('before') == before[8]
+            and entry.get('description') == correction.get('description') == after[8]
+            and type(entry.get('row')) is int and entry['row'] > 1 and entry['row'] == correction.get('row'),
+            'native pending editorial exact source target or description differs')
+        preimage = entry.get('original_row_values')
+        _require(isinstance(preimage,list) and len(preimage) == 15,
+            'native pending editorial original row preimage differs')
+        for index in range(15):
+            if index in {1,2}:
+                same = pipeline._parse_dt(preimage[index]) == pipeline._parse_dt(before[index])
+            elif index in {3,10} and isinstance(preimage[index],str):
+                # Only the witnessed integer display's optional lone trailing dot.
+                same = (re.fullmatch(r'[0-9]+\.?',preimage[index]) is not None
+                        and int(preimage[index].removesuffix('.')) == before[index])
+            else:
+                same = publisher._same_cell(preimage[index],before[index])
+            _require(same, 'native pending editorial original native preimage differs')
+        items = [item for category in snapshot['categories'].values() for item in category
+                 if item.get('activity_id') == proposal['activity_id']]
+        target = review_corrections.proposal_target(proposal)
+        matched = [d for d in decisions if (d['activity_id'],d['evidence_fingerprint']) == target]
+        _require(len(items) == len(matched) == 1, 'native pending editorial evidence target is ambiguous')
+        decision = review_corrections.validate_decision(matched[0],item=items[0])
+        _require(decision['decision'] == 'modify' and decision['correction_categories'] == ['wording']
+            and decision['field_patch'] == {'description':{'op':'replace','value':after[8]}}
+            and receipt_sha in decision['rationale']
+            and _time(decision['reviewed_at']) == _time(binding['utc']) >= _time(receipt['utc']),
+            'native pending editorial ordinary description decision differs')
+    return changed
+
+
+def _native_pending_delivery(config, source_stage, replay_stage, proofs, documents, *, title, raw, load):
+    """Existing incremental publication plus retained pending, not posted holds."""
+    from scripts import clockify_pending_review_selection as pending
+    source = Path(source_stage['run_dir'])
+    spreadsheet = str(config['spreadsheet_id'])
+    selection, packet, receipt, live = [documents[name] for name in (
+        'selection','publication_packet','publication_receipt','live_readback')]
+    current_source = selection['sources'][selection['current_source']]
+    source_handles = current_source['artifacts']
+    _require(current_source['basis'] == 'completed-review-run'
+        and Path(source_handles['proposals']['path']) == source/'proposals.json'
+        and source_handles['proposals']['sha256'] == source_stage['proposals_digest']
+        and Path(source_handles['replay']['path']) == Path(replay_stage['run_dir'])/'replay-integrity.json',
+        'native pending completed source or replay binding differs')
+    proposals = load(source_handles['proposals'])
+    routing = load(source_handles['routing'])
+    verified = pending.verify(bindings_path=Path(proofs['selection']['path']), source_dir=source,
+        proposals=proposals, spreadsheet_id=spreadsheet, sheet_title=title, run_id=source.name,
+        project_allowlist=publisher.project_allowlist(routing))
+    _require(all(record['disposition'] == 'retain' for record in verified['prior']),
+        'native pending delivery requires retained-only predecessors')
+    accepted = {row[0]:row for row in verified['rows']}
+    new_ids = verified['new_ids']
+    retained = [record['review_id'] for record in verified['prior']]
+    by_review = {publisher.stable_review_id(p):p for p in proposals}
+    _require(len(accepted) == len(verified['rows']) == len(proposals)
+        and set(accepted) == set(by_review) == set(source_stage['review_ids'])
+        and not set(new_ids)&set(retained) and set(new_ids)|set(retained) == set(accepted),
+        'native pending delivery partition is not disjoint and exhaustive')
+    current_checks = _pending_acceptance(receipt.get('pending_selection'),verified['receipt'],raw)
+    new_rows = [accepted[identity] for identity in new_ids]
+    _require(packet.get('schema_version') == 'native-prospective-incremental-publication/v1'
+        and packet.get('simulation_not_actual_publication') is True
+        and packet.get('source') == str(source) and packet.get('replay') == replay_stage['run_dir']
+        and packet.get('consumer_profile') == proofs['selection'] and packet.get('new_rows') == new_rows
+        and (packet.get('spreadsheet_id'),packet.get('sheet_title')) == (spreadsheet,title),
+        'native pending original planning source binding differs')
+    _require(receipt.get('status') == 'verified' and receipt.get('clockify_writes') == 0
+        and receipt.get('new_rows') == len(new_rows)
+        and receipt.get('new_minutes') == sum(row[3] for row in new_rows)
+        and receipt.get('publication_receipt') == publisher._publication_receipt(
+            spreadsheet_id=spreadsheet,sheet_title=title,rows=new_rows),
+        'native pending actual incremental publication receipt differs')
+    published_at = _time(receipt['utc'])
+    target_id = packet['sheet_id']
+    original = _capture_rows(receipt['readback'],spreadsheet,title,target_id,15)
+    current_capture = live.get('readback',live.get('identity_and_portfolio_readback',live))
+    current = _capture_rows(current_capture,spreadsheet,title,target_id,15)
+    observed_at = live.get('captured_utc',live.get('observed_at_utc'))
+    if observed_at is not None:
+        _require(_time(observed_at) >= published_at, 'native pending current capture predates publication')
+    _require(original.get(1) == publisher.HEADER and current.get(1) == publisher.HEADER,
+        'native pending original or current captured header differs')
+    match = re.fullmatch(r'A([1-9][0-9]*):O([1-9][0-9]*)',receipt['range'])
+    _require(match is not None, 'native pending incremental publication range differs')
+    numbers = list(range(int(match[1]),int(match[2])+1))
+    _require(len(numbers) == len(new_rows) and [original.get(n) for n in numbers] == new_rows,
+        'native pending exact original incremental readback differs')
+    original_ids, current_ids = _by_identity(original), _by_identity(current)
+    _require(set(accepted) <= set(original_ids) and set(accepted) <= set(current_ids)
+        and all(original_ids[identity][1] == row for identity,row in accepted.items()),
+        'native pending original accepted or current review identities differ')
+    for identity,row in accepted.items():
+        indexes = range(15) if identity in retained else [i for i in range(15) if i != 8]
+        _require(all(publisher._same_cell(row[i],current_ids[identity][1][i]) for i in indexes),
+            'native pending current retained or selected native cells differ')
+        _require(row[9] == 'pending' and row[13] == 'unposted', 'native pending row is not pending/unposted')
+    editorial_ids = _pending_editorial(documents.get('editorial_projection'),source=source,
+        expected={identity:accepted[identity] for identity in new_ids},current=current_ids,by_review=by_review,
+        source_handle=source_handles['proposals'],spreadsheet=spreadsheet,title=title,sheet_id=target_id,
+        published_at=published_at,raw=raw,load=load)
+    manifest = Path(proofs['native_checkpoint_manifest']['path'])
+    _require(Path(proofs['native_checkpoint_page']['path']) == manifest.parent/'pages/000001.json',
+        'native pending checkpoint page locator differs')
+    interval = json.loads((source/'completion-bundle.json').read_bytes())
+    since,until = _time(interval['since_utc']),_time(interval['until_utc'])
+    identity,request = native._request(str(config['workspace_id']),str(config['member_id']),since,until)
+    native._validate(manifest.parent,{'manifest.json':raw(proofs['native_checkpoint_manifest']),
+        'pages/000001.json':raw(proofs['native_checkpoint_page'])},raw(proofs['native_evidence']),
+        identity=identity,request=request,since=since,until=until)
+    diagnostics = monthly.project_rows(source)
+    diagnostic_delivery = {'status':'diagnostic_proof_missing' if diagnostics else 'complete',
+        'expected_count':len(diagnostics),'review_ids':[],'historical_alias_ids':[],
+        'missing':['native_pending_diagnostic_delivery'] if diagnostics else []}
+    if diagnostics and {'unresolved_packet','unresolved_receipt','header_readback'} <= set(proofs):
+        from scripts import clockify_pending_diagnostic_availability as availability
+        diagnostic_delivery = availability.verify(config,source,title,proofs,documents)
+    return {'selected_review_ids':new_ids,'selected_minutes':sum(row[3] for row in new_rows),
+        'retained_pending_review_ids':retained,'retained_pending_minutes':sum(accepted[i][3] for i in retained),
+        'held_review_ids':[],'held_minutes':0,'proofs':dict(proofs),
+        'historical_pending_acceptance_sha256':receipt['pending_selection']['acceptance_sha256'],
+        'current_additive_native_checks':current_checks,'editorial_projection_review_ids':editorial_ids,
+        'current_capture_basis':'byte-bound native grid; no unstated wall-clock freshness claimed',
+        'adoption_provider_writes':0,'posted_credits_created':0,
+        'diagnostics':diagnostic_delivery}
+
+
 def validate(config: Mapping[str, Any], source_stage: Mapping[str, Any],
              replay_stage: Mapping[str, Any], proofs: Mapping[str, Any], *, title: str) -> dict[str, Any]:
     """Independently verify original review delivery and diagnostic representation."""
+    if isinstance(proofs,Mapping) and set(proofs)=={'selection','live_readback'}:
+        selection=json.loads(artifacts._capture(proofs['selection'],{}))
+        if selection.get('schema_version')=='mixed-review-availability/v1':
+            from scripts import clockify_mixed_review_availability as mixed
+            return mixed.verify(config,source_stage,replay_stage,proofs,title=title)
+        if selection.get('schema_version')=='native-pending-review-availability/v1':
+            from scripts import clockify_native_pending_review_availability as available
+            return available.verify(config,source_stage,replay_stage,proofs,title=title)
     core = {'publication_packet','publication_receipt','selection','live_readback',
             'native_evidence','native_checkpoint_manifest','native_checkpoint_page'}
-    optional = {'unresolved_packet','unresolved_receipt','diagnostic_aliases','header_readback'}
+    optional = {'unresolved_packet','unresolved_receipt','diagnostic_aliases','header_readback','editorial_projection'}
     _require(isinstance(proofs,Mapping) and core <= set(proofs) and not set(proofs)-core-optional,
              'selected delivery proof handles are invalid')
     cache = {}
@@ -163,6 +367,9 @@ def validate(config: Mapping[str, Any], source_stage: Mapping[str, Any],
         return json.loads(raw(handle))
     documents = {name:load(handle) for name,handle in proofs.items()}
     packet, receipt, selection, live = [documents[name] for name in ('publication_packet','publication_receipt','selection','live_readback')]
+    if selection.get('schema_version') == 'pending-review-selection/v1':
+        return _native_pending_delivery(config,source_stage,replay_stage,proofs,documents,title=title,raw=raw,load=load)
+    _require('editorial_projection' not in proofs, 'selected Sep25 delivery does not accept native editorial projection')
     source = Path(source_stage['run_dir'])
     proposals = json.loads((source/'proposals.json').read_bytes())
     spreadsheet = str(config['spreadsheet_id'])

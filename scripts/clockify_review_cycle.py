@@ -415,7 +415,15 @@ def _audit_recovered_source(
         expected_snapshot_digests=parent["snapshot_digests"], allow_historical_runtime=True,
         historical_state_validation=True, expected_runtime_digest=parent.get("runtime_identity_digest"),
     )
-    if "runtime_identity_digest" not in parent:
+    if "runtime_identity_digest" in parent:
+        # Observer configs need not carry a current executor identity. Bind the
+        # stored parent's runtime to its actual seal, never to today's runtime.
+        parent_bundle = collector_receipts.load_completion_bundle(
+            Path(str(parent["run_dir"])) / "completion-bundle.json",
+            run_dir=Path(str(parent["run_dir"])),
+        )
+        parent_checked["runtime_identity_digest"] = parent_bundle.runtime_identity_digest
+    else:
         parent_checked.pop("runtime_identity_digest", None)
     if parent_checked != parent or not _recovery_parent_matches_debt(parent, debt):
         raise CycleError("coverage audit recovery parent identity differs")
@@ -3640,6 +3648,43 @@ def _audit_debt_covers_gap(
     )
 
 
+@contextmanager
+def _coverage_audit_runs_config(
+    config: Mapping[str, Any], record: Mapping[str, Any], since: str, until: str,
+    stage: Mapping[str, Any],
+) -> Iterator[Mapping[str, Any]]:
+    """Authenticate one historical graph before observer-only native reads.
+
+    Ordinary stages retain operational containment. A stored path alone never
+    selects a graph: the durable adoption witness and its complete native
+    source/replay/publication ancestry must still verify.
+    """
+    adoption = _historical_adoption_document(config, record, since, until)
+    if adoption is None:
+        yield config
+        return
+    from scripts import clockify_selected_delivery_adoption as selected
+    if adoption.get("schema_version") == selected.ADOPTION_SCHEMA:
+        source, replay, _delivery = _verify_selected_adoption(config, adoption)
+        if dict(stage) != source or record.get("replay") != replay:
+            raise CycleError("coverage audit historical stage identity drifted")
+        with _selected_runs_config(config, adoption["request"]["runs_root"]) as validation:
+            yield validation
+        return
+    with _native_adoption_runs_config(config, adoption) as validation:
+        source = _stage_from_state(validation, record, "source", since, until,
+            replay=False, expected_snapshot_digests=adoption["adopted_snapshot_digests"])
+        if source is None or dict(stage) != source:
+            raise CycleError("coverage audit historical source identity drifted")
+        replay = _stage_from_state(validation, record, "replay", since, until,
+            replay=True, expected_snapshot_digests=source["snapshot_digests"],
+            source_run_id=source["run_id"], source_run_dir=source["run_dir"])
+        if replay is None:
+            raise CycleError("coverage audit historical replay is missing")
+        _verify_historical_adoption(validation, record, adoption, since, until, source, replay)
+        yield validation
+
+
 def source_interval_coverage_audit(config: Mapping[str, Any]) -> dict[str, Any]:
     """Derive a transient observer report from verified bundles and debt state."""
     state_dir = _path(config, "state_dir")
@@ -3666,41 +3711,59 @@ def source_interval_coverage_audit(config: Mapping[str, Any]) -> dict[str, Any]:
                 snapshots = stage.get("snapshot_digests")
                 if not isinstance(until, str) or not isinstance(snapshots, Mapping):
                     raise CycleError("coverage audit delivered source identity is invalid")
-                checked = _validate_stage(
-                    config, Path(str(stage.get("result_path"))), str(since), until,
-                    replay=False, expected_snapshot_digests=snapshots,
-                    allow_historical_runtime=True, historical_state_validation=True,
-                    expected_runtime_digest=stage.get("runtime_identity_digest"),
-                )
-                run_dir = Path(checked["run_dir"])
-                try:
-                    selected = collector_receipts.load_completion_bundle(
-                        run_dir / "completion-bundle.json", run_dir=run_dir,
+                with _coverage_audit_runs_config(config, raw, str(since), until, stage) as validation:
+                    checked = _validate_stage(
+                        validation, Path(str(stage.get("result_path"))), str(since), until,
+                        replay=False, expected_snapshot_digests=snapshots,
+                        allow_historical_runtime=True, historical_state_validation=True,
+                        expected_runtime_digest=stage.get("runtime_identity_digest"),
                     )
-                except collector_receipts.CollectorReceiptError as exc:
-                    raise CycleError("coverage audit delivered bundle is invalid") from exc
-                if "runtime_identity_digest" in stage:
-                    checked["runtime_identity_digest"] = selected.runtime_identity_digest
-                else:
-                    checked.pop("runtime_identity_digest", None)
-                if dict(stage) != checked:
-                    raise CycleError("coverage audit stored source identity drifted")
-                interval = _interval_from_stage(
-                    config, "runner/unclassified", stage, allow_verified_derivation=True,
-                )
-                ancestor, _ = _collector_ancestor_from_repair(config, run_dir, selected)
-                if (ancestor / "collector-source.json").exists():
-                    ancestor, _, _ = clockify_review_run._verified_collector_derivation(ancestor)
-                try:
-                    collector = collector_receipts.load_collector_source_bundle(
-                        ancestor / "completion-bundle.json", run_dir=ancestor,
+                    run_dir = Path(checked["run_dir"])
+                    try:
+                        selected = collector_receipts.load_completion_bundle(
+                            run_dir / "completion-bundle.json", run_dir=run_dir,
+                        )
+                    except collector_receipts.CollectorReceiptError as exc:
+                        raise CycleError("coverage audit delivered bundle is invalid") from exc
+                    if "runtime_identity_digest" in stage:
+                        checked["runtime_identity_digest"] = selected.runtime_identity_digest
+                    else:
+                        checked.pop("runtime_identity_digest", None)
+                    if dict(stage) != checked:
+                        raise CycleError("coverage audit stored source identity drifted")
+                    recovered = _audit_recovered_source(
+                        validation, raw, stage, selected, store, str(since), until,
                     )
-                except collector_receipts.CollectorReceiptError as exc:
-                    raise CycleError("coverage audit collector ancestor is invalid") from exc
-                stage = {
-                    "run_dir": str(ancestor), "bundle_digest": collector.source_bundle_digest,
-                    **{field: getattr(interval, field) for field in identity_fields},
-                }
+                    if recovered is not None:
+                        # The original backlog seals the parent, not its later
+                        # recovery child. Native recovery proof binds both and
+                        # supplies the child's authenticated collector identity.
+                        verified.append(_audit_bundle(recovered))
+                        continue
+                    interval = _interval_from_stage(
+                        validation, "runner/unclassified", stage, allow_verified_derivation=True,
+                    )
+                    ancestor, _ = _collector_ancestor_from_repair(validation, run_dir, selected)
+                    if (ancestor / "collector-source.json").exists():
+                        _raw, _identity, lineage = clockify_review_run._verified_collector_derivation(ancestor)
+                        # Native collector admission carries pending raw proof;
+                        # a raw pending source has no downstream completion seal.
+                        stage = _validate_collector_source_stage(validation,
+                            ancestor / "autopilot-result.json", str(since), until,
+                            expected_snapshot_digests=lineage["snapshot_digests"])
+                    else:
+                        try:
+                            collector = collector_receipts.load_collector_source_bundle(
+                                ancestor / "completion-bundle.json", run_dir=ancestor,
+                            )
+                        except collector_receipts.CollectorReceiptError as exc:
+                            raise CycleError("coverage audit collector ancestor is invalid") from exc
+                        stage = {
+                            "run_dir": str(ancestor), "bundle_digest": collector.source_bundle_digest,
+                            **{field: getattr(interval, field) for field in identity_fields},
+                        }
+                    verified.append(_audit_bundle(stage))
+                continue
             verified.append(_audit_bundle(stage))
 
     intervals: dict[str, dict[str, Any]] = {}

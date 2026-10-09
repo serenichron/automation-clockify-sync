@@ -67,15 +67,37 @@ def _source(record: Mapping[str, Any], cache: dict) -> dict[str, Any]:
     proposals, accounting, receipt = originals["proposals"], originals["accounting"], originals["receipt"]
     if not isinstance(proposals, list) or not isinstance(accounting.get("proposals"), list) or any(p not in accounting["proposals"] for p in proposals):
         raise ValueError("pending selection saved proposals differ from native accounting output")
-    if record["basis"] == "completed-review-run":
+    if record["basis"] in {"completed-review-run", "completed-review-replay"}:
         receipt_path = Path(handles["receipt"]["path"])
         bundle = collector_receipts.load_completion_bundle(receipt_path, run_dir=receipt_path.parent)
-        if receipt_path.parent.name != record["run_id"] or bundle.replay:
+        is_replay = record["basis"] == "completed-review-replay"
+        if receipt_path.parent.name != record["run_id"] or bundle.replay is not is_replay:
             raise ValueError("pending selection completed source identity differs")
         if (Path(handles["proposals"]["path"]) != receipt_path.parent / "proposals.json"
                 or Path(handles["accounting"]["path"]) != receipt_path.parent / "work-accounting-result.json"
                 or Path(handles["ledger"]["path"]) != receipt_path.parent / "evidence/evidence-ledger.json"):
             raise ValueError("pending selection completion artifacts differ from native run")
+        if is_replay:
+            # Keep the genuine replay completion identity; never relabel it as
+            # a provider-completed source or synthesize a replacement receipt.
+            bound = {artifact.kind: artifact for artifact in bundle.artifacts}
+            proof = json.loads(adoptions._capture({"path": str(bound["replay_integrity"].path),
+                "sha256": bound["replay_integrity"].digest}, cache))
+            quality = json.loads(adoptions._capture({"path": str(bound["quality_report"].path),
+                "sha256": bound["quality_report"].digest}, cache))
+            from scripts import review_acceptance, clockify_sheet_publish as publisher
+            if (proposals != accounting["proposals"]
+                    or proof.get("schema_version") != 1
+                    or proof.get("replay_run_id") != record["run_id"]
+                    or not isinstance(proof.get("source_run_id"), str) or not proof["source_run_id"]
+                    or proof.get("integrity_digest") != review_acceptance.digest({k: v for k, v in proof.items() if k != "integrity_digest"})
+                    or proof.get("work_accounting_result", {}).get("file_sha256") != handles["accounting"]["sha256"][7:]
+                    or proof.get("ledger_identity", {}).get("file_sha256") != handles["ledger"]["sha256"][7:]
+                    or proof.get("reconciliation_binding", {}).get("routing_sha256") != handles["routing"]["sha256"]
+                    or any(name in handles and Path(handles[name]["path"]) != receipt_path.parent / filename
+                           for name, filename in (("replay", "replay-integrity.json"), ("quality", "quality_report.json")))):
+                raise ValueError("pending selection completed replay binding differs")
+            publisher.verify_gates(proposals, quality, proof, proof["source_run_id"])
     elif record["basis"] in {"supplemental-native-packet", "composed-native-packet"}:
         if not {"replay_proposals", "replay_accounting"} <= handles.keys():
             raise ValueError("pending selection saved packet requires original replay artifacts")
@@ -148,19 +170,150 @@ def _cited_timing_contexts(cited, timing):
     return contexts
 
 
-def _credits(selected: list[dict[str, Any]], all_sources: Mapping[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Re-execute native final helpers on saved commitments, not reallocate."""
+def _fixed_recording_credit(item: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate saved fixed source time, not inferred effort or financial credit.
+
+    Native meeting proposals deliberately precede the session allocator. A
+    canonical ID dispatches validation but is never sufficient authority: the
+    sealed original ledger, reconciliation and full saved partition must agree.
+    Historical projections and posted-credit residuals are not this contract.
+    """
+    from scripts import clockify_sheet_publish as publisher, meeting_reconciliation as meetings
+    proposal, source = item["proposal"], item["source"]
+    try:
+        accounting, ledger = source["accounting"], source["ledger"]
+        saved = accounting["proposals"]
+        original = adoptions._source(saved, ledger, publisher.stable_review_id(proposal))
+        if original != proposal:
+            raise ValueError("selected proposal differs from saved native output")
+        source_keys = [(e["source_type"], e["source_ref"].get("source_id"))
+                       for e in ledger["events"] if e["source_type"] in {"fathom", "calendly"}]
+        if len(source_keys) != len(set(source_keys)):
+            raise ValueError("recording source identity is ambiguous")
+        recordings, exceptions = pipeline._recording_events(ledger["events"], ledger["manifest"])
+        canonical_id = proposal["provenance"]["canonical_meeting_id"]
+        matches = [entry for entry in recordings if entry["meeting"].canonical_id == canonical_id]
+        if len(matches) != 1:
+            raise ValueError("canonical recording identity is absent or ambiguous")
+        entry = matches[0]
+        source_ids = entry["source_evidence_ids"]
+        if any(set(error["source_evidence_ids"]) & set(source_ids) for error in exceptions):
+            raise ValueError("canonical recording is quarantined")
+        representative = next((e for e in entry["events"] if e["source_type"] == "fathom"), entry["events"][0])
+        member_ids = meetings.manifest_member_identities(ledger["manifest"])
+        if (not pipeline._meeting_is_eligible(representative, member_ids)[0]
+                or pipeline._attributes(representative).get("semantic_evidence_status") == "title_only"):
+            raise ValueError("canonical recording is not eligible")
+        reconciliation = [row for row in accounting["fathom_reconciliation"] if row["canonical_id"] == canonical_id]
+        if (len(reconciliation) != 1 or reconciliation[0].get("status") != "proposed"
+                or reconciliation[0].get("source_evidence_ids") != source_ids):
+            raise ValueError("saved native reconciliation differs")
+        siblings = sorted((p for p in saved if p.get("provenance", {}).get("canonical_meeting_id") == canonical_id),
+                          key=lambda p: _time(p["start"]))
+        activities = [p["activity_id"] for p in siblings]
+        native_activities = reconciliation[0].get("activity_ids", [reconciliation[0].get("activity_id")])
+        if (not siblings or len(set(activities)) != len(activities)
+                or not isinstance(native_activities, list) or len(activities) != len(native_activities)
+                or set(activities) != set(native_activities)
+                or any(d["activity_id"] in activities for d in accounting["allocation"]["evidence"])):
+            raise ValueError("fixed recording activity membership differs")
+        meeting = entry["meeting"]
+        start, end = pipeline._canonical_meeting_span(meeting, representative)
+        splits = []
+        for index, sibling in enumerate(siblings):
+            provenance = sibling["provenance"]
+            ids = provenance["evidence_ids"]
+            seconds = (_time(sibling["end"]) - _time(sibling["start"])).total_seconds()
+            if (type(sibling.get("duration_seconds")) is not int or seconds <= 0
+                    or seconds != sibling["duration_seconds"]
+                    or type(sibling.get("duration_minutes")) is not int
+                    or sibling["duration_minutes"] != sibling["duration_seconds"] // 60
+                    or not ids or len(ids) != len(set(ids)) or not set(ids) <= set(source_ids)
+                    or "credited_overlap_receipt" in provenance or "verified_posted_credit" in provenance):
+                raise ValueError("exact saved recording duration or source differs")
+            # Fathom binds its immutable RecordingID/share URL explicitly.
+            # Calendly's strict native EvidenceEvent schema already validates
+            # its recording/meeting IDs, source digest and exact source span.
+            if representative["source_type"] == "fathom":
+                adoptions._native_meeting_identity([representative], sibling)
+            if len(siblings) == 1:
+                if (set(ids) != set(source_ids) or _time(sibling["start"]) != start
+                        or _time(sibling["end"]) != end
+                        or provenance.get("timestamped_split_evidence_ids")):
+                    raise ValueError("whole recording does not conserve canonical span")
+            else:
+                boundaries = provenance.get("timestamped_split_evidence_ids")
+                lo = int((_time(sibling["start"]) - start).total_seconds())
+                hi = int((_time(sibling["end"]) - start).total_seconds())
+                if (not isinstance(boundaries, list) or len(boundaries) != 1
+                        or boundaries[0] not in {f"{evidence_id}:{lo}-{hi}" for evidence_id in ids}):
+                    raise ValueError("native timestamped split source differs")
+                splits.append(meetings.MeetingSplit(canonical_id, index, sibling["start"], sibling["end"],
+                    {"project_name": sibling["client_project"],
+                     "task_name": ", ".join(sorted(sibling["tag_names"]))}, tuple(boundaries)))
+        if splits:
+            meetings.validate_meeting_splits(meeting, splits)
+        return {"canonical_meeting_id": canonical_id, "activity_id": proposal["activity_id"],
+                "source_evidence_ids": source_ids, "canonical_duration_seconds": int((end - start).total_seconds()),
+                "saved_duration_seconds": proposal["duration_seconds"]}
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise ValueError("pending selection fixed recording proof differs: " + str(exc)) from exc
+
+
+def _tool_pool_locator(event: Mapping[str, Any]) -> tuple[Any, ...] | None:
+    """Distinguish captured tool results without changing outcome atoms."""
+    attrs, ref = event["attributes"], event["source_ref"]
+    source_type = event.get("source_type")
+    if (attrs.get("role") != "tool" or attrs.get("kind") != "tool_result"
+            or source_type not in {"hermes_db_sessions_event", "hermes_sessions_event", "claude_bursts_event", "codex_sessions_event"}
+            or ref.get("source_type") != source_type.removesuffix("_event")
+            or any(not isinstance(ref.get(name), str) or not ref[name].strip()
+                   for name in ("machine", "session_id", "source_id"))
+            or type(ref.get("ordinal")) is not int or ref["ordinal"] < 0):
+        return None
+    # Source type, tool name and native time are checked as alias agreement,
+    # not discriminators that could hide drift at one captured location.
+    return (ref["machine"], ref["session_id"], ref["source_id"], ref["ordinal"])
+
+
+def _pool_event_key(event: Mapping[str, Any]) -> tuple[Any, ...]:
+    try:
+        atom = _atom(event)
+    except ValueError:
+        atom = ("other", digest(event))
+    locator = _tool_pool_locator(event)
+    return ("tool-pool-record", atom, locator) if locator is not None else atom
+
+
+def _canonical_pool_events(all_sources: Mapping[str, Any]) -> dict[tuple[Any, ...], dict[str, Any]]:
     union = {}
+    old_aliases, tool_sources, tool_ordinals = {}, {}, {}
     for source in all_sources.values():
         for event in source["ledger"]["events"]:
             if event.get("source_type") == "existing_clockify":
                 raise ValueError("pending selection cannot reuse posted Clockify credit")
             # Only session atoms participate in canonical pools. Other captured
             # sources remain separate original events for native fixed blocks.
-            try:
-                key = _atom(event)
-            except ValueError:
-                key = ("other", digest(event))
+            key = _pool_event_key(event)
+            locator = _tool_pool_locator(event)
+            atom = key[1] if locator is not None else key
+            earlier = old_aliases.get(atom)
+            if (earlier is not None and _pool_event_key(earlier) != key
+                    and (locator is None or _tool_pool_locator(earlier) is None)):
+                raise ValueError("pending selection canonical aliases disagree on native human timestamp/source")
+            old_aliases.setdefault(atom, event)
+            if locator is not None:
+                # Claude ordinals are local to historical bursts. Validate the
+                # locator only within the unchanged exact observation atom;
+                # different observed points must retain their native identity.
+                source_key = (atom, *locator[:3])
+                ordinal_key = (atom, locator[0], locator[1], locator[3])
+                prior_source, prior_ordinal = tool_sources.get(source_key), tool_ordinals.get(ordinal_key)
+                if ((prior_source is not None and _pool_event_key(prior_source) != key)
+                        or (prior_ordinal is not None and _tool_pool_locator(prior_ordinal) != locator)):
+                    raise ValueError("pending selection canonical aliases disagree on native human timestamp/source")
+                tool_sources.setdefault(source_key, event)
+                tool_ordinals.setdefault(ordinal_key, event)
             previous = union.get(key)
             canonical = copy.deepcopy(event)
             # Clockify comparison warnings must cite the immutable native
@@ -177,13 +330,22 @@ def _credits(selected: list[dict[str, Any]], all_sources: Mapping[str, Any]) -> 
                     raise ValueError("pending selection canonical aliases disagree on native human timestamp/source")
             else:
                 union[key] = canonical
-    segments, demands, members = [], {}, {}
+    return union
+
+
+def _credits(selected: list[dict[str, Any]], all_sources: Mapping[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Re-execute native final helpers on saved commitments, not reallocate."""
+    union = _canonical_pool_events(all_sources)
+    segments, demands, members, fixed_checks = [], {}, {}, []
     for item in selected:
         proposal, source = item["proposal"], item["source"]
         if any(event.get("source_type") in {"clockify", "existing_clockify"}
                for event in adoptions._source_events(proposal, source["ledger"])):
             raise ValueError("pending selection cannot reuse posted Clockify credit")
         activity = proposal["activity_id"]
+        if proposal.get("provenance", {}).get("canonical_meeting_id"):
+            fixed_checks.append(_fixed_recording_credit(item))
+            continue
         matches = [d for d in source["accounting"]["allocation"]["evidence"] if d["activity_id"] == activity]
         if len(matches) != 1 or (activity in demands and matches[0] != demands[activity]):
             raise ValueError("pending selection original demand is absent or ambiguous")
@@ -208,18 +370,16 @@ def _credits(selected: list[dict[str, Any]], all_sources: Mapping[str, Any]) -> 
         residual = demand.effort.recommended_minutes - credited
         if residual < 0:
             raise ValueError("pending selection credit exceeds original native effort")
-        remaining = pipeline._capacity_recovery_slices(demand, segments, residual)
-        recoverable = sum(int((hi - lo).total_seconds()) // 60 for lo, hi in remaining)
-        if recoverable:
-            raise ValueError("pending selection leaves recoverable whole-minute capacity")
         checks.append({"activity_id": activity, "credited_minutes": credited, "native_requested_minutes": demand.effort.recommended_minutes,
-                       "native_residual_minutes": residual, "recoverable_minutes": recoverable})
+                       "native_residual_minutes": residual, "recoverable_minutes": 0})
     timing = pipeline._session_timing_contexts(union.values())
     borrowers = {}
     source_timing = {}
+    estimated_activities = set()
     for activity, items in members.items():
-        atoms = set().union(*(item["atoms"] for item in items))
-        cited = [union[key] for key in atoms]
+        pool_keys = {_pool_event_key(event) for item in items
+                     for event in adoptions._source_events(item["proposal"], item["source"]["ledger"])}
+        cited = [union[key] for key in pool_keys]
         contexts = _cited_timing_contexts(cited, timing)
         demand = allocator._as_activity(demands[activity])
         estimated = [item["proposal"]["provenance"].get("timing_placement") == "estimated" for item in items]
@@ -247,8 +407,21 @@ def _credits(selected: list[dict[str, Any]], all_sources: Mapping[str, Any]) -> 
                     or provenance.get("timing_context_evidence_ids") != evidence_ids
                     or demand.allowed_intervals != native_intervals):
                 raise ValueError("pending selection saved native placement context differs")
+        estimated_activities.add(activity)
         for key, context in contexts.items():
             borrowers.setdefault(key, {"interval": context["interval"], "activities": set()})["activities"].add(activity)
+    for check in checks:
+        # The native producer explicitly forbids recovery for shared-context
+        # estimated placement: own-activity free time is not unused human-pool
+        # credit. Preserve that saved residual only after original placement and
+        # context validation above; the ordinary recovery and pool guards stay.
+        if check["activity_id"] in estimated_activities:
+            continue
+        demand = allocator._as_activity(demands[check["activity_id"]])
+        remaining = pipeline._capacity_recovery_slices(demand, segments, check["native_residual_minutes"])
+        recoverable = sum(int((hi - lo).total_seconds()) // 60 for lo, hi in remaining)
+        if recoverable:
+            raise ValueError("pending selection leaves recoverable whole-minute capacity")
     pool_checks = []
     for key, pool in borrowers.items():
         if len(pool["activities"]) < 2:
@@ -275,7 +448,17 @@ def _credits(selected: list[dict[str, Any]], all_sources: Mapping[str, Any]) -> 
         before = originals.get(proposal["candidate_key"])
         if before is None or {k: v for k, v in before.items() if k != "review_warnings"} != {k: v for k, v in proposal.items() if k != "review_warnings"}:
             raise ValueError("pending selection native normalization altered a saved allocation")
-    return normalized, {"saved_credit_rows": len(selected), "saved_credit_minutes": sum(s.duration_minutes for s in segments),
+        # Re-running the native helper appends identical captured-context
+        # warnings. Preserve the saved list and only add genuinely new facts.
+        warnings = copy.deepcopy(before.get("review_warnings", []))
+        for warning in proposal.get("review_warnings", []):
+            if warning not in warnings:
+                warnings.append(warning)
+        proposal["review_warnings"] = warnings
+    return normalized, {"saved_credit_rows": len(selected),
+                        "saved_credit_minutes": sum(item["proposal"]["duration_minutes"] for item in selected),
+                        "saved_credit_seconds": sum(item["proposal"]["duration_seconds"] for item in selected),
+                        "fixed_recording_rows": len(fixed_checks), "fixed_recording_checks": fixed_checks,
                         "native_demand_count": len(demands), "native_credit_checks": checks, "shared_pool_debits": pool_checks,
                         "remaining_recoverable_minutes": 0, "native_residual_minutes": sum(c["native_residual_minutes"] for c in checks)}
 
@@ -381,6 +564,56 @@ def _reviewed_routing_correction(binding: Mapping[str, Any], *, source: Mapping[
             "native_project_suffix": proof["project_suffix"], "native_tag_suffixes": proof["tag_suffixes"]}
 
 
+def _historical_last_seen_run(binding: Mapping[str, Any], *, source: Mapping[str, Any],
+                              proposal: Mapping[str, Any], row: list[Any], expected: list[Any],
+                              cache: dict) -> dict[str, Any]:
+    """Witness only a legacy display label for unchanged native session credit.
+
+    The explicit pinned packet is a trusted coordinator input, not a completion
+    or financial receipt. Its input manifest must bind the genuine completed
+    source bytes. Recordings, residuals, routes and time cannot use this path.
+    """
+    from scripts import clockify_sheet_publish as publisher
+    if (not isinstance(binding, Mapping) or set(binding) != {"packet", "input_manifest"}
+            or source["basis"] not in {"completed-review-run", "completed-review-replay"}
+            or proposal.get("provenance", {}).get("canonical_meeting_id")
+            or any(e["source_type"] in {"fathom", "calendly", "clockify", "existing_clockify"}
+                   for e in adoptions._source_events(proposal, source["ledger"]))):
+        raise ValueError("pending selection historical label requires an unchanged native session")
+    packet = json.loads(adoptions._capture(binding["packet"], cache))
+    manifest = json.loads(adoptions._capture(binding["input_manifest"], cache))
+    if (packet.get("proposal_header") != publisher.HEADER
+            or any("sha256:" + str(manifest.get(filename)) != source["artifacts"][name]["sha256"]
+                   for filename, name in (("proposals.json", "proposals"), ("routing.json", "routing")))):
+        raise ValueError("pending selection historical packet source binding differs")
+    rows, declarations = packet.get("proposal_rows"), packet.get("proposal_bindings")
+    if (not isinstance(rows, list) or not isinstance(declarations, list)
+            or packet.get("proposal_count") != len(rows) or len(rows) != len(declarations)
+            or any(not isinstance(r, list) or len(r) != 15 for r in rows)
+            or len({r[0] for r in rows}) != len(rows)
+            or len({d["review_id"] for d in declarations}) != len(declarations)):
+        raise ValueError("pending selection historical packet row identity is ambiguous")
+    matches = [r for r in rows if r[0] == row[0]]
+    links = [d for d in declarations if d["review_id"] == row[0]]
+    if len(matches) != 1 or len(links) != 1:
+        raise ValueError("pending selection historical session binding is absent")
+    original_row, link = matches[0], links[0]
+    same = lambda a, b, i: (pipeline._parse_dt(a) == pipeline._parse_dt(b) if i in {1, 2}
+                            else publisher._same_cell(a, b))
+    if (set(link) != {"review_id", "parent_review_id", "native_recording_id", "seconds"}
+            or link["parent_review_id"] != publisher.stable_review_id(proposal)
+            or link["native_recording_id"] is not None or link["seconds"] != proposal["duration_seconds"]
+            or not isinstance(original_row[11], str) or not original_row[11].strip()
+            or any(not same(original_row[i], expected[i], i) for i in [*range(8), 10])
+            or any(not same(original_row[i], row[i], i) for i in [*range(8), 10, 11])):
+        raise ValueError("pending selection historical session identity, credit or label differs")
+    return {**binding, "represented_columns": ["L"],
+            "authority_boundary": "trusted_coordinator_packet_not_completion_or_financial_proof",
+            "authentic_source_run_id": source["run_id"], "captured_display_run_id": row[11],
+            "source_proposal_sha256": digest(proposal), "captured_all15_sha256": digest(row),
+            "historical_packet_row_sha256": digest(original_row)}
+
+
 def verify(*, bindings_path: Path, source_dir: Path, proposals: Sequence[Mapping[str, Any]],
            spreadsheet_id: str, sheet_title: str, run_id: str, project_allowlist: Mapping[str, str]) -> dict[str, Any]:
     from scripts import clockify_sheet_publish as publisher
@@ -439,7 +672,7 @@ def verify(*, bindings_path: Path, source_dir: Path, proposals: Sequence[Mapping
     prior, seen = [], set(ids)
     for declaration in document["prior_rows"]:
         if (not {"review_id", "source", "disposition"} <= declaration.keys()
-                or declaration.keys() - {"review_id", "source", "disposition", "preserve_captured_routing", "preserve_captured_description", "reviewed_routing_correction"}
+                or declaration.keys() - {"review_id", "source", "disposition", "preserve_captured_routing", "preserve_captured_description", "reviewed_routing_correction", "historical_last_seen_run"}
                 or declaration["disposition"] not in {"retain", "supersede", "inactive"}):
             raise ValueError("pending selection prior disposition differs")
         review_id = declaration["review_id"]
@@ -451,6 +684,13 @@ def verify(*, bindings_path: Path, source_dir: Path, proposals: Sequence[Mapping
         row = captured_by_id[review_id]
         expected = publisher.proposal_row(record["proposal"], source["run_id"], project_allowlist=publisher.project_allowlist(source["routing"]))
         columns = [*range(9), 10, 11]
+        if "historical_last_seen_run" in declaration:
+            if declaration.get("preserve_captured_routing") or "reviewed_routing_correction" in declaration:
+                raise ValueError("pending selection historical session label cannot project routing")
+            record["historical_last_seen_run"] = _historical_last_seen_run(
+                declaration["historical_last_seen_run"], source=source, proposal=record["proposal"],
+                row=row, expected=expected, cache=cache)
+            columns.remove(11)
         if "preserve_captured_description" in declaration:
             if declaration["preserve_captured_description"] is not True or not isinstance(row[8], str) or not row[8].strip():
                 raise ValueError("pending selection captured description preservation differs")
@@ -536,6 +776,8 @@ def verify(*, bindings_path: Path, source_dir: Path, proposals: Sequence[Mapping
                                                  "verified_native_columns": record["verified_native_columns"],
                                                  **({"reviewed_routing_correction": record["reviewed_routing_correction"]}
                                                     if "reviewed_routing_correction" in record else {}),
+                                                 **({"historical_last_seen_run": record["historical_last_seen_run"]}
+                                                    if "historical_last_seen_run" in record else {}),
                                                  "all15_live_cells_must_match_capture": True} for record in prior],
                "supersession_contract": {"column": "J", "before": "pending", "after": "superseded",
                                            "review_status": "unposted", "other14_cells": "unchanged"},

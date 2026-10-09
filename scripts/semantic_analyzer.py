@@ -295,6 +295,9 @@ CONTRACT_FAILURE_CODES = {
     *(f"contract_rejected_{code}" for code, _needle in _CONTRACT_FAILURE_PATTERNS),
 }
 CACHE_REJECTION_CODES = CONTRACT_FAILURE_CODES | {
+    # Historical v2 rejection remains rejected; cache/decision digest guards
+    # still bind its original bytes. This is not an accepted-response alias.
+    "contract_rejected_client_description_hygiene",
     "transport_error",
     "transport_timeout",
 }
@@ -309,7 +312,9 @@ def _contract_failure_code(error: BaseException) -> str:
     """Return a privacy-safe operational reason for a rejected model response."""
     message = str(error).casefold()
     cached_code = re.search(r"\b(contract_rejected(?:_[a-z_]+)?)\b", message)
-    if cached_code and cached_code.group(1) in CONTRACT_FAILURE_CODES:
+    # Historical sealed rejections retain their original exception category.
+    # This does not add them to response validation or fresh repair contracts.
+    if cached_code and cached_code.group(1) in CACHE_REJECTION_CODES:
         return cached_code.group(1)
     for code, needle in _CONTRACT_FAILURE_PATTERNS:
         if needle in message:

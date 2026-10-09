@@ -950,6 +950,7 @@ def publish(
     sheet_title: str,
     template_title: str,
     rows: Sequence[Sequence[Any]],
+    partial_revision: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     return _apply_publish_plan(
         gateway,
@@ -960,8 +961,108 @@ def publish(
             sheet_title=sheet_title,
             template_title=template_title,
             rows=rows,
+            partial_revision=partial_revision,
         ),
     )
+
+
+def _partial_revision_projection(
+    record: Mapping[str, Any], row: Sequence[Any], *,
+    spreadsheet_id: str, sheet_title: str, sheet_id: int, row_number: int,
+) -> tuple[list[Any], dict[str, Any]]:
+    """One explicit superseded recording revision, never approval or posting.
+
+    Native source proposals remain immutable (including legacy minute floors).
+    The publication's revision and original history are bound separately.
+    """
+    from scripts import collector_receipts
+    from scripts import clockify_source_adoptions as adoptions, review_corrections
+    from scripts import work_accounting_pipeline as accounting
+    try:
+        if set(record) != {"source_dir", "replay_dir", "preimage", "reason"}:
+            raise ValueError("partial revision record fields differ")
+        reason = record["reason"]
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 4000:
+            raise ValueError("partial revision requires a readable correction reason")
+        capture = json.loads(adoptions._capture(record["preimage"], {}))
+        prior = list(capture["values"])
+        if len(prior) > len(HEADER):
+            raise ValueError("partial revision preimage width differs")
+        prior.extend([""] * (len(HEADER) - len(prior)))
+        if (capture["spreadsheetId"] != spreadsheet_id or capture["sheetId"] != sheet_id
+                or capture["row"] != row_number or prior[0] != row[0]
+                or prior[9] != "superseded" or prior[13] != "superseded"
+                or type(prior[10]) is not int or prior[10] < 1):
+            raise ValueError("partial revision needs the exact superseded destination preimage")
+        source, replay = Path(record["source_dir"]), Path(record["replay_dir"])
+        if any(not path.is_absolute() or path.resolve() != path for path in (source, replay)):
+            raise ValueError("partial revision source paths must be original absolute paths")
+        completion = collector_receipts.load_completion_bundle(source / "completion-bundle.json", run_dir=source)
+        replay_completion = collector_receipts.load_completion_bundle(replay / "completion-bundle.json", run_dir=replay)
+        if completion.replay or not replay_completion.replay:
+            raise ValueError("partial revision source/replay completion kinds differ")
+        proposals = json.loads((source / "proposals.json").read_text())
+        quality = json.loads((source / "quality_report.json").read_text())
+        # This is the genuine native report sealed in the replay completion,
+        # not a new report or an accounting rerun in a publication consumer.
+        integrity = json.loads((replay / "replay-integrity.json").read_text())
+        verify_gates(proposals, quality, integrity, source.name)
+        matches = [p for p in proposals if stable_review_id(p) == row[0]]
+        if len(matches) != 1:
+            raise ValueError("partial revision native review identity is not unique")
+        proposal = matches[0]
+        routing = json.loads((source / "routing.json").read_text())
+        expected = proposal_row(proposal, source.name, project_allowlist=project_allowlist(routing))
+        if len(row) != len(HEADER) or any(not _same_cell(a, b) for a, b in zip(row, expected)):
+            raise ValueError("partial revision row differs from exact native projection")
+        credits = review_corrections.load_verified_posted_credits(source / "review-corrections.jsonl")
+        matched = []
+        for credit in credits:
+            if credit.get("coverage_kind") != "source_native_meeting_intersection":
+                continue
+            for target in credit["current_targets"]:
+                parent = target["proposal"]
+                if stable_review_id(parent) == row[0]:
+                    matched.append((credit, parent))
+        if len(matched) != 1:
+            raise ValueError("partial revision lacks unique verified native meeting credit")
+        credit, parent = matched[0]
+        if (not parent.get("provenance", {}).get("canonical_meeting_id")
+                or parent["provenance"]["canonical_meeting_id"] != proposal["provenance"].get("canonical_meeting_id")):
+            raise ValueError("partial revision native recording identity differs")
+        lineage = json.loads((source / "repair-source.json").read_text())
+        original = proposal_row(parent, lineage["source_run_id"], project_allowlist=project_allowlist(routing))
+        if any(not _same_cell(prior[i], original[i]) for i in [*range(9), 10, 11]):
+            raise ValueError("partial revision original recording row differs from its source")
+        counterparts = [{"block_id": proof["clockify_entry_id"],
+            "start": accounting._parse_dt(proof["payload"]["start"]),
+            "end": accounting._parse_dt(proof["payload"]["end"])} for proof in credit["prior_proofs"]]
+        residuals = accounting._slice_proposal_around_credits(parent, counterparts,
+            "existing_clockify_overlap", [], fully_credited_reason="verified recording interval")
+        matches = [p for p in residuals if stable_review_id(p) == row[0]
+            and all(p[key] == proposal[key] for key in ("start", "end", "duration_seconds"))
+            and p["provenance"]["credited_overlap_receipt"] == proposal["provenance"].get("credited_overlap_receipt")]
+        if len(matches) != 1 or not 0 < proposal["duration_seconds"] < parent["duration_seconds"]:
+            raise ValueError("partial revision is not the proved exact uncredited recording interval")
+        # Keep even the captured blank spelling of untouched cells; equality
+        # normalization must not turn an immutable null preimage into an edit.
+        revised = [prior[i] if _same_cell(prior[i], row[i]) else row[i] for i in range(len(HEADER))]
+        revised[9], revised[10], revised[13], revised[14] = "pending", prior[10] + 1, "unposted", prior[14]
+        revised[12] = (reason.strip() + "\nOriginal superseded recording row preserved at "
+            + record["preimage"]["path"] + " (" + record["preimage"]["sha256"] + ")."
+            + ("\nNative review warnings: " + str(row[12]) if row[12] else ""))
+        binding = {"schema_version": "source-backed-partial-revision/v1", "review_id": row[0],
+            "spreadsheet_id": spreadsheet_id, "sheet_id": sheet_id, "row_number": row_number,
+            "preimage": dict(record["preimage"]), "prior_row": prior, "revised_row": revised,
+            "source_dir": str(source), "replay_dir": str(replay),
+            "source_completion_digest": completion.bundle_digest,
+            "replay_completion_digest": replay_completion.bundle_digest,
+            "credit_digest": credit["credit_digest"], "native_proposal_digest": adoptions.recurring_proposal_digest(proposal),
+            "credited_seconds": proposal["provenance"]["credited_overlap_receipt"]["credited_seconds"],
+            "remaining_seconds": proposal["duration_seconds"], "reason": reason}
+        return revised, binding
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise PublicationError("source-backed partial revision is invalid") from exc
 
 
 def _plan_publish(
@@ -972,6 +1073,7 @@ def _plan_publish(
     template_title: str,
     rows: Sequence[Sequence[Any]],
     preserved_ids: frozenset[str] = frozenset(),
+    partial_revision: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     ids = [str(row[0]) for row in rows]
     if len(ids) != len(set(ids)):
@@ -980,6 +1082,8 @@ def _plan_publish(
     metadata = gateway.spreadsheet(spreadsheet_id)
     sheets = _sheet_map(metadata)
     created = sheet_title not in sheets
+    if partial_revision is not None and (created or len(rows) != 1 or preserved_ids):
+        raise PublicationError("partial revision requires one existing native review row")
     if created:
         if preserved_ids:
             raise PublicationError("meeting representation target Sheet is missing")
@@ -1001,6 +1105,15 @@ def _plan_publish(
     quoted = _a1_title(sheet_title)
     row_count = _sheet_row_count(metadata, sheet_title)
     positions, existing = _scan_rows(gateway, spreadsheet_id, quoted, row_count)
+    revision_binding = None
+    if partial_revision is not None:
+        position = positions.get(str(rows[0][0]))
+        if position is None:
+            raise PublicationError("partial revision target row is missing")
+        revised, revision_binding = _partial_revision_projection(partial_revision, rows[0],
+            spreadsheet_id=spreadsheet_id, sheet_title=sheet_title,
+            sheet_id=sheets[sheet_title], row_number=position)
+        rows = [revised]
 
     for row in rows:
         if str(row[0]) not in preserved_ids:
@@ -1024,6 +1137,17 @@ def _plan_publish(
         row_number = positions[review_id]
         prior = list(existing[row_number])
         prior.extend([""] * (len(HEADER) - len(prior)))
+        if revision_binding is not None:
+            # Exact original/prepared postimage only. Never reset later human decisions.
+            if all(_same_cell(prior[i], row[i]) for i in range(len(HEADER))):
+                unchanged += 1
+                continue
+            if not all(_same_cell(prior[i], revision_binding["prior_row"][i]) for i in range(len(HEADER))):
+                raise PublicationError("partial revision live full preimage drifted")
+            updates.extend({"range": f"{quoted}!{chr(ord('A') + i)}{row_number}",
+                "values": [[row[i]]]} for i in range(len(HEADER))
+                if not _same_cell(prior[i], row[i]))
+            continue
         machine_columns = [index for index in range(len(HEADER)) if index not in HUMAN_COLUMNS]
         if all(_same_cell(prior[index], row[index]) for index in machine_columns):
             unchanged += 1
@@ -1032,6 +1156,10 @@ def _plan_publish(
             raise PublicationError(
                 f"approved or posted review ID cannot change machine fields: {review_id}"
             )
+        if (type(prior[10]) is int and type(row[10]) is int and prior[10] > row[10]):
+            raise PublicationError(f"older projection cannot replace a newer review revision: {review_id}")
+        if str(prior[9]).strip().casefold() == str(prior[13]).strip().casefold() == "superseded":
+            raise PublicationError(f"superseded review history requires an explicit source-backed revision: {review_id}")
         updates.extend([
             {"range": f"{quoted}!A{row_number}:I{row_number}", "values": [list(row[:9])]},
             {"range": f"{quoted}!K{row_number}:M{row_number}", "values": [list(row[10:13])]},
@@ -1049,6 +1177,7 @@ def _plan_publish(
         "unchanged": unchanged,
         "new_ids": new_ids,
         "existing_max_row": max(positions.values(), default=1),
+        **({"partial_revision": revision_binding} if revision_binding is not None else {}),
     }
 
 
@@ -1082,7 +1211,20 @@ def _apply_publish_plan(
         return {"created": True, "appended": len(rows), "updated": 0, "unchanged": 0}
 
     sheet_id = int(plan["sheet_id"])
-    gateway.prepare_sheet(spreadsheet_id, sheet_id)
+    revision_binding = plan.get("partial_revision")
+    if revision_binding is None:
+        gateway.prepare_sheet(spreadsheet_id, sheet_id)
+    else:
+        # Value-only existing-row revision preserves validation, format and chips.
+        positions, existing = _scan_rows(gateway, spreadsheet_id, quoted, row_count)
+        position = positions.get(revision_binding["review_id"])
+        if position != revision_binding["row_number"]:
+            raise PublicationError("partial revision bound row moved before application")
+        actual = list(existing.get(position, []))
+        actual.extend([""] * (len(HEADER) - len(actual)))
+        expected = revision_binding["prior_row"] if plan["updates"] else revision_binding["revised_row"]
+        if len(actual) != len(HEADER) or any(not _same_cell(actual[i], expected[i]) for i in range(len(HEADER))):
+            raise PublicationError("partial revision full preimage changed before application")
     updates = plan["updates"]
     appends = plan["appends"]
     gateway.update_values(spreadsheet_id, updates)
@@ -1097,13 +1239,14 @@ def _apply_publish_plan(
         quoted,
         max(row_count, int(plan["existing_max_row"]) + len(appends)),
         rows,
-        new_ids=new_ids,
+        new_ids=new_ids | (frozenset({revision_binding["review_id"]}) if revision_binding is not None else frozenset()),
     )
     return {
         "created": False,
         "appended": len(appends),
-        "updated": len(updates) // 2,
+        "updated": int(bool(updates)) if revision_binding is not None else len(updates) // 2,
         "unchanged": int(plan["unchanged"]),
+        **({"partial_revision": revision_binding} if revision_binding is not None else {}),
     }
 
 
