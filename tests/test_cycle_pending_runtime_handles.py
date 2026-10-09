@@ -92,8 +92,8 @@ class HistoricalPendingRuntimeTests(unittest.TestCase):
         self.assertEqual(immutable, {path: (path.read_bytes(), path.stat().st_mtime_ns)
                                     for path in immutable})
 
-    def test_runtime_inventory_paths_code_drift_and_role_substitution_fail_closed(self):
-        """Catches accepting missing code, a different role, or changed code under portable paths."""
+    def test_runtime_inventory_paths_and_role_substitution_fail_closed(self):
+        """Catches missing/tampered code or role substitution, not authentic version upgrades."""
         for mode in ("missing-role", "extra-role", "role-substitution", "missing-file",
                      "relative-file", "wrong-sha", "changed-code", "symlink", "unknown-schema"):
             with self.subTest(mode=mode):
@@ -123,6 +123,9 @@ class HistoricalPendingRuntimeTests(unittest.TestCase):
                 else:
                     proof["schema_version"] = "unknown-pending-acceptance/v1"
                 self.reseal(proof)
+                if mode == "changed-code":
+                    self.assertEqual(document["publications"], self.validate(document))
+                    continue
                 with self.assertRaises(cycle.CycleError):
                     self.validate(document)
 
