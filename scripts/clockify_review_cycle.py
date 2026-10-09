@@ -548,8 +548,12 @@ os.write(1,payload)
             raise ValueError(f"historical native {returned['proof_phase']} proof failed ({returned['error_type']})")
         if returned != expected:
             raise ValueError("historical native recovery proof binding differs")
-        from scripts import clockify_historical_runtime as historical
-        collector = historical.collector_source(run_dir)
+        if release == current_root:
+            collector = collector_receipts.load_collector_source_bundle(
+                run_dir / "completion-bundle.json", run_dir=run_dir)
+        else:
+            from scripts import clockify_historical_runtime as historical
+            collector = historical.collector_source(run_dir)
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         raise CycleError("coverage audit historical recovery proof is invalid") from exc
     return {"run_dir": str(run_dir), "bundle_digest": collector.source_bundle_digest,
@@ -5801,27 +5805,134 @@ def _native_adoption_runs_config(
         yield validation
 
 
-def _selected_stages(config: Mapping[str,Any], request: Mapping[str,Any]) -> tuple[dict[str,Any],dict[str,Any]]:
+def _selected_recovered_source(
+    config: Mapping[str, Any], request: Mapping[str, Any],
+    source: Mapping[str, Any], prior_record: Mapping[str, Any] | None,
+) -> None:
+    """Authenticate native recovery, never manufacture collector derivation ancestry."""
+    provenance = request["source_provenance"]
+    required = {"kind", "debt_id", "attempt_id", "recovery_receipt_path",
+                "recovery_receipt_digest", "cached_source_result", "cached_source_result_digest"}
+    if (not isinstance(provenance, Mapping) or set(provenance) != required
+        or provenance.get("kind") != "source_debt_recovery"
+        or any(not isinstance(provenance[key], str) or not provenance[key] for key in required)
+        or any(not _valid_digest(provenance[key]) for key in (
+            "attempt_id", "recovery_receipt_digest", "cached_source_result_digest"))
+        or Path(source["run_dir"]).parent != _runs_dir(config)
+        or not isinstance(prior_record, Mapping) or prior_record.get("source") != source):
+        raise CycleError("selected native recovery provenance or stored source differs")
+    attempts = prior_record.get("recovery_attempts")
+    attempt = attempts.get(provenance["debt_id"]) if isinstance(attempts, Mapping) else None
+    if (not isinstance(attempt, Mapping)
+        or any(attempt.get(key) != provenance[key] for key in (
+            "attempt_id", "recovery_receipt_path", "recovery_receipt_digest"))):
+        raise CycleError("selected native recovery receipt or attempt binding differs")
+    try:
+        store = source_coverage.SourceDebtStore.from_document(
+            _json_file(_path(config, "state_dir") / "source-coverage.json", "selected recovery debt"))
+        bundle = collector_receipts.load_completion_bundle(
+            Path(source["run_dir"]) / "completion-bundle.json", run_dir=Path(source["run_dir"]))
+        if _audit_recovered_source(config, prior_record, source, bundle, store,
+                                   request["since"], request["until"]) is None:
+            raise CycleError("selected source has no native recovery proof")
+        history = prior_record.get("source_recovery_history", [])
+        if not isinstance(history, list):
+            raise CycleError("selected recovery history is invalid")
+        for item in history:
+            if (not isinstance(item, Mapping)
+                or item.get("schema_version") != "review-cycle-source-recovery-history/v1"
+                or item.get("history_digest") != _value_digest(
+                    {k:v for k,v in item.items() if k != "history_digest"})
+                or not _valid_digest(item.get("replacement_source_digest"))
+                or not _valid_digest(item.get("recovery_attempt_id"))):
+                raise CycleError("selected recovery history digest differs")
+            checked = _recovery_source_history(config, item, request["since"], request["until"],
+                                              source, {"attempt_id": item["recovery_attempt_id"]})
+            if checked is None:
+                raise CycleError("selected native recovery history has no authenticated derivatives")
+            if item["recovery_attempt_id"] != attempt["attempt_id"]:
+                # Authenticate the retained native graph without relabeling an
+                # earlier transition as the current recovery (same as repair).
+                checked["replacement_source_digest"] = item["replacement_source_digest"]
+                checked["history_digest"] = _value_digest(
+                    {k:v for k,v in checked.items() if k != "history_digest"})
+            if checked != item:
+                raise CycleError("selected native recovery history binding differs")
+    except (ValueError, TypeError, KeyError, collector_receipts.CollectorReceiptError) as exc:
+        raise CycleError("selected native recovery proof is invalid") from exc
+
+
+def _selected_cached_source(
+    config: Mapping[str, Any], request: Mapping[str, Any], source: Mapping[str, Any],
+) -> Path:
+    """Authenticate the replay's original byte-identical cache, preserving all locators."""
+    provenance = request["source_provenance"]
+    path = _safe_run_file(_runs_dir(config), provenance["cached_source_result"], "cached source result")
+    cached = path.parent
+    original = Path(source["run_dir"])
+    if (cached.parent != _runs_dir(config) or cached.name != source["run_id"]
+        or path.name != "autopilot-result.json"
+        or provenance["cached_source_result_digest"] != source["result_digest"]
+        or _digest(path) != source["result_digest"]):
+        raise CycleError("selected cached source identity or result digest differs")
+    try:
+        def inventory(root: Path) -> dict[str, str]:
+            files = {}
+            for item in root.rglob("*"):
+                if item.is_symlink() or not (item.is_dir() or item.is_file()):
+                    raise CycleError("selected cached source contains an unsafe artifact")
+                if item.is_file():
+                    files[str(item.relative_to(root))] = _digest(
+                        _safe_run_file(root, str(item), "cached source artifact"))
+            return files
+        if inventory(cached) != inventory(original):
+            raise CycleError("selected cached source original artifact inventory or bytes differ")
+        native = collector_receipts.load_completion_bundle(original / "completion-bundle.json", run_dir=original)
+        cache = collector_receipts.load_completion_bundle(cached / "completion-bundle.json", run_dir=cached)
+        if (cache.document() != native.document()
+            or _digest(cached / "completion-bundle.json") != _digest(original / "completion-bundle.json")
+            or any(_digest(_safe_run_file(cached, str(cached / name), "cached source input")) != digest
+                   for name,digest in source["snapshot_digests"].items())
+            or _validate_accounting(cached) != _validate_accounting(original)
+            or _digest(cached / "proposals.json") != source["proposals_digest"]):
+            raise CycleError("selected cached source sealed artifacts or inputs differ")
+    except (OSError, ValueError, collector_receipts.CollectorReceiptError) as exc:
+        raise CycleError("selected cached source completion proof is invalid") from exc
+    return cached
+
+
+def _selected_stages(config: Mapping[str,Any], request: Mapping[str,Any], *,
+    prior_record: Mapping[str, Any] | None = None) -> tuple[dict[str,Any],dict[str,Any]]:
     frozen, adopted = request["frozen_snapshot_digests"], request["adopted_snapshot_digests"]
     if (not isinstance(frozen,Mapping) or not isinstance(adopted,Mapping) or set(frozen) != set(adopted)
         or any(not _valid_digest(adopted[name]) or (name not in {"routing.json","review-corrections.jsonl"}
             and adopted[name] != frozen[name]) for name in frozen)):
         raise CycleError("selected historical snapshot transition differs")
     source_path = _safe_run_file(_runs_dir(config),request["source_result"],"selected source")
-    replay_path = _safe_run_file(_runs_dir(config),request["replay_result"],"selected replay")
-    if (_digest(source_path) != request["source_result_digest"] or _digest(replay_path) != request["replay_result_digest"]):
+    if _digest(source_path) != request["source_result_digest"]:
         raise CycleError("selected historical result digest differs")
     if adopted["review-corrections.jsonl"] != frozen["review-corrections.jsonl"]:
         _verify_credit_adoption_transition(config,source_path.parent,frozen["review-corrections.jsonl"],adopted["review-corrections.jsonl"])
     source = _validate_stage(config,source_path,request["since"],request["until"],replay=False,
         expected_snapshot_digests=adopted,expected_runtime_digest=request["runtime_identity_digest"],historical_state_validation=True)
-    replay = _validate_stage(config,replay_path,request["since"],request["until"],replay=True,
-        expected_snapshot_digests=adopted,expected_runtime_digest=request["runtime_identity_digest"],historical_state_validation=True,
-        source_run_id=source["run_id"],source_run_dir=source["run_dir"])
+    recovered = isinstance(request["source_provenance"], Mapping) and request["source_provenance"].get("kind") == "source_debt_recovery"
+    if recovered:
+        _selected_recovered_source(config,request,source,prior_record)
+    elif "replay_runs_root" in request:
+        raise CycleError("separate replay root requires native recovery provenance")
+    with _selected_runs_config(config, request.get("replay_runs_root", request["runs_root"])) as replay_config:
+        replay_source = _selected_cached_source(replay_config,request,source) if recovered else Path(source["run_dir"])
+        replay_path = _safe_run_file(_runs_dir(replay_config),request["replay_result"],"selected replay")
+        if _digest(replay_path) != request["replay_result_digest"]:
+            raise CycleError("selected historical result digest differs")
+        replay = _validate_stage(replay_config,replay_path,request["since"],request["until"],replay=True,
+            expected_snapshot_digests=adopted,expected_runtime_digest=request["runtime_identity_digest"],historical_state_validation=True,
+            source_run_id=source["run_id"],source_run_dir=str(replay_source))
     if (source["coverage"].get("status") != "complete" or source["coverage"].get("incomplete_sources") != []
         or source["accounting_digest"] != replay["accounting_digest"]):
         raise CycleError("selected historical source coverage or replay differs")
-    _interval_from_derived_stage(config,request["since"],request["until"],source,request["source_provenance"])
+    if not recovered:
+        _interval_from_derived_stage(config,request["since"],request["until"],source,request["source_provenance"])
     return source,replay
 
 
@@ -5855,7 +5966,7 @@ def _verify_selected_adoption(config: Mapping[str,Any], document: Mapping[str,An
         or document.get("request_digest") != _value_digest(request)):
         raise CycleError("selected historical predecessor binding differs")
     with _selected_runs_config(config,request["runs_root"]) as validation:
-        source,replay = _selected_stages(validation,request)
+        source,replay = _selected_stages(validation,request,prior_record=document.get("superseded_record"))
         if document.get("source") != source or document.get("replay") != replay:
             raise CycleError("selected historical adoption stage drifted")
         try:
@@ -5873,7 +5984,7 @@ def _adopt_selected_historical_slice(config: Mapping[str,Any], request: Mapping[
     required = {"schema_version","since","until","source_result","replay_result","source_provenance",
         "frozen_snapshot_digests","adopted_snapshot_digests","runtime_identity_digest",
         "source_result_digest","replay_result_digest","runs_root","prior_record_digest","selected_delivery_proofs"}
-    if set(request) != required or _date(request["since"],"selected since") >= _date(request["until"],"selected until"):
+    if set(request) not in (required, required | {"replay_runs_root"}) or _date(request["since"],"selected since") >= _date(request["until"],"selected until"):
         raise CycleError("selected historical request is invalid")
     since,until = request["since"],request["until"]
     state_dir = _path(config,"state_dir"); state_path = state_dir/"review-cycle-state.json"
@@ -5902,7 +6013,7 @@ def _adopt_selected_historical_slice(config: Mapping[str,Any], request: Mapping[
         if any(prior.get(k) is not None for k in ("replay","delivery_receipt","historical_adoption_receipt")):
             raise CycleError("selected historical recovery cannot overwrite delivery history")
         with _selected_runs_config(config,request["runs_root"]) as validation:
-            source,replay = _selected_stages(validation,request)
+            source,replay = _selected_stages(validation,request,prior_record=prior)
             try:
                 delivery = selected.validate(validation,source,replay,request["selected_delivery_proofs"],
                     title=_sheet_title(config["monthly_sheet_title_template"],since=since))
@@ -5950,6 +6061,9 @@ def _adopt_selected_historical_slice(config: Mapping[str,Any], request: Mapping[
             source_coverage.write(debt_path,store.document(migration_warnings=warnings))
         status = "delivered_with_exceptions" if source["exception_ids"] else "delivered"
         record = {key:prior[key] for key in ("until","period_manifest","expected_snapshot_digests") if key in prior}
+        if request["source_provenance"].get("kind") == "source_debt_recovery":
+            record.update({key:prior[key] for key in (
+                "recovery_attempts", "recovery_parents", "source_recovery_history") if key in prior})
         record.update(status=status,source=source,replay=replay,source_completeness=source["coverage"],
             source_run_id=source["run_id"],replay_run_id=replay["run_id"],review_ids=source["review_ids"],
             exception_ids=source["exception_ids"],exceptions_complete=not source["exception_ids"],
