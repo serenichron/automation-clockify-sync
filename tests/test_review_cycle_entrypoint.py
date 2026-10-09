@@ -465,8 +465,8 @@ class ReviewCycleEntrypointTests(unittest.TestCase):
             {Path(command[1]).name for command in commands},
         )
 
-    def test_partial_publication_exits_seventy_five_without_claiming_complete_coverage(self) -> None:
-        """Catches a legitimate partial publication being rejected as an unknown status."""
+    def test_successful_partial_publication_exits_zero_without_claiming_complete_coverage(self) -> None:
+        """Successful available-row publication is not a failed delivery operation."""
         coverage = {
             "status": "incomplete",
             "incomplete_sources": ["sessions/macbook"],
@@ -483,18 +483,41 @@ class ReviewCycleEntrypointTests(unittest.TestCase):
             code, result, error = self.call_main(enable_write=True)
 
         self.assertEqual("published_with_source_gaps", result["status"])
-        self.assertEqual(75, code, error)
+        self.assertEqual(0, code, error)
         self.assertNotIn("unsupported result status", error)
         state = json.loads((self.state_dir / "review-cycle-state.json").read_text())
         self.assertIsNone(state["completed_through"])
         record = state["slices"]["2026-09-07"]
         self.assertEqual("published_with_source_gaps", record["status"])
+        self.assertEqual(1, len(record["review_ids"]))
+        self.assertEqual([], record["exception_ids"])
+        self.assertEqual([], result["slices"][0]["exception_ids"])
+        self.assertEqual("incomplete", record["source_completeness"]["status"])
         self.assertEqual(["sessions/macbook"], record["source_completeness"]["incomplete_sources"])
         self.assertNotIn("delivery_receipt", record)
         receipt = json.loads(Path(record["publication_receipt"]).read_text())
         self.assertEqual("clockify-review-partial-publication/v1", receipt["schema_version"])
         self.assertEqual(coverage, receipt["source_completeness"])
         self.assertTrue(receipt["publication_receipts"][0]["row_ids"])
+
+    def test_partial_exit_preserves_explicit_gap_counts_and_debt_metadata(self) -> None:
+        """The exit classifier must not relabel or discard incomplete coverage."""
+        outcome = {
+            "status": "published_with_source_gaps",
+            "slices": [{"since": "2026-09-29", "until": "2026-09-30"}],
+            "pending_review_count": 24, "exception_count": 88,
+            "source_completeness": {"status": "incomplete", "incomplete_sources": ["sessions/macbook"]},
+            "source_debt": {"active_count": 2, "resolved_count": 1},
+            "completed_through": None,
+        }
+        expected = json.loads(json.dumps(outcome))
+        # This classifier test substitutes the delivery-operation boundary.
+        # The test above separately proves actual durable partial publication.
+        with mock.patch.object(cycle, "run_cycle", return_value=outcome):
+            code, result, error = self.call_main(enable_write=True)
+        self.assertEqual(0, code, error)
+        self.assertEqual(expected, result)
+        self.assertEqual(expected, outcome)
 
     def test_incomplete_failed_and_recovery_blocked_exit_seventy_five(self) -> None:
         """Catches logical non-delivery being hidden behind process success."""
