@@ -7,25 +7,29 @@ from unittest import mock
 from scripts import clockify_review_cycle as cycle
 from scripts import clockify_selected_delivery_adoption as selected
 from scripts import clockify_mixed_review_availability as mixed
+from scripts import clockify_native_pending_review_availability as native
 import test_cycle_selected_delivery_adoption as fixtures
 
 
 class SelectedRuntimeRelocationTests(unittest.TestCase):
+    runtime_field = 'consumer_runtime'
+    runtime_module = mixed
+
     def setUp(self):
         self.fixture = fixtures.SelectedHistoricalDeliveryTests()
         self.fixture.setUp()
         self.addCleanup(self.fixture.doCleanups)
-        self.old_runtime = self.fixture.root/'old-release'/'clockify_mixed_review_availability.py'
+        self.old_runtime = self.fixture.root/'old-release'/Path(self.runtime_module.__file__).name
         self.old_runtime.parent.mkdir()
-        self.old_runtime.write_bytes(Path(mixed.__file__).read_bytes())
+        self.old_runtime.write_bytes(Path(self.runtime_module.__file__).read_bytes())
         self.original_validate = selected.validate
         self.runtime = self.old_runtime
-        # The real native selected proof still runs. Only the mixed consumer's
+        # The real native selected proof still runs. Only the consumer's
         # output runtime handle is supplied at the verifier boundary, avoiding
         # unrelated financial/own-accomplishment fixture construction.
         def validate(*args, **kwargs):
             document = self.original_validate(*args, **kwargs)
-            return {**document, 'consumer_runtime': {
+            return {**document, self.runtime_field: {
                 'path': str(self.runtime), 'sha256': cycle._digest(self.runtime)}}
         self.patch = mock.patch.object(selected, 'validate', side_effect=validate)
         self.patch.start()
@@ -36,7 +40,7 @@ class SelectedRuntimeRelocationTests(unittest.TestCase):
         record = self.state['slices'][self.fixture.since]
         self.paths = [self.state_path, Path(record['delivery_receipt']), Path(record['historical_adoption_receipt'])]
         self.before = {path: path.read_bytes() for path in self.paths}
-        self.runtime = Path(mixed.__file__).resolve()
+        self.runtime = Path(self.runtime_module.__file__).resolve()
 
     def verify_delivery(self):
         record = self.state['slices'][self.fixture.since]
@@ -80,16 +84,44 @@ class SelectedRuntimeRelocationTests(unittest.TestCase):
         with self.assertRaises(cycle.CycleError):
             self.fixture.adopt()
 
+    def test_unsafe_runtime_locator_is_rejected(self):
+        """Identical bytes must not authorize a symlink or relative runtime locator."""
+        link = self.fixture.root/'runtime-link.py'
+        link.symlink_to(self.runtime)
+        for runtime in (link, Path(self.runtime.name)):
+            with self.subTest(runtime=runtime):
+                def unsafe(*args, **kwargs):
+                    value = self.original_validate(*args, **kwargs)
+                    return {**value, self.runtime_field: {
+                        'path': str(runtime), 'sha256': cycle._digest(self.runtime)}}
+                with mock.patch.object(selected, 'validate', side_effect=unsafe):
+                    with self.assertRaises(cycle.CycleError):
+                        self.verify_delivery()
+                    with self.assertRaises(cycle.CycleError):
+                        self.fixture.adopt()
+
+        self.old_runtime.unlink()
+        self.old_runtime.symlink_to(self.runtime)
+        with self.assertRaises(cycle.CycleError):
+            self.verify_delivery()
+        with self.assertRaises(cycle.CycleError):
+            self.fixture.adopt()
+
     def test_semantic_or_extra_delivery_field_drift_is_rejected(self):
         """The relocation exception must leave every other output field exact."""
         for update in ({'adoption_provider_writes': 1}, {'unrecognized': True}):
             with self.subTest(update=update):
                 def changed(*args, **kwargs):
                     value = self.original_validate(*args, **kwargs)
-                    return {**value, 'consumer_runtime': {
+                    return {**value, self.runtime_field: {
                         'path': str(self.runtime), 'sha256': cycle._digest(self.runtime)}, **update}
                 with mock.patch.object(selected, 'validate', side_effect=changed):
                     with self.assertRaises(cycle.CycleError):
                         self.verify_delivery()
                     with self.assertRaises(cycle.CycleError):
                         self.fixture.adopt()
+
+
+class SelectedNativeRuntimeRelocationTests(SelectedRuntimeRelocationTests):
+    runtime_field = 'native_consumer_runtime'
+    runtime_module = native

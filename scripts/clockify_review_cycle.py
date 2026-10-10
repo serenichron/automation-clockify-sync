@@ -6092,15 +6092,17 @@ def _selected_delivery_recorded_runtime(
 ) -> dict[str, Any]:
     """Preserve an authentic original locator only for byte-identical code."""
     current = dict(delivery)
-    if "consumer_runtime" in current and "consumer_runtime" in recorded:
+    for field in ("consumer_runtime", "native_consumer_runtime"):
+        if field not in current or field not in recorded:
+            continue
         from scripts import clockify_source_adoptions as artifacts
-        historical = recorded["consumer_runtime"]
-        runtime = current["consumer_runtime"]
+        historical = recorded[field]
+        runtime = current[field]
         artifacts._capture(historical, {})
         artifacts._capture(runtime, {})
         if historical["sha256"] != runtime["sha256"]:
             raise ValueError("selected historical consumer runtime bytes differ")
-        current["consumer_runtime"] = historical
+        current[field] = historical
     return current
 
 
