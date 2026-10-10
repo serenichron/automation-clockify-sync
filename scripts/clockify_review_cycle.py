@@ -4041,6 +4041,103 @@ def _finish_attempt(
         _finish_runner_attempt(record)
 
 
+def _failed_source_candidate(
+    config: Mapping[str, Any], stdout: str, since: str, until: str,
+    expected_snapshots: Mapping[str, str],
+) -> dict[str, str] | None:
+    """Retain a bounded diagnostic identity, not a verified source stage."""
+    try:
+        path = _result(stdout, _runs_dir(config))
+        result_bytes, result_digest = collector_receipts._safe_read_bytes_and_digest(path)
+        result = json.loads(result_bytes)
+        expected_since, expected_until = _expected_interval(config, since, until)
+        if (
+            not isinstance(result, Mapping)
+            or result.get("run_id") != path.parent.name
+            or result.get("run_dir") != str(path.parent)
+            or result.get("date_range") != {"since": expected_since, "until": expected_until}
+            or {
+                name: _digest(_safe_run_file(path.parent, str(path.parent / name), name))
+                for name in expected_snapshots
+            } != dict(expected_snapshots)
+        ):
+            return None
+        return {
+            "result_path": str(path), "result_digest": result_digest,
+            "run_id": path.parent.name, "run_dir": str(path.parent),
+        }
+    except (CycleError, OSError, ValueError):
+        return None
+
+
+def _failed_source_code(candidate: Mapping[str, str] | None, fallback: str) -> str:
+    """Classify only a completion-bound semantic diagnostic, never child stderr."""
+    if candidate is None or fallback != "quality_blocked":
+        return fallback
+    try:
+        path = Path(candidate["result_path"])
+        result_bytes, result_digest = collector_receipts._safe_read_bytes_and_digest(path)
+        if result_digest != candidate["result_digest"]:
+            return fallback
+        result = json.loads(result_bytes)
+        run_dir = path.parent
+        bundle_path = _safe_run_file(run_dir, str(run_dir / "completion-bundle.json"), "completion bundle")
+        bundle = collector_receipts.load_completion_bundle(bundle_path, run_dir=run_dir)
+        if (
+            bundle.replay
+            or result.get("completion_bundle_digest") != bundle.bundle_digest
+            or result.get("completion_bundle") != bundle.document()
+            or result.get("date_range") != {"since": bundle.since_utc, "until": bundle.until_utc}
+        ):
+            return fallback
+        paths = result.get("paths")
+        quality_path = _safe_run_file(run_dir, paths.get("quality_report") if isinstance(paths, Mapping) else None, "quality report")
+        artifact = next((item for item in bundle.artifacts if item.kind == "quality_report"), None)
+        if artifact is None or artifact.path.resolve() != quality_path:
+            return fallback
+        quality_bytes, quality_digest = collector_receipts._safe_read_bytes_and_digest(quality_path)
+        if artifact.digest != quality_digest:
+            return fallback
+        quality = json.loads(quality_bytes)
+        summary = quality.get("summary") if isinstance(quality, Mapping) else None
+        if (
+            not isinstance(quality, Mapping)
+            or quality.get("status") != "blocked"
+            or not isinstance(summary, Mapping)
+            or summary.get("semantic_analysis") != "unavailable_or_invalid"
+            or summary != result.get("quality_summary")
+            or not isinstance(summary.get("reason"), str)
+        ):
+            return fallback
+        reason = summary["reason"]
+        if reason in semantic_analyzer.CACHE_REJECTION_CODES:
+            return reason
+        code = semantic_analyzer._contract_failure_code(ValueError(reason))
+        return code if code in semantic_analyzer.CACHE_REJECTION_CODES and code != "contract_rejected_other" else fallback
+    except (CycleError, OSError, ValueError, collector_receipts.CollectorReceiptError):
+        return fallback
+
+
+def _stored_failed_attempt(
+    record: Mapping[str, Any], attempt: Mapping[str, Any],
+    interval: source_coverage.SourceInterval,
+) -> Mapping[str, Any] | None:
+    outcomes = record.get("source_attempt_outcomes", [])
+    if not isinstance(outcomes, list) or not all(isinstance(item, Mapping) for item in outcomes):
+        raise CycleError("stored source attempt outcomes are invalid")
+    matching = [item for item in outcomes if item.get("resume_state_digest") == attempt["resume_state_digest"]]
+    if not matching:
+        return None
+    if (
+        len(matching) != 1
+        or any(matching[0].get(key) != attempt[key] for key in ("ordinal", "command_digest"))
+        or matching[0].get("interval") != interval.document()
+        or matching[0].get("failure_class") not in {"child_timeout", "child_nonzero", "result_unverified"}
+    ):
+        raise CycleError("stored failed source attempt identity differs")
+    return matching[0]
+
+
 def _finish_runner_attempt(record: dict[str, Any]) -> None:
     if "runner_attempt" in record:
         record["runner_attempt"] = {**record["runner_attempt"], "status": "finished"}
@@ -5348,6 +5445,25 @@ def _run_slice(
             **({"command": pending_launch["command"]} if pending_launch is not None else {}))
         _persist_state(state_path, state, since, record)
         transition_validation = {"expected_runtime_digest": _value_digest(record["fresh_input_binding"]["runtime_identity"]), "historical_state_validation": True}
+        fresh_attempt = record["source_attempt"]
+        if record.get("source") is None and record.get("fresh_child_started") and fresh_attempt["status"] == "started":
+            interval = generic.interval if generic is not None else _generic_interval(config, since, until)
+            failed_attempt = _stored_failed_attempt(record, fresh_attempt, interval)
+            if failed_attempt is not None:
+                # A sealed failed child is not an orphan source candidate. Finish
+                # its interrupted debt transition before any completed-run scan.
+                if not _attempt_failure_exists(debt_store, interval, fresh_attempt):
+                    _record_generic_failure(
+                        debt_store, interval, failure_class=failed_attempt["failure_class"],
+                        resume_state_digest=str(fresh_attempt["resume_state_digest"]),
+                        classification=generic is not None and generic.status == "exhausted",
+                    )
+                    source_coverage.write(debt_path, debt_store.document())
+                _finish_attempt(record, fresh_attempt)
+                record["status"] = "incomplete"
+                _persist_state(state_path, state, since, record)
+                return {"status": "incomplete", "slice": {"since": since, "until": until},
+                        "advance_frontier": bool(fresh_attempt["advance_frontier"])}
         if record.get("source") is None:
             completed = []
             results = ([Path(pending_launch["child_run_dir"]) / "autopilot-result.json"] if pending_launch is not None
@@ -5476,6 +5592,16 @@ def _run_slice(
                 "status": "pending",
             }
         _persist_state(state_path, state, since, record)
+        failed_attempt = _stored_failed_attempt(record, attempt, interval)
+        if failed_attempt is not None and not _attempt_failure_exists(debt_store, interval, attempt):
+            # The child already finished. Replay only its durable failure after
+            # a crash before debt persistence, never launch it a second time.
+            _record_generic_failure(
+                debt_store, interval, failure_class=failed_attempt["failure_class"],
+                resume_state_digest=str(attempt["resume_state_digest"]),
+                classification=classification,
+            )
+            source_coverage.write(debt_path, debt_store.document())
         if _attempt_failure_exists(debt_store, interval, attempt):
             _finish_attempt(record, attempt)
             record["status"] = "incomplete"
@@ -5535,8 +5661,6 @@ def _run_slice(
                         else:
                             raise
         except CycleError as exc:
-            if not classification:
-                raise
             source_error = exc
         if source is None and collector_source is not None:
             record.update({
@@ -5566,6 +5690,25 @@ def _run_slice(
                 else "child_nonzero" if child.returncode != 0
                 else "result_unverified"
             )
+            candidate = _failed_source_candidate(config, child.stdout, since, until, expected_snapshots)
+            failure_code = (
+                "child_timeout" if child.timed_out
+                else "quality_blocked" if isinstance(source_error, _QualityBlocked)
+                else "result_validation_failed" if source_error is not None
+                else "result_path_invalid"
+            )
+            outcome = {
+                **{key: attempt[key] for key in ("ordinal", "command_digest", "resume_state_digest")},
+                "interval": interval.document(),
+                "returncode": child.returncode, "timed_out": child.timed_out,
+                "failure_class": failure_class,
+                "failure_code": _failed_source_code(candidate, failure_code),
+                "candidate": candidate,
+            }
+            record["source_attempt_outcomes"] = [
+                *record.get("source_attempt_outcomes", []), outcome,
+            ]
+            _persist_state(state_path, state, since, record)
             _record_generic_failure(
                 debt_store, interval, failure_class=failure_class,
                 resume_state_digest=str(attempt["resume_state_digest"]),
