@@ -6087,12 +6087,42 @@ def _selected_delivery_document(config: Mapping[str,Any], since: str, until: str
     return {**body,"receipt_digest":_value_digest(body)}
 
 
+def _selected_delivery_recorded_runtime(
+    delivery: Mapping[str, Any], recorded: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Preserve an authentic original locator only for byte-identical code."""
+    current = dict(delivery)
+    if "consumer_runtime" in current and "consumer_runtime" in recorded:
+        from scripts import clockify_source_adoptions as artifacts
+        historical = recorded["consumer_runtime"]
+        runtime = current["consumer_runtime"]
+        artifacts._capture(historical, {})
+        artifacts._capture(runtime, {})
+        if historical["sha256"] != runtime["sha256"]:
+            raise ValueError("selected historical consumer runtime bytes differ")
+        current["consumer_runtime"] = historical
+    return current
+
+
+def _verify_selected_partial_predecessor(
+    config: Mapping[str, Any], prior: Mapping[str, Any], since: str, until: str,
+) -> None:
+    """Authenticate only this retained partial graph, without inventing recovery."""
+    if prior.get("status") != "published_with_source_gaps":
+        return
+    if (prior.get("until") != until or prior.get("delivery_receipt") is not None
+        or prior.get("historical_adoption_receipt") is not None):
+        raise CycleError("selected partial predecessor identity differs")
+    _validate_delivered_state(config, {"slices": {since: prior}})
+
+
 def _verify_selected_delivery(config: Mapping[str,Any], document: Mapping[str,Any], since: str, until: str,
     source: Mapping[str,Any], replay: Mapping[str,Any]) -> None:
     from scripts import clockify_selected_delivery_adoption as selected
     try:
         delivery = selected.validate(config,source,replay,document["selected_delivery"]["proofs"],
             title=_sheet_title(config["monthly_sheet_title_template"],since=since))
+        delivery = _selected_delivery_recorded_runtime(delivery, document["selected_delivery"])
         expected = _selected_delivery_document(config,since,until,source,replay,delivery)
     except (OSError,ValueError,TypeError,KeyError,IndexError) as exc:
         raise CycleError("selected historical delivery proof drifted or is missing") from exc
@@ -6108,6 +6138,8 @@ def _verify_selected_adoption(config: Mapping[str,Any], document: Mapping[str,An
         or document.get("prior_record_digest") != _value_digest(document.get("superseded_record"))
         or document.get("request_digest") != _value_digest(request)):
         raise CycleError("selected historical predecessor binding differs")
+    _verify_selected_partial_predecessor(
+        config, document["superseded_record"], request["since"], request["until"])
     with _selected_runs_config(config,request["runs_root"]) as validation:
         source,replay = _selected_stages(validation,request,prior_record=document.get("superseded_record"))
         if document.get("source") != source or document.get("replay") != replay:
@@ -6115,6 +6147,7 @@ def _verify_selected_adoption(config: Mapping[str,Any], document: Mapping[str,An
         try:
             delivery = selected.validate(validation,source,replay,request["selected_delivery_proofs"],
                 title=_sheet_title(config["monthly_sheet_title_template"],since=request["since"]))
+            delivery = _selected_delivery_recorded_runtime(delivery, document["selected_delivery"])
         except (OSError,ValueError,TypeError,KeyError,IndexError) as exc:
             raise CycleError("selected historical adoption proof drifted or is missing") from exc
         if document.get("selected_delivery") != delivery or delivery["diagnostics"]["status"] != "complete":
@@ -6151,10 +6184,13 @@ def _adopt_selected_historical_slice(config: Mapping[str,Any], request: Mapping[
         events_path, expected_manifest = _period_paths(state_dir,since)
         if manifest != expected_manifest or not events_path.is_file() or _digest(manifest) != request["frozen_snapshot_digests"]["period-manifest.json"]:
             raise CycleError("selected historical frozen period proof differs")
-        # Existing delivery is never silently overwritten; this path supersedes
-        # an incomplete source/attempt, not another completed publication.
-        if any(prior.get(k) is not None for k in ("replay","delivery_receipt","historical_adoption_receipt")):
+        # A partial publication may be superseded only after authenticating its
+        # native graph. Its complete original record and receipt remain retained.
+        partial = prior.get("status") == "published_with_source_gaps"
+        if (any(prior.get(k) is not None for k in ("delivery_receipt","historical_adoption_receipt"))
+            or not partial and any(prior.get(k) is not None for k in ("replay","publication_receipt"))):
             raise CycleError("selected historical recovery cannot overwrite delivery history")
+        _verify_selected_partial_predecessor(config, prior, since, until)
         with _selected_runs_config(config,request["runs_root"]) as validation:
             source,replay = _selected_stages(validation,request,prior_record=prior)
             try:
