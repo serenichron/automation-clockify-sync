@@ -367,6 +367,9 @@ def validate(config: Mapping[str, Any], source_stage: Mapping[str, Any],
         return json.loads(raw(handle))
     documents = {name:load(handle) for name,handle in proofs.items()}
     packet, receipt, selection, live = [documents[name] for name in ('publication_packet','publication_receipt','selection','live_readback')]
+    if selection.get('schema_version') == 'sep29-publication-validation/v1':
+        from scripts import clockify_sep29_review_availability as supplement
+        return supplement.verify(config,source_stage,replay_stage,proofs,documents,title=title,raw=raw,load=load)
     if selection.get('schema_version') == 'pending-review-selection/v1':
         return _native_pending_delivery(config,source_stage,replay_stage,proofs,documents,title=title,raw=raw,load=load)
     _require('editorial_projection' not in proofs, 'selected Sep25 delivery does not accept native editorial projection')
