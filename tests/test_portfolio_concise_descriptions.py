@@ -9,10 +9,34 @@ from test_portfolio_quality import document, fathom_event, ledger
 APPROVED_DESCRIPTIONS = (
     "M&P — Uploaded missing Mazilu Drive files",
     'M&P — Created sheet "Inventar documente"',
+    "MB — Corrected email-rendering metadata",
+    "SC — Verified advertising-page routing",
 )
 
 
 class ConcisePortfolioDescriptionTests(unittest.TestCase):
+    def test_execution_detail_regressions_require_cleanup_before_review(self):
+        event = fathom_event()
+        descriptions = (
+            "M&P — Uploaded missing Mazilu Drive files 249 files uploaded with identical md5, 2 already present",
+            "M&P — Created Inventar documente sheet 392 MP-DOC rows with 383 Copiat and 9 Exclus",
+            "TSTP — Built Speech demonstration module with 47 tests and 32 browser checks",
+        )
+        for description in descriptions:
+            with self.subTest(description=description):
+                self.assertTrue(repair.repair_reasons(description))
+                report = quality.audit(document(event, description), ledger(event))
+                self.assertEqual(len(report["semantic_repair_rows"]), 1)
+
+    def test_client_relevant_quantities_are_not_blanket_rejected(self):
+        for description in (
+            "M&P — Reviewed 12 invoices for the client",
+            "SC — Planned delivery capacity for two client engagements",
+            "TSTP — Improved test coverage for the Speech module",
+        ):
+            with self.subTest(description=description):
+                self.assertEqual([], repair.repair_reasons(description))
+
     def test_approved_descriptions_need_no_wording_repair(self):
         for description in APPROVED_DESCRIPTIONS:
             with self.subTest(description=description):

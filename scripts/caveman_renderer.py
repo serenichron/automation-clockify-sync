@@ -52,6 +52,12 @@ _EVIDENCE_DUMP_RE = re.compile(
     r"trace\s+ids?|log\s+dump|artifact\s+(?:ids?|paths?)|source\s+ids?)\b",
     re.I,
 )
+_EXECUTION_DETAIL_RE = re.compile(
+    r"\b(?:identical|matching)\s+(?:md5|sha[- ]?256)\b|"
+    r"\b\d+\s+(?:files\s+uploaded|(?:[A-Z0-9]+-DOC\s+)?rows\s+with|"
+    r"(?:unit\s+)?tests?\b|browser\s+checks?\b)",
+    re.I,
+)
 _COMPACT_TECHNICAL_SLASH_RE = re.compile(
     r"\b(?:[A-Za-z0-9][A-Za-z0-9_-]*)(?:/[A-Za-z0-9][A-Za-z0-9_-]*)+\b"
 )
@@ -71,6 +77,7 @@ _FORBIDDEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("prompt or rule", _PROMPT_OR_RULE_RE),
     ("agent status", _STATUS_DUMP_RE),
     ("evidence dump", _EVIDENCE_DUMP_RE),
+    ("execution detail", _EXECUTION_DETAIL_RE),
 )
 
 
@@ -127,12 +134,8 @@ def validate_description(
     body_words = re.findall(r"\b[\w'-]+\b", body)
     if any(left.casefold() == right.casefold() for left, right in zip(body_words, body_words[1:])):
         raise CavemanValidationError("description contains adjacent repeated words")
-    word_count = len(re.findall(r"\b[\w'-]+\b", description))
-    if word_count < 5:
-        raise CavemanValidationError(
-            f"description has {word_count} words; expected at least 5 words "
-            f"with an 8–{max_words} word target"
-        )
+    if len(body_words) < 2:
+        raise CavemanValidationError("body must include an action and its object")
     return description
 
 
