@@ -9,6 +9,8 @@ import unittest
 from scripts import clockify_review_batches as batches
 from scripts import clockify_sheet_publish as publisher
 from scripts import clockify_review_cycle as cycle
+from scripts import clockify_review_batch_publication as prepared
+from scripts.clockify_meeting_publication_alias import artifact_handle
 from test_sheet_publish import StatefulGateway, AppendCorruptingGateway
 
 
@@ -63,6 +65,193 @@ class BatchPublicationTests(unittest.TestCase):
             sheet_title="August 2026 review", template_title="Proposals", proposals=self.sources,
             run_id="source-run", project_allowlist={}, source_dir=self.run,
             review_batch_publication=self.binding)
+
+    def staging(self, children, *, historical=None, notes=None):
+        cells = [[{"userEnteredValue": {"numberValue" if type(value) in (int, float) else "stringValue": value}}
+                  for value in row] for row in [publisher.HEADER, *children]]
+        for row, column in notes or []:
+            cells[row][column]["note"] = "Keep this native annotation"
+        capture = {"spreadsheetId": "sheet", "sheets": [{"properties": {"sheetId": 1,
+            "title": "August 2026 review", "gridProperties": {"rowCount": 100, "columnCount": 15}},
+            "data": [{"rowData": [{"values": row} for row in cells]}]}]}
+        capture_path = self.root / "capture.json"
+        self.write(capture_path, capture)
+        clockify = self.root / "clockify.json"
+        self.write(clockify, {"read_only": True, "entries": []})
+        materialization = self.root / "materialization.json"
+        self.write(materialization, {"schema_version": "isolated-unsealed-editorial-projection-qualification/v1",
+            "sources": [{"index": 0, "source_handles": {"proposals.json": artifact_handle(self.run / "proposals.json"),
+                "routing.json": artifact_handle(self.run / "routing.json")},
+                "projection_proposals": artifact_handle(self.run / "proposals.json")} ]})
+        declaration = {"schema_version": "review-batch-staging/v1", "source_index": 0,
+            "projection_binding": artifact_handle(self.binding), "qualified_materialization": artifact_handle(materialization),
+            "sheet_capture": artifact_handle(capture_path), "clockify_capture": artifact_handle(clockify),
+            "historical_sources": historical or []}
+        path = self.root / "stage.json"
+        self.write(path, declaration)
+        return path, capture
+
+    def test_staged_source_bound_display_preimage_retires_exact_cells_without_rewriting_run_marker(self):
+        children = [publisher.proposal_row(p, "source-run") for p in self.sources[:2]]
+        for child in children:
+            child[8] = self.descriptions[child[0]]
+            child[12] = "Historical display warning remains visible"
+        path, capture = self.staging(children)
+        function = getattr(prepared, "stage_projection", None)
+        self.assertIsNotNone(function, "source-bound captured display preimage adapter is missing")
+        projection = function(path)
+        self.assertEqual(children, list(projection["children"].values()))
+        gateway = StatefulGateway(rows=[publisher.HEADER, *copy.deepcopy(children)])
+        gateway.cell_data = lambda *_args: copy.deepcopy(capture)
+        plans = prepared.plan_children(gateway, spreadsheet_id="sheet", sheet_title="August 2026 review", projection=projection)
+        gateway.rows.extend(copy.deepcopy(projection["rows"]))
+        self.assertEqual(2, prepared.retire_children(gateway, spreadsheet_id="sheet", sheet_title="August 2026 review",
+            plans=plans, parent_rows=projection["rows"]))
+        self.assertEqual(["source-run", "source-run"], [row[11] for row in gateway.rows[1:3]])
+        self.assertEqual([71 / 60, 83 / 60], [row[3] for row in gateway.rows[1:3]])
+        self.assertTrue(all("Historical display warning remains visible" in row[12] for row in gateway.rows[1:3]))
+
+    def test_staging_rejects_unbound_wording_run_financial_identity_and_revision(self):
+        baseline = [publisher.proposal_row(p, "source-run") for p in self.sources[:2]]
+        for column, value in ((8, "Unbound human wording"), (11, "invented-run"), (4, "Other client"),
+                              (6, "other-activity"), (3, 99), (10, 2)):
+            with self.subTest(column=column):
+                children = copy.deepcopy(baseline)
+                children[0][column] = value
+                path, _capture = self.staging(children)
+                projection = prepared.stage_projection(path)
+                self.assertEqual([publisher.stable_review_id(self.sources[1])], [row[0] for row in projection["rows"]])
+                self.assertEqual({}, projection["children"])
+                self.assertTrue(projection["staging_receipt"]["diagnostics"])
+
+    def test_staging_native_notes_protect_group_and_new_note_or_values_block_retirement(self):
+        children = [publisher.proposal_row(p, "source-run") for p in self.sources[:2]]
+        path, _capture = self.staging(children, notes=[(1, 12)])
+        self.assertEqual([publisher.stable_review_id(self.sources[1])],
+                         [row[0] for row in prepared.stage_projection(path)["rows"]])
+        for change in ("note", "values"):
+            with self.subTest(change=change):
+                path, capture = self.staging(children)
+                projection = prepared.stage_projection(path)
+                gateway = StatefulGateway(rows=[publisher.HEADER, *copy.deepcopy(children)])
+                gateway.cell_data = lambda *_args: copy.deepcopy(capture)
+                plans = prepared.plan_children(gateway, spreadsheet_id="sheet", sheet_title="August 2026 review", projection=projection)
+                gateway.rows.extend(copy.deepcopy(projection["rows"]))
+                if change == "note":
+                    capture["sheets"][0]["data"][0]["rowData"][1]["values"][12]["note"] = "Added after planning"
+                else:
+                    capture["sheets"][0]["data"][0]["rowData"][1]["values"][8]["userEnteredValue"] = {"stringValue": "Changed after planning"}
+                with self.assertRaises(publisher.PublicationError):
+                    prepared.retire_children(gateway, spreadsheet_id="sheet", sheet_title="August 2026 review",
+                        plans=plans, parent_rows=projection["rows"])
+                self.assertEqual(children, gateway.rows[1:3])
+
+    def test_staging_historical_run_needs_real_same_native_source_witness(self):
+        witness = self.root / "historical-run"
+        witness.mkdir()
+        self.write(witness / "proposals.json", self.sources)
+        self.write(witness / "routing.json", {})
+        children = [publisher.proposal_row(p, "historical-run") for p in self.sources[:2]]
+        declaration = [{"proposals": artifact_handle(witness / "proposals.json"), "routing": artifact_handle(witness / "routing.json")}]
+        path, _capture = self.staging(children, historical=declaration)
+        projection = prepared.stage_projection(path)
+        self.assertEqual(1, len(projection["rows"]))
+        self.assertEqual(["historical-run"] * 2, [row[11] for row in projection["children"].values()])
+        self.write(witness / "proposals.json", [])
+        with self.assertRaises(ValueError):
+            prepared.stage_projection(path)
+
+    def test_staging_missing_or_mutated_materialization_and_source_pin_fails(self):
+        children = [publisher.proposal_row(p, "source-run") for p in self.sources[:2]]
+        for mutation in ("missing", "materialization", "source"):
+            with self.subTest(mutation=mutation):
+                path, _capture = self.staging(children)
+                if mutation == "missing":
+                    document = json.loads(path.read_bytes())
+                    document.pop("qualified_materialization")
+                    self.write(path, document)
+                elif mutation == "materialization":
+                    self.write(self.root / "materialization.json", {})
+                else:
+                    self.write(self.run / "proposals.json", [])
+                with self.assertRaises(ValueError):
+                    prepared.stage_projection(path)
+                self.write(self.run / "proposals.json", self.sources)
+
+    def test_fresh_clockify_warning_binds_native_counterpart_identity_not_normalized_sort_position(self):
+        from scripts import evidence_ledger
+        entries = [{"id": "later", "timeInterval": {"start": self.sources[1]["start"], "end": self.sources[1]["end"]}},
+                   {"id": "earlier", "timeInterval": {"start": self.sources[0]["start"], "end": self.sources[0]["end"]}}]
+        capture = {"read_only": True, "entries": entries}
+        events = evidence_ledger.normalize_collector_snapshot({"clockify": capture})
+        by_source = {event.source_ref["source_id"]: event.evidence_id for event in events}
+        view = prepared.fresh_warning_view(self.sources, capture)
+        self.assertEqual(by_source["earlier"], view[0]["review_warnings"][0]["counterpart_id"])
+        self.assertEqual(by_source["later"], view[1]["review_warnings"][0]["counterpart_id"])
+        self.assertEqual(71, view[0]["review_warnings"][0]["overlap_duration_seconds"])
+        self.assertEqual(83, view[1]["review_warnings"][0]["overlap_duration_seconds"])
+        self.assertEqual([], self.sources[0]["review_warnings"])
+
+    def test_staged_value_only_publication_and_exact_retirement_retry_preserve_every_original_cell(self):
+        children = [publisher.proposal_row(p, "source-run") for p in self.sources[:2]]
+        for child in children:
+            child[8] = self.descriptions[child[0]]
+            child[12] = "Historical warning text"
+        path, capture = self.staging(children)
+        projection = prepared.stage_projection(path)
+        gateway = StatefulGateway(rows=[publisher.HEADER, *copy.deepcopy(children)])
+        def current_cells(*_args):
+            result = copy.deepcopy(capture)
+            result["sheets"][0]["data"][0]["rowData"] = [{"values":[{"userEnteredValue":{
+                "numberValue" if type(v) in (int,float) else "stringValue":v}} for v in row]} for row in gateway.rows]
+            return result
+        gateway.cell_data = current_cells
+        gateway.prepare_sheet = lambda *_args: self.fail("staged publication must not reformat existing rows")
+        function = getattr(prepared, "publish_staged_projection", None)
+        self.assertIsNotNone(function, "staged value-only mutation boundary is missing")
+        receipt = function(gateway, projection=projection, spreadsheet_id="sheet", sheet_title="August 2026 review")
+        self.assertEqual(2, receipt["terminal_updates"])
+        self.assertEqual([2,3], receipt["retired_child_rows"])
+        self.assertEqual(children[0][:9], gateway.rows[1][:9])
+        self.assertEqual("source-run", gateway.rows[1][11])
+        repeated = function(gateway, projection=projection, spreadsheet_id="sheet", sheet_title="August 2026 review")
+        self.assertEqual(0, repeated["terminal_updates"])
+        self.assertEqual(4, len(gateway.rows))
+
+    def test_fresh_warning_standalone_preserves_wording_run_and_reason_and_rechecks_native_notes(self):
+        children = [publisher.proposal_row(p, "source-run") for p in self.sources[:2]]
+        for child in children:
+            child[8] = self.descriptions[child[0]]
+            child[12] = "Keep historical warning"
+        path, capture = self.staging(children)
+        clockify = {"read_only": True, "entries": [{"id":"live-counterpart",
+            "timeInterval":{"start":self.sources[0]["start"],"end":self.sources[0]["end"]}}]}
+        self.write(self.root / "clockify.json", clockify)
+        view = prepared.fresh_warning_view(self.sources,clockify)
+        folder = self.root / "warning-view"
+        folder.mkdir()
+        self.write(folder / "proposals.json",view)
+        document = {**self.document,"run_id":"warning-view","source_proposals":artifact_handle(folder / "proposals.json"),
+            "package":batches.package_review_batches(view,editorial_descriptions=self.descriptions,work_contexts=self.contexts)}
+        self.write(self.binding,document)
+        declaration=json.loads(path.read_bytes())
+        declaration["projection_binding"]=artifact_handle(self.binding)
+        declaration["clockify_capture"]=artifact_handle(self.root / "clockify.json")
+        self.write(path,declaration)
+        projection=prepared.stage_projection(path)
+        target=next(row for row in projection["rows"] if row[0]==children[0][0])
+        self.assertEqual(children[0][8],target[8])
+        self.assertEqual("source-run",target[11])
+        self.assertIn("Keep historical warning",target[12])
+        self.assertIn("existing_clockify_overlap",target[12])
+        self.assertEqual(71/60,target[3])
+        gateway=StatefulGateway(rows=[publisher.HEADER,*copy.deepcopy(children)])
+        gateway.cell_data=lambda *_args:copy.deepcopy(capture)
+        self.assertEqual([],prepared.plan_children(gateway,spreadsheet_id="sheet",sheet_title="August 2026 review",projection=projection))
+        capture["sheets"][0]["data"][0]["rowData"][1]["values"][12]["note"]="Added after plan"
+        with self.assertRaises(publisher.PublicationError):
+            prepared.publish_staged_projection(gateway,projection=projection,spreadsheet_id="sheet",sheet_title="August 2026 review")
+        self.assertEqual(children,gateway.rows[1:])
 
     def test_real_publisher_cycle_receipts_agree_on_disjoint_exact_seconds_and_retry(self):
         gateway = StatefulGateway(rows=[publisher.HEADER])
