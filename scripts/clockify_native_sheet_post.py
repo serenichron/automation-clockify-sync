@@ -391,12 +391,13 @@ def _review_batch_groups(binding: Mapping[str, Any], timezone: str) -> tuple[dic
                 or not isinstance(binding["work_contexts"], Mapping)):
             raise NativePostError("review batch source binding is invalid")
         authority = binding.get("preparation_authority")
-        wording_ids, allow_overlaps = [], False
+        wording_ids, allow_overlaps, allow_clockify_overlaps = [], False, False
         if authority is not None:
             from scripts import clockify_review_batch_publication as prepared
             if (not isinstance(authority, Mapping) or set(authority) != {"consolidation_policy", "wording_only_ids"}
                     or authority["consolidation_policy"] not in {
-                        prepared.WORDING_CONSOLIDATION_POLICY, prepared.OVERLAP_CONSOLIDATION_POLICY}):
+                        prepared.WORDING_CONSOLIDATION_POLICY, prepared.OVERLAP_CONSOLIDATION_POLICY,
+                        prepared.CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY}):
                 raise NativePostError("review batch preparation authority differs")
             wording_ids = authority["wording_only_ids"]
             originals = {stable_review_id(source): source for source in sources}
@@ -408,7 +409,9 @@ def _review_batch_groups(binding: Mapping[str, Any], timezone: str) -> tuple[dic
                         identity in descriptions and originals[identity].get("description") != descriptions[identity])
                         for identity in wording_ids)):
                 raise NativePostError("review batch wording-only source authority differs")
-            allow_overlaps = authority["consolidation_policy"] == prepared.OVERLAP_CONSOLIDATION_POLICY
+            allow_overlaps = authority["consolidation_policy"] in {
+                prepared.OVERLAP_CONSOLIDATION_POLICY, prepared.CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY}
+            allow_clockify_overlaps = authority["consolidation_policy"] == prepared.CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY
         protected = {str(row["Review ID"]).strip() for _, row in binding["captured_rows"]
                      if str(row["Disposition"]).strip().casefold() == "approved"
                      or str(row["Review Status"]).strip().casefold() == "posted"}
@@ -416,7 +419,8 @@ def _review_batch_groups(binding: Mapping[str, Any], timezone: str) -> tuple[dic
         protected.update(retained["review_id"] for retained in package["retained"] if retained["review_id"])
         package = batches.verify_package(package, proposals=sources,
             work_contexts=binding["work_contexts"], protected_ids=protected, timezone=timezone,
-            wording_only_ids=wording_ids, allow_review_overlaps=allow_overlaps)
+            wording_only_ids=wording_ids, allow_review_overlaps=allow_overlaps,
+            allow_clockify_overlaps=allow_clockify_overlaps)
         groups = {group["review_id"]: group for group in package["activities"]}
         if len(groups) != len(package["activities"]):
             raise NativePostError("review batch identities are duplicated")
@@ -471,10 +475,11 @@ def _group_payloads(group: Mapping[str, Any], route: Mapping[str, Any], *,
 
 
 def _independent_review_ids(plan: Mapping[str, Any]) -> set[str]:
-    """Only explicit v3 source-bound claims are independent of payload aliases."""
+    """Only explicit v3/v4 source-bound claims are independent of payload aliases."""
     from scripts import clockify_review_batch_publication as prepared
     binding = plan.get("review_batches_binding") or {}
-    if (binding.get("preparation_authority") or {}).get("consolidation_policy") != prepared.OVERLAP_CONSOLIDATION_POLICY:
+    if (binding.get("preparation_authority") or {}).get("consolidation_policy") not in {
+            prepared.OVERLAP_CONSOLIDATION_POLICY, prepared.CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY}:
         return set()
     return {child for group in binding["package"]["activities"] for child in group["child_review_ids"]}
 
@@ -553,7 +558,8 @@ def build_plan(document: Mapping[str, Any], *, capture_sha256: str, routing: Map
             if route is None:
                 raise NativePostError("Clockify route is missing for source-bound review batch")
             from scripts import clockify_review_batch_publication as prepared
-            child_descriptions = (binding.get("preparation_authority") or {}).get("consolidation_policy") == prepared.OVERLAP_CONSOLIDATION_POLICY
+            child_descriptions = (binding.get("preparation_authority") or {}).get("consolidation_policy") in {
+                prepared.OVERLAP_CONSOLIDATION_POLICY, prepared.CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY}
             payloads = _group_payloads(group, route, child_descriptions=child_descriptions)
         else:
             payload, seconds = _row_payload(row, routes, timezone)

@@ -18,7 +18,7 @@ from collections import Counter
 from typing import Any, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
-from scripts.clockify_sheet_publish import PublicationError, stable_review_id
+from scripts.clockify_sheet_publish import PublicationError, _validate_review_warning, stable_review_id
 
 OVERLAP_REVIEW_NOTICE = (
     "Review presentation includes overlapping workstreams; summed reviewed seconds can exceed "
@@ -94,6 +94,7 @@ def package_review_batches(
     protected_ids: Iterable[str] = (), timezone: str = "Europe/Bucharest",
     wording_only_ids: Iterable[str] = (),
     allow_review_overlaps: bool = False,
+    allow_clockify_overlaps: bool = False,
 ) -> dict[str, list[dict[str, Any]]]:
     """Consolidate compatible sub-fifteen-minute sources to reviewable batches.
 
@@ -110,9 +111,11 @@ def package_review_batches(
     Only explicit, source-bound wording-only authority may exempt a source's
     human_corrected flag; it never overrides protected IDs or other guards.
     The default remains the historic protected-human-correction behavior.
-    Explicit approved overlap presentation permits distinct review-proposal
-    windows to sum without merging or deducting time. Provider/meeting/unknown
-    overlap warnings remain standalone; all original warnings remain unchanged.
+    ``allow_review_overlaps`` preserves the historical review-proposal overlap
+    policy. Separate explicit ``allow_clockify_overlaps`` authority permits
+    well-formed existing Clockify overlap warnings to group without merging or
+    deducting time. Meeting/unknown/malformed overlaps remain standalone under
+    the new policy; all original warnings remain unchanged.
 
     Every input survives exactly once as a child or a retained original copy.
     Malformed/duplicate identities remain explicit retained records, never
@@ -143,7 +146,7 @@ def package_review_batches(
         if any(str(source.get(field) or "").strip().casefold() in {"approved", "posted"}
                for field in ("disposition", "review_status", "status")):
             reasons.append("approved_or_posted")
-        if (allow_review_overlaps or review_id in wording_only) and any(
+        if (allow_review_overlaps or allow_clockify_overlaps or review_id in wording_only) and any(
                 str(source.get(field) or "").strip().casefold() in {"approve", "skip", "skipped", "rejected", "superseded"}
                 for field in ("disposition", "review_status", "status")):
             reasons.append("protected_terminal_status")
@@ -163,10 +166,23 @@ def package_review_batches(
         warnings = source.get("review_warnings", [])
         if not isinstance(warnings, list) or any(not isinstance(w, Mapping) for w in warnings):
             reasons.append("invalid_review_warnings")
-        elif any("overlap" in str(w.get("type") or "").casefold()
-                 and not (allow_review_overlaps and w.get("type") == "review_proposal_overlap")
-                 for w in warnings):
-            reasons.append("overlap_warning")
+        else:
+            for warning in warnings:
+                if "overlap" not in str(warning.get("type") or "").casefold():
+                    continue
+                if (allow_review_overlaps and warning.get("type") == "review_proposal_overlap"
+                        and not allow_clockify_overlaps):
+                    continue  # Preserve historical v3 reconstruction exactly.
+                if allow_clockify_overlaps and (warning.get("type") == "existing_clockify_overlap"
+                        or allow_review_overlaps and warning.get("type") == "review_proposal_overlap"):
+                    try:
+                        _validate_review_warning(warning, {})
+                    except PublicationError:
+                        pass
+                    else:
+                        continue
+                reasons.append("overlap_warning")
+                break
         description = editorial_descriptions.get(review_id)
         context = work_contexts.get(review_id)
         if not _text(description):
@@ -201,7 +217,8 @@ def package_review_batches(
         items.append({"proposal": source, "review_id": review_id, "reasons": reasons,
                       "start": start, "end": end, "description": description, "context": context,
                       "has_review_overlap": isinstance(warnings, list) and any(
-                          isinstance(w, Mapping) and w.get("type") == "review_proposal_overlap" for w in warnings)})
+                          isinstance(w, Mapping) and w.get("type") in (
+                              "review_proposal_overlap", "existing_clockify_overlap") for w in warnings)})
 
     counts = Counter(item["review_id"] for item in items if item["review_id"] is not None)
     for item in items:
@@ -252,7 +269,8 @@ def package_review_batches(
                 partitions[-1].extend(current)
             else:
                 partitions.append(current)
-        activities.extend(_activity(members, allow_review_overlaps=allow_review_overlaps) for members in partitions)
+        activities.extend(_activity(members, allow_review_overlaps=allow_review_overlaps or allow_clockify_overlaps)
+                          for members in partitions)
     activities.sort(key=lambda row: (_time(row["start"]), row["review_id"]))
     retained.sort(key=lambda row: (row["review_id"] or "", _canonical(row["proposal"])))
     return {"activities": activities, "retained": retained}
@@ -264,6 +282,7 @@ def verify_package(
     timezone: str = "Europe/Bucharest",
     wording_only_ids: Iterable[str] = (),
     allow_review_overlaps: bool = False,
+    allow_clockify_overlaps: bool = False,
 ) -> dict[str, list[dict[str, Any]]]:
     """Bind a prepared projection to original sources, not claimed totals.
 
@@ -296,6 +315,7 @@ def verify_package(
         proposals, editorial_descriptions=descriptions, work_contexts=work_contexts,
         protected_ids=protected_ids, timezone=timezone, wording_only_ids=wording_only_ids,
         allow_review_overlaps=allow_review_overlaps,
+        allow_clockify_overlaps=allow_clockify_overlaps,
     )
     if package["activities"] != expected["activities"]:
         raise ValueError("review batch differs from original sources or preparation")

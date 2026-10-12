@@ -53,6 +53,46 @@ class NativeReviewBatchTests(unittest.TestCase):
         return native.approval_template(plan, approval_id="board-approval", approver="human board user",
                                        approved_at="2026-10-04T10:00:00Z", expires_at="2026-10-05T10:00:00Z")
 
+    def test_v4_existing_overlap_reconstructs_exact_children_without_alias_credit(self):
+        for number, source in enumerate(self.sources, 1):
+            source["review_warnings"] = [{
+                "type": "existing_clockify_overlap", "counterpart_id": f"ev-{number:064x}",
+                "overlap_start": source["start"], "overlap_end": source["end"],
+                "overlap_duration_seconds": source["duration_seconds"],
+            }]
+        package = batches.package_review_batches(self.sources,
+            editorial_descriptions={identity(1): "SC — Prepared one", identity(2): "SC — Prepared two"},
+            work_contexts=self.contexts, allow_review_overlaps=True, allow_clockify_overlaps=True)
+        group = package["activities"][0]
+        plan = native.build_plan(capture(publisher.portfolio_row(group, "source-run")),
+            capture_sha256="c" * 64, routing=route(), routing_sha256="r" * 64,
+            timezone="Europe/Bucharest", workspace_id="workspace-1", member_id="user-1",
+            projects=[{"id": "project-123456"}], tags=[{"id": "tag-654321"}], live_entries=[],
+            review_batches=package, review_batch_sources=self.sources, review_batch_work_contexts=self.contexts,
+            review_batch_authority={"consolidation_policy": "approved-daily-project-presentation/v4",
+                                    "wording_only_ids": []})
+        self.assertEqual(package, plan["review_batches_binding"]["package"])
+        self.assertEqual([identity(1), identity(2)], [entry["review_id"] for entry in plan["entries"]])
+        self.assertEqual(["2026-09-29T07:00:07Z", "2026-09-29T07:10:00Z"],
+                         [entry["payload"]["start"] for entry in plan["entries"]])
+        self.assertEqual(["2026-09-29T07:01:18Z", "2026-09-29T07:11:23Z"],
+                         [entry["payload"]["end"] for entry in plan["entries"]])
+        self.assertEqual(["SC — Prepared one", "SC — Prepared two"],
+                         [entry["payload"]["description"] for entry in plan["entries"]])
+        independent = native._independent_review_ids(plan)
+        self.assertEqual({identity(1), identity(2)}, independent)
+        with self.assertRaisesRegex(native.NativePostError, "distinct Clockify entries"):
+            native._check_unique_native_ids(plan["entries"], ["one-entry", "one-entry"],
+                                           independent_review_ids=independent)
+        gateway = FakeGateway()
+        with tempfile.TemporaryDirectory() as directory:
+            events, receipt_path = Path(directory) / "events.jsonl", Path(directory) / "receipt.json"
+            receipt = native.execute_plan(plan, self.approval(plan), events, receipt_path, gateway, now=NOW)
+            self.assertEqual(receipt, native.execute_plan(plan, self.approval(plan), events, receipt_path, gateway, now=NOW))
+        self.assertEqual(2, len(gateway.posts))
+        self.assertEqual(["created", "created"], [entry["disposition"] for entry in receipt["entries"]])
+        self.assertEqual(154, receipt["review_groups"][0]["duration_seconds"])
+
     def test_multitag_batch_routes_by_tag_identity_not_config_order(self):
         for source in self.sources:
             source.update(tag_names=["Process", "Development"], tag_suffixes=["654321", "987654"])

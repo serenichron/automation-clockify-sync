@@ -1,8 +1,10 @@
 """Pure review packaging: preserve evidence and never manufacture elapsed time."""
 import copy
+import json
 import unittest
 
 from scripts import clockify_post_approved_portfolio as poster
+from scripts import clockify_sheet_publish as publisher
 
 try:
     from scripts import clockify_review_batches as batches
@@ -55,6 +57,85 @@ class ReviewBatchTests(unittest.TestCase):
         self.assertEqual([71, 83], [p["duration_seconds"] for p in plans])
         self.assertEqual(["2026-09-29T07:00:07Z", "2026-09-29T07:10:00Z"], [p["start"] for p in plans])
         self.assertEqual(["2026-09-29T07:01:18Z", "2026-09-29T07:11:23Z"], [p["end"] for p in plans])
+
+    def test_explicit_overlap_policy_groups_existing_clockify_warnings_without_losing_sources(self):
+        sources = [proposal(1), proposal(2, "2026-09-29T10:10:00+03:00", "2026-09-29T10:11:23+03:00", 83)]
+        for source, number, start, end in (
+            (sources[0], 1, "2026-09-29T10:00:07+03:00", "2026-09-29T10:00:17+03:00"),
+            (sources[1], 2, "2026-09-29T10:10:00+03:00", "2026-09-29T10:10:10+03:00"),
+        ):
+            source["review_warnings"] = [{
+                "type": "existing_clockify_overlap", "counterpart_id": f"ev-{number:064x}",
+                "overlap_start": start, "overlap_end": end, "overlap_duration_seconds": 10,
+            }]
+        original = copy.deepcopy(sources)
+        result = self.package(sources, allow_review_overlaps=True, allow_clockify_overlaps=True)
+        self.assertEqual([], result["retained"])
+        self.assertEqual(1, len(result["activities"]))
+        row = result["activities"][0]
+        self.assertEqual([identity(1), identity(2)], row["child_review_ids"])
+        self.assertEqual(["activity-1", "activity-2"], row["source_activity_ids"])
+        self.assertEqual(["ev-1", "ev-2"], row["evidence_ids"])
+        self.assertEqual(154, row["duration_seconds"])
+        self.assertEqual(2, row["duration_minutes"])
+        self.assertEqual([
+            {"start": "2026-09-29T10:00:07+03:00", "end": "2026-09-29T10:01:18+03:00",
+             "duration_seconds": 71, "duration_minutes": 1},
+            {"start": "2026-09-29T10:10:00+03:00", "end": "2026-09-29T10:11:23+03:00",
+             "duration_seconds": 83, "duration_minutes": 1},
+        ], row["allocation_segments"])
+        expected_warnings = [{"review_id": identity(n), "warnings": source["review_warnings"]}
+                             for n, source in enumerate(original, 1)]
+        self.assertEqual(expected_warnings, row["child_review_warnings"])
+        visible = publisher.portfolio_row(row, "source-run")
+        warning_text, notice = visible[12].split("\n", 1)
+        self.assertEqual(expected_warnings, json.loads(warning_text))
+        self.assertEqual(batches.OVERLAP_REVIEW_NOTICE, notice)
+        self.assertEqual("pending", visible[9])
+        self.assertEqual("unposted", visible[13])
+        self.assertNotIn("credited_minutes", row)
+        self.assertNotIn("validation_status", row)
+        self.assertEqual(original, sources)
+        self.assertEqual(result, batches.verify_package(result, proposals=sources,
+            work_contexts={identity(1): "explicit-task", identity(2): "explicit-task"},
+            allow_review_overlaps=True, allow_clockify_overlaps=True))
+        with self.assertRaises(ValueError):
+            batches.verify_package(result, proposals=sources,
+                work_contexts={identity(1): "explicit-task", identity(2): "explicit-task"})
+        default = self.package(sources, allow_review_overlaps=True)
+        self.assertEqual([], default["activities"])
+        self.assertEqual(original, [item["proposal"] for item in default["retained"]])
+
+    def test_explicit_overlap_policy_does_not_exempt_malformed_or_protected_warnings(self):
+        warning = {
+            "type": "existing_clockify_overlap", "counterpart_id": "ev-" + "1" * 64,
+            "overlap_start": "2026-09-29T10:00:07+03:00",
+            "overlap_end": "2026-09-29T10:00:17+03:00", "overlap_duration_seconds": 10,
+        }
+        variants = [dict(warning, type="meeting_proposal_overlap", counterpart_id="wks-" + "1" * 24),
+                    dict(warning, type="unknown_overlap"), dict(warning, counterpart_id="missing"),
+                    dict(warning, overlap_duration_seconds=11), dict(warning, overlap_start="invalid"),
+                    dict(warning, type=["existing_clockify_overlap"]),
+                    dict(warning, type={"type": "existing_clockify_overlap"})]
+        variants.extend({key: value for key, value in warning.items() if key != missing}
+                        for missing in ("counterpart_id", "overlap_start", "overlap_end", "overlap_duration_seconds"))
+        for value in variants:
+            with self.subTest(warning=value):
+                source = {**proposal(1), "review_warnings": [value]}
+                result = self.package([source], allow_review_overlaps=True, allow_clockify_overlaps=True)
+                self.assertEqual([], result["activities"])
+                self.assertEqual(source, result["retained"][0]["proposal"])
+                self.assertIn("overlap_warning", result["retained"][0]["preparation_reasons"])
+        for changes, protected, reason in (({}, {identity(1)}, "protected_review_id"),
+                                          ({"disposition": "approved"}, set(), "approved_or_posted"),
+                                          ({"review_status": "posted"}, set(), "approved_or_posted")):
+            with self.subTest(reason=reason):
+                source = {**proposal(1), **changes, "review_warnings": [warning]}
+                result = self.package([source], allow_review_overlaps=True, allow_clockify_overlaps=True,
+                                      protected_ids=protected)
+                self.assertEqual([], result["activities"])
+                self.assertEqual(source, result["retained"][0]["proposal"])
+                self.assertIn(reason, result["retained"][0]["preparation_reasons"])
 
     def test_editorial_input_is_required_and_distinct_prepared_descriptions_are_explicit(self):
         second = proposal(2, "2026-09-29T10:10:00+03:00", "2026-09-29T10:11:23+03:00", 83)

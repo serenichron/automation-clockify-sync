@@ -10,6 +10,7 @@ from scripts import clockify_review_batches as batches
 from scripts import clockify_sheet_publish as publisher
 from scripts import clockify_review_cycle as cycle
 from scripts import clockify_review_batch_publication as prepared
+from scripts import semantic_analyzer
 from scripts.clockify_meeting_publication_alias import artifact_handle
 from test_sheet_publish import StatefulGateway, AppendCorruptingGateway
 
@@ -65,6 +66,52 @@ class BatchPublicationTests(unittest.TestCase):
             sheet_title="August 2026 review", template_title="Proposals", proposals=self.sources,
             run_id="source-run", project_allowlist={}, source_dir=self.run,
             review_batch_publication=self.binding)
+
+    def test_existing_clockify_overlap_requires_v4_and_existing_v3_binding_is_unchanged(self):
+        sources = self.sources[:2]
+        model, revision = semantic_analyzer.CURRENT_LIVE_FLASH_ROUTE
+        for number, item in enumerate(sources, 1):
+            item["provenance"].update(semantic_reviewer_model=model, semantic_reviewer_revision=revision)
+            item["review_warnings"] = [{
+                "type": "existing_clockify_overlap", "counterpart_id": f"ev-{number:064x}",
+                "overlap_start": item["start"], "overlap_end": item["end"],
+                "overlap_duration_seconds": item["duration_seconds"],
+            }]
+        self.write(self.run / "proposals.json", sources)
+        self.write(self.run / "semantic-analysis.json", {"activities": [
+            {"activity_id": item["activity_id"], "evidence_ids": item["provenance"]["evidence_ids"],
+             "rendered_description": "SC — Prepared guarded source publication safely",
+             "semantic_reviewer_model": model, "semantic_reviewer_revision": revision} for item in sources]})
+        self.write(self.run / "routing.json", {"session_routes": [{"project_name": "Example",
+            "project_suffix": "abc123", "prefix": "SC", "tag_names": ["Development"],
+            "tag_suffixes": ["def456"], "billable": True}]})
+        (self.run / "review-corrections.jsonl").write_text("")
+        authority = {name: artifact_handle(self.run / filename) for name, filename in prepared.AUTHORITY_FILES.items()}
+        legacy_fields = prepared._auto_fields(sources, authority, self.run, "Europe/Bucharest",
+            consolidation_policy="approved-daily-project-presentation/v3")
+        self.assertEqual([], legacy_fields["package"]["activities"])
+        self.assertEqual(sources, [item["proposal"] for item in legacy_fields["package"]["retained"]])
+        legacy = {**self.document, "schema_version": prepared.AUTO_SCHEMA,
+            "source_proposals": artifact_handle(self.run / "proposals.json"), "authority": authority,
+            "consolidation_policy": "approved-daily-project-presentation/v3", **legacy_fields}
+        self.write(self.binding, legacy)
+        before = self.binding.read_bytes()
+        prepared.prepare(source_dir=self.run, output=self.binding, run_id="source-run",
+            spreadsheet_id="sheet", sheet_title="August 2026 review", timezone="Europe/Bucharest")
+        self.assertEqual(before, self.binding.read_bytes())
+        fresh = self.root / "fresh-v4.json"
+        prepared.prepare(source_dir=self.run, output=fresh, run_id="source-run",
+            spreadsheet_id="sheet", sheet_title="August 2026 review", timezone="Europe/Bucharest")
+        document, _ = prepared.load(fresh)
+        self.assertEqual("approved-daily-project-presentation/v4", document["consolidation_policy"])
+        self.assertEqual([], document["package"]["retained"])
+        self.assertEqual(154, document["package"]["activities"][0]["duration_seconds"])
+        projection = prepared.project(path=fresh, source_dir=self.run, proposals=sources,
+            run_id="source-run", spreadsheet_id="sheet", sheet_title="August 2026 review",
+            project_allowlist={"abc123": "Example"})
+        self.assertEqual(1, len(projection["rows"]))
+        self.assertIn("existing_clockify_overlap", projection["rows"][0][12])
+        self.assertIn(batches.OVERLAP_REVIEW_NOTICE, projection["rows"][0][12])
 
     def staging(self, children, *, historical=None, notes=None):
         cells = [[{"userEnteredValue": {"numberValue" if type(value) in (int, float) else "stringValue": value}}
