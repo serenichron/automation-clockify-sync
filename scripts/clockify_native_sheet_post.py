@@ -97,11 +97,29 @@ def _sheet_rows(document: Mapping[str, Any], *, pending_only: bool = True
     if not isinstance(properties, Mapping) or not isinstance(data, list) or not data:
         raise NativePostError("native Sheet capture grid is invalid")
     title = str(properties.get("title") or "")
-    grid = data[0]
-    raw_rows = grid.get("rowData") if isinstance(grid, Mapping) else None
-    if not title or not isinstance(raw_rows, list) or not raw_rows:
+    physical_rows: dict[int, Mapping[str, Any]] = {}
+    for grid in data:
+        if not isinstance(grid, Mapping):
+            raise NativePostError("native Sheet capture grid is invalid")
+        start_row, start_column = grid.get("startRow", 0), grid.get("startColumn", 0)
+        if (isinstance(start_row, bool) or not isinstance(start_row, int) or start_row < 0
+                or isinstance(start_column, bool) or not isinstance(start_column, int)
+                or start_column != 0):
+            raise NativePostError("native Sheet capture grid position is invalid")
+        raw_rows = grid.get("rowData", [])
+        if not isinstance(raw_rows, list):
+            raise NativePostError("native Sheet capture rows are invalid")
+        for row_number, raw in enumerate(raw_rows, start_row + 1):
+            if not isinstance(raw, Mapping):
+                raise NativePostError("native Sheet capture row is invalid")
+            if row_number in physical_rows:
+                raise NativePostError("native Sheet capture grid blocks overlap")
+            physical_rows[row_number] = raw
+    if not title or not physical_rows:
         raise NativePostError("native Sheet capture rows are missing")
-    first = raw_rows[0]
+    first = physical_rows.get(1)
+    if first is None:
+        raise NativePostError("native Sheet capture header is missing from physical row 1")
     headers = [_cell_value(cell) for cell in first.get("values", [])]
     expected = [
         "Review ID", "Start", "End", "Duration (min)", "Project", "Tags",
@@ -111,7 +129,9 @@ def _sheet_rows(document: Mapping[str, Any], *, pending_only: bool = True
     if headers != expected:
         raise NativePostError("native Sheet capture headers differ from the posting contract")
     rows: list[tuple[int, dict[str, Any]]] = []
-    for row_number, raw in enumerate(raw_rows[1:], 2):
+    for row_number, raw in sorted(physical_rows.items()):
+        if row_number == 1:
+            continue
         values = [_cell_value(cell) for cell in raw.get("values", [])]
         values += [""] * (len(expected) - len(values))
         if pending_only and (str(values[9]).strip().lower() != "pending"
@@ -1084,11 +1104,30 @@ class ClockifyGateway:
             raise NativePostError("configured Clockify workspace does not match approval")
 
     def period_entries(self, start: str, end: str) -> list[dict[str, Any]]:
-        query = urllib.parse.urlencode({"start": legacy._utc(start), "end": legacy._utc(end)})
-        return legacy._paged(
-            f"/workspaces/{self.workspace}/user/{self.member}/time-entries?{query}",
-            self.api_key, timeout_seconds=self.timeout_seconds,
+        period_start, period_end = legacy._parse(start), legacy._parse(end)
+        # Backend date filters omit entries that started before the window.
+        # Exhaust this member's inventory, then select intersections locally.
+        entries = legacy._paged(
+            f"/workspaces/{self.workspace}/user/{self.member}/time-entries",
+            self.api_key, timeout_seconds=self.timeout_seconds, page_size=1000, strict_items=True,
         )
+        overlapping = []
+        for entry in entries:
+            interval = entry.get("timeInterval")
+            if not isinstance(interval, Mapping):
+                raise NativePostError("Clockify overlap read entry interval is invalid")
+            try:
+                entry_start = legacy._parse(str(interval.get("start") or ""))
+                entry_end = legacy._parse(str(interval["end"])) if interval.get("end") else None
+            except (ValueError, legacy.PortfolioPostError) as error:
+                raise NativePostError("Clockify overlap read entry interval is invalid") from error
+            if entry_end is None:
+                if entry_start < period_end:
+                    raise NativePostError("Clockify running entry prevents a complete overlap read")
+                continue
+            if max(period_start, entry_start) < min(period_end, entry_end):
+                overlapping.append(entry)
+        return overlapping
 
     def recovery_entries(self, start: str, end: str) -> list[dict[str, Any]]:
         widened_start = legacy._parse(start) - dt.timedelta(days=1)

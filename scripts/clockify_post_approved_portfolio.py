@@ -169,20 +169,23 @@ def _request(
     raise AssertionError("unreachable retry state")
 
 
-def _paged(path: str, api_key: str, *, timeout_seconds: int) -> list[dict[str, Any]]:
+def _paged(path: str, api_key: str, *, timeout_seconds: int,
+           page_size: int = 200, strict_items: bool = False) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     separator = "&" if "?" in path else "?"
     for page in range(1, 101):
         value = _request(
-            f"{path}{separator}page={page}&page-size=200",
+            f"{path}{separator}page={page}&page-size={page_size}",
             api_key,
             timeout_seconds=timeout_seconds,
         )
         if not isinstance(value, list):
             raise PortfolioPostError("Clockify list response is invalid")
+        if strict_items and any(not isinstance(item, dict) for item in value):
+            raise PortfolioPostError("Clockify list response contains an invalid item")
         batch = [item for item in value if isinstance(item, dict)]
         rows.extend(batch)
-        if len(batch) < 200:
+        if len(value) < page_size:
             return rows
     raise PortfolioPostError("Clockify pagination exceeded safety limit")
 
