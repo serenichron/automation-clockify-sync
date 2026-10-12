@@ -53,6 +53,37 @@ class NativeReviewBatchTests(unittest.TestCase):
         return native.approval_template(plan, approval_id="board-approval", approver="human board user",
                                        approved_at="2026-10-04T10:00:00Z", expires_at="2026-10-05T10:00:00Z")
 
+    def test_multitag_batch_routes_by_tag_identity_not_config_order(self):
+        for source in self.sources:
+            source.update(tag_names=["Process", "Development"], tag_suffixes=["654321", "987654"])
+        package = batches.package_review_batches(self.sources,
+            editorial_descriptions={identity(1): "SC — Prepared one", identity(2): "SC — Prepared two"},
+            work_contexts=self.contexts)
+        row = publisher.portfolio_row(package["activities"][0], "source-run")
+        routing = route()
+        routing["session_routes"][0].update(tag_names=["Process", "Development"], tag_suffixes=["654321", "987654"])
+        plan = native.build_plan(capture(row), capture_sha256="c" * 64,
+            routing=routing, routing_sha256="r" * 64, timezone="Europe/Bucharest",
+            workspace_id="workspace-1", member_id="user-1", projects=[{"id": "project-123456"}],
+            tags=[{"id": "tag-654321"}, {"id": "tag-987654"}], live_entries=[],
+            review_batches=package, review_batch_sources=self.sources, review_batch_work_contexts=self.contexts)
+        self.assertEqual(1, plan["row_count"])
+        self.assertEqual([["tag-654321", "tag-987654"]] * 2, [entry["payload"]["tagIds"] for entry in plan["entries"]])
+
+    def test_native_planning_rejects_removed_child_warning_from_parent_review(self):
+        self.sources[0]["review_warnings"] = [{"type": "estimated_session_placement",
+                                               "reason": "Observed work; estimated placement."}]
+        self.package = batches.package_review_batches(self.sources,
+            editorial_descriptions={identity(1): "SC — Prepared one", identity(2): "SC — Prepared two"},
+            work_contexts=self.contexts)
+        self.group = self.package["activities"][0]
+        self.sheet_row = publisher.portfolio_row(self.group, "source-run")
+        self.assertEqual(1, self.plan()["row_count"])
+        removed_warning = list(self.sheet_row)
+        removed_warning[12] = ""
+        with self.assertRaises(native.NativePostError):
+            self.plan(sheet_row=removed_warning)
+
     def test_disjoint_group_posts_only_original_windows_and_all_child_receipt_mapping(self):
         plan = self.plan()
         self.assertEqual(1, plan["row_count"])

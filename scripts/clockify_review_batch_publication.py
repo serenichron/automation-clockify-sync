@@ -125,12 +125,14 @@ def plan_children(gateway: publisher.SheetsGateway, *, spreadsheet_id: str,
             continue
         if not any(equal(row) for row in variants):
             raise publisher.PublicationError("prepared review child changed or has a protected human decision")
-        plans.append({"row": number, "before": prior, "after": _retired(prior, projection["parents"][child])})
+        plans.append({"row": number, "before": prior, "after": _retired(prior, projection["parents"][child]),
+                      "parent_review_id": projection["parents"][child]})
     return plans
 
 
 def retire_children(gateway: publisher.SheetsGateway, *, spreadsheet_id: str,
-                    sheet_title: str, plans: Sequence[Mapping[str, Any]]) -> int:
+                    sheet_title: str, plans: Sequence[Mapping[str, Any]],
+                    parent_rows: Sequence[Sequence[Any]]) -> int:
     """Called only after exact parent readbacks; financial tombstones are unrelated."""
     if not plans:
         return 0
@@ -138,6 +140,14 @@ def retire_children(gateway: publisher.SheetsGateway, *, spreadsheet_id: str,
     metadata = gateway.spreadsheet(spreadsheet_id)
     positions, existing = publisher._scan_rows(gateway, spreadsheet_id, quoted,
         publisher._sheet_row_count(metadata, sheet_title))
+    expected_parents = {row[0]: list(row) for row in parent_rows}
+    for parent_id in {plan["parent_review_id"] for plan in plans}:
+        expected = expected_parents.get(parent_id)
+        actual = list(existing.get(positions.get(parent_id), []))
+        actual.extend([""] * (len(publisher.HEADER) - len(actual)))
+        if (expected is None or len(actual) != len(expected)
+                or any(not publisher._same_cell(a, b) for a, b in zip(actual, expected))):
+            raise publisher.PublicationError("prepared review parent changed or has a protected human decision")
     for plan in plans:
         before = plan["before"]
         prior = list(existing.get(plan["row"], []))

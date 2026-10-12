@@ -734,6 +734,21 @@ def portfolio_row(activity: Mapping[str, Any], run_id: str) -> list[Any]:
     duration = _duration_minutes(activity)
     if duration <= 0:
         raise PublicationError("portfolio activity duration is invalid")
+    reason = str(activity.get("validation_status") or "")
+    child_warnings = activity.get("child_review_warnings", [])
+    if not isinstance(child_warnings, list):
+        raise PublicationError("portfolio child warnings are invalid")
+    visible_warnings = []
+    for child in child_warnings:
+        if (not isinstance(child, Mapping) or set(child) != {"review_id", "warnings"}
+                or child["review_id"] not in activity.get("child_review_ids", [])
+                or not isinstance(child["warnings"], list)):
+            raise PublicationError("portfolio child warning identity is invalid")
+        warnings = [_validate_review_warning(warning, {}) for warning in child["warnings"]]
+        if warnings:
+            visible_warnings.append({"review_id": child["review_id"], "warnings": warnings})
+    if visible_warnings:
+        reason += ("\n" if reason else "") + json.dumps(visible_warnings, ensure_ascii=False, sort_keys=True)
     return [
         review_id,
         _timestamp(activity.get("start")),
@@ -747,7 +762,7 @@ def portfolio_row(activity: Mapping[str, Any], run_id: str) -> list[Any]:
         "pending",
         1,
         run_id,
-        str(activity.get("validation_status") or ""),
+        reason,
         "unposted",
         "",
     ]
@@ -1720,7 +1735,7 @@ def publish_proposal_partitions(
     terminal_updates = 0
     if batch_projection is not None:
         terminal_updates += prepared_batches.retire_children(gateway, spreadsheet_id=spreadsheet_id,
-            sheet_title=sheet_title, plans=batch_child_plan)
+            sheet_title=sheet_title, plans=batch_child_plan, parent_rows=batch_projection["rows"])
     if selection_plan is not None:
         terminal_updates += pending.apply(gateway, spreadsheet_id=spreadsheet_id, plan=selection_plan)
     for destination, members in (

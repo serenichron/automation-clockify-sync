@@ -160,7 +160,7 @@ def _resolve_routes(routing: Mapping[str, Any], projects: Sequence[Mapping[str, 
         resolved = {"projectId": project_ids[project_suffix],
                     "tagIds": sorted(tag_ids[value] for value in tag_suffixes),
                     "taskId": route.get("task_id"), "billable": bool(route.get("billable", True))}
-        key = (project_name, tag_names)
+        key = (project_name, tuple(sorted(tag_names)))
         if key in result and result[key] != resolved:
             raise NativePostError(f"Clockify route is ambiguous for {project_name}")
         result[key] = resolved
@@ -257,7 +257,7 @@ def _row_payload(row: Mapping[str, Any], routes: Mapping[Any, Any], timezone: st
                  ) -> tuple[dict[str, Any], int]:
     start, end, seconds = _row_interval(row, timezone)
     tag_names = tuple(value.strip() for value in str(row["Tags"]).split(",") if value.strip())
-    key = (str(row["Project"]).strip(), tag_names)
+    key = (str(row["Project"]).strip(), tuple(sorted(tag_names)))
     route = routes.get(key)
     if route is None:
         raise NativePostError(f"Clockify route is missing for {key[0]} / {', '.join(tag_names)}")
@@ -376,7 +376,7 @@ def _check_unique_native_ids(entries: Sequence[Mapping[str, Any]], entry_ids: Se
 def _review_batch_groups(binding: Mapping[str, Any], timezone: str) -> tuple[dict[str, Any], dict[str, Any]]:
     """Reproduce batches from frozen originals, never from asserted envelopes."""
     from scripts import clockify_review_batches as batches
-    from scripts.clockify_sheet_publish import stable_review_id
+    from scripts.clockify_sheet_publish import stable_review_id, portfolio_row
     try:
         if set(binding) != {"package", "source_proposals", "work_contexts", "captured_rows"}:
             raise NativePostError("review batch binding fields differ")
@@ -415,6 +415,7 @@ def _review_batch_groups(binding: Mapping[str, Any], timezone: str) -> tuple[dic
             if (row["Review ID"] != group_id or row["Project"] != group["client_project"]
                     or row["Tags"] != ", ".join(group["tag_names"])
                     or row["Description"] != group["description"]
+                    or row["Reason"] != portfolio_row(group, str(row["Last Seen Run"]))[12]
                     or _parse_sheet_time(row["Start"], timezone) != legacy._parse(group["start"])
                     or _parse_sheet_time(row["End"], timezone) != legacy._parse(group["end"])
                     or type(minutes) not in {int, float} or not math.isfinite(minutes)

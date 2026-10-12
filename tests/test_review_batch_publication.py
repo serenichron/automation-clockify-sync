@@ -202,6 +202,40 @@ class BatchPublicationTests(unittest.TestCase):
         self.assertEqual(["SC — Clean standalone deliverable"] * 2, [row[8] for row in gateway.rows[2:]])
         self.assertIn("existing_clockify_overlap", gateway.rows[2][12])
 
+    def test_grouped_child_warnings_remain_visible_on_parent_review_and_receipt(self):
+        warning = {"type": "estimated_session_placement", "reason": "Observed work; estimated placement."}
+        self.sources[0]["review_warnings"] = [warning]
+        self.write(self.run / "proposals.json", self.sources)
+        self.write(self.run / "work-accounting-result.json", {"schema_version": 1,
+            "allocation_mode": "non_overlapping_v1", "proposals": self.sources,
+            "ambiguous": [], "skipped": []})
+        self.document["source_proposals"]["sha256"] = "sha256:" + hashlib.sha256((self.run / "proposals.json").read_bytes()).hexdigest()
+        self.document["package"] = batches.package_review_batches(self.sources,
+            editorial_descriptions=self.descriptions, work_contexts=self.contexts)
+        self.write(self.binding, self.document)
+        gateway = StatefulGateway(rows=[publisher.HEADER])
+        published = self.publish(gateway)
+        self.assertNotEqual("", gateway.rows[1][12], "Grouped review must expose original child warnings")
+        visible = json.loads(gateway.rows[1][12])
+        self.assertEqual([{"review_id": "wka-000000000000000000000001-s01", "warnings": [warning]}], visible)
+        expected = cycle._expected_publication_receipts(
+            {"spreadsheet_id": "sheet", "review_batch_publication": str(self.binding)},
+            {"run_dir": str(self.run), "run_id": "source-run"},
+            sheet_title="August 2026 review", publication_profile=None)
+        self.assertEqual(expected[0]["rows_sha256"], published["publications"][0]["rows_sha256"])
+
+    def test_rejected_existing_parent_never_supersedes_still_pending_children(self):
+        children = [publisher.proposal_row(p, "source-run") for p in self.sources[:2]]
+        for column, value in ((9, "skip"), (13, "posted"), (14, "Do not use this proposed grouping")):
+            with self.subTest(column=column):
+                parent = publisher.portfolio_row(self.package["activities"][0], "source-run")
+                parent[column] = value
+                gateway = StatefulGateway(rows=[publisher.HEADER, *copy.deepcopy(children), parent])
+                with self.assertRaises(publisher.PublicationError):
+                    self.publish(gateway)
+                self.assertEqual(children, gateway.rows[1:3])
+                self.assertEqual(parent, gateway.rows[-1])
+
 
 if __name__ == "__main__":
     unittest.main()
