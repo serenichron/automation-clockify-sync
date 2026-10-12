@@ -2397,6 +2397,9 @@ def _validate_repair_credit_transition(
             fields = set(patch) if isinstance(patch, Mapping) else set()
             has_wording = "description" in fields
             has_routing = "client_project" in fields or "tag_names" in fields
+            # _read_log has already proved the latest explicit predecessor and
+            # description-only shape. No other duplicate decision gains authority.
+            wording_supersession = record.get("supersedes_digest") is not None
             expected_fields = ({"description"} if has_wording else set()) | (
                 {"client_project", "tag_names"} if has_routing else set()
             )
@@ -2417,8 +2420,8 @@ def _validate_repair_credit_transition(
                 or (target not in proposal_targets and not (
                     has_routing and _unresolved_repair_target(source, target)
                 ))
-                or target in prior_decision_targets
-                or target in appended_decision_targets
+                or (target in prior_decision_targets and not wording_supersession)
+                or (target in appended_decision_targets and not wording_supersession)
             ):
                 raise ReviewRunError("repair editorial decision is not exact source-bound replacement")
             if has_routing:

@@ -223,3 +223,59 @@ def package_review_batches(
     activities.sort(key=lambda row: (_time(row["start"]), row["review_id"]))
     retained.sort(key=lambda row: (row["review_id"] or "", _canonical(row["proposal"])))
     return {"activities": activities, "retained": retained}
+
+
+def verify_package(
+    package: Mapping[str, Any], *, proposals: Sequence[Mapping[str, Any]],
+    work_contexts: Mapping[str, str], protected_ids: Iterable[str] = (),
+    timezone: str = "Europe/Bucharest",
+) -> dict[str, list[dict[str, Any]]]:
+    """Bind a prepared projection to original sources, not claimed totals.
+
+    This proves mechanical source/segment conservation only. It does not grant
+    editorial approval, source credit, or permission to publish/post anything.
+    Reconstruct from frozen inputs; consumers need not trust supplied intervals
+    or reread mutable source files during approval-bound execution.
+    """
+    if (not isinstance(package, Mapping) or set(package) != {"activities", "retained"}
+            or not isinstance(package["activities"], list)
+            or not isinstance(package["retained"], list)):
+        raise ValueError("review batch package shape differs")
+    descriptions: dict[str, str] = {}
+    for activity in package["activities"]:
+        if not isinstance(activity, Mapping):
+            raise ValueError("review batch activity is invalid")
+        prepared = activity.get("prepared_descriptions")
+        if (not isinstance(prepared, list) or not prepared
+                or any(not isinstance(item, Mapping)
+                       or set(item) != {"review_id", "description"}
+                       or not _text(item["review_id"]) or not _text(item["description"])
+                       for item in prepared)
+                or [item["review_id"] for item in prepared] != activity.get("child_review_ids")):
+            raise ValueError("review batch prepared wording or membership differs")
+        for item in prepared:
+            if item["review_id"] in descriptions:
+                raise ValueError("review batch child appears more than once")
+            descriptions[item["review_id"]] = item["description"]
+    expected = package_review_batches(
+        proposals, editorial_descriptions=descriptions, work_contexts=work_contexts,
+        protected_ids=protected_ids, timezone=timezone,
+    )
+    if package["activities"] != expected["activities"]:
+        raise ValueError("review batch differs from original sources or preparation")
+    # Unused editorial metadata can change preparation reasons, but it cannot
+    # change which original source objects remain visible for preparation.
+    def retained_sources(rows: list[Any]) -> Counter:
+        values = []
+        for row in rows:
+            if (not isinstance(row, Mapping)
+                    or set(row) != {"review_id", "proposal", "preparation_reasons"}
+                    or not isinstance(row["preparation_reasons"], list)
+                    or not row["preparation_reasons"]
+                    or any(not _text(reason) for reason in row["preparation_reasons"])):
+                raise ValueError("retained review source is invalid")
+            values.append(_canonical({"review_id": row["review_id"], "proposal": row["proposal"]}))
+        return Counter(values)
+    if retained_sources(package["retained"]) != retained_sources(expected["retained"]):
+        raise ValueError("review batch drops or changes retained sources")
+    return copy.deepcopy(dict(package))

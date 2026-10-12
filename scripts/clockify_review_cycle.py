@@ -741,7 +741,7 @@ def load_config(path: Path) -> dict[str, Any]:
         raise CycleError("config must be valid JSON") from exc
     if not isinstance(config, dict) or not _REQUIRED.issubset(config):
         raise CycleError("config is missing required review-cycle fields")
-    if set(config) - (_REQUIRED | {"runs_dir", "catchup_until", "max_slices", "total_child_budget_seconds", "monthly_unresolved_alias_proof", "monthly_unresolved_historical_sources", "meeting_publication_bindings", "native_credit_input", "private_routing", "publication_presentation", "pending_review_selection"}):
+    if set(config) - (_REQUIRED | {"runs_dir", "catchup_until", "max_slices", "total_child_budget_seconds", "monthly_unresolved_alias_proof", "monthly_unresolved_historical_sources", "meeting_publication_bindings", "native_credit_input", "private_routing", "publication_presentation", "pending_review_selection", "review_batch_publication"}):
         raise CycleError("config contains unsupported review-cycle fields")
     if "native_credit_input" in config:
         handle = config["native_credit_input"]
@@ -751,7 +751,7 @@ def load_config(path: Path) -> dict[str, Any]:
         _canonical_runtime_path(handle["path"], label="native credit input")
     if "meeting_publication_bindings" in config:
         _canonical_runtime_path(config["meeting_publication_bindings"], label="meeting publication bindings")
-    for key in ("publication_presentation", "pending_review_selection"):
+    for key in ("publication_presentation", "pending_review_selection", "review_batch_publication"):
         if key in config:
             _canonical_runtime_path(config[key], label=key)
     if "monthly_unresolved_historical_sources" in config:
@@ -2239,7 +2239,8 @@ def _publisher_command(
     if meeting_bindings is not None:
         command.extend(["--meeting-publication-bindings", str(meeting_bindings)])
     for key, flag in (("publication_presentation", "--publication-presentation"),
-                      ("pending_review_selection", "--pending-review-selection")):
+                      ("pending_review_selection", "--pending-review-selection"),
+                      ("review_batch_publication", "--review-batch-publication")):
         optional = _source_publication_input(config, source, sheet_title=sheet_title, key=key)
         if optional is not None:
             command.extend([flag, str(optional)])
@@ -2252,6 +2253,13 @@ def _source_publication_input(config: Mapping[str, Any], source: Mapping[str, An
     from scripts import clockify_publication_presentation as display, clockify_source_adoptions as adoptions
     path = Path(str(config[key]))
     try:
+        if key == "review_batch_publication":
+            from scripts import clockify_review_batch_publication as prepared_batches
+            document, _handle = prepared_batches.load(path)
+            if document["spreadsheet_id"] != config["spreadsheet_id"]:
+                raise ValueError("prepared review publication destination differs")
+            return path if (document["sheet_title"] == sheet_title and document["run_id"] == source["run_id"]
+                and document["source_proposals"]["path"] == str(Path(str(source["run_dir"])) / "proposals.json")) else None
         if key == "publication_presentation":
             return display.for_source(path, source_dir=Path(str(source["run_dir"])), run_id=str(source["run_id"]),
                 spreadsheet_id=str(config["spreadsheet_id"]), sheet_title=sheet_title)
@@ -2296,7 +2304,8 @@ def _receipt_publication_config(config: Mapping[str, Any], document: Mapping[str
     records = document.get("publication_receipts", document.get("publications", []))
     from scripts import clockify_source_adoptions as adoptions
     for key, field, handle_field in (("publication_presentation", "presentation", "manifest"),
-                                      ("pending_review_selection", "pending_selection", "selection")):
+                                      ("pending_review_selection", "pending_selection", "selection"),
+                                      ("review_batch_publication", "review_batches", "binding")):
         handles = [item[field][handle_field] for item in records if isinstance(item, Mapping) and field in item] if isinstance(records, list) else []
         if handles:
             try:
@@ -2391,6 +2400,20 @@ def _expected_publication_receipts(
     partition_rows = {title: [receipt_row(item) for item in members]
                       for title, members in partitions if members and (
                           publication_profile is None or title != "unresolved-evidence")}
+    batch_path = _source_publication_input(config, source, sheet_title=sheet_title, key="review_batch_publication")
+    batch_projection = None
+    if batch_path is not None:
+        if timestamp_projection is not None or any(config.get(key) for key in (
+                "meeting_publication_bindings", "pending_review_selection", "publication_presentation")):
+            raise CycleError("prepared review batches conflict with another primary projection")
+        try:
+            from scripts import clockify_review_batch_publication as prepared_batches
+            batch_projection = prepared_batches.project(path=batch_path, source_dir=source_dir,
+                proposals=proposals, run_id=str(source["run_id"]), spreadsheet_id=str(config["spreadsheet_id"]),
+                sheet_title=sheet_title, project_allowlist=projects)
+            partition_rows = {sheet_title: batch_projection["rows"]}
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            raise CycleError("prepared review publication source projection differs") from exc
     meeting_bindings = _meeting_bindings_for_target(config, sheet_title)
     aliases = []
     if meeting_bindings is not None:
@@ -2447,6 +2470,8 @@ def _expected_publication_receipts(
             receipt["presentation"] = presentation_proof
         if selection is not None and title == sheet_title:
             receipt["pending_selection"] = selection["receipt"]
+        if batch_projection is not None and title == sheet_title:
+            receipt["review_batches"] = batch_projection["receipt"]
         receipts.append(receipt)
     if publication_profile in (clockify_monthly_unresolved.PROFILE, clockify_monthly_unresolved.ALIAS_PROFILE):
         rows = clockify_monthly_unresolved.project_rows(source_dir)
@@ -2500,7 +2525,7 @@ def _validated_publication_document(
          **({"source_aliases": item["source_aliases"]} if "source_aliases" in item else {}),
          **({"meeting_aliases": item["meeting_aliases"]} if "meeting_aliases" in item else {}),
          **({"historical_sources": item["historical_sources"]} if "historical_sources" in item else {}),
-         **({field: item[field] for field in ("presentation", "pending_selection") if field in item}),
+         **({field: item[field] for field in ("presentation", "pending_selection", "review_batches") if field in item}),
          **({field: item.get(field) for field in ("monthly_layout", "monthly_target_readback")}
             if "monthly_layout" in item or "monthly_target_readback" in item else {})}
         for item in publications if isinstance(item, Mapping)

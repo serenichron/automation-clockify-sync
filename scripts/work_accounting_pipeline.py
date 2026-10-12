@@ -1280,6 +1280,9 @@ def _route_from_review_correction(
         patch = case.get("expected_field_patch")
         if not isinstance(patch, Mapping):
             return None
+        if not {"client_project", "tag_names"}.intersection(patch):
+            # A later wording-only expectation must not shadow retained routing.
+            continue
         project = patch.get("client_project")
         tags = patch.get("tag_names")
         project_name = project.get("value") if isinstance(project, Mapping) else None

@@ -10,6 +10,7 @@ Distinct reviewed rows and all approved intervals are otherwise preserved.
 from __future__ import annotations
 
 import argparse
+import copy
 from contextlib import contextmanager
 import datetime as dt
 import fcntl
@@ -372,14 +373,120 @@ def _check_unique_native_ids(entries: Sequence[Mapping[str, Any]], entry_ids: Se
         by_id[entry_id] = item
 
 
+def _review_batch_groups(binding: Mapping[str, Any], timezone: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Reproduce batches from frozen originals, never from asserted envelopes."""
+    from scripts import clockify_review_batches as batches
+    from scripts.clockify_sheet_publish import stable_review_id
+    try:
+        if set(binding) != {"package", "source_proposals", "work_contexts", "captured_rows"}:
+            raise NativePostError("review batch binding fields differ")
+        package = binding["package"]
+        sources = binding["source_proposals"]
+        if (set(package) != {"activities", "retained"} or not isinstance(sources, list)
+                or not isinstance(binding["work_contexts"], Mapping)):
+            raise NativePostError("review batch source binding is invalid")
+        protected = {str(row["Review ID"]).strip() for _, row in binding["captured_rows"]
+                     if str(row["Disposition"]).strip().casefold() == "approved"
+                     or str(row["Review Status"]).strip().casefold() == "posted"}
+        # Retained source rows are never silently promoted by this consumer.
+        protected.update(retained["review_id"] for retained in package["retained"] if retained["review_id"])
+        package = batches.verify_package(package, proposals=sources,
+            work_contexts=binding["work_contexts"], protected_ids=protected, timezone=timezone)
+        groups = {group["review_id"]: group for group in package["activities"]}
+        if len(groups) != len(package["activities"]):
+            raise NativePostError("review batch identities are duplicated")
+        by_source = {}
+        for source in sources:
+            try:
+                source_id = stable_review_id(source)
+            except ValueError:
+                continue  # Invalid source identities survive in retained originals.
+            if source_id in by_source:
+                raise NativePostError("review batch original child identity is duplicated")
+            by_source[source_id] = source
+        captured = {str(row["Review ID"]).strip(): (number, row) for number, row in binding["captured_rows"]
+                    if str(row["Disposition"]).strip().casefold() == "pending"
+                    and str(row["Review Status"]).strip().casefold() == "unposted"}
+        for group_id, group in groups.items():
+            if group_id not in captured:
+                raise NativePostError("prepared review batch is missing from native pending rows")
+            _, row = captured[group_id]
+            minutes = row["Duration (min)"]
+            if (row["Review ID"] != group_id or row["Project"] != group["client_project"]
+                    or row["Tags"] != ", ".join(group["tag_names"])
+                    or row["Description"] != group["description"]
+                    or _parse_sheet_time(row["Start"], timezone) != legacy._parse(group["start"])
+                    or _parse_sheet_time(row["End"], timezone) != legacy._parse(group["end"])
+                    or type(minutes) not in {int, float} or not math.isfinite(minutes)
+                    or not math.isclose(minutes * 60, group["duration_seconds"], rel_tol=0, abs_tol=1e-9)):
+                raise NativePostError("native review batch row differs from source-bound group")
+        return groups, by_source
+    except (ValueError, TypeError, KeyError, AttributeError) as error:
+        raise NativePostError("review batch binding is invalid: " + str(error)) from error
+
+
+def _group_payloads(group: Mapping[str, Any], route: Mapping[str, Any]) -> list[tuple[str, dict[str, Any], int]]:
+    # Validate the existing exact-second segment contract, but do not merge
+    # touching windows: original child IDs must remain one-to-one with intents.
+    legacy._merged_segments(group)
+    if route["billable"] is not group["billable"]:
+        raise NativePostError("review batch billable route differs from original sources")
+    output = []
+    for child, segment in zip(group["child_review_ids"], group["allocation_segments"], strict=True):
+        start, end = legacy._parse(segment["start"]), legacy._parse(segment["end"])
+        if start.microsecond or end.microsecond:
+            raise NativePostError("native posting cannot truncate original sub-second batch bounds")
+        output.append((child, {"start": _utc(start), "end": _utc(end),
+                              "description": group["description"], **route}, segment["duration_seconds"]))
+    return output
+
+
+def _validate_review_batch_plan(plan: Mapping[str, Any]) -> None:
+    binding = plan.get("review_batches_binding")
+    if binding is None:
+        if any("sheet_review_id" in item for item in plan["entries"]):
+            raise NativePostError("grouped posting entries lack original source binding")
+        return
+    groups, _ = _review_batch_groups(binding, str(plan["timezone"]))
+    grouped_entries = [item for item in plan["entries"] if "sheet_review_id" in item]
+    by_child = {item["review_id"]: item for item in grouped_entries}
+    if len(by_child) != len(grouped_entries):
+        raise NativePostError("grouped posting child intents are duplicated")
+    expected_children = {child for group in groups.values() for child in group["child_review_ids"]}
+    if set(by_child) != expected_children:
+        raise NativePostError("grouped posting entries differ from exact child coverage")
+    rows = {str(row["Review ID"]).strip(): number for number, row in binding["captured_rows"]}
+    for group_id, group in groups.items():
+        first = by_child[group["child_review_ids"][0]]["payload"]
+        route = {key: first[key] for key in ("projectId", "tagIds", "taskId", "billable")}
+        for child, payload, seconds in _group_payloads(group, route):
+            item = by_child[child]
+            if (item["sheet_review_id"] != group_id or item["row_number"] != rows[group_id]
+                    or item["payload"] != payload or item["duration_minutes"] != seconds / 60):
+                raise NativePostError("grouped posting payload differs from original child interval")
+
+
 def build_plan(document: Mapping[str, Any], *, capture_sha256: str, routing: Mapping[str, Any],
                routing_sha256: str, timezone: str, workspace_id: str, member_id: str,
                projects: Sequence[Mapping[str, Any]], tags: Sequence[Mapping[str, Any]],
                live_entries: Sequence[Mapping[str, Any]],
-               source_adoptions: Mapping[str, Any] | None = None) -> dict[str, Any]:
+               source_adoptions: Mapping[str, Any] | None = None,
+               review_batches: Mapping[str, Any] | None = None,
+               review_batch_sources: Sequence[Mapping[str, Any]] | None = None,
+               review_batch_work_contexts: Mapping[str, str] | None = None) -> dict[str, Any]:
     spreadsheet_id, sheet_title, rows = _sheet_rows(document)
     _, _, captured_rows = _sheet_rows(document, pending_only=False)
     routes = _resolve_routes(routing, projects, tags)
+    binding = None
+    groups, batch_sources = {}, {}
+    if review_batches is not None:
+        if review_batch_sources is None or review_batch_work_contexts is None:
+            raise NativePostError("review batches require their original sources and work contexts")
+        binding = copy.deepcopy({"package": review_batches, "source_proposals": list(review_batch_sources),
+                                 "work_contexts": review_batch_work_contexts, "captured_rows": captured_rows})
+        groups, batch_sources = _review_batch_groups(binding, timezone)
+    elif review_batch_sources is not None or review_batch_work_contexts is not None:
+        raise NativePostError("review batch source inputs require their prepared package")
     entries: list[dict[str, Any]] = []
     total_seconds = 0
     seen: set[str] = set()
@@ -388,20 +495,35 @@ def build_plan(document: Mapping[str, Any], *, capture_sha256: str, routing: Map
         if not review_id or review_id in seen:
             raise NativePostError("Sheet posting review IDs are missing or duplicated")
         seen.add(review_id)
-        payload, seconds = _row_payload(row, routes, timezone)
-        total_seconds += seconds
-        overlaps = [value for item in live_entries if (value := _overlap(payload, item)) is not None]
-        entries.append({"review_id": review_id, "row_number": row_number,
+        group = groups.get(review_id)
+        if group is not None:
+            route_key = (group["client_project"], tuple(group["tag_names"]))
+            route = routes.get(route_key)
+            if route is None:
+                raise NativePostError("Clockify route is missing for source-bound review batch")
+            payloads = _group_payloads(group, route)
+        else:
+            payload, seconds = _row_payload(row, routes, timezone)
+            payloads = [(review_id, payload, seconds)]
+        for child_id, payload, seconds in payloads:
+            total_seconds += seconds
+            overlaps = [value for item in live_entries if (value := _overlap(payload, item)) is not None]
+            entries.append({"review_id": child_id, "row_number": row_number,
+                        **({"sheet_review_id": review_id} if group is not None else {}),
                         "duration_minutes": seconds // 60 if seconds % 60 == 0 else seconds / 60,
                         "payload": payload,
                         "payload_digest": _digest(payload), "live_overlaps": overlaps})
+    if len({item["review_id"] for item in entries}) != len(entries):
+        raise NativePostError("posting child identities are reused by multiple native rows")
     result = {"schema_version": PLAN_SCHEMA, "spreadsheet_id": spreadsheet_id,
               "sheet_title": sheet_title, "capture_sha256": capture_sha256,
               "routing_sha256": routing_sha256, "timezone": timezone,
               "workspace_id": workspace_id, "member_id": member_id,
               "live_snapshot_sha256": _live_digest(live_entries), "entries": entries,
-              "row_count": len(entries),
+              "row_count": len(rows),
               "total_minutes": total_seconds // 60 if total_seconds % 60 == 0 else total_seconds / 60}
+    if binding is not None:
+        result["review_batches_binding"] = binding
     result["review_ids_sha256"] = _digest(sorted(seen))
     if source_adoptions is not None:
         try:
@@ -417,10 +539,12 @@ def build_plan(document: Mapping[str, Any], *, capture_sha256: str, routing: Map
         result["source_adoptions_sha256"] = _digest(sorted(
             source_adoptions["declarations"], key=lambda value: value["current_review_id"],
         ))
-    for item, (_, row) in zip(entries, rows):
+    rows_by_number = dict(rows)
+    for item in entries:
         if "prior_entry_credit" in item:
             continue  # Explicit audited adoptions keep their existing contract.
-        source = str(row["Source"]).strip()
+        source = (str(batch_sources[item["review_id"]].get("activity_id") or "")
+                  if "sheet_review_id" in item else str(rows_by_number[item["row_number"]]["Source"]).strip())
         credit = _posted_source_credit(item, source, captured_rows, routes, timezone, live_entries)
         if credit is not None:
             item.update(source=source, sheet_source_credit=credit)
@@ -460,6 +584,7 @@ def _validate_approval(plan: Mapping[str, Any], approval: Mapping[str, Any], now
         raise NativePostError("approval identity is missing")
     if any(item["payload_digest"] != _digest(item["payload"]) for item in plan["entries"]):
         raise NativePostError("approved row payload digest differs from its exact payload")
+    _validate_review_batch_plan(plan)
     return _digest(approval)
 
 
@@ -781,6 +906,7 @@ def _execute_plan_locked(plan: Mapping[str, Any], approval: Mapping[str, Any], e
         if not isinstance(readback, Mapping) or not _item_matches(item, readback):
             raise NativePostError("final per-ID Clockify readback differs from approved payload")
         receipt_entry = {"review_id": item["review_id"], "row_number": item["row_number"],
+                                **({"sheet_review_id": item["sheet_review_id"]} if "sheet_review_id" in item else {}),
                                 "payload_digest": item["payload_digest"],
                                 "clockify_entry_id": event["clockify_entry_id"],
                                 "disposition": event["disposition"],
@@ -817,10 +943,21 @@ def _execute_plan_locked(plan: Mapping[str, Any], approval: Mapping[str, Any], e
         receipt_entries.append(receipt_entry)
     receipt = {"schema_version": RECEIPT_SCHEMA, "status": "complete",
                "approval_id": approval["approval_id"], "approval_digest": approval_digest,
-               "plan_digest": plan_digest, "row_count": len(entries),
+               "plan_digest": plan_digest, "row_count": plan["row_count"],
                "total_minutes": plan["total_minutes"], "entries": receipt_entries,
                "final_live_snapshot_sha256": _live_digest(final_live),
                "event_ledger_sha256": hashlib.sha256(events_path.read_bytes()).hexdigest()}
+    if "review_batches_binding" in plan:
+        receipt["review_groups"] = []
+        for group in plan["review_batches_binding"]["package"]["activities"]:
+            children = group["child_review_ids"]
+            # Every confirmed child has passed a fresh exact per-ID GET above.
+            # A late failure exits before writing any complete parent receipt.
+            receipt["review_groups"].append({"sheet_review_id": group["review_id"],
+                "row_number": next(item["row_number"] for item in entries if item.get("sheet_review_id") == group["review_id"]),
+                "child_review_ids": list(children),
+                "clockify_entry_ids": [confirmed[child]["clockify_entry_id"] for child in children],
+                "duration_seconds": group["duration_seconds"], "status": "complete"})
     if any("sheet_source_credit" in item for item in entries):
         # Approval totals count visible rows; credit totals count retained native
         # entries once, even when multiple current rows are exact source aliases.
@@ -932,6 +1069,8 @@ def main(argv: list[str] | None = None) -> int:
     plan_parser.add_argument("--routing", type=Path, required=True)
     plan_parser.add_argument("--source-adoptions", type=Path,
                              help="optional explicit audited source/confirmed-POST adoption snapshot")
+    plan_parser.add_argument("--review-batches", type=Path,
+                             help="prepared package with original source proposals and work contexts")
     plan_parser.add_argument("--timezone", default="Europe/Bucharest")
     plan_parser.add_argument("--output", type=Path, required=True)
     approval_parser = commands.add_parser("approval-template")
@@ -956,6 +1095,14 @@ def main(argv: list[str] | None = None) -> int:
             document = json.loads(capture_bytes)
             routing_bytes = args.routing.read_bytes()
             routing = json.loads(routing_bytes)
+            prepared = None
+            if args.review_batches is not None:
+                prepared = _load(args.review_batches)
+                if (not isinstance(prepared, Mapping)
+                        or set(prepared) != {"package", "source_proposals", "work_contexts"}):
+                    raise NativePostError("prepared review batch input fields differ")
+                _, _, captured_rows = _sheet_rows(document, pending_only=False)
+                _review_batch_groups({**prepared, "captured_rows": captured_rows}, args.timezone)
             gateway, workspace, member, api_key = _gateway(routing)
             projects = legacy._paged(f"/workspaces/{workspace}/projects?archived=false", api_key,
                                      timeout_seconds=gateway.timeout_seconds)
@@ -969,7 +1116,10 @@ def main(argv: list[str] | None = None) -> int:
                               routing_sha256=hashlib.sha256(routing_bytes).hexdigest(),
                               timezone=args.timezone, workspace_id=workspace, member_id=member,
                               projects=projects, tags=tags, live_entries=live_entries,
-                              source_adoptions=_load(args.source_adoptions) if args.source_adoptions else None)
+                              source_adoptions=_load(args.source_adoptions) if args.source_adoptions else None,
+                              review_batches=prepared["package"] if prepared is not None else None,
+                              review_batch_sources=prepared["source_proposals"] if prepared is not None else None,
+                              review_batch_work_contexts=prepared["work_contexts"] if prepared is not None else None)
             _atomic_write(args.output, plan)
             result = {"status": "planned", "row_count": plan["row_count"],
                       "total_minutes": plan["total_minutes"], "plan_digest": plan["plan_digest"]}

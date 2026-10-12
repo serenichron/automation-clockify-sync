@@ -1533,7 +1533,20 @@ def publish_proposal_partitions(
     pending_selection: Path | None = None,
     presentation: Path | None = None,
     existing_publication: Path | None = None,
+    review_batch_publication: Path | None = None,
 ) -> dict[str, Any]:
+    batch_projection = None
+    batch_child_plan = []
+    if review_batch_publication is not None:
+        if source_dir is None or any((meeting_bindings, pending_selection, presentation)) or tombstones:
+            raise PublicationError("prepared review batches require native sources and no competing primary projection")
+        try:
+            from scripts import clockify_review_batch_publication as prepared_batches
+            batch_projection = prepared_batches.project(path=review_batch_publication,
+                source_dir=source_dir, proposals=proposals, run_id=run_id,
+                spreadsheet_id=spreadsheet_id, sheet_title=sheet_title, project_allowlist=project_allowlist)
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            raise PublicationError("prepared review publication binding is invalid") from exc
     if existing_publication is not None:
         try:
             from scripts import clockify_publication_presentation as display
@@ -1576,6 +1589,10 @@ def publish_proposal_partitions(
         for destination, members in proposal_partitions
         if members and (monthly_rows is None or destination != "unresolved-evidence")
     ]
+    if batch_projection is not None:
+        partitions = [(sheet_title, batch_projection["rows"])] if batch_projection["rows"] else []
+        batch_child_plan = prepared_batches.plan_children(gateway, spreadsheet_id=spreadsheet_id,
+            sheet_title=sheet_title, projection=batch_projection)
     meeting_aliases: dict[str, list[dict[str, Any]]] = {}
     if selection is not None:
         partitions = [(sheet_title, selection["rows"]), *[(title, rows) for title, rows in partitions if title != sheet_title]]
@@ -1651,7 +1668,7 @@ def publish_proposal_partitions(
         )
     publications: list[dict[str, Any]] = []
     if existing_publication is not None:
-        if (tombstones or any(plan["created"] or plan["updates"] or plan["appends"] for plan in plans)
+        if (tombstones or batch_child_plan or any(plan["created"] or plan["updates"] or plan["appends"] for plan in plans)
                 or selection_plan is not None and selection_plan["updates"]
                 or monthly_plan is not None and monthly_plan["appends"]):
             raise PublicationError("existing publication does not satisfy native readback contract")
@@ -1661,6 +1678,8 @@ def publish_proposal_partitions(
                 item["presentation"] = presentation_proofs[title]
             if selection is not None and title == sheet_title:
                 item["pending_selection"] = selection["receipt"]
+            if batch_projection is not None and title == sheet_title:
+                item["review_batches"] = batch_projection["receipt"]
             item["existing_publication"] = {"verification_basis": "immutable_operator_readback",
                 "operator_receipt": gateway.handle, "rows": [list(row) for row in rows]}
             display.verify_existing(item["existing_publication"], item)
@@ -1690,6 +1709,7 @@ def publish_proposal_partitions(
             **({"meeting_aliases": meeting_aliases[destination]} if destination in meeting_aliases else {}),
             **({"presentation": presentation_proofs[destination]} if destination in presentation_proofs else {}),
             **({"pending_selection": selection["receipt"]} if selection is not None and destination == sheet_title else {}),
+            **({"review_batches": batch_projection["receipt"]} if batch_projection is not None and destination == sheet_title else {}),
         })
     if monthly_plan is not None:
         publications.append({
@@ -1698,6 +1718,9 @@ def publish_proposal_partitions(
             **({"presentation": presentation_proofs[monthly_plan["sheet_title"]]} if monthly_plan["sheet_title"] in presentation_proofs else {}),
         })
     terminal_updates = 0
+    if batch_projection is not None:
+        terminal_updates += prepared_batches.retire_children(gateway, spreadsheet_id=spreadsheet_id,
+            sheet_title=sheet_title, plans=batch_child_plan)
     if selection_plan is not None:
         terminal_updates += pending.apply(gateway, spreadsheet_id=spreadsheet_id, plan=selection_plan)
     for destination, members in (
@@ -1771,7 +1794,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pending-review-selection", type=Path)
     parser.add_argument("--publication-presentation", type=Path)
     parser.add_argument("--verify-existing-publication", type=Path)
+    parser.add_argument("--review-batch-publication", type=Path)
     args = parser.parse_args(argv)
+    if args.review_batch_publication is not None and (args.proposals is None or any((
+            args.meeting_publication_bindings, args.pending_review_selection, args.publication_presentation,
+            args.review_tombstones))):
+        parser.error("prepared review batches require --proposals without competing primary projections")
     if args.monthly_unresolved_historical_sources is not None and not (args.monthly_unresolved and args.proposals is not None):
         parser.error("monthly historical sources require --monthly-unresolved and --proposals")
 
@@ -1819,6 +1847,15 @@ def main(argv: list[str] | None = None) -> int:
             proposal_row(proposal, args.run_id, project_allowlist=projects)
             for proposal in proposals
         ]
+        if args.review_batch_publication is not None:
+            try:
+                from scripts import clockify_review_batch_publication as prepared_batches
+                preview = prepared_batches.project(path=args.review_batch_publication,
+                    source_dir=args.proposals.parent, proposals=proposals, run_id=args.run_id,
+                    spreadsheet_id=args.spreadsheet_id, sheet_title=args.sheet_title, project_allowlist=projects)
+                rows = preview["rows"]
+            except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+                raise PublicationError("prepared review publication binding is invalid") from exc
         monthly_rows = None
         monthly_aliases = None
         if args.monthly_unresolved:
@@ -1900,6 +1937,7 @@ def main(argv: list[str] | None = None) -> int:
             pending_selection=args.pending_review_selection,
             presentation=args.publication_presentation,
             existing_publication=args.verify_existing_publication,
+            review_batch_publication=args.review_batch_publication,
         )
     else:
         result = publish(
@@ -1938,7 +1976,7 @@ def main(argv: list[str] | None = None) -> int:
                      **({"meeting_aliases": item["meeting_aliases"]} if "meeting_aliases" in item else {}),
                      **({"canonical_source_aliases": item["canonical_source_aliases"]} if "canonical_source_aliases" in item else {}),
                      **({"historical_sources": item["historical_sources"]} if "historical_sources" in item else {}),
-                     **({field: item[field] for field in ("presentation", "pending_selection", "existing_publication") if field in item}),
+                     **({field: item[field] for field in ("presentation", "pending_selection", "existing_publication", "review_batches") if field in item}),
                      **({field: item[field] for field in ("monthly_layout", "monthly_target_readback")} if "monthly_layout" in item else {})}
                     for item in document["publications"]
                 ],
