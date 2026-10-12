@@ -1,5 +1,6 @@
 """Pure review packaging: preserve evidence and never manufacture elapsed time."""
 import copy
+import datetime as dt
 import json
 import unittest
 
@@ -28,6 +29,19 @@ def proposal(number, start="2026-09-29T10:00:07+03:00", end="2026-09-29T10:01:18
 
 def identity(number):
     return f"wka-{number:024x}-s01"
+
+
+def natural_batch_sources(count):
+    """Disjoint day/context fixtures reproducing the 34/19-child split shapes."""
+    sources = []
+    first = dt.datetime.fromisoformat("2026-09-23T08:00:07+03:00")
+    for number in range(1, count + 1):
+        seconds = 300 if number <= (30 if count == 34 else 15) else 30
+        start = first + dt.timedelta(minutes=(number - 1) * 6)
+        source = proposal(number, start.isoformat(), (start + dt.timedelta(seconds=seconds)).isoformat(), seconds)
+        source["review_warnings"] = [{"type": "estimated_session_placement", "reason": "Observed work; estimated placement."}]
+        sources.append(source)
+    return sources
 
 
 class ReviewBatchTests(unittest.TestCase):
@@ -202,6 +216,39 @@ class ReviewBatchTests(unittest.TestCase):
         result = self.package([proposal(1, "2026-09-29T10:00:00+03:00", "2026-09-29T10:07:30+03:00", 450),
                                proposal(2, "2026-09-29T11:00:00+03:00", "2026-09-29T11:07:30+03:00", 450)])
         self.assertEqual([900], [a["duration_seconds"] for a in result["activities"]])
+
+    def test_natural_batch_keeps_all_34_or_19_compatible_children_without_threshold_splits(self):
+        for count, legacy_parents, expected_seconds in ((34, 10, 9120), (19, 5, 4620)):
+            with self.subTest(children=count):
+                sources = natural_batch_sources(count)
+                descriptions = {identity(n): f"SC — Prepared task {n}" for n in range(1, count + 1)}
+                contexts = dict.fromkeys(descriptions, "explicit-task")
+                legacy = self.package(sources, editorial_descriptions=descriptions, work_contexts=contexts)
+                self.assertEqual(legacy_parents, len(legacy["activities"]))
+                natural = self.package(sources, editorial_descriptions=descriptions, work_contexts=contexts,
+                                       natural_batches=True)
+                self.assertEqual([], natural["retained"])
+                self.assertEqual(1, len(natural["activities"]))
+                group = natural["activities"][0]
+                self.assertEqual(expected_seconds, group["duration_seconds"])
+                self.assertEqual([identity(n) for n in range(1, count + 1)], group["child_review_ids"])
+                self.assertEqual([(p["start"], p["end"], p["duration_seconds"]) for p in sources],
+                                 [(p["start"], p["end"], p["duration_seconds"]) for p in group["allocation_segments"]])
+                self.assertEqual([p["review_warnings"] for p in sources],
+                                 [p["warnings"] for p in group["child_review_warnings"]])
+                self.assertEqual(natural, batches.verify_package(natural, proposals=sources,
+                    work_contexts=contexts, natural_batches=True))
+                with self.assertRaises(ValueError):
+                    batches.verify_package(natural, proposals=sources, work_contexts=contexts)
+
+    def test_natural_strategy_alone_does_not_group_terminal_human_decisions(self):
+        for status in ("skip", "rejected", "superseded"):
+            with self.subTest(status=status):
+                source = {**proposal(1), "disposition": status}
+                result = self.package([source], natural_batches=True)
+                self.assertEqual([], result["activities"])
+                self.assertEqual(source, result["retained"][0]["proposal"])
+                self.assertIn("protected_terminal_status", result["retained"][0]["preparation_reasons"])
 
     def test_protected_human_corrected_meeting_and_unresolved_sources_are_retained(self):
         variants = [

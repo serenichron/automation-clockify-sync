@@ -14,6 +14,7 @@ from scripts import clockify_sheet_publish as publisher
 from scripts import review_corrections, semantic_analyzer, evidence_ledger
 from scripts.autopilot_process import ChildResult
 from test_review_batch_publication import source
+from test_review_batches import natural_batch_sources
 from test_sheet_publish import StatefulGateway
 
 
@@ -99,6 +100,38 @@ class AutomaticPreparationTests(unittest.TestCase):
             publication_profile=None)
         self.assertEqual(expected[0], {key: result["publications"][0][key] for key in expected[0]})
 
+    def test_fresh_natural_batch_does_not_reinterpret_existing_v5_threshold_package(self):
+        self.sources = natural_batch_sources(34)
+        model, revision = semantic_analyzer.CURRENT_LIVE_FLASH_ROUTE
+        activities = []
+        for item in self.sources:
+            item["provenance"].update(semantic_reviewer_model=model, semantic_reviewer_revision=revision)
+            activities.append({"activity_id": item["activity_id"], "evidence_ids": item["provenance"]["evidence_ids"],
+                "rendered_description": "SC — Prepared guarded source publication safely",
+                "semantic_reviewer_model": model, "semantic_reviewer_revision": revision})
+        self.write(self.run / "proposals.json", self.sources)
+        self.write(self.run / "semantic-analysis.json", {"activities": activities})
+        authority = {name: prepared.artifact_handle(self.run / filename) for name, filename in prepared.AUTHORITY_FILES.items()}
+        fields = prepared._auto_fields(self.sources, authority, self.run, "Europe/Bucharest",
+                                      consolidation_policy="approved-daily-project-presentation/v5")
+        self.assertEqual(10, len(fields["package"]["activities"]))
+        legacy = {"schema_version": prepared.AUTO_SCHEMA, "run_id": "source-run", "spreadsheet_id": "sheet",
+            "sheet_title": "August 2026 review", "source_proposals": prepared.artifact_handle(self.run / "proposals.json"),
+            "timezone": "Europe/Bucharest", "authority": authority,
+            "consolidation_policy": "approved-daily-project-presentation/v5", **fields}
+        old = self.root / "legacy-v5.json"
+        self.write(old, legacy)
+        before = old.read_bytes()
+        prepared.prepare(source_dir=self.run, output=old, run_id="source-run", spreadsheet_id="sheet",
+            sheet_title="August 2026 review", timezone="Europe/Bucharest")
+        self.assertEqual(before, old.read_bytes())
+        result = self.prepare()
+        document, _ = prepared.load(self.root / "prepared.json")
+        self.assertEqual(1, len(document["package"]["activities"]))
+        self.assertEqual("approved-daily-project-presentation/v6", document["consolidation_policy"])
+        self.assertEqual(9120, result["prepared_seconds"])
+        self.assertEqual(0, result["unprepared_seconds"])
+
     def test_fresh_structured_preparation_removes_internal_outcome_not_time_or_status(self):
         parts = [
             ("Installed", "locked dependencies", "111 locked Composer packages installed and 46 PHP files lint clean"),
@@ -122,7 +155,7 @@ class AutomaticPreparationTests(unittest.TestCase):
         self.assertEqual(154, outcome["prepared_seconds"])
         self.assertEqual(0, outcome["unprepared_seconds"])
         document, _ = prepared.load(self.root / "prepared.json")
-        self.assertEqual("approved-daily-project-presentation/v5", document["consolidation_policy"])
+        self.assertEqual("approved-daily-project-presentation/v6", document["consolidation_policy"])
         activity = document["package"]["activities"][0]
         self.assertEqual(["SC — Installed locked dependencies", "SC — Built PHP-FPM isolation role"],
                          [item["description"] for item in activity["prepared_descriptions"]])

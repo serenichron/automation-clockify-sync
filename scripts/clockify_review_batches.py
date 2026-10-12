@@ -95,6 +95,7 @@ def package_review_batches(
     wording_only_ids: Iterable[str] = (),
     allow_review_overlaps: bool = False,
     allow_clockify_overlaps: bool = False,
+    natural_batches: bool = False,
 ) -> dict[str, list[dict[str, Any]]]:
     """Consolidate compatible sub-fifteen-minute sources to reviewable batches.
 
@@ -102,6 +103,9 @@ def package_review_batches(
     trailing compatible residual joins the preceding batch. A group with less
     than fifteen minutes total stays honest; time is never invented to meet a
     presentation target. No arbitrary upper duration cap is imposed.
+    Explicit ``natural_batches`` presentation instead keeps all eligible
+    children in each existing day/project/tags/billable/work-context group in
+    one parent. Original child windows and seconds are always retained.
 
     ``work_contexts`` must contain caller-verified work identities, not labels
     synthesized from date/project. ``editorial_descriptions`` must contain the
@@ -146,7 +150,7 @@ def package_review_batches(
         if any(str(source.get(field) or "").strip().casefold() in {"approved", "posted"}
                for field in ("disposition", "review_status", "status")):
             reasons.append("approved_or_posted")
-        if (allow_review_overlaps or allow_clockify_overlaps or review_id in wording_only) and any(
+        if (allow_review_overlaps or allow_clockify_overlaps or natural_batches or review_id in wording_only) and any(
                 str(source.get(field) or "").strip().casefold() in {"approve", "skip", "skipped", "rejected", "superseded"}
                 for field in ("disposition", "review_status", "status")):
             reasons.append("protected_terminal_status")
@@ -254,6 +258,10 @@ def package_review_batches(
         grouped.setdefault(key, []).append(item)
     activities = []
     for key in sorted(grouped):
+        if natural_batches:
+            activities.append(_activity(grouped[key],
+                allow_review_overlaps=allow_review_overlaps or allow_clockify_overlaps))
+            continue
         partitions: list[list[dict[str, Any]]] = []
         current: list[dict[str, Any]] = []
         total = 0
@@ -283,6 +291,7 @@ def verify_package(
     wording_only_ids: Iterable[str] = (),
     allow_review_overlaps: bool = False,
     allow_clockify_overlaps: bool = False,
+    natural_batches: bool = False,
 ) -> dict[str, list[dict[str, Any]]]:
     """Bind a prepared projection to original sources, not claimed totals.
 
@@ -316,6 +325,7 @@ def verify_package(
         protected_ids=protected_ids, timezone=timezone, wording_only_ids=wording_only_ids,
         allow_review_overlaps=allow_review_overlaps,
         allow_clockify_overlaps=allow_clockify_overlaps,
+        natural_batches=natural_batches,
     )
     if package["activities"] != expected["activities"]:
         raise ValueError("review batch differs from original sources or preparation")

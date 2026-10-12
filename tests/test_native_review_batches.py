@@ -10,7 +10,7 @@ from scripts import clockify_native_sheet_post as native
 from scripts import clockify_review_batches as batches
 from scripts import clockify_sheet_publish as publisher
 from test_clockify_native_sheet_post import FakeGateway, capture, route, row
-from test_review_batches import proposal, identity
+from test_review_batches import proposal, identity, natural_batch_sources
 
 
 NOW = dt.datetime(2026, 10, 4, 11, tzinfo=dt.timezone.utc)
@@ -67,6 +67,29 @@ class NativeReviewBatchTests(unittest.TestCase):
                          [entry["payload"]["start"] for entry in fresh["entries"]])
         self.assertEqual(["2026-09-29T07:01:18Z", "2026-09-29T07:11:23Z"],
                          [entry["payload"]["end"] for entry in fresh["entries"]])
+
+    def test_v6_natural_parent_reconstructs_every_original_disjoint_child_payload(self):
+        self.sources = natural_batch_sources(34)
+        for item in self.sources:
+            item.update(clockify_project_suffix="123456", tag_names=["Process"], tag_suffixes=["654321"])
+        descriptions = {identity(n): f"SC — Prepared task {n}" for n in range(1, 35)}
+        self.contexts = dict.fromkeys(descriptions, "explicit-work")
+        package = batches.package_review_batches(self.sources, editorial_descriptions=descriptions,
+            work_contexts=self.contexts, natural_batches=True)
+        group = package["activities"][0]
+        plan = self.plan(sheet_row=publisher.portfolio_row(group, "source-run"), package=package,
+            authority={"consolidation_policy": "approved-daily-project-presentation/v6", "wording_only_ids": []})
+        self.assertEqual(1, plan["row_count"])
+        self.assertEqual(34, len(plan["entries"]))
+        self.assertEqual(9120, sum(entry["duration_minutes"] * 60 for entry in plan["entries"]))
+        self.assertEqual([identity(n) for n in range(1, 35)], [entry["review_id"] for entry in plan["entries"]])
+        self.assertEqual([descriptions[identity(n)] for n in range(1, 35)],
+                         [entry["payload"]["description"] for entry in plan["entries"]])
+        self.assertEqual([dt.datetime.fromisoformat(p["start"]).astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+                          for p in self.sources], [entry["payload"]["start"] for entry in plan["entries"]])
+        self.assertEqual([dt.datetime.fromisoformat(p["end"]).astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+                          for p in self.sources], [entry["payload"]["end"] for entry in plan["entries"]])
+        self.assertEqual(set(descriptions), native._independent_review_ids(plan))
 
     def test_v4_existing_overlap_reconstructs_exact_children_without_alias_credit(self):
         for number, source in enumerate(self.sources, 1):
