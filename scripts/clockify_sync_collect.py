@@ -127,6 +127,8 @@ CANONICAL_EXPORT_TIMEOUT_MIN_SECONDS = 60
 CANONICAL_EXPORT_TIMEOUT_MAX_SECONDS = 1800
 CANONICAL_EXPORT_ENVELOPE_PREFIX = "clockify-canonical-v1:"
 COMPATIBLE_CANONICAL_EXPORT_DIGESTS = frozenset({
+    # Historical snapshot validation only. Wire compatibility does not establish
+    # current parser coverage; live admission uses the modern-only list below.
     # Approved 5d329568 / dd455bb fleet exporter. Later coordinator-only
     # attestation changes do not alter its evidence-export contract.
     "fd8d72d4f3469a91087568da1a953c1f8bb09a45bef572a0a4390476101053bb",
@@ -136,6 +138,11 @@ COMPATIBLE_CANONICAL_EXPORT_DIGESTS = frozenset({
     # Approved bab6bdf8 fleet exporter. Repository comparison confirms its
     # canonical export envelope and two-step attestation protocol are unchanged.
     "df85b284c6d99f34e4c68f2012ee052e27bdceea73de1bf3382c4ef49efacccd",
+})
+MODERN_CANONICAL_EXPORT_DIGESTS = frozenset({
+    # Exact 9726a5f / 0af22c1 collector bytes: modern Codex messages, paired
+    # transport deduplication and scoped rollout recovery are supported.
+    "a7519dd43c6a7f1ab554b997812d13822bae7ac9497534811c6391212fb4b00e",
 })
 BUCHAREST = ZoneInfo("Europe/Bucharest")
 
@@ -1700,12 +1707,11 @@ def collect_remote_sessions(
                     runtime = attestation.get("runtime_identity")
                     if (
                         remote_digest != negotiated_digest
-                        and remote_digest in COMPATIBLE_CANONICAL_EXPORT_DIGESTS
+                        and remote_digest in MODERN_CANONICAL_EXPORT_DIGESTS
                     ):
-                        # The first request is an attestation-only handshake.
-                        # Rerun only an explicitly allowlisted exporter digest;
-                        # arbitrary remote code never receives evidence-export
-                        # authority from its self-reported checksum.
+                        # The first request is attestation-only. Only an exact
+                        # exporter with verified current parser capability may
+                        # receive authority for the second evidence export.
                         negotiated_digest = remote_digest
                         canonical = run_canonical(negotiated_digest)
                         if canonical.returncode != 0:
@@ -1732,9 +1738,17 @@ def collect_remote_sessions(
                         )
                         runtime = attestation.get("runtime_identity")
                     if remote_digest != negotiated_digest:
+                        # Old accepted wire formats omit modern Codex messages.
+                        # Preserve their historical receipts, but do not grant a
+                        # second live export based on that historical allowlist.
                         result["errors"].append(
-                            "canonical remote evidence export script digest mismatch; no legacy metadata fallback used"
+                            "canonical remote evidence export script digest mismatch; current parser capability requires matching or verified modern collector bytes; no legacy metadata fallback used"
                         )
+                        result["canonical_export"] = {
+                            "status": "capability_mismatch",
+                            "collector_script_sha256": remote_digest,
+                            "coordinator_collector_script_sha256": expected_script_digest,
+                        }
                         return result
                     if not isinstance(runtime, dict):
                         result["errors"].append(

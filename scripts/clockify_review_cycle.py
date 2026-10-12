@@ -4620,7 +4620,10 @@ def _verify_fresh_native_source(config: Mapping[str, Any], record: Mapping[str, 
                     host.get("collector_contract") != "canonical_export_v1"
                     or not isinstance(attestation, Mapping) or not isinstance(export, Mapping)
                     or export.get("provenance") != "full_context_remote_export"
-                    or attestation.get("collector_script_sha256") not in {digest, *collector.COMPATIBLE_CANONICAL_EXPORT_DIGESTS}
+                    or attestation.get("collector_script_sha256") not in {
+                        digest, *collector.COMPATIBLE_CANONICAL_EXPORT_DIGESTS,
+                        *collector.MODERN_CANONICAL_EXPORT_DIGESTS,
+                    }
                     or export.get("collector_script_sha256") != attestation.get("collector_script_sha256")
                     or not isinstance(attestation.get("runtime_identity"), Mapping)
                 ):

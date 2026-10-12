@@ -398,11 +398,11 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
         write_json(self.state_dir / "review-cycle-state.json", state)
         return config, record, manifest
 
-    def make_modern_raw_source(self, config, *, name="source-run", attest=True, incomplete_peer=False):
+    def make_modern_raw_source(self, config, *, name="source-run", attest=True, incomplete_peer=False, peer_collector_digest=None):
         result = make_run(self.root, name, replay=False, runtime_identity=config["_runtime_identity"], analyzer_tier="fixture", record_checkpoint=False)
         run = result.parent
         runtime = config["_runtime_identity"]
-        collector_digest = hashlib.sha256(Path(runtime["collector_path"]).read_bytes()).hexdigest()
+        collector_digest = peer_collector_digest or hashlib.sha256(Path(runtime["collector_path"]).read_bytes()).hexdigest()
         host = {"machine": "macbook", "status": "ok", "complete": True,
             "collector_contract": "canonical_export_v1", "claude_bursts": [], "hermes_sessions": [],
             "hermes_db_sessions": [], "codex_sessions": [], "repository_events": [],
@@ -440,6 +440,40 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
         backlog=store.open(backlog_identity,planned)
         store.record_complete(backlog,finalization["slice_id"],(run/"completion-bundle.json").resolve(),"sha256:"+hashlib.sha256((run/"completion-bundle.json").read_bytes()).hexdigest())
         return result
+
+    def assert_fleet_export_snapshot_delivers_and_revalidates(self, peer_digest):
+        config, _, _ = self.fresh_routing_fixture()
+        def child(command, **_kwargs):
+            if "--replay-from" in command:
+                path = make_run(self.root, "replay-run", replay=True,
+                    snapshots_from=self.root / "runs/source-run", runtime_identity=config["_runtime_identity"],
+                    analyzer_tier="fixture", ledger_from=self.root / "runs/source-run")
+            elif "clockify_sheet_publish.py" in command[1]:
+                return publisher_result_for_command(config, command)
+            else:
+                path = self.make_modern_raw_source(config, peer_collector_digest=peer_digest)
+            return ChildResult(0, str(path) + "\n", "", False, 0.1)
+        try:
+            with mock.patch.object(cycle, "run_child_bounded", side_effect=child):
+                result = cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 10))
+        except cycle.CycleError as exc:
+            self.fail(f"Content-pinned fleet source must remain admissible: {exc}")
+        self.assertEqual("delivered", result["status"])
+        source_snapshot = self.root / "runs/source-run/evidence/sessions.json"
+        before = source_snapshot.read_bytes()
+        state = json.loads((self.state_dir / "review-cycle-state.json").read_text())
+        cycle._validate_delivered_state(config, state)
+        self.assertEqual(before, source_snapshot.read_bytes())
+
+    def test_fresh_source_accepts_verified_modern_peer_with_newer_coordinator(self):
+        """Catches live modern admission being rejected by native source validation."""
+        self.assert_fleet_export_snapshot_delivers_and_revalidates(
+            "a7519dd43c6a7f1ab554b997812d13822bae7ac9497534811c6391212fb4b00e")
+
+    def test_delivered_source_preserves_historical_peer_exporter_receipt(self):
+        """Catches tightening live admission invalidating a sealed historical peer snapshot."""
+        self.assert_fleet_export_snapshot_delivers_and_revalidates(
+            "6550287f05bd8bdd8bf1e133a6edd6d0d58be469e47f9d0c54c6811d16f4c240")
 
     def test_fresh_routing_attempt_binds_before_child_and_preserves_legacy_history(self):
         """Catches stale no-runner legacy bindings stopping the next modern collection."""
