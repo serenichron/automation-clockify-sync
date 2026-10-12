@@ -166,7 +166,10 @@ class SelectedHistoricalDeliveryTests(unittest.TestCase):
             {name:source/name for name in review._RECONCILIATION_INPUTS.values()},executor_runtime_identity={'git_sha':'fixture-sha'},environment={})
         files=('semantic-analysis.json','work-accounting-result.json','quality_report.json','review-snapshot.json','proposals.json','ambiguous.json','fathom-reconciliation.json')
         for name in files:(derived/name).write_bytes((source/name).read_bytes())
-        analysis=json.loads((derived/'semantic-analysis.json').read_text());analysis['activities'][0]['analyzer_tier']='fixture'
+        analysis=json.loads((derived/'semantic-analysis.json').read_text())
+        # All selected targets are synthetic fixture activities, not cached inference.
+        for activity in analysis['activities']:
+            activity['analyzer_tier']='fixture'
         write_json(derived/'semantic-analysis.json',analysis)
         bundle=review._finalize_collector_derivation_completion(derived)
         document=json.loads((previous/'autopilot-result.json').read_text())

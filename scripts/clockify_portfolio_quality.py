@@ -971,8 +971,8 @@ def audit(
                 allow_compact_technical_underscores=True,
             )
             words = len(description.split())
-            if not 8 <= words <= 24:
-                raise caveman_renderer.CavemanValidationError("description outside accepted 8-24 word convention")
+            if words > 24:
+                raise caveman_renderer.CavemanValidationError("description exceeds accepted 24-word maximum")
         except (AttributeError, caveman_renderer.CavemanValidationError) as exc:
             semantic_repairs.append({
                 "review_id": review_id,

@@ -201,6 +201,27 @@ class ReviewCycleArtifactContractTests(unittest.TestCase):
 
 
 class ReviewCycleEntrypointTests(unittest.TestCase):
+    @staticmethod
+    def write_review_inputs(root: Path) -> None:
+        # Preparation reads sealed routing and correction authority, just as a
+        # real replay does. A JSON object is not an empty JSONL decision ledger.
+        write_json(root / "routing.json", {
+            "workspace_id": "workspace-1",
+            "member_id": "member-1",
+            "session_routes": [{
+                "project_suffix": "775f9f",
+                "project_name": "Serenichron Level 2",
+                "prefix": "SC",
+                "tag_names": ["Delivery"],
+                "tag_suffixes": ["111111"],
+                "billable": True,
+            }],
+            "meeting_routes": [],
+            "evidence_routes": [],
+        })
+        for filename in ("corrections.jsonl", "acceptance.jsonl"):
+            (root / filename).write_text("", encoding="utf-8")
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -208,12 +229,7 @@ class ReviewCycleEntrypointTests(unittest.TestCase):
         self.runs_dir = self.root / "operational" / "runs"
         self.state_dir = self.root / "state"
         self.cache = self.state_dir / "analyzer-cache.jsonl"
-        for filename, value in (
-            ("routing.json", {"workspace_id": "workspace-1", "member_id": "member-1"}),
-            ("corrections.jsonl", {}),
-            ("acceptance.jsonl", {}),
-        ):
-            write_json(self.root / filename, value)
+        self.write_review_inputs(self.root)
         self.config = {
             "root": str(self.root),
             "runs_dir": str(self.runs_dir),
@@ -545,12 +561,7 @@ class ReviewCycleEntrypointTests(unittest.TestCase):
                 nested.runs_dir = nested.root / "operational" / "runs"
                 nested.state_dir = nested.root / "state"
                 nested.cache = nested.state_dir / "analyzer-cache.jsonl"
-                for filename, value in (
-                    ("routing.json", {"workspace_id": "workspace-1", "member_id": "member-1"}),
-                    ("corrections.jsonl", {}),
-                    ("acceptance.jsonl", {}),
-                ):
-                    write_json(nested.root / filename, value)
+                self.write_review_inputs(nested.root)
                 nested.config = {
                     **self.config,
                     "root": str(nested.root),

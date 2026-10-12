@@ -2317,6 +2317,22 @@ def _receipt_publication_config(config: Mapping[str, Any], document: Mapping[str
                 raise CycleError("delivery publication input artifact has drifted") from exc
         elif key in config:
             config = {name: value for name, value in config.items() if name != key}
+    if "review_preparation" in document:
+        try:
+            from scripts import clockify_review_batch_publication as prepared
+            proof = document["review_preparation"]
+            if not isinstance(proof, Mapping) or set(proof) != {"binding", "outcome"}:
+                raise ValueError("partial editorial preparation proof differs")
+            adoptions._capture(proof["binding"], {})
+            frozen, _handle = prepared.load(Path(proof["binding"]["path"]))
+            if (frozen["schema_version"] != prepared.AUTO_SCHEMA or proof["outcome"] != frozen["preparation_outcome"]
+                    or proof["outcome"]["status"] != "incomplete" or proof["outcome"]["unprepared_seconds"] <= 0):
+                raise ValueError("partial editorial preparation outcome differs")
+            if config.get("review_batch_publication") not in {None, proof["binding"]["path"]}:
+                raise ValueError("partial editorial preparation bindings differ")
+            config = {**config, "review_batch_publication": proof["binding"]["path"]}
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise CycleError("delivery partial editorial preparation proof has drifted") from exc
     historical_handles = [item["historical_sources"] for item in records
                           if isinstance(item, Mapping) and "historical_sources" in item] if isinstance(records, list) else []
     if historical_handles:
@@ -2693,6 +2709,13 @@ def _delivery_document(
     if source.get("coverage", {}).get("status") == "incomplete":
         unsigned["schema_version"] = PARTIAL_RECEIPT_SCHEMA_VERSION
         unsigned["source_completeness"] = dict(source["coverage"])
+    prepared_path = _source_publication_input(config, source, sheet_title=sheet_title, key="review_batch_publication")
+    if prepared_path is not None:
+        from scripts import clockify_review_batch_publication as prepared
+        frozen, handle = prepared.load(prepared_path)
+        if frozen.get("preparation_outcome", {}).get("status") == "incomplete":
+            unsigned["schema_version"] = PARTIAL_RECEIPT_SCHEMA_VERSION
+            unsigned["review_preparation"] = {"binding": handle, "outcome": frozen["preparation_outcome"]}
     if publication_profile is not None:
         unsigned["publication_profile"] = publication_profile
     meeting_bindings = _meeting_bindings_for_target(config, sheet_title)
@@ -4733,7 +4756,7 @@ def _validate_delivered_state(config: Mapping[str, Any], state: Mapping[str, Any
         raise CycleError("cycle state slices are invalid")
     for since, raw_record in slices.items():
         if not isinstance(raw_record, Mapping) or raw_record.get("status") not in {
-            "delivered", "delivered_with_exceptions", "published_with_source_gaps",
+            "delivered", "delivered_with_exceptions", "published_with_source_gaps", "published_with_preparation_gaps",
         }:
             continue
         until = raw_record.get("until")
@@ -4808,8 +4831,11 @@ def _validate_delivered_state(config: Mapping[str, Any], state: Mapping[str, Any
                 _verify_historical_adoption(
                     stage_config, raw_record, adoption, since, until, source, replay,
                 )
-            partial = raw_record.get("status") == "published_with_source_gaps"
-            if partial != (source["coverage"].get("status") != "complete"):
+            source_partial = source["coverage"].get("status") != "complete"
+            preparation_partial = raw_record.get("status") == "published_with_preparation_gaps"
+            partial = raw_record.get("status") == "published_with_source_gaps" or preparation_partial
+            if ((raw_record.get("status") == "published_with_source_gaps" and not source_partial)
+                    or (not partial and source_partial)):
                 raise CycleError("publication status differs from source coverage")
             receipt = raw_record.get("publication_receipt" if partial else "delivery_receipt")
             if not isinstance(receipt, str):
@@ -4818,6 +4844,15 @@ def _validate_delivered_state(config: Mapping[str, Any], state: Mapping[str, Any
             _verify_delivery_receipt(
                 Path(receipt), graph_config, since, until, source, replay, sheet_title=title
             )
+            proof = _json_file(Path(receipt), "delivered publication receipt").get("review_preparation")
+            if preparation_partial != (proof is not None):
+                raise CycleError("publication status differs from immutable preparation outcome")
+            if preparation_partial:
+                stored = raw_record.get("review_preparation")
+                if (not isinstance(stored, Mapping) or stored.get("binding") != proof["binding"]
+                        or any(stored.get(key) != value for key, value in proof["outcome"].items())
+                        or raw_record.get("exceptions_complete") is not False):
+                    raise CycleError("stored preparation debt differs from immutable publication proof")
 
 
 def _attempt_id(debt_id: str, ordinal: int) -> str:
@@ -5429,6 +5464,58 @@ def _run_exact_recovery(
     )
 
 
+def _prepare_new_publication(
+    config: Mapping[str, Any], source: Mapping[str, Any], *, sheet_title: str, state_dir: Path,
+) -> tuple[Mapping[str, Any], dict[str, Any]]:
+    """New-delivery-only preparation; never called to reconstruct old receipts."""
+    from scripts import clockify_review_batch_publication as prepared
+    source_dir = Path(str(source["run_dir"]))
+    # These adapters have their own immutable representation/retirement proofs.
+    # Combining them with automatic batches needs an explicit integration, not
+    # silently dropping a configured safeguard or reverting to raw proposals.
+    effective = dict(config)
+    exclusions = []
+    if config.get("meeting_publication_bindings"):
+        if _meeting_bindings_for_target(config, sheet_title) is not None:
+            exclusions.append("meeting_publication_bindings")
+        else:
+            effective.pop("meeting_publication_bindings", None)
+    for key in ("pending_review_selection", "publication_presentation"):
+        if config.get(key):
+            if _source_publication_input(config, source, sheet_title=sheet_title, key=key) is not None:
+                exclusions.append(key)
+            else:
+                effective.pop(key, None)
+    config = effective
+    tombstone_path = source_dir / "review-tombstones.json"
+    if tombstone_path.exists() and _json_file(tombstone_path, "native review tombstones"):
+        exclusions.append("native_review_tombstones")
+    if exclusions:
+        return config, {"status": "incomplete", "reason": "prepared_projection_integration_gap", "exclusions": exclusions}
+    explicit = _source_publication_input(config, source, sheet_title=sheet_title, key="review_batch_publication")
+    if explicit is not None:
+        document, handle = prepared.load(explicit)
+        proposals, _exceptions = _validate_accounting(source_dir)
+        prepared.project(path=explicit, source_dir=source_dir, proposals=proposals, run_id=str(source["run_id"]),
+            spreadsheet_id=str(config["spreadsheet_id"]), sheet_title=sheet_title,
+            project_allowlist=project_allowlist(_json_file(source_dir / "routing.json", "source routing snapshot")))
+        # Operator-directed immutable v1 captures remain compatible. They did
+        # not claim automatic full preparation, and this consumer cannot invent it.
+        outcome = document.get("preparation_outcome", {"status": "complete", "basis": "operator_directed_v1"})
+        return config, {**outcome, "binding": handle}
+    output = state_dir / "prepared-review-publications" / f"{source['run_id']}.json"
+    try:
+        outcome = prepared.prepare(source_dir=source_dir, output=output, run_id=str(source["run_id"]),
+            spreadsheet_id=str(config["spreadsheet_id"]), sheet_title=sheet_title, timezone=str(config["timezone"]))
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        # No raw source content is placed in state or error reporting. Preserve
+        # the already verified replay and require an explicit repair/retry.
+        if output.exists():
+            raise CycleError("immutable automatic review preparation drifted") from exc
+        return config, {"status": "incomplete", "reason": "editorial_authority_unavailable"}
+    return {**config, "review_batch_publication": outcome["binding"]["path"]}, outcome
+
+
 def _run_slice(
     config: Mapping[str, Any], state: dict[str, Any], state_path: Path,
     state_dir: Path, root: Path, since: str, until: str,
@@ -5856,19 +5943,42 @@ def _run_slice(
         record.update({"status": "replay_verified", "replay": replay})
         _persist_state(state_path, state, since, record)
 
-    receipt_path = (
-        state_dir / "partial-publication-receipts" / f"{since}-{source['run_id']}.json"
-        if partial_publication else state_dir / "delivery-receipts" / f"{since}.json"
-    )
+    partial_receipt_path = state_dir / "partial-publication-receipts" / f"{since}-{source['run_id']}.json"
+    receipt_path = (partial_receipt_path if partial_publication or partial_receipt_path.exists()
+                    else state_dir / "delivery-receipts" / f"{since}.json")
     publisher_result_path = (
         _runs_dir(config) / f"publication-{source['run_id']}" / "autopilot-result.json"
     )
+    preparation_partial = False
     if receipt_path.exists():
         _verify_delivery_receipt(
             receipt_path, config, since, until, source, replay,
             sheet_title=sheet_title,
         )
+        historical = _json_file(receipt_path, "existing publication receipt")
+        if "review_preparation" in historical:
+            preparation_partial = True
+            record["review_preparation"] = {**historical["review_preparation"]["outcome"],
+                "binding": historical["review_preparation"]["binding"]}
     else:
+        config, preparation = _prepare_new_publication(config, source, sheet_title=sheet_title, state_dir=state_dir)
+        record["review_preparation"] = preparation
+        if preparation["status"] != "complete":
+            ready = preparation.get("prepared_seconds", 0) > 0
+            if not ready and preparation.get("binding"):
+                # Existing native monthly evidence remains visible even when
+                # no routed primary row is publication-ready.
+                ready = bool(clockify_monthly_unresolved.project_rows(Path(str(source["run_dir"]))))
+            if not ready:
+                record["status"] = "incomplete"
+                record["exceptions_complete"] = False
+                _persist_state(state_path, state, since, record)
+                return {"status": "incomplete", "reason": preparation.get("reason", "review_preparation_incomplete"),
+                        "preparation": preparation, "slice": {"since": since, "until": until},
+                        "advance_frontier": False}
+            preparation_partial = True
+            receipt_path = partial_receipt_path
+        _persist_state(state_path, state, since, record)
         receipt = _delivery_document(
             config, since, until, source, replay, sheet_title=sheet_title
         )
@@ -5915,6 +6025,7 @@ def _run_slice(
 
     record.update({
         "status": (
+            "published_with_preparation_gaps" if preparation_partial else
             "published_with_source_gaps" if partial_publication else
             "delivered_with_exceptions" if source["exception_ids"] else "delivered"
         ),
@@ -5922,14 +6033,14 @@ def _run_slice(
         "replay_run_id": replay["run_id"],
         "review_ids": source["review_ids"],
         "exception_ids": source["exception_ids"],
-        "exceptions_complete": not source["exception_ids"],
+        "exceptions_complete": not source["exception_ids"] and not preparation_partial,
     })
-    record["publication_receipt" if partial_publication else "delivery_receipt"] = str(receipt_path.resolve())
+    record["publication_receipt" if partial_publication or preparation_partial else "delivery_receipt"] = str(receipt_path.resolve())
     _persist_state(state_path, state, since, record)
     return {
         "status": record["status"],
         "slice": {"since": since, "until": until, "exception_ids": source["exception_ids"]},
-        "advance_frontier": _record_advances_frontier(record, advance_frontier),
+        "advance_frontier": False if preparation_partial else _record_advances_frontier(record, advance_frontier),
     }
 
 
@@ -6135,7 +6246,7 @@ def _verify_selected_partial_predecessor(
     config: Mapping[str, Any], prior: Mapping[str, Any], since: str, until: str,
 ) -> None:
     """Authenticate only this retained partial graph, without inventing recovery."""
-    if prior.get("status") != "published_with_source_gaps":
+    if prior.get("status") not in {"published_with_source_gaps", "published_with_preparation_gaps"}:
         return
     if (prior.get("until") != until or prior.get("delivery_receipt") is not None
         or prior.get("historical_adoption_receipt") is not None):
@@ -6213,7 +6324,7 @@ def _adopt_selected_historical_slice(config: Mapping[str,Any], request: Mapping[
             raise CycleError("selected historical frozen period proof differs")
         # A partial publication may be superseded only after authenticating its
         # native graph. Its complete original record and receipt remain retained.
-        partial = prior.get("status") == "published_with_source_gaps"
+        partial = prior.get("status") in {"published_with_source_gaps", "published_with_preparation_gaps"}
         if (any(prior.get(k) is not None for k in ("delivery_receipt","historical_adoption_receipt"))
             or not partial and any(prior.get(k) is not None for k in ("replay","publication_receipt"))):
             raise CycleError("selected historical recovery cannot overwrite delivery history")
@@ -6597,6 +6708,7 @@ def run_cycle(config: Mapping[str, Any], *, enable_sheet_write: bool, today: dt.
         final_status = "delivered"
         final_reason: str | None = None
         any_exceptions = False
+        any_preparation_gaps = False
         budget = [float(config.get("total_child_budget_seconds", 7200))]
         for since, until, kind, generic in selected:
             if kind == "exact":
@@ -6617,6 +6729,7 @@ def run_cycle(config: Mapping[str, Any], *, enable_sheet_write: bool, today: dt.
             if outcome.get("reason") == "total_child_budget_exhausted":
                 final_reason = "total_child_budget_exhausted"
             any_exceptions = any_exceptions or final_status == "delivered_with_exceptions"
+            any_preparation_gaps = any_preparation_gaps or final_status == "published_with_preparation_gaps"
             if (
                 kind == "routine" and outcome.get("advance_frontier") is not False
             ) or outcome.get("advance_frontier") is True:
@@ -6626,8 +6739,10 @@ def run_cycle(config: Mapping[str, Any], *, enable_sheet_write: bool, today: dt.
                     state["scheduled_through"] = until
             _recompute_completed_through(config, state)
             _atomic(state_path, state)
-        if final_status not in {"incomplete", "failed", "recovery_blocked"} and any_exceptions:
+        if final_status not in {"incomplete", "failed", "recovery_blocked", "published_with_preparation_gaps"} and any_exceptions:
             final_status = "delivered_with_exceptions"
+        if any_preparation_gaps and final_status not in {"incomplete", "failed", "recovery_blocked"}:
+            final_status = "published_with_preparation_gaps"
         if final_reason == "total_child_budget_exhausted":
             final_status = "incomplete"
         result: dict[str, Any] = {"status": final_status, "slices": attempted}
@@ -6688,7 +6803,7 @@ def main(argv: list[str] | None = None) -> int:
         return 75
     if result.get("status") in {
         "idle", "locked", "delivered", "delivered_with_exceptions", "plan",
-        "published_with_source_gaps",
+        "published_with_source_gaps", "published_with_preparation_gaps",
     }:
         return 0
     print("clockify review cycle blocked: unsupported result status", file=sys.stderr)

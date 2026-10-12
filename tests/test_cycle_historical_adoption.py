@@ -305,7 +305,10 @@ class HistoricalAdoptionTests(unittest.TestCase):
         ):
             shutil.copyfile(collector / filename, derived / filename)
         analysis = json.loads((derived / "semantic-analysis.json").read_text())
-        analysis["activities"][0]["analyzer_tier"] = "fixture"
+        # These activities are hand-built adoption inputs, not analyzer output;
+        # every target must carry the fixture tier when a run has multiple rows.
+        for activity in analysis["activities"]:
+            activity["analyzer_tier"] = "fixture"
         write_json(derived / "semantic-analysis.json", analysis)
         bundle = clockify_review_run._finalize_collector_derivation_completion(derived)
         result = json.loads(self.source_result.read_text())

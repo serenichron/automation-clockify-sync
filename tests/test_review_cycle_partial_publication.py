@@ -70,7 +70,7 @@ class PartialPublicationTests(unittest.TestCase):
         self.assertEqual("published", document["status"])
         self.assertEqual(0, document["clockify_writes"])
         self.assertIn(
-            "wka-alpha-s01",
+            "wka-000000000000000000000001-s01",
             document["publications"][0]["row_ids"],
         )
         state = json.loads((fixture.state_dir / "review-cycle-state.json").read_text())

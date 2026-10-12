@@ -49,11 +49,19 @@ class ReviewCycleSourceDebtTests(unittest.TestCase):
         self.cache = self.root / "cache"
         self.cache.mkdir()
         for filename, value in (
-            ("routing.json", {"workspace_id": "workspace-1", "member_id": "member-1"}),
+            ("routing.json", {
+                "workspace_id": "workspace-1", "member_id": "member-1",
+                "session_routes": [{
+                    "project_suffix": "775f9f", "project_name": "Serenichron Level 2",
+                    "prefix": "SC", "tag_names": ["Delivery"], "tag_suffixes": ["111111"],
+                }],
+                "meeting_routes": [], "evidence_routes": [],
+            }),
             ("corrections.jsonl", {}),
             ("acceptance.jsonl", {}),
         ):
             write_json(self.root / filename, value)
+        (self.root / "corrections.jsonl").write_text("", encoding="utf-8")
         self.config = {
             "root": str(self.root),
             "runs_dir": str(self.root / "runs"),

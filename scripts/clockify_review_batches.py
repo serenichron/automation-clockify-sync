@@ -171,6 +171,10 @@ def package_review_batches(
                 or not _strings(source.get("tag_suffixes", [])) or type(source.get("billable")) is not bool
                 or not _text(source.get("activity_id"))):
             reasons.append("invalid_route_or_activity")
+        elif not source["tag_names"]:
+            # A valid untagged native entry cannot be represented by a
+            # portfolio parent, whose publication contract requires tags.
+            reasons.append("untagged_native_entry")
         items.append({"proposal": source, "review_id": review_id, "reasons": reasons,
                       "start": start, "end": end, "description": description, "context": context})
 
