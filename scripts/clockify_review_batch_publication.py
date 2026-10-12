@@ -23,6 +23,7 @@ CONSOLIDATION_POLICY = "approved-daily-project-presentation/v1"
 WORDING_CONSOLIDATION_POLICY = "approved-daily-project-presentation/v2"
 OVERLAP_CONSOLIDATION_POLICY = "approved-daily-project-presentation/v3"
 CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY = "approved-daily-project-presentation/v4"
+STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY = "approved-daily-project-presentation/v5"
 FIELDS = {"schema_version", "run_id", "spreadsheet_id", "sheet_title", "source_proposals",
           "editorial_descriptions", "work_contexts", "protected_ids", "timezone", "package"}
 STANDALONE_REASONS = {"meeting", "overlap_warning", "source_interval_overlap", "not_micro_entry",
@@ -33,9 +34,55 @@ WORDING_AUTO_FIELDS = AUTO_FIELDS | {"wording_only_ids"}
 AUTHORITY_FILES = {"semantic_analysis": "semantic-analysis.json",
                    "corrections": "review-corrections.jsonl", "routing": "routing.json"}
 
+_INTERNAL_JOURNAL_RE = re.compile(
+    r"\b(?:uncommitted|undeployed|lint\s+clean)\b|"
+    r"\b\d+\s+(?:(?:locked|combined|local|unit)\s+)*(?:Composer\s+packages|PHP\s+files|tests?)\b",
+    re.I,
+)
+_MEANINGFUL_OUTCOME_RE = re.compile(
+    r"[$€£]|\b(?:EUR|USD|GBP|RON|euros?|dollars?|saved|reduced|increased|delivered|"
+    r"approved|resolved|blocked|failed|unresolved|incomplete)\b|\b\d{4}-\d{2}-\d{2}\b|"
+    r"\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}\b",
+    re.I,
+)
+
+
+def _structured_editorial_description(activity: Mapping[str, Any], proposal: Mapping[str, Any]) -> Any:
+    """Omit whole clearly technical fields from an exact reviewed field render.
+
+    This is a narrow presentation transform, not a semantic certification.
+    Safe reviewed wording needs no new field contract. Ambiguous mixed outcomes
+    require explicit review rather than guessing, truncating, or deleting facts.
+    """
+    from scripts import clockify_portfolio_repair as repair
+    description = activity.get("rendered_description")
+    if not isinstance(description, str) or not _INTERNAL_JOURNAL_RE.search(description):
+        return description
+    parts = [activity.get(field) for field in ("action", "object", "outcome")]
+    if any(not isinstance(part, str) or not part or part != part.strip()
+           or any(char in part for char in "\n\r\t") for part in parts):
+        raise ValueError("missing_structured_editorial_authority")
+    prefix, separator, _ = description.partition(" — ")
+    if (not separator or f"{prefix} — {' '.join(parts)}" != description
+            or proposal.get("description") != description):
+        raise ValueError("structured_editorial_source_mismatch")
+    action, obj, outcome = parts
+    clean = f"{prefix} — {action} {obj}"
+    if _INTERNAL_JOURNAL_RE.search(obj):
+        if _MEANINGFUL_OUTCOME_RE.search(obj):
+            raise ValueError("inseparable_internal_editorial_object")
+        # Some reviewed actions already name the full accomplishment. Keep the
+        # entire action, never guess a new action/object split from its words.
+        clean = f"{prefix} — {action}"
+    if (_INTERNAL_JOURNAL_RE.search(clean) or repair.repair_reasons(clean)
+            or not _INTERNAL_JOURNAL_RE.search(outcome) or _MEANINGFUL_OUTCOME_RE.search(outcome)):
+        raise ValueError("inseparable_internal_editorial_outcome")
+    return clean
+
 
 def _derive_authority(proposals: Sequence[Mapping[str, Any]], authority: Mapping[str, Any],
-                      source_dir: Path, timezone: str, *, allow_wording_consolidation: bool = False) -> dict[str, Any]:
+                      source_dir: Path, timezone: str, *, allow_wording_consolidation: bool = False,
+                      clean_structured_outcomes: bool = False) -> dict[str, Any]:
     """Derive editorial maps from sealed reviewed sources, not raw descriptions.
 
     Daily-project context is an approved presentation policy identity. It does
@@ -120,6 +167,11 @@ def _derive_authority(proposals: Sequence[Mapping[str, Any]], authority: Mapping
                         provenance.get("semantic_reviewer_model"), provenance.get("semantic_reviewer_revision")) != (model, revision):
                     reasons.append("unapproved_or_mismatched_editorial_reviewer")
                 description = activity.get("rendered_description")
+                if clean_structured_outcomes and not reasons:
+                    try:
+                        description = _structured_editorial_description(activity, proposal)
+                    except ValueError as error:
+                        reasons.append(str(error))
         unsafe = repair.repair_reasons(description)
         if unsafe:
             reasons.append("unsafe_or_missing_reviewed_wording")
@@ -167,13 +219,17 @@ def _auto_fields(proposals: Sequence[Mapping[str, Any]], authority: Mapping[str,
                  source_dir: Path, timezone: str, *, consolidation_policy: str = CONSOLIDATION_POLICY) -> dict[str, Any]:
     fields = _derive_authority(proposals, authority, source_dir, timezone,
         allow_wording_consolidation=consolidation_policy in {WORDING_CONSOLIDATION_POLICY, OVERLAP_CONSOLIDATION_POLICY,
-                                                            CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY})
+                                                            CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
+                                                            STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY},
+        clean_structured_outcomes=consolidation_policy == STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY)
     protected_existing = fields.pop("protected_existing_ids")
     package = batches.package_review_batches(proposals, editorial_descriptions=fields["editorial_descriptions"],
         work_contexts=fields["work_contexts"], protected_ids=fields["protected_ids"], timezone=timezone,
         wording_only_ids=fields.get("wording_only_ids", ()),
-        allow_review_overlaps=consolidation_policy in {OVERLAP_CONSOLIDATION_POLICY, CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY},
-        allow_clockify_overlaps=consolidation_policy == CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY)
+        allow_review_overlaps=consolidation_policy in {OVERLAP_CONSOLIDATION_POLICY, CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
+                                                      STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY},
+        allow_clockify_overlaps=consolidation_policy in {CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
+                                                       STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY})
     fields["package"] = package
     members = _publication_members({**fields, "schema_version": AUTO_SCHEMA})
     withheld = [item for item in proposals if publisher.stable_review_id(item) not in members | protected_existing]
@@ -213,7 +269,7 @@ def prepare(*, source_dir: Path, output: Path, run_id: str, spreadsheet_id: str,
     proposals = json.loads(adoptions._capture(proposals_handle, {}))
     authority = {name: artifact_handle(source_dir / filename) for name, filename in AUTHORITY_FILES.items()}
     existing = load(output)[0] if output.exists() else None
-    policy = existing["consolidation_policy"] if existing is not None else CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY
+    policy = existing["consolidation_policy"] if existing is not None else STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY
     fields = _auto_fields(proposals, authority, source_dir, timezone, consolidation_policy=policy)
     document = {"schema_version": AUTO_SCHEMA, "run_id": run_id, "spreadsheet_id": spreadsheet_id,
         "sheet_title": sheet_title, "source_proposals": proposals_handle, "timezone": timezone,
@@ -237,7 +293,7 @@ def load(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
             or set(document) != (FIELDS if document["schema_version"] == SCHEMA else
                 WORDING_AUTO_FIELDS if document.get("consolidation_policy") in {
                     WORDING_CONSOLIDATION_POLICY, OVERLAP_CONSOLIDATION_POLICY,
-                    CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY} else AUTO_FIELDS)):
+                    CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY, STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY} else AUTO_FIELDS)):
         raise ValueError("prepared review publication fields differ")
     for field in ("run_id", "spreadsheet_id", "sheet_title", "timezone"):
         if not isinstance(document[field], str) or not document[field].strip():
@@ -254,7 +310,8 @@ def load(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
         raise ValueError("prepared review protected identities differ")
     if document["schema_version"] == AUTO_SCHEMA:
         if document["consolidation_policy"] not in {CONSOLIDATION_POLICY, WORDING_CONSOLIDATION_POLICY,
-                                                   OVERLAP_CONSOLIDATION_POLICY, CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY}:
+                                                   OVERLAP_CONSOLIDATION_POLICY, CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
+                                                   STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY}:
             raise ValueError("automatic preparation consolidation policy differs")
         source_handle = document["source_proposals"]
         proposals = json.loads(adoptions._capture(source_handle, {}))
@@ -282,15 +339,19 @@ def project(*, path: Path, source_dir: Path, proposals: Sequence[Mapping[str, An
         editorial_descriptions=document["editorial_descriptions"], work_contexts=document["work_contexts"],
         protected_ids=document["protected_ids"], timezone=document["timezone"],
         wording_only_ids=document.get("wording_only_ids", ()),
-        allow_review_overlaps=document.get("consolidation_policy") in {OVERLAP_CONSOLIDATION_POLICY, CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY},
-        allow_clockify_overlaps=document.get("consolidation_policy") == CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY)
+        allow_review_overlaps=document.get("consolidation_policy") in {OVERLAP_CONSOLIDATION_POLICY, CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
+                                                                    STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY},
+        allow_clockify_overlaps=document.get("consolidation_policy") in {CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
+                                                                     STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY})
     if expected != document["package"]:
         raise ValueError("prepared review package differs from explicit editorial inputs")
     package = batches.verify_package(document["package"], proposals=frozen,
         work_contexts=document["work_contexts"], protected_ids=document["protected_ids"],
         timezone=document["timezone"], wording_only_ids=document.get("wording_only_ids", ()),
-        allow_review_overlaps=document.get("consolidation_policy") in {OVERLAP_CONSOLIDATION_POLICY, CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY},
-        allow_clockify_overlaps=document.get("consolidation_policy") == CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY)
+        allow_review_overlaps=document.get("consolidation_policy") in {OVERLAP_CONSOLIDATION_POLICY, CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
+                                                                    STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY},
+        allow_clockify_overlaps=document.get("consolidation_policy") in {CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
+                                                                     STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY})
     # Exercise native warning validation even though raw wording is not exposed.
     children = {publisher.stable_review_id(item): publisher.proposal_row(item, run_id,
                 project_allowlist=project_allowlist) for item in frozen
@@ -483,8 +544,10 @@ def stage_projection(path: Path) -> dict[str, Any]:
         editorial_descriptions=document["editorial_descriptions"], work_contexts=document["work_contexts"],
         protected_ids=set(document["protected_ids"]) | (set(origins) - eligible),
         wording_only_ids=document.get("wording_only_ids", ()), timezone=document["timezone"],
-        allow_review_overlaps=document.get("consolidation_policy") in {OVERLAP_CONSOLIDATION_POLICY, CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY},
-        allow_clockify_overlaps=document.get("consolidation_policy") == CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY)
+        allow_review_overlaps=document.get("consolidation_policy") in {OVERLAP_CONSOLIDATION_POLICY, CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
+                                                                    STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY},
+        allow_clockify_overlaps=document.get("consolidation_policy") in {CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
+                                                                     STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY})
     # A lone safe peer is already a usable native row: do not create a new
     # parent merely to move the same micro-entry under another identity.
     singles = [activity for activity in package["activities"] if len(activity["child_review_ids"]) == 1]

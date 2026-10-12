@@ -397,7 +397,8 @@ def _review_batch_groups(binding: Mapping[str, Any], timezone: str) -> tuple[dic
             if (not isinstance(authority, Mapping) or set(authority) != {"consolidation_policy", "wording_only_ids"}
                     or authority["consolidation_policy"] not in {
                         prepared.WORDING_CONSOLIDATION_POLICY, prepared.OVERLAP_CONSOLIDATION_POLICY,
-                        prepared.CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY}):
+                        prepared.CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
+                        prepared.STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY}):
                 raise NativePostError("review batch preparation authority differs")
             wording_ids = authority["wording_only_ids"]
             originals = {stable_review_id(source): source for source in sources}
@@ -410,8 +411,10 @@ def _review_batch_groups(binding: Mapping[str, Any], timezone: str) -> tuple[dic
                         for identity in wording_ids)):
                 raise NativePostError("review batch wording-only source authority differs")
             allow_overlaps = authority["consolidation_policy"] in {
-                prepared.OVERLAP_CONSOLIDATION_POLICY, prepared.CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY}
-            allow_clockify_overlaps = authority["consolidation_policy"] == prepared.CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY
+                prepared.OVERLAP_CONSOLIDATION_POLICY, prepared.CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
+                prepared.STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY}
+            allow_clockify_overlaps = authority["consolidation_policy"] in {
+                prepared.CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY, prepared.STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY}
         protected = {str(row["Review ID"]).strip() for _, row in binding["captured_rows"]
                      if str(row["Disposition"]).strip().casefold() == "approved"
                      or str(row["Review Status"]).strip().casefold() == "posted"}
@@ -475,11 +478,12 @@ def _group_payloads(group: Mapping[str, Any], route: Mapping[str, Any], *,
 
 
 def _independent_review_ids(plan: Mapping[str, Any]) -> set[str]:
-    """Only explicit v3/v4 source-bound claims are independent of payload aliases."""
+    """Only explicit v3-v5 source-bound claims are independent of payload aliases."""
     from scripts import clockify_review_batch_publication as prepared
     binding = plan.get("review_batches_binding") or {}
     if (binding.get("preparation_authority") or {}).get("consolidation_policy") not in {
-            prepared.OVERLAP_CONSOLIDATION_POLICY, prepared.CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY}:
+            prepared.OVERLAP_CONSOLIDATION_POLICY, prepared.CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
+            prepared.STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY}:
         return set()
     return {child for group in binding["package"]["activities"] for child in group["child_review_ids"]}
 
@@ -559,7 +563,8 @@ def build_plan(document: Mapping[str, Any], *, capture_sha256: str, routing: Map
                 raise NativePostError("Clockify route is missing for source-bound review batch")
             from scripts import clockify_review_batch_publication as prepared
             child_descriptions = (binding.get("preparation_authority") or {}).get("consolidation_policy") in {
-                prepared.OVERLAP_CONSOLIDATION_POLICY, prepared.CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY}
+                prepared.OVERLAP_CONSOLIDATION_POLICY, prepared.CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
+                prepared.STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY}
             payloads = _group_payloads(group, route, child_descriptions=child_descriptions)
         else:
             payload, seconds = _row_payload(row, routes, timezone)

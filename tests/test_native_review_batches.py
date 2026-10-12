@@ -38,7 +38,7 @@ class NativeReviewBatchTests(unittest.TestCase):
         self.group = self.package["activities"][0]
         self.sheet_row = publisher.portfolio_row(self.group, "source-run")
 
-    def plan(self, sheet_row=None, package=None, sources=None, contexts=None, extra_rows=()):
+    def plan(self, sheet_row=None, package=None, sources=None, contexts=None, extra_rows=(), authority=None):
         self.assertIn("review_batches", inspect.signature(native.build_plan).parameters,
                       "Native consumer must accept source-bound review batches")
         return native.build_plan(capture(sheet_row or self.sheet_row, *extra_rows),
@@ -47,11 +47,26 @@ class NativeReviewBatchTests(unittest.TestCase):
             projects=[{"id": "project-123456"}], tags=[{"id": "tag-654321"}], live_entries=[],
             review_batches=self.package if package is None else package,
             review_batch_sources=self.sources if sources is None else sources,
-            review_batch_work_contexts=self.contexts if contexts is None else contexts)
+            review_batch_work_contexts=self.contexts if contexts is None else contexts,
+            review_batch_authority=authority)
 
     def approval(self, plan):
         return native.approval_template(plan, approval_id="board-approval", approver="human board user",
                                        approved_at="2026-10-04T10:00:00Z", expires_at="2026-10-05T10:00:00Z")
+
+    def test_v5_editorial_authority_preserves_v4_native_segments_and_independent_children(self):
+        legacy = self.plan(authority={"consolidation_policy": "approved-daily-project-presentation/v4",
+                                      "wording_only_ids": []})
+        fresh = self.plan(authority={"consolidation_policy": "approved-daily-project-presentation/v5",
+                                     "wording_only_ids": []})
+        self.assertEqual(legacy["entries"], fresh["entries"])
+        self.assertEqual({identity(1), identity(2)}, native._independent_review_ids(fresh))
+        self.assertEqual(["SC — Prepared one", "SC — Prepared two"],
+                         [entry["payload"]["description"] for entry in fresh["entries"]])
+        self.assertEqual(["2026-09-29T07:00:07Z", "2026-09-29T07:10:00Z"],
+                         [entry["payload"]["start"] for entry in fresh["entries"]])
+        self.assertEqual(["2026-09-29T07:01:18Z", "2026-09-29T07:11:23Z"],
+                         [entry["payload"]["end"] for entry in fresh["entries"]])
 
     def test_v4_existing_overlap_reconstructs_exact_children_without_alias_credit(self):
         for number, source in enumerate(self.sources, 1):

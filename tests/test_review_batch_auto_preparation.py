@@ -99,6 +99,100 @@ class AutomaticPreparationTests(unittest.TestCase):
             publication_profile=None)
         self.assertEqual(expected[0], {key: result["publications"][0][key] for key in expected[0]})
 
+    def test_fresh_structured_preparation_removes_internal_outcome_not_time_or_status(self):
+        parts = [
+            ("Installed", "locked dependencies", "111 locked Composer packages installed and 46 PHP files lint clean"),
+            ("Built", "PHP-FPM isolation role", "39 combined local tests pass uncommitted and undeployed"),
+        ]
+        for source, activity, (action, obj, outcome) in zip(self.sources, self.analysis["activities"], parts):
+            activity.update(action=action, object=obj, outcome=outcome,
+                            rendered_description=f"SC — {action} {obj} {outcome}")
+            source["description"] = activity["rendered_description"]
+            source["review_warnings"] = [{"type": "estimated_session_placement", "reason": "Observed work; estimated placement."}]
+        self.write(self.run / "proposals.json", self.sources)
+        self.write(self.run / "semantic-analysis.json", self.analysis)
+        source_before = (self.run / "proposals.json").read_bytes()
+        authority = {name: prepared.artifact_handle(self.run / filename) for name, filename in prepared.AUTHORITY_FILES.items()}
+        historical = prepared._auto_fields(self.sources, authority, self.run, "Europe/Bucharest",
+            consolidation_policy="approved-daily-project-presentation/v4")
+        self.assertEqual([activity["rendered_description"] for activity in self.analysis["activities"]],
+                         [item["description"] for item in historical["package"]["activities"][0]["prepared_descriptions"]])
+        outcome = self.prepare()
+        self.assertEqual("complete", outcome["status"])
+        self.assertEqual(154, outcome["prepared_seconds"])
+        self.assertEqual(0, outcome["unprepared_seconds"])
+        document, _ = prepared.load(self.root / "prepared.json")
+        self.assertEqual("approved-daily-project-presentation/v5", document["consolidation_policy"])
+        activity = document["package"]["activities"][0]
+        self.assertEqual(["SC — Installed locked dependencies", "SC — Built PHP-FPM isolation role"],
+                         [item["description"] for item in activity["prepared_descriptions"]])
+        self.assertEqual([publisher.stable_review_id(p) for p in self.sources], activity["child_review_ids"])
+        self.assertEqual([(p["start"], p["end"], p["duration_seconds"]) for p in self.sources],
+                         [(p["start"], p["end"], p["duration_seconds"]) for p in activity["allocation_segments"]])
+        self.assertEqual([p["review_warnings"] for p in self.sources],
+                         [item["warnings"] for item in activity["child_review_warnings"]])
+        self.assertEqual(source_before, (self.run / "proposals.json").read_bytes())
+
+    def test_structured_clean_results_keep_amounts_dates_and_investigation_status(self):
+        parts = [
+            ("Reconciled", "client invoice", "saved EUR 111 for September 30"),
+            ("Investigated", "blocked isolation deployment", "39 combined local tests pass uncommitted and undeployed"),
+        ]
+        for source, activity, (action, obj, outcome) in zip(self.sources, self.analysis["activities"], parts):
+            activity.update(action=action, object=obj, outcome=outcome,
+                            rendered_description=f"SC — {action} {obj} {outcome}")
+            source["description"] = activity["rendered_description"]
+        self.write(self.run / "proposals.json", self.sources)
+        self.write(self.run / "semantic-analysis.json", self.analysis)
+        self.prepare()
+        document, _ = prepared.load(self.root / "prepared.json")
+        self.assertEqual(["SC — Reconciled client invoice saved EUR 111 for September 30",
+                          "SC — Investigated blocked isolation deployment"],
+                         list(document["editorial_descriptions"].values()))
+        self.assertEqual(154, document["preparation_outcome"]["prepared_seconds"])
+
+    def test_complete_reviewed_action_can_omit_whole_technical_object_and_outcome(self):
+        activity = self.analysis["activities"][0]
+        activity.update(action="Installed locked dependencies", object="111 locked Composer packages",
+            outcome="111 packages installed PHP 8.3 verified and 46 PHP files lint clean",
+            rendered_description="SC — Installed locked dependencies 111 locked Composer packages 111 packages installed PHP 8.3 verified and 46 PHP files lint clean")
+        self.sources[0]["description"] = activity["rendered_description"]
+        self.write(self.run / "proposals.json", self.sources)
+        self.write(self.run / "semantic-analysis.json", self.analysis)
+        before = (self.run / "semantic-analysis.json").read_bytes()
+        outcome = self.prepare()
+        self.assertEqual("complete", outcome["status"])
+        self.assertEqual(154, outcome["prepared_seconds"])
+        document, _ = prepared.load(self.root / "prepared.json")
+        self.assertEqual("SC — Installed locked dependencies",
+                         document["editorial_descriptions"][publisher.stable_review_id(self.sources[0])])
+        self.assertEqual(before, (self.run / "semantic-analysis.json").read_bytes())
+
+    def test_journal_cleanup_requires_exact_structured_source_authority(self):
+        baseline = copy.deepcopy(self.analysis["activities"][0])
+        baseline.update(action="Built", object="PHP-FPM isolation role",
+            outcome="39 combined local tests pass uncommitted and undeployed",
+            rendered_description="SC — Built PHP-FPM isolation role 39 combined local tests pass uncommitted and undeployed")
+        variants = [{"action": None}, {"object": None}, {"outcome": None},
+                    {"object": "different reviewed object"}, {"source_description": "SC — Unrelated raw wording"}]
+        for number, changes in enumerate(variants):
+            with self.subTest(changes=changes):
+                activity = copy.deepcopy(baseline)
+                source_description = changes.get("source_description", baseline["rendered_description"])
+                activity.update({key: value for key, value in changes.items() if key != "source_description"})
+                self.analysis["activities"][0] = activity
+                self.sources[0]["description"] = source_description
+                self.write(self.run / "proposals.json", self.sources)
+                self.write(self.run / "semantic-analysis.json", self.analysis)
+                outcome = prepared.prepare(source_dir=self.run, output=self.root / f"missing-{number}.json",
+                    run_id="source-run", spreadsheet_id="sheet", sheet_title="August 2026 review", timezone="Europe/Bucharest")
+                self.assertEqual("incomplete", outcome["status"])
+                self.assertEqual(71, outcome["unprepared_seconds"])
+                self.assertEqual(83, outcome["prepared_seconds"])
+                document, _ = prepared.load(self.root / f"missing-{number}.json")
+                self.assertNotIn(publisher.stable_review_id(self.sources[0]), document["editorial_descriptions"])
+                self.assertEqual(self.sources[0], document["package"]["retained"][0]["proposal"])
+
     def test_missing_or_unsafe_reviewed_wording_is_private_and_blocks_full_preparation(self):
         for wording in (None, "SC — Bad", "SC — See https://private.example.com/secret for execution details"):
             with self.subTest(wording=wording):

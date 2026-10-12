@@ -67,7 +67,7 @@ class BatchPublicationTests(unittest.TestCase):
             run_id="source-run", project_allowlist={}, source_dir=self.run,
             review_batch_publication=self.binding)
 
-    def test_existing_clockify_overlap_requires_v4_and_existing_v3_binding_is_unchanged(self):
+    def test_existing_clockify_overlap_requires_explicit_policy_and_existing_v3_binding_is_unchanged(self):
         sources = self.sources[:2]
         model, revision = semantic_analyzer.CURRENT_LIVE_FLASH_ROUTE
         for number, item in enumerate(sources, 1):
@@ -99,11 +99,11 @@ class BatchPublicationTests(unittest.TestCase):
         prepared.prepare(source_dir=self.run, output=self.binding, run_id="source-run",
             spreadsheet_id="sheet", sheet_title="August 2026 review", timezone="Europe/Bucharest")
         self.assertEqual(before, self.binding.read_bytes())
-        fresh = self.root / "fresh-v4.json"
+        fresh = self.root / "fresh-v5.json"
         prepared.prepare(source_dir=self.run, output=fresh, run_id="source-run",
             spreadsheet_id="sheet", sheet_title="August 2026 review", timezone="Europe/Bucharest")
         document, _ = prepared.load(fresh)
-        self.assertEqual("approved-daily-project-presentation/v4", document["consolidation_policy"])
+        self.assertEqual("approved-daily-project-presentation/v5", document["consolidation_policy"])
         self.assertEqual([], document["package"]["retained"])
         self.assertEqual(154, document["package"]["activities"][0]["duration_seconds"])
         projection = prepared.project(path=fresh, source_dir=self.run, proposals=sources,
