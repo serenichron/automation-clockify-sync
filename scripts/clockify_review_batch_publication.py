@@ -20,18 +20,21 @@ from scripts import clockify_sheet_publish as publisher
 SCHEMA = "review-batch-publication/v1"
 AUTO_SCHEMA = "review-batch-publication/v2"
 CONSOLIDATION_POLICY = "approved-daily-project-presentation/v1"
+WORDING_CONSOLIDATION_POLICY = "approved-daily-project-presentation/v2"
+OVERLAP_CONSOLIDATION_POLICY = "approved-daily-project-presentation/v3"
 FIELDS = {"schema_version", "run_id", "spreadsheet_id", "sheet_title", "source_proposals",
           "editorial_descriptions", "work_contexts", "protected_ids", "timezone", "package"}
 STANDALONE_REASONS = {"meeting", "overlap_warning", "source_interval_overlap", "not_micro_entry",
                      "untagged_native_entry"}
 AUTO_FIELDS = FIELDS | {"authority", "consolidation_policy", "standalone_review_ids",
                         "preparation_diagnostics", "preparation_outcome"}
+WORDING_AUTO_FIELDS = AUTO_FIELDS | {"wording_only_ids"}
 AUTHORITY_FILES = {"semantic_analysis": "semantic-analysis.json",
                    "corrections": "review-corrections.jsonl", "routing": "routing.json"}
 
 
 def _derive_authority(proposals: Sequence[Mapping[str, Any]], authority: Mapping[str, Any],
-                      source_dir: Path, timezone: str) -> dict[str, Any]:
+                      source_dir: Path, timezone: str, *, allow_wording_consolidation: bool = False) -> dict[str, Any]:
     """Derive editorial maps from sealed reviewed sources, not raw descriptions.
 
     Daily-project context is an approved presentation policy identity. It does
@@ -51,6 +54,11 @@ def _derive_authority(proposals: Sequence[Mapping[str, Any]], authority: Mapping
     routes = pipeline._routes_by_selection(routing)
     decisions = review_corrections.load_decisions(Path(authority["corrections"]["path"]))
     cases = review_corrections.derive_regression_cases(decisions)
+    # Historical timing metadata is intentionally not an executable regression
+    # decision, but its presence must not become wording-only grouping consent.
+    non_wording_targets = {(record.get("activity_id"), record.get("evidence_fingerprint"))
+        for record in review_corrections._read_log(Path(authority["corrections"]["path"]))
+        if record.get("record_type")} if allow_wording_consolidation else set()
     # The integrity-checked loader reads the same snapshot bytes, not a mutable
     # current configuration or corrections log outside this completed run.
     adoptions._capture(authority["corrections"], {})
@@ -59,26 +67,43 @@ def _derive_authority(proposals: Sequence[Mapping[str, Any]], authority: Mapping
         if isinstance(activity, Mapping) and (target := review_corrections.proposal_target(activity)):
             activities.setdefault(target, []).append(activity)
     descriptions, contexts, protected, standalone, diagnostics = {}, {}, set(), set(), []
+    wording_only = set()
     protected_existing = set()
     for proposal in proposals:
         identity = publisher.stable_review_id(proposal)
         target = review_corrections.proposal_target(proposal)
         matches = [case for case in cases if (case["activity_id"], case["evidence_fingerprint"]) == target]
+        terminal = {"approved", "posted", "rejected", "superseded"}
+        if allow_wording_consolidation:
+            terminal |= {"approve", "skip", "skipped"}
         if (any(case["decision"] in {"approve", "skip"} for case in matches)
-                or any(str(proposal.get(field) or "").strip().casefold() in {"approved", "posted", "rejected", "superseded"}
+                or any(str(proposal.get(field) or "").strip().casefold() in terminal
                        for field in ("disposition", "review_status", "status"))):
             protected.add(identity)
             protected_existing.add(identity)
             continue
         corrected = pipeline._description_from_review_correction(proposal, cases)
+        # Every effective exact-target correction must be description-only.
+        # Wording supersession deliberately leaves older routing cases active.
+        pure_wording = bool(matches) and all(
+            case["decision"] == "modify" and case["correction_categories"] == ["wording"]
+            and set(case["expected_field_patch"]) == {"description"}
+            and case["expected_field_patch"]["description"] == {"op": "replace", "value": corrected}
+            for case in matches)
+        pending = all(str(proposal.get(field) or "").strip().casefold() in {"", "pending", "unposted"}
+                      for field in ("disposition", "review_status", "status"))
+        group_corrected = (allow_wording_consolidation and pure_wording and pending
+                           and target not in non_wording_targets
+                           and corrected is not None and proposal.get("description") == corrected)
         if matches or proposal.get("human_corrected"):
-            protected.add(identity)
+            if not group_corrected:
+                protected.add(identity)
         reasons = []
         if corrected is not None:
             description = corrected
             if proposal.get("description") != corrected:
                 reasons.append("wording_correction_not_materialized_in_source")
-            else:
+            elif not group_corrected:
                 standalone.add(identity)
         else:
             reviewed = activities.get(target, [])
@@ -115,10 +140,13 @@ def _derive_authority(proposals: Sequence[Mapping[str, Any]], authority: Mapping
             continue
         descriptions[identity] = description
         contexts[identity] = CONSOLIDATION_POLICY
+        if group_corrected:
+            wording_only.add(identity)
     return {"editorial_descriptions": descriptions, "work_contexts": contexts,
             "protected_ids": sorted(protected), "standalone_review_ids": sorted(standalone),
             "preparation_diagnostics": sorted(diagnostics, key=lambda item: item["review_id"]),
-            "protected_existing_ids": protected_existing}
+            "protected_existing_ids": protected_existing,
+            **({"wording_only_ids": sorted(wording_only)} if allow_wording_consolidation else {})}
 
 
 def _publication_members(document: Mapping[str, Any]) -> set[str]:
@@ -135,11 +163,14 @@ def _publication_members(document: Mapping[str, Any]) -> set[str]:
 
 
 def _auto_fields(proposals: Sequence[Mapping[str, Any]], authority: Mapping[str, Any],
-                 source_dir: Path, timezone: str) -> dict[str, Any]:
-    fields = _derive_authority(proposals, authority, source_dir, timezone)
+                 source_dir: Path, timezone: str, *, consolidation_policy: str = CONSOLIDATION_POLICY) -> dict[str, Any]:
+    fields = _derive_authority(proposals, authority, source_dir, timezone,
+        allow_wording_consolidation=consolidation_policy in {WORDING_CONSOLIDATION_POLICY, OVERLAP_CONSOLIDATION_POLICY})
     protected_existing = fields.pop("protected_existing_ids")
     package = batches.package_review_batches(proposals, editorial_descriptions=fields["editorial_descriptions"],
-        work_contexts=fields["work_contexts"], protected_ids=fields["protected_ids"], timezone=timezone)
+        work_contexts=fields["work_contexts"], protected_ids=fields["protected_ids"], timezone=timezone,
+        wording_only_ids=fields.get("wording_only_ids", ()),
+        allow_review_overlaps=consolidation_policy == OVERLAP_CONSOLIDATION_POLICY)
     fields["package"] = package
     members = _publication_members({**fields, "schema_version": AUTO_SCHEMA})
     withheld = [item for item in proposals if publisher.stable_review_id(item) not in members | protected_existing]
@@ -178,13 +209,14 @@ def prepare(*, source_dir: Path, output: Path, run_id: str, spreadsheet_id: str,
     proposals_handle = artifact_handle(source_dir / "proposals.json")
     proposals = json.loads(adoptions._capture(proposals_handle, {}))
     authority = {name: artifact_handle(source_dir / filename) for name, filename in AUTHORITY_FILES.items()}
-    fields = _auto_fields(proposals, authority, source_dir, timezone)
+    existing = load(output)[0] if output.exists() else None
+    policy = existing["consolidation_policy"] if existing is not None else OVERLAP_CONSOLIDATION_POLICY
+    fields = _auto_fields(proposals, authority, source_dir, timezone, consolidation_policy=policy)
     document = {"schema_version": AUTO_SCHEMA, "run_id": run_id, "spreadsheet_id": spreadsheet_id,
         "sheet_title": sheet_title, "source_proposals": proposals_handle, "timezone": timezone,
-        "authority": authority, "consolidation_policy": CONSOLIDATION_POLICY, **fields}
+        "authority": authority, "consolidation_policy": policy, **fields}
     output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if output.exists():
-        existing, _handle = load(output)
         if existing != document:
             raise ValueError("immutable automatic preparation binding differs")
     else:
@@ -199,7 +231,9 @@ def load(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
     handle = artifact_handle(path)
     document = json.loads(adoptions._capture(handle, {}))
     if (not isinstance(document, dict) or document.get("schema_version") not in {SCHEMA, AUTO_SCHEMA}
-            or set(document) != (FIELDS if document["schema_version"] == SCHEMA else AUTO_FIELDS)):
+            or set(document) != (FIELDS if document["schema_version"] == SCHEMA else
+                WORDING_AUTO_FIELDS if document.get("consolidation_policy") in {
+                    WORDING_CONSOLIDATION_POLICY, OVERLAP_CONSOLIDATION_POLICY} else AUTO_FIELDS)):
         raise ValueError("prepared review publication fields differ")
     for field in ("run_id", "spreadsheet_id", "sheet_title", "timezone"):
         if not isinstance(document[field], str) or not document[field].strip():
@@ -215,12 +249,13 @@ def load(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
             or len(protected) != len(set(protected))):
         raise ValueError("prepared review protected identities differ")
     if document["schema_version"] == AUTO_SCHEMA:
-        if document["consolidation_policy"] != CONSOLIDATION_POLICY:
+        if document["consolidation_policy"] not in {CONSOLIDATION_POLICY, WORDING_CONSOLIDATION_POLICY, OVERLAP_CONSOLIDATION_POLICY}:
             raise ValueError("automatic preparation consolidation policy differs")
         source_handle = document["source_proposals"]
         proposals = json.loads(adoptions._capture(source_handle, {}))
         source_dir = Path(source_handle["path"]).parent
-        derived = _auto_fields(proposals, document["authority"], source_dir, document["timezone"])
+        derived = _auto_fields(proposals, document["authority"], source_dir, document["timezone"],
+                              consolidation_policy=document["consolidation_policy"])
         if any(document[key] != value for key, value in derived.items()):
             raise ValueError("automatic preparation editorial authority or derived maps differ")
     return document, handle
@@ -240,12 +275,15 @@ def project(*, path: Path, source_dir: Path, proposals: Sequence[Mapping[str, An
         raise ValueError("prepared review original proposal content differs")
     expected = batches.package_review_batches(frozen,
         editorial_descriptions=document["editorial_descriptions"], work_contexts=document["work_contexts"],
-        protected_ids=document["protected_ids"], timezone=document["timezone"])
+        protected_ids=document["protected_ids"], timezone=document["timezone"],
+        wording_only_ids=document.get("wording_only_ids", ()),
+        allow_review_overlaps=document.get("consolidation_policy") == OVERLAP_CONSOLIDATION_POLICY)
     if expected != document["package"]:
         raise ValueError("prepared review package differs from explicit editorial inputs")
     package = batches.verify_package(document["package"], proposals=frozen,
         work_contexts=document["work_contexts"], protected_ids=document["protected_ids"],
-        timezone=document["timezone"])
+        timezone=document["timezone"], wording_only_ids=document.get("wording_only_ids", ()),
+        allow_review_overlaps=document.get("consolidation_policy") == OVERLAP_CONSOLIDATION_POLICY)
     # Exercise native warning validation even though raw wording is not exposed.
     children = {publisher.stable_review_id(item): publisher.proposal_row(item, run_id,
                 project_allowlist=project_allowlist) for item in frozen

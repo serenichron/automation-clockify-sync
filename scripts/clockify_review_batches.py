@@ -20,6 +20,10 @@ from zoneinfo import ZoneInfo
 
 from scripts.clockify_sheet_publish import PublicationError, stable_review_id
 
+OVERLAP_REVIEW_NOTICE = (
+    "Review presentation includes overlapping workstreams; summed reviewed seconds can exceed "
+    "elapsed wall-clock time. This is not financial credit or certified human hours."
+)
 
 def _canonical(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -43,7 +47,7 @@ def _strings(value: Any) -> bool:
     return isinstance(value, list) and all(_text(item) for item in value) and len(set(value)) == len(value)
 
 
-def _activity(members: list[dict[str, Any]]) -> dict[str, Any]:
+def _activity(members: list[dict[str, Any]], *, allow_review_overlaps: bool = False) -> dict[str, Any]:
     members = sorted(members, key=lambda item: (item["start"], item["end"], item["review_id"]))
     sources = [item["proposal"] for item in members]
     descriptions = [{"review_id": item["review_id"], "description": item["description"]} for item in members]
@@ -51,9 +55,12 @@ def _activity(members: list[dict[str, Any]]) -> dict[str, Any]:
                  "duration_seconds": source["duration_seconds"],
                  "duration_minutes": source["duration_seconds"] // 60} for source in sources]
     # Bind editorial wording and exact source content, not just the grouping key.
+    notice = OVERLAP_REVIEW_NOTICE if allow_review_overlaps and any(
+        item.get("has_review_overlap") for item in members) else None
     digest = hashlib.sha256(_canonical({
         "children": [{"review_id": item["review_id"], "proposal": item["proposal"],
-                      "description": item["description"], "context": item["context"]} for item in members]
+                      "description": item["description"], "context": item["context"]} for item in members],
+        **({"review_notice": notice} if notice else {}),
     }).encode()).hexdigest()[:24]
     first = sources[0]
     seconds = sum(source["duration_seconds"] for source in sources)
@@ -70,13 +77,14 @@ def _activity(members: list[dict[str, Any]]) -> dict[str, Any]:
         "evidence_ids": sorted({str(value) for source in sources
                                 for value in (source.get("provenance") or {}).get("evidence_ids", [])}),
         "allocation_segments": segments,
-        "start": sources[0]["start"], "end": sources[-1]["end"],
+        "start": sources[0]["start"], "end": max(members, key=lambda item: item["end"])["proposal"]["end"],
         "duration_seconds": seconds, "duration_minutes": seconds // 60,
         "client_project": first["client_project"], "tag_names": sorted(first["tag_names"]),
         "billable": first["billable"],
         "confidence": next(iter(confidence)) if len(confidence) == 1 else "",
         "description": "; ".join(dict.fromkeys(item["description"] for item in members)),
         "disposition": "pending",
+        **({"review_notice": notice} if notice else {}),
     }
 
 
@@ -84,6 +92,8 @@ def package_review_batches(
     proposals: Sequence[Mapping[str, Any]], *,
     editorial_descriptions: Mapping[str, str], work_contexts: Mapping[str, str],
     protected_ids: Iterable[str] = (), timezone: str = "Europe/Bucharest",
+    wording_only_ids: Iterable[str] = (),
+    allow_review_overlaps: bool = False,
 ) -> dict[str, list[dict[str, Any]]]:
     """Consolidate compatible sub-fifteen-minute sources to reviewable batches.
 
@@ -97,6 +107,12 @@ def package_review_batches(
     already prepared wording; raw source descriptions are never a fallback.
     Explicit protected IDs must include all authoritative approvals, postings
     and human corrections, even if those facts are absent from source objects.
+    Only explicit, source-bound wording-only authority may exempt a source's
+    human_corrected flag; it never overrides protected IDs or other guards.
+    The default remains the historic protected-human-correction behavior.
+    Explicit approved overlap presentation permits distinct review-proposal
+    windows to sum without merging or deducting time. Provider/meeting/unknown
+    overlap warnings remain standalone; all original warnings remain unchanged.
 
     Every input survives exactly once as a child or a retained original copy.
     Malformed/duplicate identities remain explicit retained records, never
@@ -104,6 +120,7 @@ def package_review_batches(
     """
     zone = ZoneInfo(timezone)
     protected = frozenset(protected_ids)
+    wording_only = frozenset(wording_only_ids)
     items: list[dict[str, Any]] = []
     for raw in proposals:
         source = copy.deepcopy(raw)
@@ -126,7 +143,11 @@ def package_review_batches(
         if any(str(source.get(field) or "").strip().casefold() in {"approved", "posted"}
                for field in ("disposition", "review_status", "status")):
             reasons.append("approved_or_posted")
-        if source.get("human_corrected"):
+        if (allow_review_overlaps or review_id in wording_only) and any(
+                str(source.get(field) or "").strip().casefold() in {"approve", "skip", "skipped", "rejected", "superseded"}
+                for field in ("disposition", "review_status", "status")):
+            reasons.append("protected_terminal_status")
+        if source.get("human_corrected") and review_id not in wording_only:
             reasons.append("human_corrected")
         provenance = source.get("provenance") or {}
         if not isinstance(provenance, Mapping):
@@ -142,7 +163,9 @@ def package_review_batches(
         warnings = source.get("review_warnings", [])
         if not isinstance(warnings, list) or any(not isinstance(w, Mapping) for w in warnings):
             reasons.append("invalid_review_warnings")
-        elif any("overlap" in str(w.get("type") or "").casefold() for w in warnings):
+        elif any("overlap" in str(w.get("type") or "").casefold()
+                 and not (allow_review_overlaps and w.get("type") == "review_proposal_overlap")
+                 for w in warnings):
             reasons.append("overlap_warning")
         description = editorial_descriptions.get(review_id)
         context = work_contexts.get(review_id)
@@ -176,7 +199,9 @@ def package_review_batches(
             # portfolio parent, whose publication contract requires tags.
             reasons.append("untagged_native_entry")
         items.append({"proposal": source, "review_id": review_id, "reasons": reasons,
-                      "start": start, "end": end, "description": description, "context": context})
+                      "start": start, "end": end, "description": description, "context": context,
+                      "has_review_overlap": isinstance(warnings, list) and any(
+                          isinstance(w, Mapping) and w.get("type") == "review_proposal_overlap" for w in warnings)})
 
     counts = Counter(item["review_id"] for item in items if item["review_id"] is not None)
     for item in items:
@@ -189,9 +214,13 @@ def package_review_batches(
     for item in spans:
         active = [prior for prior in active if prior["end"] > item["start"]]
         if active:
-            item["reasons"].append("source_interval_overlap")
+            item["has_review_overlap"] = True
+            if not allow_review_overlaps:
+                item["reasons"].append("source_interval_overlap")
             for prior in active:
-                prior["reasons"].append("source_interval_overlap")
+                prior["has_review_overlap"] = True
+                if not allow_review_overlaps:
+                    prior["reasons"].append("source_interval_overlap")
         active.append(item)
 
     grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
@@ -223,7 +252,7 @@ def package_review_batches(
                 partitions[-1].extend(current)
             else:
                 partitions.append(current)
-        activities.extend(_activity(members) for members in partitions)
+        activities.extend(_activity(members, allow_review_overlaps=allow_review_overlaps) for members in partitions)
     activities.sort(key=lambda row: (_time(row["start"]), row["review_id"]))
     retained.sort(key=lambda row: (row["review_id"] or "", _canonical(row["proposal"])))
     return {"activities": activities, "retained": retained}
@@ -233,6 +262,8 @@ def verify_package(
     package: Mapping[str, Any], *, proposals: Sequence[Mapping[str, Any]],
     work_contexts: Mapping[str, str], protected_ids: Iterable[str] = (),
     timezone: str = "Europe/Bucharest",
+    wording_only_ids: Iterable[str] = (),
+    allow_review_overlaps: bool = False,
 ) -> dict[str, list[dict[str, Any]]]:
     """Bind a prepared projection to original sources, not claimed totals.
 
@@ -263,7 +294,8 @@ def verify_package(
             descriptions[item["review_id"]] = item["description"]
     expected = package_review_batches(
         proposals, editorial_descriptions=descriptions, work_contexts=work_contexts,
-        protected_ids=protected_ids, timezone=timezone,
+        protected_ids=protected_ids, timezone=timezone, wording_only_ids=wording_only_ids,
+        allow_review_overlaps=allow_review_overlaps,
     )
     if package["activities"] != expected["activities"]:
         raise ValueError("review batch differs from original sources or preparation")

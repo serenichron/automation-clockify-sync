@@ -8,6 +8,8 @@ import unittest
 from unittest import mock
 
 from scripts import clockify_native_sheet_post as native
+from scripts import clockify_review_batches as batches
+from scripts import clockify_sheet_publish as publisher
 
 
 def cell(value):
@@ -108,6 +110,111 @@ class DelayedDirectGetGateway(FakeGateway):
 
 
 class NativeSheetPostTests(unittest.TestCase):
+    def same_window_v3_plan(self, descriptions=None):
+        from test_review_batches import proposal, identity
+        descriptions = descriptions or ["SC — Prepared original guarded publication result",
+                                        "SC — Verified exact receipt binding result"]
+        sources = [proposal(1), proposal(2)]
+        for source, description in zip(sources, descriptions):
+            source.update(clockify_project_suffix="123456", tag_names=["Process"], tag_suffixes=["654321"],
+                          human_corrected=True, description=description)
+        ids = [identity(1), identity(2)]
+        contexts = dict.fromkeys(ids, "approved-daily-project-presentation/v1")
+        package = batches.package_review_batches(sources,
+            editorial_descriptions=dict(zip(ids, descriptions)), work_contexts=contexts,
+            wording_only_ids=ids, allow_review_overlaps=True)
+        document = capture(publisher.portfolio_row(package["activities"][0], "source-run"))
+        return native.build_plan(document, capture_sha256="c" * 64, routing=route(), routing_sha256="r" * 64,
+            timezone="Europe/Bucharest", workspace_id="workspace-1", member_id="user-1",
+            projects=[{"id": "project-123456"}], tags=[{"id": "tag-654321"}], live_entries=[],
+            review_batches=package, review_batch_sources=sources, review_batch_work_contexts=contexts,
+            review_batch_authority={"consolidation_policy": "approved-daily-project-presentation/v3", "wording_only_ids": ids})
+
+    def test_distinct_same_window_children_post_and_read_back_all_142_seconds_not_payload_alias_credit(self):
+        plan = self.same_window_v3_plan()
+        gateway = FakeGateway()
+        now = dt.datetime(2026, 10, 4, 11, tzinfo=dt.timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            events, receipt_path = Path(directory) / "events.jsonl", Path(directory) / "receipt.json"
+            receipt = native.execute_plan(plan, self._approval(plan), events, receipt_path, gateway, now=now)
+            self.assertEqual(2, len(gateway.posts))
+            self.assertEqual(["SC — Prepared original guarded publication result", "SC — Verified exact receipt binding result"],
+                             [entry["description"] for entry in gateway.posts])
+            self.assertEqual(["created", "created"], [entry["disposition"] for entry in receipt["entries"]])
+            self.assertEqual(["created-1", "created-2"], receipt["review_groups"][0]["clockify_entry_ids"])
+            self.assertEqual(142, receipt["review_groups"][0]["duration_seconds"])
+            readbacks = [gateway.entry_by_id(entry["clockify_entry_id"]) for entry in receipt["entries"]]
+            self.assertEqual(142, sum(int((dt.datetime.fromisoformat(entry["timeInterval"]["end"].replace("Z", "+00:00"))
+                - dt.datetime.fromisoformat(entry["timeInterval"]["start"].replace("Z", "+00:00"))).total_seconds())
+                for entry in readbacks))
+            retry = native.execute_plan(plan, self._approval(plan), events, receipt_path, gateway, now=now)
+            self.assertEqual(receipt, retry)
+            self.assertEqual(2, len(gateway.posts))
+
+    def test_same_window_v3_distinct_claims_recover_ambiguous_creates_without_reusing_one_entry(self):
+        plan = self.same_window_v3_plan()
+        gateway = FakeGateway(ambiguous=True)
+        now = dt.datetime(2026, 10, 4, 11, tzinfo=dt.timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            events, receipt_path = Path(directory) / "events.jsonl", Path(directory) / "receipt.json"
+            receipt = native.execute_plan(plan, self._approval(plan), events, receipt_path, gateway, now=now)
+            self.assertEqual(2, len(gateway.posts))
+            self.assertEqual(["created-1", "created-2"], [entry["clockify_entry_id"] for entry in receipt["entries"]])
+            self.assertEqual(["recovered_after_ambiguous_response"] * 2,
+                             [entry["disposition"] for entry in receipt["entries"]])
+            self.assertEqual(142, receipt["review_groups"][0]["duration_seconds"])
+            self.assertEqual(receipt, native.execute_plan(plan, self._approval(plan), events, receipt_path, gateway, now=now))
+            self.assertEqual(2, len(gateway.posts))
+
+    def test_identical_native_payloads_for_distinct_v3_claims_remain_unready_until_source_equivalence_verified(self):
+        with self.assertRaisesRegex(native.NativePostError, "identical native payloads; verify source equivalence"):
+            self.same_window_v3_plan(["SC — Same reviewed accomplishment description"] * 2)
+
+    def test_v3_independent_claims_cannot_alias_or_share_one_native_credit_identity(self):
+        plan = self.same_window_v3_plan()
+        independent = native._independent_review_ids(plan)
+        entries = copy.deepcopy(plan["entries"])
+        entries[1]["payload"] = copy.deepcopy(entries[0]["payload"])
+        self.assertEqual({}, native._batch_alias_leaders(entries, independent_review_ids=independent))
+        with self.assertRaisesRegex(native.NativePostError, "distinct Clockify entries"):
+            native._check_unique_native_ids(entries, ["one-entry", "one-entry"], independent_review_ids=independent)
+
+    def test_frozen_presentation_authority_plans_corrected_overlapping_children_without_posts(self):
+        from test_review_batches import proposal, identity
+        sources = [proposal(1), proposal(2, "2026-09-29T10:00:30+03:00", "2026-09-29T10:01:53+03:00", 83)]
+        descriptions = ["SC — Prepared original guarded publication result", "SC — Verified exact receipt binding result"]
+        for source, description in zip(sources, descriptions):
+            source.update(clockify_project_suffix="123456", tag_names=["Process"], tag_suffixes=["654321"],
+                          human_corrected=True, description=description)
+        ids = [identity(1), identity(2)]
+        contexts = dict.fromkeys(ids, "approved-daily-project-presentation/v1")
+        package = batches.package_review_batches(sources,
+            editorial_descriptions=dict(zip(ids, descriptions)), work_contexts=contexts,
+            wording_only_ids=ids, allow_review_overlaps=True)
+        document = capture(publisher.portfolio_row(package["activities"][0], "source-run"))
+        inputs = dict(capture_sha256="c" * 64, routing=route(), routing_sha256="r" * 64,
+            timezone="Europe/Bucharest", workspace_id="workspace-1", member_id="user-1",
+            projects=[{"id": "project-123456"}], tags=[{"id": "tag-654321"}], live_entries=[],
+            review_batches=package, review_batch_sources=sources, review_batch_work_contexts=contexts)
+        authority = {"consolidation_policy": "approved-daily-project-presentation/v3", "wording_only_ids": ids}
+        plan = native.build_plan(document, **inputs, review_batch_authority=authority)
+        self.assertEqual(1, plan["row_count"])
+        self.assertEqual(154 / 60, plan["total_minutes"])
+        self.assertEqual(ids, [entry["review_id"] for entry in plan["entries"]])
+        self.assertEqual(["2026-09-29T07:00:07Z", "2026-09-29T07:00:30Z"],
+                         [entry["payload"]["start"] for entry in plan["entries"]])
+        self.assertEqual(["2026-09-29T07:01:18Z", "2026-09-29T07:01:53Z"],
+                         [entry["payload"]["end"] for entry in plan["entries"]])
+        self.assertEqual(descriptions, [entry["payload"]["description"] for entry in plan["entries"]])
+        self.assertEqual(authority, plan["review_batches_binding"]["preparation_authority"])
+        native._validate_review_batch_plan(plan)
+        with self.assertRaises(native.NativePostError):
+            native.build_plan(document, **inputs)
+        tampered = copy.deepcopy(plan)
+        tampered["review_batches_binding"]["preparation_authority"]["wording_only_ids"] = []
+        with self.assertRaises(native.NativePostError):
+            native._validate_review_batch_plan(tampered)
+
     def _plan(self, document, routing=None, existing=None, projects=None, tags=None):
         raw = json.dumps(document, sort_keys=True).encode()
         routing = routing or route()

@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 from scripts import clockify_review_batch_publication as prepared
+from scripts import clockify_review_batches as batches
 from scripts import clockify_review_cycle as cycle
 from scripts import clockify_sheet_publish as publisher
 from scripts import review_corrections, semantic_analyzer, evidence_ledger
@@ -117,7 +118,160 @@ class AutomaticPreparationTests(unittest.TestCase):
                 self.assertNotIn(identity, document["editorial_descriptions"])
                 self.assertTrue(document["preparation_diagnostics"])
 
-    def test_exact_local_wording_correction_is_preserved_as_standalone_not_grouped(self):
+    def correct_wording(self, index, corrected, *, categories=None, extra_patch=None, decision="modify"):
+        proposal = self.sources[index]
+        proposal["description"] = corrected
+        proposal["human_corrected"] = True
+        item = {"id": f"rvi-corrected-{index}", "current": {"activity_id": proposal["activity_id"],
+            "evidence_ids": proposal["provenance"]["evidence_ids"], "description": corrected}}
+        patch = {"description": {"op": "replace", "value": corrected}, **(extra_patch or {})}
+        record = review_corrections.build_decision(item, decision=decision, reviewer="human",
+            reviewed_at="2026-08-01T11:00:00+03:00", correction_categories=categories or ["wording"],
+            rationale="Exact wording", field_patch=patch if decision == "modify" else None)
+        review_corrections.append_decision(self.run / "review-corrections.jsonl", record, item=item)
+        self.write(self.run / "proposals.json", self.sources)
+        self.write(self.run / "work-accounting-result.json", {"schema_version": 1,
+            "allocation_mode": "non_overlapping_v1", "proposals": self.sources, "ambiguous": [], "skipped": []})
+
+    def test_two_pending_exact_wording_corrections_group_without_changing_words_or_source_seconds(self):
+        corrected = ["SC — Preserved exact reviewer wording correction for source publication including the individually reviewed accomplishment and its verified result",
+                     "SC — Preserved another exact reviewer wording correction for receipt binding including the individually reviewed accomplishment and its verified result"]
+        for index, description in enumerate(corrected):
+            self.correct_wording(index, description)
+        before = {name: (self.run / name).read_bytes() for name in
+                  ("proposals.json", "review-corrections.jsonl", "work-accounting-result.json")}
+        outcome = self.prepare()
+        self.assertEqual("complete", outcome["status"])
+        document = json.loads((self.root / "prepared.json").read_text())
+        self.assertEqual(1, len(document["package"]["activities"]))
+        activity = document["package"]["activities"][0]
+        self.assertEqual([publisher.stable_review_id(p) for p in self.sources], activity["child_review_ids"])
+        self.assertEqual(corrected, [item["description"] for item in activity["prepared_descriptions"]])
+        self.assertEqual("; ".join(corrected), activity["description"])
+        self.assertGreater(len(activity["description"].split()), 24)
+        self.assertEqual(154, activity["duration_seconds"])
+        self.assertEqual([(p["start"], p["end"], p["duration_seconds"]) for p in self.sources],
+                         [(p["start"], p["end"], p["duration_seconds"]) for p in activity["allocation_segments"]])
+        projection = prepared.project(path=self.root / "prepared.json", source_dir=self.run,
+            proposals=self.sources, run_id="source-run", spreadsheet_id="sheet",
+            sheet_title="August 2026 review", project_allowlist={"abc123": "Example"})
+        self.assertEqual(1, len(projection["rows"]))
+        self.assertEqual(154 / 60, projection["rows"][0][3])
+        self.assertEqual("; ".join(corrected), projection["rows"][0][8])
+        self.assertEqual(before, {name: (self.run / name).read_bytes() for name in before})
+
+    def test_distinct_overlapping_review_children_group_exact_seconds_and_visible_notice(self):
+        self.sources[1].update(start="2026-08-01T10:00:30+03:00", end="2026-08-01T10:01:53+03:00")
+        warning = {"type": "review_proposal_overlap", "counterpart_id": "wks-" + "a" * 24,
+            "overlap_start": "2026-08-01T10:00:30+03:00", "overlap_end": "2026-08-01T10:01:18+03:00",
+            "overlap_duration_seconds": 48}
+        self.sources[0]["review_warnings"] = [warning]
+        for index, description in enumerate(self.descriptions):
+            self.correct_wording(index, description)
+        before = (self.run / "proposals.json").read_bytes()
+        outcome = self.prepare()
+        document = json.loads((self.root / "prepared.json").read_text())
+        self.assertEqual(1, len(document["package"]["activities"]))
+        activity = document["package"]["activities"][0]
+        self.assertEqual(154, activity["duration_seconds"])
+        self.assertEqual([71, 83], [segment["duration_seconds"] for segment in activity["allocation_segments"]])
+        self.assertEqual([self.sources[0]["start"], self.sources[1]["start"]],
+                         [segment["start"] for segment in activity["allocation_segments"]])
+        self.assertEqual([self.sources[0]["end"], self.sources[1]["end"]],
+                         [segment["end"] for segment in activity["allocation_segments"]])
+        self.assertEqual([warning], activity["child_review_warnings"][0]["warnings"])
+        self.assertEqual([], activity["child_review_warnings"][1]["warnings"])
+        self.assertIn("overlapping workstreams", activity["review_notice"])
+        self.assertNotIn("validation_status", activity)
+        self.assertEqual("complete", outcome["status"])
+        projection = prepared.project(path=self.root / "prepared.json", source_dir=self.run,
+            proposals=self.sources, run_id="source-run", spreadsheet_id="sheet",
+            sheet_title="August 2026 review", project_allowlist={"abc123": "Example"})
+        self.assertEqual(154 / 60, projection["rows"][0][3])
+        self.assertIn("review_proposal_overlap", projection["rows"][0][12])
+        self.assertIn("overlapping workstreams", projection["rows"][0][12])
+        self.assertIn("not financial credit", projection["rows"][0][12])
+        self.assertEqual("; ".join(self.descriptions), projection["rows"][0][8])
+        self.assertEqual(before, (self.run / "proposals.json").read_bytes())
+
+    def test_concurrent_other_client_does_not_block_compatible_same_client_group(self):
+        other = source(3, "2026-08-01T10:00:30+03:00", "2026-08-01T10:01:00+03:00", 30)
+        other.update(client_project="Other", clockify_project_suffix="abc999", human_corrected=True)
+        self.sources.append(other)
+        self.write(self.run / "proposals.json", self.sources)
+        outcome = self.prepare()
+        document = json.loads((self.root / "prepared.json").read_text())
+        self.assertEqual(1, len(document["package"]["activities"]))
+        activity = document["package"]["activities"][0]
+        self.assertEqual([publisher.stable_review_id(p) for p in self.sources[:2]], activity["child_review_ids"])
+        self.assertEqual(154, activity["duration_seconds"])
+        self.assertIn("overlapping workstreams", activity["review_notice"])
+        self.assertEqual([other], [item["proposal"] for item in document["package"]["retained"]])
+        self.assertEqual(30, outcome["unprepared_seconds"])
+
+    def test_old_overlap_policy_exclusions_and_frozen_retry_remain_unchanged(self):
+        self.sources[1].update(start="2026-08-01T10:00:30+03:00", end="2026-08-01T10:01:53+03:00")
+        for index, description in enumerate(self.descriptions):
+            self.correct_wording(index, description)
+        self.prepare()
+        path = self.root / "prepared.json"
+        document = json.loads(path.read_text())
+        fields = prepared._auto_fields(self.sources, document["authority"], self.run, "Europe/Bucharest",
+            consolidation_policy="approved-daily-project-presentation/v2")
+        self.assertEqual([], fields["package"]["activities"])
+        self.assertEqual(0, fields["preparation_outcome"]["unprepared_seconds"])
+        self.assertEqual(154, fields["preparation_outcome"]["prepared_seconds"])
+        self.assertEqual([["source_interval_overlap"], ["source_interval_overlap"]],
+                         [item["preparation_reasons"] for item in fields["package"]["retained"]])
+        document.update(fields, consolidation_policy="approved-daily-project-presentation/v2")
+        self.write(path, document)
+        before = (path.read_bytes(), path.stat().st_mtime_ns)
+        self.prepare()
+        self.assertEqual(before, (path.read_bytes(), path.stat().st_mtime_ns))
+        # Pure/manual calls do not acquire the new overlap authority implicitly.
+        ids = [publisher.stable_review_id(p) for p in self.sources]
+        legacy = batches.package_review_batches(self.sources,
+            editorial_descriptions=dict(zip(ids, self.descriptions)), work_contexts=dict.fromkeys(ids, "reviewed-work"))
+        self.assertEqual([], legacy["activities"])
+        self.assertEqual(2, len(legacy["retained"]))
+
+    def test_overlap_allowance_does_not_override_protection_duplicates_or_provider_warning(self):
+        variants = ({"human_corrected": True}, {"disposition": "approved"},
+            {"disposition": "rejected"}, {"review_status": "skipped"},
+            {"review_warnings": [{"type": "existing_clockify_overlap"}]},
+            {"provenance": {"source_type": "recorded_meeting", "evidence_ids": ["ev-1"]}})
+        ids = [publisher.stable_review_id(p) for p in self.sources]
+        for changes in variants:
+            with self.subTest(changes=changes):
+                sources = copy.deepcopy(self.sources)
+                sources[0].update(changes)
+                package = batches.package_review_batches(sources,
+                    editorial_descriptions=dict(zip(ids, self.descriptions)), work_contexts=dict.fromkeys(ids, "reviewed-work"),
+                    allow_review_overlaps=True)
+                self.assertNotIn(ids[0], [child for activity in package["activities"] for child in activity["child_review_ids"]])
+                self.assertEqual(sources[0], package["retained"][0]["proposal"])
+        duplicate = copy.deepcopy(self.sources[0])
+        package = batches.package_review_batches([*self.sources, duplicate],
+            editorial_descriptions=dict(zip(ids, self.descriptions)), work_contexts=dict.fromkeys(ids, "reviewed-work"),
+            allow_review_overlaps=True)
+        self.assertEqual(2, len(package["retained"]))
+        self.assertTrue(all("duplicate_review_identity" in item["preparation_reasons"] for item in package["retained"]))
+
+    def test_review_notice_cannot_claim_financial_credit_or_be_removed_from_package(self):
+        self.sources[1].update(start="2026-08-01T10:00:30+03:00", end="2026-08-01T10:01:53+03:00")
+        self.write(self.run / "proposals.json", self.sources)
+        self.prepare()
+        path = self.root / "prepared.json"
+        document = json.loads(path.read_text())
+        activity = document["package"]["activities"][0]
+        with self.assertRaises(publisher.PublicationError):
+            publisher.portfolio_row({**activity, "review_notice": "Approved financial credit"}, "source-run")
+        activity.pop("review_notice")
+        self.write(path, document)
+        with self.assertRaises(ValueError):
+            prepared.load(path)
+
+    def test_exact_local_wording_correction_can_group_with_unmodified_reviewed_peer(self):
         proposal = self.sources[0]
         corrected = "SC — Preserved exact reviewer wording correction"
         proposal["description"] = corrected
@@ -134,13 +288,157 @@ class AutomaticPreparationTests(unittest.TestCase):
         self.assertEqual("complete", outcome["status"])
         document = json.loads((self.root / "prepared.json").read_text())
         identity = publisher.stable_review_id(proposal)
-        self.assertIn(identity, document["protected_ids"])
-        self.assertIn(identity, document["standalone_review_ids"])
+        self.assertNotIn(identity, document["protected_ids"])
+        self.assertNotIn(identity, document["standalone_review_ids"])
         projection = prepared.project(path=self.root / "prepared.json", source_dir=self.run,
             proposals=self.sources, run_id="source-run", spreadsheet_id="sheet",
             sheet_title="August 2026 review", project_allowlist={"abc123": "Example"})
-        row = next(row for row in projection["rows"] if row[0] == identity)
-        self.assertEqual(corrected, row[8])
+        self.assertEqual(1, len(projection["rows"]))
+        self.assertEqual(corrected + "; " + self.descriptions[1], projection["rows"][0][8])
+
+    def test_mixed_routing_or_nonwording_patch_never_grants_wording_only_grouping(self):
+        corrected = "SC — Preserved exact reviewer wording correction"
+        for categories in (["routing", "wording"], ["wording"]):
+            with self.subTest(categories=categories):
+                (self.run / "review-corrections.jsonl").write_text("")
+                self.correct_wording(0, corrected, categories=categories,
+                    extra_patch={"billable": {"op": "replace", "value": True}})
+                outcome = prepared.prepare(source_dir=self.run, output=self.root / f"mixed-{len(categories)}.json",
+                    run_id="source-run", spreadsheet_id="sheet", sheet_title="August 2026 review",
+                    timezone="Europe/Bucharest")
+                document = json.loads(Path(outcome["binding"]["path"]).read_text())
+                identity = publisher.stable_review_id(self.sources[0])
+                self.assertIn(identity, document["protected_ids"])
+                self.assertNotIn(identity, document["wording_only_ids"])
+                self.assertNotIn(identity, [child for activity in document["package"]["activities"]
+                                            for child in activity["child_review_ids"]])
+                self.assertEqual(self.sources[0], document["package"]["retained"][0]["proposal"])
+
+    def test_approve_and_skip_correction_decisions_remain_protected(self):
+        self.correct_wording(0, self.descriptions[0], decision="approve")
+        self.correct_wording(1, self.descriptions[1], decision="skip")
+        outcome = self.prepare()
+        document = json.loads((self.root / "prepared.json").read_text())
+        self.assertEqual("complete", outcome["status"])
+        self.assertEqual(154, outcome["preserved_seconds"])
+        self.assertEqual(0, outcome["prepared_seconds"])
+        self.assertEqual([], document["wording_only_ids"])
+        self.assertEqual([], document["package"]["activities"])
+        self.assertEqual(2, len(document["package"]["retained"]))
+
+    def test_matching_historical_timing_metadata_prevents_wording_only_exemption(self):
+        self.correct_wording(0, self.descriptions[0])
+        log = self.run / "review-corrections.jsonl"
+        prior = review_corrections._read_log(log)[0]
+        proposal = self.sources[0]
+        record = {"schema_version": 1, "record_type": "source_bound_timing_correction",
+            "activity_id": proposal["activity_id"], "review_item_id": "rvi-timing",
+            "evidence_fingerprint": prior["evidence_fingerprint"], "parent_run_id": "prior-run",
+            "parent_artifacts": dict.fromkeys(("evidence/evidence-ledger.json", "proposals.json",
+                "semantic-analysis.json", "work-accounting-result.json"), "sha256:" + "a" * 64),
+            "request_evidence_id": "request-id", "result_evidence_id": "result-id",
+            "start": proposal["start"], "end": proposal["end"], "duration_seconds": 71,
+            "reviewer": "human", "reviewed_at": "2026-08-01T11:00:00+03:00", "rationale": "Timing correction"}
+        record["correction_id"] = "tcor-" + review_corrections.canonical_digest(record)[7:31]
+        record["canonical_digest"] = review_corrections.canonical_digest(record)
+        record["previous_digest"] = prior["canonical_digest"]
+        with log.open("a") as handle:
+            handle.write(json.dumps(record) + "\n")
+        self.prepare()
+        document = json.loads((self.root / "prepared.json").read_text())
+        identity = publisher.stable_review_id(proposal)
+        self.assertIn(identity, document["protected_ids"])
+        self.assertNotIn(identity, document["wording_only_ids"])
+        self.assertNotIn(identity, [child for activity in document["package"]["activities"]
+                                   for child in activity["child_review_ids"]])
+
+    def test_superseding_pure_wording_does_not_erase_prior_routing_protection(self):
+        self.correct_wording(0, self.descriptions[0], categories=["wording", "routing"],
+            extra_patch={"client_project": {"op": "replace", "value": "Example"}})
+        proposal = self.sources[0]
+        corrected = "SC — Preserved latest exact human wording correction"
+        proposal["description"] = corrected
+        self.write(self.run / "proposals.json", self.sources)
+        log = self.run / "review-corrections.jsonl"
+        prior = review_corrections._read_log(log)[0]
+        item = {"id": "rvi-corrected-0", "current": {"activity_id": proposal["activity_id"],
+            "evidence_ids": proposal["provenance"]["evidence_ids"]}}
+        record = review_corrections.build_decision(item, decision="modify", reviewer="human",
+            reviewed_at="2026-08-01T12:00:00+03:00", correction_categories=["wording"],
+            rationale="Exact superseding wording", supersedes_digest=prior["canonical_digest"],
+            field_patch={"description": {"op": "replace", "value": corrected}})
+        review_corrections.append_decision(log, record, item=item)
+        self.prepare()
+        document = json.loads((self.root / "prepared.json").read_text())
+        identity = publisher.stable_review_id(proposal)
+        self.assertIn(identity, document["protected_ids"])
+        self.assertNotIn(identity, document["wording_only_ids"])
+        self.assertEqual(corrected, document["editorial_descriptions"][identity])
+
+    def test_unmaterialized_wording_is_private_not_group_authority(self):
+        self.correct_wording(0, self.descriptions[0])
+        self.sources[0]["description"] = "SC — Still the old uncorrected source description"
+        self.write(self.run / "proposals.json", self.sources)
+        outcome = self.prepare()
+        document = json.loads((self.root / "prepared.json").read_text())
+        identity = publisher.stable_review_id(self.sources[0])
+        self.assertEqual("incomplete", outcome["status"])
+        self.assertEqual(71, outcome["unprepared_seconds"])
+        self.assertNotIn(identity, document["wording_only_ids"])
+        self.assertNotIn(identity, document["editorial_descriptions"])
+        self.assertIn("wording_correction_not_materialized_in_source", document["preparation_diagnostics"][0]["reasons"])
+
+    def test_pure_package_defaults_and_explicit_protection_keep_human_corrections_standalone(self):
+        for index, description in enumerate(self.descriptions):
+            self.correct_wording(index, description)
+        ids = [publisher.stable_review_id(p) for p in self.sources]
+        editorial = dict(zip(ids, self.descriptions))
+        contexts = dict.fromkeys(ids, "approved-daily-project-presentation/v1")
+        for authority in ({}, {"wording_only_ids": ids, "protected_ids": ids}):
+            with self.subTest(authority=authority):
+                package = batches.package_review_batches(self.sources,
+                    editorial_descriptions=editorial, work_contexts=contexts, **authority)
+                self.assertEqual([], package["activities"])
+                self.assertEqual(2, len(package["retained"]))
+                self.assertCountEqual(self.sources, [item["proposal"] for item in package["retained"]])
+
+    def test_legacy_v2_binding_reconstructs_original_standalone_behavior_and_retry_bytes(self):
+        for index, description in enumerate(self.descriptions):
+            self.correct_wording(index, description)
+        self.prepare()
+        path = self.root / "prepared.json"
+        document = json.loads(path.read_text())
+        ids = [publisher.stable_review_id(p) for p in self.sources]
+        document.pop("wording_only_ids")
+        document["consolidation_policy"] = "approved-daily-project-presentation/v1"
+        document["protected_ids"] = ids
+        document["standalone_review_ids"] = ids
+        document["package"] = {"activities": [], "retained": [
+            {"review_id": identity, "proposal": proposal,
+             "preparation_reasons": ["human_corrected", "protected_review_id"]}
+            for identity, proposal in zip(ids, self.sources)]}
+        self.write(path, document)
+        before = (path.read_bytes(), path.stat().st_mtime_ns)
+        outcome = self.prepare()
+        self.assertEqual("complete", outcome["status"])
+        self.assertEqual(before, (path.read_bytes(), path.stat().st_mtime_ns))
+        projection = prepared.project(path=path, source_dir=self.run,
+            proposals=self.sources, run_id="source-run", spreadsheet_id="sheet",
+            sheet_title="August 2026 review", project_allowlist={"abc123": "Example"})
+        self.assertEqual({}, projection["parents"])
+        self.assertEqual(ids, [row[0] for row in projection["rows"]])
+        self.assertEqual(self.descriptions, [row[8] for row in projection["rows"]])
+
+    def test_frozen_wording_only_id_authority_cannot_be_removed_or_forged(self):
+        self.correct_wording(0, self.descriptions[0])
+        self.prepare()
+        path = self.root / "prepared.json"
+        document = json.loads(path.read_text())
+        for ids in ([], [publisher.stable_review_id(p) for p in self.sources]):
+            with self.subTest(ids=ids):
+                self.write(path, {**document, "wording_only_ids": ids})
+                with self.assertRaises(ValueError):
+                    prepared.load(path)
 
     def test_immutable_retry_reuses_binding_and_authority_drift_is_rejected(self):
         first = self.prepare()

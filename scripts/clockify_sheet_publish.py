@@ -749,6 +749,13 @@ def portfolio_row(activity: Mapping[str, Any], run_id: str) -> list[Any]:
             visible_warnings.append({"review_id": child["review_id"], "warnings": warnings})
     if visible_warnings:
         reason += ("\n" if reason else "") + json.dumps(visible_warnings, ensure_ascii=False, sort_keys=True)
+    if "review_notice" in activity:
+        from scripts.clockify_review_batches import OVERLAP_REVIEW_NOTICE
+        # Only the reconstructed presentation warning is displayable here;
+        # this is never an asserted validation, approval, or financial credit.
+        if activity["review_notice"] != OVERLAP_REVIEW_NOTICE:
+            raise PublicationError("portfolio review notice is invalid")
+        reason += ("\n" if reason else "") + activity["review_notice"]
     return [
         review_id,
         _timestamp(activity.get("start")),
