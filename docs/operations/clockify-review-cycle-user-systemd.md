@@ -31,7 +31,7 @@ does not copy credentials or durable evidence into a release.
 - The user units contain no `User=` or `Group=` directives and never require
   `/etc` or `/var/lib`. `ProtectSystem=strict`, `ProtectHome=read-only`, and
   the three narrow `ReadWritePaths` exceptions remain enabled.
-- Only `deepseek-v4-flash:cloud` is configured. Every inherited
+- Only `deepseek-v4.1-flash:cloud` is configured. Every inherited
   `CLOCKIFY_ANALYZER_FALLBACK_*` variable is cleared by the unit. The optional
   credential-bearing Precision client environment loads before the final
   non-secret activation override.
