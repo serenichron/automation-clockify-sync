@@ -1729,6 +1729,9 @@ def _preflight_replay_analyzer_cache(
             hinted_events = semantic_analyzer.with_actor_context(
                 hinted_events, subject_binding=routing.get("semantic_subject_binding"),
             )
+        review_prompt_version = source_analysis.get("review_prompt_version")
+        if review_prompt_version is None:
+            review_prompt_version = semantic_analyzer.REVIEW_PROMPT_VERSION
         replayed = semantic_analyzer.analyze_tiered(
             hinted_events,
             primary=primary,
@@ -1739,6 +1742,7 @@ def _preflight_replay_analyzer_cache(
             cache=cache,
             max_workers=1,
             review_taxonomy=taxonomy,
+            review_prompt_version=review_prompt_version,
             **({"failed_review_retry_targets": retry_targets} if retry_targets is not None else {}),
             **tuning,
         )

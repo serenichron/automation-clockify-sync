@@ -219,6 +219,11 @@ def run_scoped_failed_review_retry(
         events = semantic_analyzer.with_actor_context(events, subject_binding=actor_subject_binding)
     elif actor_subject_binding is not None or semantic_analyzer._actor_aware(events):
         raise WorkAccountingError("scoped semantic actor contract must be explicit")
+    # A recovery reconstructs the source review contract, not today's fresh one.
+    source_review_version = source.get("review_prompt_version")
+    review_prompt_version = semantic_analyzer._extraction_review_version(
+        events, semantic_analyzer.REVIEW_PROMPT_VERSION if source_review_version is None else source_review_version,
+    )
     if scoped_review_mode not in {
         "fresh", "scoped_review_v1", "scoped_review_v2",
         "scoped_review_v3_invalid_effort", "scoped_review_v4_citation_quarantine",
@@ -377,6 +382,7 @@ def run_scoped_failed_review_retry(
                 candidate={"activities": [], "exceptions": [], "omissions": []},
                 taxonomy=review_taxonomy, model=primary.model,
                 review_scope="failed_review_scoped_recovery",
+                review_prompt_version=review_prompt_version,
                 scoped_failed_review=marker,
                 local_coverage_repair=request_mode == "scoped_review_v4_citation_quarantine",
             )
@@ -390,6 +396,7 @@ def run_scoped_failed_review_retry(
                 subset, candidate={"activities": [], "exceptions": [], "omissions": []},
                 taxonomy=review_taxonomy, model=primary.model,
                 review_scope="failed_review_scoped_recovery", scoped_failed_review=marker,
+                review_prompt_version=review_prompt_version,
                 local_coverage_repair=request_mode == "scoped_review_v4_citation_quarantine",
             )
             requests.append({
@@ -422,6 +429,7 @@ def run_scoped_failed_review_retry(
                 before_transport=authorize_transport,
                 cancelled=None,
                 review_scope="failed_review_scoped_recovery",
+                review_prompt_version=review_prompt_version,
                 scoped_failed_review=marker,
                 local_coverage_repair=request_mode == "scoped_review_v4_citation_quarantine",
             )
@@ -1019,6 +1027,15 @@ def analyze_ledger(
     else:
         if actor_contract is not None:
             hinted_events = semantic_analyzer.with_actor_context(hinted_events, subject_binding=actor_binding)
+        if retry_source_document is not None:
+            review_prompt_version = retry_source_document.get("review_prompt_version")
+            if review_prompt_version is None:
+                review_prompt_version = semantic_analyzer.REVIEW_PROMPT_VERSION
+        else:
+            review_prompt_version = (
+                semantic_analyzer.TASK_REVIEW_PROMPT_VERSION if actor_contract is not None
+                else semantic_analyzer.REVIEW_PROMPT_VERSION
+            )
         result = semantic_analyzer.analyze_tiered(
             hinted_events,
             primary=primary,
@@ -1026,6 +1043,7 @@ def analyze_ledger(
             corrections=corrections,
             cache=cache,
             review_taxonomy=review_taxonomy,
+            review_prompt_version=review_prompt_version,
             **({"failed_review_retry_targets": retry_targets} if retry_targets is not None else {}),
             **tuning,
         )

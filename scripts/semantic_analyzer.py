@@ -44,6 +44,7 @@ EVIDENCE_BUNDLE_SCHEMA_VERSION = "clockify-semantic-evidence-bundle/v1"
 ACTOR_CONTRACT = "clockify-semantic-actors/v1"
 ACTOR_PROMPT_VERSION = "clockify-semantic-v18"
 ACTOR_REVIEW_PROMPT_VERSION = "clockify-semantic-review-v7"
+TASK_REVIEW_PROMPT_VERSION = "clockify-semantic-review-v8"
 ACTOR_BUNDLE_SCHEMA_VERSION = "clockify-semantic-evidence-bundle/v2"
 ACTOR_INSTRUCTIONS = """
 
@@ -1606,6 +1607,23 @@ exception requires a nonempty kind and reason.
 Every omission requires lifecycle planned or noise and a nonempty reason. Prefer a
 corrected evidence-supported activity over omission when the candidate merely chose
 an invalid project or task type. This review uses {review_prompt_version}."""
+    if review_prompt_version == TASK_REVIEW_PROMPT_VERSION:
+        system += """
+
+TASK-BASED ROUTING: Select the task type from the evidence-supported work and
+outcome, independently of the client's source location. A broad client folder or
+repository route can identify the client without proving its hinted task type.
+Technical GA4 measurement, signup or checkout behavior, and CRM integration work
+must be judged by the actual diagnosis, implementation, verification or outcome;
+they are not Content writing merely because the source is a content client's
+workspace. Conversely, drafting, editing or reviewing article prose or editorial
+copy can genuinely be Content writing. Topic words alone do not decide the task:
+an article about GA4 can be editorial, while debugging its event integration is
+technical. Choose only an exact supplied taxonomy row supported by the evidence;
+retain a consistent hint, override its task type when a better exact row is proved,
+and split distinct outcomes or raise an exception when the evidence is insufficient.
+The evidence remains authority and the candidate remains an untrusted hint.
+"""
     if review_scope == "portfolio":
         system += """
 
@@ -4169,6 +4187,7 @@ def _call_validated(
     timeout_recovery_attempt: int | None = None,
     connection_recovery_attempt: int | None = None,
     review_taxonomy: list[dict[str, Any]] | None = None,
+    review_prompt_version: str = REVIEW_PROMPT_VERSION,
     failed_review_retry_targets: Mapping[tuple[str, ...], str] | None = None,
 ) -> dict[str, Any]:
     body = _body_for(
@@ -4257,6 +4276,7 @@ def _call_validated(
                 cancelled=cancelled,
                 extractor_model=provider_model,
                 failed_review_retry_targets=failed_review_retry_targets,
+                review_prompt_version=review_prompt_version,
             )
             return _ValidatedAnalysis(
                 reviewed,
@@ -4482,6 +4502,19 @@ def _synthesis_candidate_key(activity: Mapping[str, Any]) -> str:
     )
 
 
+def _extraction_review_version(events: list[dict[str, Any]], version: Any) -> str:
+    """Resolve a run-wide recipe without consulting mutable cache contents."""
+    if not isinstance(version, str) or version not in {
+        REVIEW_PROMPT_VERSION, ACTOR_REVIEW_PROMPT_VERSION, TASK_REVIEW_PROMPT_VERSION,
+    }:
+        raise AnalyzerError("semantic extraction review version is unsupported")
+    if _actor_aware(events) and version == REVIEW_PROMPT_VERSION:
+        return ACTOR_REVIEW_PROMPT_VERSION
+    if events and not _actor_aware(events) and version != REVIEW_PROMPT_VERSION:
+        raise AnalyzerError("semantic actor review version requires actor evidence")
+    return version
+
+
 def analyze_tiered(
     events: Iterable[dict[str, Any]],
     *,
@@ -4496,6 +4529,7 @@ def analyze_tiered(
     private_text_approved: bool | None = None,
     cache: AnalyzerResponseCache | None = None,
     review_taxonomy: list[dict[str, Any]] | None = None,
+    review_prompt_version: str = REVIEW_PROMPT_VERSION,
     failed_review_retry_targets: Mapping[tuple[str, ...], str] | None = None,
 ) -> dict[str, Any]:
     if max_workers <= 0:
@@ -4525,6 +4559,7 @@ def analyze_tiered(
             return original_transport(endpoint, body)
         transport = retry_transport
     original_events = sorted((dict(event) for event in events), key=_event_sort_key)
+    review_prompt_version = _extraction_review_version(original_events, review_prompt_version)
     if not original_events:
         return {
             "schema_version": SCHEMA_VERSION,
@@ -4740,6 +4775,7 @@ def analyze_tiered(
                 cancelled=cancellation.is_set,
                 review_taxonomy=review_taxonomy,
                 failed_review_retry_targets=failed_review_retry_targets,
+                review_prompt_version=review_prompt_version,
             )
         except AnalyzerContractError as initial_error:
             # A sealed contract rejection receives a small, deterministic
@@ -4766,6 +4802,7 @@ def analyze_tiered(
                         repair_attempt=repair_attempt,
                         review_taxonomy=review_taxonomy,
                         failed_review_retry_targets=failed_review_retry_targets,
+                        review_prompt_version=review_prompt_version,
                     )
                 except AnalyzerContractError as error:
                     repair_error = error
@@ -4835,6 +4872,7 @@ def analyze_tiered(
                                 timeout_recovery_attempt=timeout_attempt,
                                 review_taxonomy=review_taxonomy,
                                 failed_review_retry_targets=failed_review_retry_targets,
+                                review_prompt_version=review_prompt_version,
                             )
                         except AnalyzerTimeoutError:
                             continue
@@ -4908,6 +4946,7 @@ def analyze_tiered(
                                 connection_recovery_attempt=connection_attempt,
                                 review_taxonomy=review_taxonomy,
                                 failed_review_retry_targets=failed_review_retry_targets,
+                                review_prompt_version=review_prompt_version,
                             )
                         except AnalyzerTransportError:
                             continue
@@ -5021,6 +5060,7 @@ def analyze_tiered(
                             repair_attempt=(fallback_attempt or None),
                             review_taxonomy=review_taxonomy,
                             failed_review_retry_targets=failed_review_retry_targets,
+                            review_prompt_version=review_prompt_version,
                         )
                     except AnalyzerContractError as error:
                         fallback_error = error
@@ -5095,6 +5135,7 @@ def analyze_tiered(
                         cancelled=cancellation.is_set,
                         review_taxonomy=review_taxonomy,
                         failed_review_retry_targets=failed_review_retry_targets,
+                        review_prompt_version=review_prompt_version,
                     )
                 except AnalyzerContractError:
                     # A validated low-confidence primary decision is still useful
@@ -5507,6 +5548,7 @@ def analyze_tiered(
                 candidate=synthesized,
                 taxonomy=review_taxonomy,
                 tier=f"{tier}_post_synthesis_flash_review",
+                review_prompt_version=review_prompt_version,
                 transport=transport,
                 known_evidence_ids=synthesis_ids,
                 evidence_time_spans=synthesis_spans,
@@ -5534,7 +5576,7 @@ def analyze_tiered(
         "prompt_version": _prompt_version(original_events),
         **({"actor_contract": ACTOR_CONTRACT} if _actor_aware(original_events) else {}),
         "review_prompt_version": (
-            (ACTOR_REVIEW_PROMPT_VERSION if _actor_aware(original_events) else REVIEW_PROMPT_VERSION)
+            review_prompt_version
             if review_taxonomy is not None else None
         ),
         "evidence_bundle_schema_version": _bundle_schema_version(original_events),

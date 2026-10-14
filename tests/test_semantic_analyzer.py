@@ -108,6 +108,150 @@ class ActorAwareRequestTests(unittest.TestCase):
     binding = {"source_type": "multica", "server_origin": "https://source.example",
                "workspace_id": "private-workspace", "author_id": "private-subject"}
 
+    def test_fresh_actor_pipeline_selects_task_review_contract_and_preserves_reviewer_authority(self):
+        # Catches fresh recurring accounting still constructing the historical v7 review.
+        analyze = semantic.analyze_tiered
+        endpoint = semantic.AnalyzerEndpoint("primary", "http://fixture", "fixture")
+        writing = {"project_name": "Client Level 2", "prefix": "CL", "tag_names": ["Content writing"]}
+        technical = {**writing, "tag_names": ["Development"]}
+        taxonomy = [writing, technical]
+        routing = {"semantic_actor_contract": semantic.ACTOR_CONTRACT,
+                   "semantic_subject_binding": self.binding, "session_routes": [], "meeting_routes": []}
+        for content, reviewed_route in (("Diagnosed GA4 signup checkout CRM event integration", technical),
+                                        ("Edited article prose and published editorial copy", writing)):
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as temporary:
+                rows = self.comments()[:1]
+                rows[0]["content"] = content
+                rows[0]["semantic_route_hint"] = writing
+                bodies = []
+                def transport(_endpoint, body):
+                    payload = json.loads(body["messages"][1]["content"])
+                    if payload.get("probe"):
+                        return {"probe": "ok"}
+                    bodies.append(body)
+                    response = provider_response(payload)
+                    route = reviewed_route if payload["mode"] == "review" else writing
+                    response["activities"][0]["project_recommendation"] = {
+                        "name": route["project_name"], "prefix": route["prefix"], "tag_names": route["tag_names"],
+                    }
+                    return response
+                cache_path = Path(temporary) / "cache.jsonl"
+                with mock.patch.object(semantic.AnalyzerEndpoint, "from_env", side_effect=[endpoint, None]), mock.patch.dict(os.environ, {"CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED": "approved"}), mock.patch.object(semantic, "analyze_tiered", wraps=lambda events, **options: analyze(events, transport=transport, **options)):
+                    result = work_accounting_pipeline.analyze_ledger(rows, review_routing=routing, review_taxonomy=taxonomy, analyzer_cache_path=cache_path)
+                review_payload = json.loads(bodies[-1]["messages"][1]["content"])
+                self.assertEqual("clockify-semantic-review-v8", review_payload["review_prompt_version"])
+                self.assertEqual("clockify-semantic-v18", review_payload["extractor_prompt_version"])
+                self.assertEqual(semantic.ACTOR_CONTRACT, review_payload["actor_contract"])
+                self.assertEqual("subject", provider_members(review_payload)[0]["actor"]["subject_relation"])
+                self.assertEqual(writing, provider_members(review_payload)[0]["route_hint"])
+                self.assertEqual(reviewed_route["tag_names"], result["activities"][0]["project_recommendation"]["tag_names"])
+                self.assertEqual("clockify-semantic-review-v8", result["review_prompt_version"])
+                replay = analyze(semantic.with_actor_context(rows, subject_binding=self.binding), primary=endpoint,
+                                 transport=lambda *_: self.fail("sealed v8 replay inferred"),
+                                 review_prompt_version=result["review_prompt_version"], review_taxonomy=taxonomy,
+                                 cache=semantic.AnalyzerResponseCache(cache_path), private_text_approved=True)
+                self.assertEqual(result["activities"], replay["activities"])
+
+    def test_explicit_actor_v7_recipe_and_cache_replay_remain_historical(self):
+        # Catches edits to the old recipe or ignoring a sealed review version.
+        rows = self.annotate(self.comments(), self.binding)
+        body = semantic._review_body(rows, candidate={"activities": [], "exceptions": [], "omissions": []},
+                                     taxonomy=[], model="fixture", review_prompt_version="clockify-semantic-review-v7")
+        self.assertEqual("b0495b895b286b016ff7480f389bae1a4d43a19bf194a928376490e55d98abb5",
+                         hashlib.sha256(semantic.canonical_json(body).encode()).hexdigest())
+        self.assertEqual("5b6c8aff8d79aecda354b41165cc08b2f198dbe7ca10fe3b603de98899187ea2",
+                         hashlib.sha256(semantic.canonical_json(self.body(rows)).encode()).hexdigest())
+        endpoint = semantic.AnalyzerEndpoint("primary", "http://fixture", "fixture")
+        taxonomy = [{"project_name": "Serenichron Level 2", "prefix": "SC", "tag_names": ["Processes"]}]
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = semantic.AnalyzerResponseCache(Path(temporary) / "cache.jsonl")
+            def transport(_endpoint, body):
+                payload = json.loads(body["messages"][1]["content"])
+                return {"probe": "ok"} if payload.get("probe") else provider_response(payload)
+            source = semantic.analyze_tiered(rows, primary=endpoint, transport=transport, cache=cache,
+                                            review_taxonomy=taxonomy, private_text_approved=True)
+            replay = semantic.analyze_tiered(rows, primary=endpoint, transport=lambda *_: self.fail("sealed v7 replay inferred"),
+                                            cache=semantic.AnalyzerResponseCache(cache.path), review_taxonomy=taxonomy,
+                                            review_prompt_version=source["review_prompt_version"], private_text_approved=True)
+            self.assertEqual(source["activities"], replay["activities"])
+            self.assertEqual(source["analyzer_cache"]["records"], replay["analyzer_cache"]["records"])
+
+    def test_empty_fresh_actor_pipeline_still_returns_empty_analysis(self):
+        endpoint = semantic.AnalyzerEndpoint("primary", "http://fixture", "fixture")
+        routing = {"semantic_actor_contract": semantic.ACTOR_CONTRACT, "session_routes": [], "meeting_routes": []}
+        with mock.patch.object(semantic.AnalyzerEndpoint, "from_env", side_effect=[endpoint, None]):
+            result = work_accounting_pipeline.analyze_ledger([], review_routing=routing, review_taxonomy=[])
+        self.assertEqual([], result["activities"])
+        self.assertEqual(0, result["ledger_event_count"])
+
+    def test_task_review_contract_stays_pinned_after_synthesis_and_cache_replay(self):
+        # Catches a post-synthesis review silently reverting to the historical default.
+        rows = self.annotate([event("ev-a"), event("ev-b", "2026-07-11")])
+        endpoint = semantic.AnalyzerEndpoint("primary", "http://fixture", "fixture")
+        taxonomy = [{"project_name": "Serenichron Level 2", "prefix": "SC", "tag_names": ["Processes"]}]
+        reviewed_counts = []
+        def transport(_endpoint, body):
+            payload = json.loads(body["messages"][1]["content"])
+            if payload.get("probe"):
+                return {"probe": "ok"}
+            if payload["mode"] == "synthesize":
+                response = valid_response("ev-a")
+                response["activities"][0]["evidence_ids"] = sorted(evidence_id for activity in payload["provisional_activities"] for evidence_id in activity["evidence_ids"])
+                response["activities"][0]["evidence_spans"] = [span for activity in payload["provisional_activities"] for span in activity["evidence_spans"]]
+                return response
+            if payload["mode"] == "review":
+                self.assertEqual("clockify-semantic-review-v8", payload["review_prompt_version"])
+                reviewed_counts.append(len(provider_members(payload)))
+            return provider_response(payload)
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = semantic.AnalyzerResponseCache(Path(temporary) / "cache.jsonl")
+            options = dict(primary=endpoint, review_taxonomy=taxonomy, private_text_approved=True,
+                           review_prompt_version="clockify-semantic-review-v8", max_workers=1)
+            result = semantic.analyze_tiered(rows, cache=cache, transport=transport, **options)
+            self.assertEqual([1, 1, 2], reviewed_counts)
+            self.assertEqual("clockify-semantic-review-v8", result["activities"][0]["review_prompt_version"])
+            replay = semantic.analyze_tiered(rows, cache=semantic.AnalyzerResponseCache(cache.path),
+                                            transport=lambda *_: self.fail("synthesis replay inferred"), **options)
+            self.assertEqual(result["activities"], replay["activities"])
+
+    def test_scoped_retry_pins_source_review_contract_and_replays_cache_only(self):
+        # Catches v8 recovery reverting to v7, or old missing metadata selecting fresh v8.
+        endpoint = semantic.AnalyzerEndpoint("primary", "http://fixture", semantic.DEFAULT_PRIMARY_MODEL,
+                                             revision=semantic.DEFAULT_PRIMARY_REVISION)
+        taxonomy = [{"project_name": "Serenichron Level 2", "prefix": "SC", "tag_names": ["Processes"]}]
+        rows = self.comments()[:1]
+        for version, expected in ((None, "clockify-semantic-review-v7"),
+                                  ("clockify-semantic-review-v7", "clockify-semantic-review-v7"),
+                                  ("clockify-semantic-review-v8", "clockify-semantic-review-v8")):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as temporary:
+                cache = semantic.AnalyzerResponseCache(Path(temporary) / "cache.jsonl")
+                source = {"activities": [], "omissions": [],
+                          "exceptions": [{"kind": "analyzer_review_failure", "evidence_ids": ["ev-0"], "reason": "Unresolved review"}],
+                          "ledger_event_count": 1, "ledger_evidence_digest": semantic.stable_digest("led-", ["ev-0"]),
+                          "analyzer_cache": {**cache.summary(), "snapshot": {"path": "analyzer-cache-used.jsonl", "record_count": 0, "sha256": hashlib.sha256(b"").hexdigest()}}}
+                if version is not None:
+                    source["review_prompt_version"] = version
+                options = dict(primary=endpoint, review_taxonomy=taxonomy, targets={("ev-0",): "contract_rejected_duplicate_evidence"},
+                               source_semantic_sha256="a" * 64, actor_contract=semantic.ACTOR_CONTRACT,
+                               actor_subject_binding=self.binding, scoped_review_mode="scoped_review_v2")
+                def transport(_endpoint, body):
+                    payload = json.loads(body["messages"][1]["content"])
+                    self.assertEqual(expected, payload["review_prompt_version"])
+                    return provider_response(payload)
+                result = work_accounting_pipeline.run_scoped_failed_review_retry(source, rows, cache=cache,
+                    transport=transport, private_text_approved=True, **options)
+                self.assertEqual(expected, result["activities"][0]["review_prompt_version"])
+                frozen = cache.path.read_bytes()
+                replay = work_accounting_pipeline.run_scoped_failed_review_retry(source, rows,
+                    cache=semantic.AnalyzerResponseCache(cache.path), transport=lambda *_: self.fail("scoped replay inferred"), **options)
+                self.assertEqual(result["activities"], replay["activities"])
+                self.assertEqual(frozen, cache.path.read_bytes())
+                for invalid_version in ("clockify-semantic-review-v99", [], False):
+                    source["review_prompt_version"] = invalid_version
+                    with self.assertRaisesRegex((semantic.AnalyzerError, work_accounting_pipeline.WorkAccountingError), "review.*version"):
+                        work_accounting_pipeline.run_scoped_failed_review_retry(source, rows, cache=cache,
+                            transport=lambda *_: self.fail("unsupported contract inferred"), private_text_approved=True, **options)
+
     def comments(self):
         rows = []
         for index, (author, kind) in enumerate((("private-subject", "member"),
