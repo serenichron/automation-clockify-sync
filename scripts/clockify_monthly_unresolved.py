@@ -9,6 +9,7 @@ import datetime as dt
 import hashlib
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -20,6 +21,8 @@ except ImportError:  # pragma: no cover
 
 PROFILE = "visible-monthly-unresolved/v1"
 ALIAS_PROFILE = "visible-monthly-unresolved-source-aliases/v1"
+RETAINED_DEBT_SCHEMA = "monthly-retained-provenance-debt/v1"
+RETAINED_READBACK_SCHEMA = "monthly-retained-target-readback/v1"
 HEADER = [
     "Stable Evidence ID", "Local Date / Slice", "Source / Machine", "Category",
     "Why No Valid Interval", "Project / Client Candidates or Routing State",
@@ -302,6 +305,112 @@ def machine_digest(row: list[Any]) -> str:
     return "sha256:" + hashlib.sha256(json.dumps(
         [*row[:10], row[11]], sort_keys=True, separators=(",", ":")
     ).encode()).hexdigest()
+
+
+def _value_digest(value: Any) -> str:
+    return "sha256:" + hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False).encode()).hexdigest()
+
+
+def retained_machine_digest(shared_fields_digest: str, provenance_digest: str) -> str:
+    """Versioned machine preimage; human-owned K never enters a receipt."""
+    return _value_digest({"schema_version": RETAINED_DEBT_SCHEMA,
+        "shared_fields_digest": shared_fields_digest, "provenance_digest": provenance_digest})
+
+
+def retained_row_digest(row: list[Any]) -> str:
+    return retained_machine_digest(_value_digest(row[:10]), _value_digest(row[11]))
+
+
+def retained_projection(source_dir: Path, *, layout: str | None = None) -> list[list[Any]]:
+    return rows_for_layout(project_rows(source_dir), layout)
+
+
+def prepare_retained_debt(source_dir: Path, requested: list[Any], existing: list[Any], *,
+                          spreadsheet_id: str, sheet_title: str, layout: str | None = None,
+                          historical_sources: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Record an unresolved preimage, never assert a restored canonical alias."""
+    canonical = retained_projection(source_dir, layout=layout)
+    matches = [row for row in canonical if row[0] == requested[0]]
+    if (len(matches) != 1 or matches[0] != requested or len(existing) != 12
+            or existing[:10] != requested[:10] or existing[11] == requested[11]):
+        raise ValueError("retained provenance debt does not match exact source prefix")
+    prior, current = json.loads(existing[11]), json.loads(requested[11])
+    if (not isinstance(prior, dict) or set(prior) != {"source_run_id", "artifacts", "evidence_ids"}
+            or prior["evidence_ids"] != current["evidence_ids"]
+            or not isinstance(prior["artifacts"], dict) or set(prior["artifacts"]) != set(current["artifacts"])
+            or any(not isinstance(value, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None
+                   for value in prior["artifacts"].values())):
+        raise ValueError("retained provenance debt has invalid original provenance")
+    name = prior["source_run_id"]
+    if (not isinstance(name, str) or not name or name in {".", ".."} or Path(name).name != name
+            or historical_sources is not None and name in historical_sources):
+        raise ValueError("retained provenance debt original source is not missing")
+    original = source_dir.parent / name
+    if original.exists() or original.is_symlink():
+        raise ValueError("retained provenance debt original source is not missing")
+    shared = _value_digest(requested[:10])
+    provenance = _value_digest(existing[11])
+    return {"schema_version": RETAINED_DEBT_SCHEMA, "stable_evidence_id": requested[0],
+        "reason": "original_source_unavailable", "requested_machine_digest": machine_digest(requested),
+        "shared_fields_digest": shared, "retained_provenance_digest": provenance,
+        "retained_machine_digest": retained_machine_digest(shared, provenance),
+        "source_projection_digest": _value_digest([machine_digest(row) for row in canonical]),
+        "destination_digest": _value_digest({"spreadsheet_id": spreadsheet_id, "sheet_title": sheet_title})}
+
+
+def validate_retained_debt(source_dir: Path, rows: list[list[Any]], debt: Any, *,
+                          spreadsheet_id: str, sheet_title: str, layout: str | None = None) -> list[str]:
+    """Reconstruct only the explicit partial/digest contract, not old authority."""
+    canonical = retained_projection(source_dir, layout=layout)
+    if rows != canonical or not isinstance(debt, list) or not debt:
+        raise ValueError("retained provenance debt source projection differs")
+    by_id = {row[0]: row for row in rows}
+    fields = {"schema_version", "stable_evidence_id", "reason", "requested_machine_digest",
+        "shared_fields_digest", "retained_provenance_digest", "retained_machine_digest",
+        "source_projection_digest", "destination_digest"}
+    expected_source = _value_digest([machine_digest(row) for row in canonical])
+    destination = _value_digest({"spreadsheet_id": spreadsheet_id, "sheet_title": sheet_title})
+    retained = {}
+    for entry in debt:
+        if (not isinstance(entry, dict) or set(entry) != fields
+                or entry.get("schema_version") != RETAINED_DEBT_SCHEMA
+                or entry.get("reason") != "original_source_unavailable"):
+            raise ValueError("retained provenance debt contract differs")
+        identity = entry["stable_evidence_id"]
+        if identity not in by_id or identity in retained:
+            raise ValueError("retained provenance debt identity differs")
+        row = by_id[identity]
+        if (any(not isinstance(entry[field], str) or re.fullmatch(r"sha256:[0-9a-f]{64}", entry[field]) is None
+                for field in fields if field.endswith("digest"))
+                or entry["requested_machine_digest"] != machine_digest(row)
+                or entry["shared_fields_digest"] != _value_digest(row[:10])
+                or entry["retained_provenance_digest"] == _value_digest(row[11])
+                or entry["source_projection_digest"] != expected_source or entry["destination_digest"] != destination
+                or entry["retained_machine_digest"] != retained_machine_digest(entry["shared_fields_digest"], entry["retained_provenance_digest"])):
+            raise ValueError("retained provenance debt preimage or binding differs")
+        retained[identity] = entry["retained_machine_digest"]
+    return [retained.get(row[0], retained_row_digest(row)) for row in rows]
+
+
+def retained_rows_digest(row_ids: list[str], row_digests: list[str]) -> str:
+    return _value_digest({"schema_version": RETAINED_DEBT_SCHEMA,
+        "machine_rows": list(zip(row_ids, row_digests, strict=True))})
+
+
+def validate_retained_readback(evidence: Any, debt: list[dict[str, Any]], *,
+                               spreadsheet_id: str, sheet_title: str) -> None:
+    fields = {"schema_version", "spreadsheet_id", "sheet_title", "sheet_id", "layout",
+              "row_ids", "machine_row_digests", "sha256"}
+    if (not isinstance(evidence, dict) or set(evidence) != fields
+            or evidence.get("schema_version") != RETAINED_READBACK_SCHEMA
+            or evidence.get("spreadsheet_id") != spreadsheet_id or evidence.get("sheet_title") != sheet_title
+            or type(evidence.get("sheet_id")) is not int or evidence["sheet_id"] < 0
+            or evidence.get("layout") not in {None, LEGACY_LAYOUT}
+            or evidence.get("row_ids") != [entry["stable_evidence_id"] for entry in debt]
+            or evidence.get("machine_row_digests") != [entry["retained_machine_digest"] for entry in debt]
+            or evidence.get("sha256") != _value_digest({key: value for key, value in evidence.items() if key != "sha256"})):
+        raise ValueError("retained provenance target readback differs")
 
 
 def _bound_document(binding: dict[str, Any]) -> tuple[Any, Path]:

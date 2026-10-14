@@ -1273,13 +1273,13 @@ def _apply_publish_plan(
 
 
 def _publication_receipt(
-    *, spreadsheet_id: str, sheet_title: str, rows: Sequence[Sequence[Any]],
+    *, spreadsheet_id: str, sheet_title: str, rows: Sequence[Sequence[Any]], rows_digest: str | None = None,
 ) -> dict[str, Any]:
     payload = {
         "spreadsheet_id": spreadsheet_id,
         "sheet_title": sheet_title,
         "row_ids": [str(row[0]) for row in rows],
-        "rows_sha256": "sha256:" + hashlib.sha256(
+        "rows_sha256": rows_digest or "sha256:" + hashlib.sha256(
             json.dumps(list(rows), separators=(",", ":"), sort_keys=True).encode("utf-8")
         ).hexdigest(),
     }
@@ -1398,6 +1398,7 @@ def _plan_monthly_unresolved(
     aliases: Mapping[str, Any] | None = None,
     source_dir: Path | None = None,
     historical_sources: Path | None = None,
+    retain_provenance_debt: bool = False,
 ) -> dict[str, Any]:
     if any(len(row) != 12 or not str(row[0]).startswith("uev-") for row in rows):
         raise PublicationError("monthly unresolved row contract is invalid")
@@ -1441,6 +1442,7 @@ def _plan_monthly_unresolved(
     appends = []
     aliases = aliases or {}
     canonical_aliases = []
+    retained_debt = []
     for row in rows:
         prior = by_id.get(row[0])
         alias = aliases.get(row[0])
@@ -1459,20 +1461,59 @@ def _plan_monthly_unresolved(
                 canonical_aliases.append(monthly_unresolved.canonical_source_alias(
                     source_dir, list(row), prior, layout=layout, historical_sources=source_handles))
             except (OSError, KeyError, TypeError, ValueError) as exc:
-                raise PublicationError(f"monthly canonical machine-field conflict: {row[0]}") from exc
+                if not retain_provenance_debt or str(exc) != "canonical alias historical source is unsafe":
+                    raise PublicationError(f"monthly canonical machine-field conflict: {row[0]}") from exc
+                try:
+                    retained_debt.append(monthly_unresolved.prepare_retained_debt(source_dir, list(row), prior,
+                        spreadsheet_id=spreadsheet_id, sheet_title=sheet_title, layout=layout,
+                        historical_sources=source_handles))
+                except (OSError, KeyError, TypeError, ValueError) as debt_error:
+                    raise PublicationError(f"monthly canonical machine-field conflict: {row[0]}") from debt_error
     if appends and len(existing) < 2:
         raise PublicationError("monthly unresolved tab lacks a native data-row exemplar")
+    if retained_debt:
+        try:
+            monthly_unresolved.validate_retained_debt(source_dir, [list(row) for row in rows], retained_debt,
+                spreadsheet_id=spreadsheet_id, sheet_title=sheet_title, layout=layout)
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            raise PublicationError("retained provenance source projection differs") from exc
     return {"sheet_title": sheet_title, "sheet_id": prop["sheetId"], "grid_rows": grid["rowCount"],
             "existing": existing, "appends": appends, "rows": [list(row) for row in rows], "aliases": aliases,
-            "canonical_aliases": canonical_aliases, "layout": layout, "historical_sources": sources_handle}
+            "canonical_aliases": canonical_aliases, "layout": layout, "historical_sources": sources_handle,
+            **({"retained_provenance_debt": retained_debt, "retained_source_dir": source_dir} if retained_debt else {})}
+
+
+def _retained_monthly_preflight(
+    gateway: SheetsGateway, *, spreadsheet_id: str, plan: Mapping[str, Any],
+) -> tuple[Sequence[Sequence[Any]], list[str] | None]:
+    title = str(plan["sheet_title"])
+    existing = plan["existing"]
+    padded = lambda row: list(row) + [""] * (12 - len(row))
+    retained_digests = None
+    if plan.get("retained_provenance_debt"):
+        try:
+            retained_digests = monthly_unresolved.validate_retained_debt(plan["retained_source_dir"], plan["rows"],
+                plan["retained_provenance_debt"], spreadsheet_id=spreadsheet_id, sheet_title=title, layout=plan["layout"])
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            raise PublicationError("retained provenance source changed before append") from exc
+        # A human may edit K after planning. No machine-cell/preimage drift may
+        # cause even an independent append before it is detected.
+        fresh = gateway.values(spreadsheet_id, f"{_a1_title(title)}!A1:L{plan['grid_rows']}")
+        if (len(fresh) != len(existing) or any(
+                any(not _same_cell(padded(a)[index], padded(b)[index]) for index in (*range(10), 11))
+                for a, b in zip(fresh, existing, strict=True))):
+            raise PublicationError("retained provenance preimage changed before append")
+        existing = fresh
+    return existing, retained_digests
 
 
 def _apply_monthly_unresolved(
     gateway: SheetsGateway, *, spreadsheet_id: str, plan: Mapping[str, Any],
 ) -> dict[str, Any]:
     title = str(plan["sheet_title"])
-    existing = plan["existing"]
+    existing, retained_digests = _retained_monthly_preflight(gateway, spreadsheet_id=spreadsheet_id, plan=plan)
     appends = plan["appends"]
+    padded = lambda row: list(row) + [""] * (12 - len(row))
     if appends:
         gateway.append_monthly_rows(  # type: ignore[attr-defined]
             spreadsheet_id, plan["sheet_id"], len(existing) + 1, plan["grid_rows"], appends,
@@ -1481,18 +1522,29 @@ def _apply_monthly_unresolved(
     observed = gateway.values(spreadsheet_id, f"{_a1_title(title)}!A1:L{count}")
     expected = [*existing, *appends]
     # A retry's existing K is human-owned; the exact old prefix must survive.
-    padded = lambda row: list(row) + [""] * (12 - len(row))
     if len(observed) != len(expected) or any(padded(a) != padded(b) for a, b in zip(observed, expected, strict=True)):
         raise PublicationError("monthly unresolved exact readback differs")
     result = {"appended": len(appends), "unchanged": len(plan["rows"]) - len(appends),
               **_publication_receipt(spreadsheet_id=spreadsheet_id, sheet_title=title, rows=plan["rows"])}
+    if plan.get("retained_provenance_debt"):
+        debt = plan["retained_provenance_debt"]
+        result.update(_publication_receipt(spreadsheet_id=spreadsheet_id, sheet_title=title, rows=plan["rows"],
+            rows_digest=monthly_unresolved.retained_rows_digest([row[0] for row in plan["rows"]], retained_digests)))
+        by_id = {row[0]: padded(row) for row in observed[1:] if row}
+        evidence = {"schema_version": monthly_unresolved.RETAINED_READBACK_SCHEMA,
+            "spreadsheet_id": spreadsheet_id, "sheet_title": title, "sheet_id": plan["sheet_id"],
+            "layout": plan["layout"], "row_ids": [entry["stable_evidence_id"] for entry in debt],
+            "machine_row_digests": [monthly_unresolved.retained_row_digest(by_id[entry["stable_evidence_id"]]) for entry in debt]}
+        evidence["sha256"] = monthly_unresolved._value_digest(evidence)
+        monthly_unresolved.validate_retained_readback(evidence, debt, spreadsheet_id=spreadsheet_id, sheet_title=title)
+        result.update(retained_provenance_debt=debt, retained_target_readback=evidence)
     if plan["aliases"]:
         result["source_aliases"] = monthly_unresolved.alias_metadata(plan["rows"], plan["aliases"])
     if plan["canonical_aliases"]:
         result["canonical_source_aliases"] = plan["canonical_aliases"]
     if plan["historical_sources"] is not None:
         result["historical_sources"] = plan["historical_sources"]
-    if plan["layout"] is not None:
+    if plan["layout"] is not None and not plan.get("retained_provenance_debt"):
         by_id = {row[0]: padded(row) for row in observed[1:] if row}
         evidence = {
             "schema_version": "monthly-unresolved-target-readback/v1",
@@ -1511,9 +1563,11 @@ def publish_monthly_unresolved(
     aliases: Mapping[str, Any] | None = None,
     source_dir: Path | None = None,
     historical_sources: Path | None = None,
+    retain_provenance_debt: bool = False,
 ) -> dict[str, Any]:
     plan = _plan_monthly_unresolved(gateway, spreadsheet_id=spreadsheet_id, sheet_title=sheet_title, rows=rows, aliases=aliases,
-                                   source_dir=source_dir, historical_sources=historical_sources)
+                                   source_dir=source_dir, historical_sources=historical_sources,
+                                   retain_provenance_debt=retain_provenance_debt)
     return _apply_monthly_unresolved(gateway, spreadsheet_id=spreadsheet_id, plan=plan)
 
 
@@ -1556,6 +1610,7 @@ def publish_proposal_partitions(
     presentation: Path | None = None,
     existing_publication: Path | None = None,
     review_batch_publication: Path | None = None,
+    retain_provenance_debt: bool = False,
 ) -> dict[str, Any]:
     batch_projection = None
     batch_child_plan = []
@@ -1687,6 +1742,7 @@ def publish_proposal_partitions(
             sheet_title=monthly_unresolved.title_for_review(sheet_title), rows=monthly_rows, aliases=monthly_aliases,
             source_dir=monthly_source_dir,
             historical_sources=monthly_historical_sources,
+            retain_provenance_debt=retain_provenance_debt,
         )
     publications: list[dict[str, Any]] = []
     if existing_publication is not None:
@@ -1717,6 +1773,10 @@ def publish_proposal_partitions(
             publications.append(item)
         return {"schema_version": "sheet-publication-result/v1", "status": "verified-existing",
                 "external_writes": False, "clockify_writes": 0, "terminal_updates": 0, "publications": publications}
+    if monthly_plan is not None:
+        # Check protected monthly/source preimages before even primary effects;
+        # the monthly apply repeats this check for drift during primary writes.
+        _retained_monthly_preflight(gateway, spreadsheet_id=spreadsheet_id, plan=monthly_plan)
     for (destination, rows), plan in zip(partitions, plans, strict=True):
         result = _apply_publish_plan(
             gateway, spreadsheet_id=spreadsheet_id, plan=plan,
@@ -1810,6 +1870,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--result-output", type=Path)
     parser.add_argument("--enable-write", action="store_true")
     parser.add_argument("--monthly-unresolved", action="store_true")
+    parser.add_argument("--retain-provenance-debt", action="store_true")
     parser.add_argument("--monthly-unresolved-alias-proof", type=Path)
     parser.add_argument("--monthly-unresolved-historical-sources", type=Path)
     parser.add_argument("--meeting-publication-bindings", type=Path)
@@ -1818,6 +1879,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--verify-existing-publication", type=Path)
     parser.add_argument("--review-batch-publication", type=Path)
     args = parser.parse_args(argv)
+    if args.retain_provenance_debt and not (args.monthly_unresolved and args.proposals is not None):
+        parser.error("retained provenance debt requires --monthly-unresolved and --proposals")
     if args.review_batch_publication is not None and (args.proposals is None or any((
             args.meeting_publication_bindings, args.pending_review_selection, args.publication_presentation,
             args.review_tombstones))):
@@ -1960,6 +2023,7 @@ def main(argv: list[str] | None = None) -> int:
             presentation=args.publication_presentation,
             existing_publication=args.verify_existing_publication,
             review_batch_publication=args.review_batch_publication,
+            retain_provenance_debt=args.retain_provenance_debt,
         )
     else:
         result = publish(
@@ -2000,6 +2064,8 @@ def main(argv: list[str] | None = None) -> int:
                      **({"historical_sources": item["historical_sources"]} if "historical_sources" in item else {}),
                      **({field: item[field] for field in ("presentation", "pending_selection", "existing_publication", "review_batches") if field in item}),
                      **({field: item[field] for field in ("monthly_layout", "monthly_target_readback")} if "monthly_layout" in item else {})}
+                    | ({field: item[field] for field in ("retained_provenance_debt", "retained_target_readback")}
+                       if "retained_provenance_debt" in item else {})
                     for item in document["publications"]
                 ],
             }

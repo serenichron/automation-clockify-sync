@@ -2229,6 +2229,7 @@ def _publisher_command(
         "--run-id", str(source["run_id"]),
         "--result-output", str(result_path),
         "--monthly-unresolved",
+        "--retain-provenance-debt",
         "--enable-write",
     ]
     if config.get("monthly_unresolved_alias_proof"):
@@ -2543,14 +2544,43 @@ def _validated_publication_document(
          **({"historical_sources": item["historical_sources"]} if "historical_sources" in item else {}),
          **({field: item[field] for field in ("presentation", "pending_selection", "review_batches") if field in item}),
          **({field: item.get(field) for field in ("monthly_layout", "monthly_target_readback")}
-            if "monthly_layout" in item or "monthly_target_readback" in item else {})}
+            if "monthly_layout" in item or "monthly_target_readback" in item else {}),
+         **({field: item.get(field) for field in ("retained_provenance_debt", "retained_target_readback")}
+            if "retained_provenance_debt" in item or "retained_target_readback" in item else {})}
         for item in publications if isinstance(item, Mapping)
     ]
     base_expected = [{key: value for key, value in item.items() if key != "canonical_source_aliases"} for item in expected]
     legacy_rows = {}
+    retained_rows = {}
     if len(retained) != len(publications) or len(publications) != len(expected):
         raise CycleError("publisher result destinations or readbacks differ")
     for index, item in enumerate(publications):
+        if "retained_provenance_debt" in item or "retained_target_readback" in item:
+            try:
+                if source_dir is None or "presentation" in expected[index]:
+                    raise ValueError("retained provenance source context differs")
+                proof = item["retained_target_readback"]
+                debt = item["retained_provenance_debt"]
+                canonical = clockify_monthly_unresolved.project_rows(source_dir)
+                canonical_receipt = _publication_receipt(spreadsheet_id=expected[index]["spreadsheet_id"],
+                    sheet_title=expected[index]["sheet_title"], rows=canonical)
+                if (not expected[index]["sheet_title"].endswith(" unresolved evidence")
+                        or any(expected[index].get(field) != value for field, value in canonical_receipt.items())):
+                    raise ValueError("retained provenance does not bind expected monthly source")
+                rows = clockify_monthly_unresolved.rows_for_layout(canonical, proof["layout"])
+                digests = clockify_monthly_unresolved.validate_retained_debt(source_dir, rows, debt,
+                    spreadsheet_id=expected[index]["spreadsheet_id"], sheet_title=expected[index]["sheet_title"],
+                    layout=proof["layout"])
+                clockify_monthly_unresolved.validate_retained_readback(proof, debt,
+                    spreadsheet_id=expected[index]["spreadsheet_id"], sheet_title=expected[index]["sheet_title"])
+                base_expected[index] = {**base_expected[index],
+                    **_publication_receipt(spreadsheet_id=expected[index]["spreadsheet_id"],
+                        sheet_title=expected[index]["sheet_title"], rows=rows,
+                        rows_digest=clockify_monthly_unresolved.retained_rows_digest([row[0] for row in rows], digests)),
+                    "retained_provenance_debt": debt, "retained_target_readback": proof}
+                retained_rows[index] = rows
+            except (OSError, KeyError, TypeError, ValueError) as exc:
+                raise CycleError("publisher retained provenance debt differs") from exc
         if "pending_selection" in item and "pending_selection" in expected[index]:
             try:
                 from scripts import clockify_pending_runtime_proof as pending_runtime
@@ -2622,8 +2652,8 @@ def _validated_publication_document(
                 clockify_source_adoptions._capture(handle, {})
                 historical_sources, _ = clockify_monthly_unresolved.load_historical_sources(Path(handle["path"]))
             aliases = clockify_monthly_unresolved.validate_canonical_aliases(
-                source_dir, legacy_rows.get(index, clockify_monthly_unresolved.project_rows(source_dir)),
-                item["canonical_source_aliases"], layout=item.get("monthly_layout"),
+                source_dir, retained_rows.get(index, legacy_rows.get(index, clockify_monthly_unresolved.project_rows(source_dir))),
+                item["canonical_source_aliases"], layout=item.get("monthly_layout", item.get("retained_target_readback", {}).get("layout")),
                 historical_sources=historical_sources,
             )
         except (OSError, KeyError, TypeError, ValueError) as exc:
@@ -2716,6 +2746,10 @@ def _delivery_document(
         if frozen.get("preparation_outcome", {}).get("status") == "incomplete":
             unsigned["schema_version"] = PARTIAL_RECEIPT_SCHEMA_VERSION
             unsigned["review_preparation"] = {"binding": handle, "outcome": frozen["preparation_outcome"]}
+    retained_debt = [entry for receipt in publication_receipts for entry in receipt.get("retained_provenance_debt", [])]
+    if retained_debt:
+        unsigned["schema_version"] = PARTIAL_RECEIPT_SCHEMA_VERSION
+        unsigned["retained_provenance_debt"] = retained_debt
     if publication_profile is not None:
         unsigned["publication_profile"] = publication_profile
     meeting_bindings = _meeting_bindings_for_target(config, sheet_title)
@@ -4847,15 +4881,21 @@ def _validate_delivered_state(config: Mapping[str, Any], state: Mapping[str, Any
             _verify_delivery_receipt(
                 Path(receipt), graph_config, since, until, source, replay, sheet_title=title
             )
-            proof = _json_file(Path(receipt), "delivered publication receipt").get("review_preparation")
-            if preparation_partial != (proof is not None):
+            document = _json_file(Path(receipt), "delivered publication receipt")
+            proof = document.get("review_preparation")
+            retained_debt = document.get("retained_provenance_debt")
+            if preparation_partial != (proof is not None or bool(retained_debt)):
                 raise CycleError("publication status differs from immutable preparation outcome")
-            if preparation_partial:
+            if preparation_partial and raw_record.get("exceptions_complete") is not False:
+                raise CycleError("stored preparation debt differs from immutable publication proof")
+            if proof is not None:
                 stored = raw_record.get("review_preparation")
                 if (not isinstance(stored, Mapping) or stored.get("binding") != proof["binding"]
                         or any(stored.get(key) != value for key, value in proof["outcome"].items())
                         or raw_record.get("exceptions_complete") is not False):
                     raise CycleError("stored preparation debt differs from immutable publication proof")
+            if retained_debt and raw_record.get("retained_provenance_debt") != retained_debt:
+                raise CycleError("stored retained provenance debt differs from immutable publication proof")
 
 
 def _attempt_id(debt_id: str, ordinal: int) -> str:
@@ -5953,6 +5993,7 @@ def _run_slice(
         _runs_dir(config) / f"publication-{source['run_id']}" / "autopilot-result.json"
     )
     preparation_partial = False
+    retained_only = False
     if receipt_path.exists():
         _verify_delivery_receipt(
             receipt_path, config, since, until, source, replay,
@@ -5963,6 +6004,10 @@ def _run_slice(
             preparation_partial = True
             record["review_preparation"] = {**historical["review_preparation"]["outcome"],
                 "binding": historical["review_preparation"]["binding"]}
+        if historical.get("retained_provenance_debt"):
+            preparation_partial = True
+            record["retained_provenance_debt"] = historical["retained_provenance_debt"]
+            retained_only = "review_preparation" not in historical
     else:
         config, preparation = _prepare_new_publication(config, source, sheet_title=sheet_title, state_dir=state_dir)
         record["review_preparation"] = preparation
@@ -6024,6 +6069,11 @@ def _run_slice(
         receipt = _delivery_document(
             config, since, until, source, replay, sheet_title=sheet_title, publication_readbacks=publication_readbacks,
         )
+        if receipt.get("retained_provenance_debt"):
+            preparation_partial = True
+            receipt_path = partial_receipt_path
+            record["retained_provenance_debt"] = receipt["retained_provenance_debt"]
+            retained_only = "review_preparation" not in receipt
         _write_delivery_receipt(receipt_path, receipt)
 
     record.update({
@@ -6043,7 +6093,9 @@ def _run_slice(
     return {
         "status": record["status"],
         "slice": {"since": since, "until": until, "exception_ids": source["exception_ids"]},
-        "advance_frontier": False if preparation_partial else _record_advances_frontier(record, advance_frontier),
+        # Provenance debt holds completed_through, not independent routine
+        # scheduling: exact source/replay are already sealed and need no retry.
+        "advance_frontier": False if preparation_partial and not retained_only else _record_advances_frontier(record, advance_frontier),
     }
 
 
