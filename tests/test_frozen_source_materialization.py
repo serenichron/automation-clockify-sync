@@ -26,12 +26,13 @@ def frozen_source(root: Path) -> Path:
     """Build a real local collector snapshot, without network or external state."""
     store = PageCheckpointStore(root / "private-test-cache")
     identity = collector._clockify_checkpoint_identity(
-        "workspace-one", "user-one", SINCE, UNTIL,
+        "workspace-one", "user-one", SINCE, UNTIL, overlap_history=True,
     )
     state = store.open(identity, initial_metadata={"snapshot_at": "2026-09-03T00:00:00Z"})
     state = store.append_page(
         state, payload=[], continuation={"page": 2},
         signature=collector._clockify_page_signature([]),
+        metadata={"wire_row_count": 0, "wire_signature": collector._clockify_page_signature([])},
     )
     store.mark_complete(state)
     source = root / "frozen" / "source"

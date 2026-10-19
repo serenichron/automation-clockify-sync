@@ -247,7 +247,8 @@ class RecurringNativeCreditTests(unittest.TestCase):
         state = store.mark_complete(state)
         source = root / "original-run/evidence/clockify-existing.json"
         source.parent.mkdir(parents=True)
-        projection = collector.fetch_clockify({"CLOCKIFY_WORKSPACE_ID": "workspace-1"}, {"clockify_user_id": "user-1"}, since, until, checkpoint_store=store)
+        projection = collector.fetch_clockify({"CLOCKIFY_WORKSPACE_ID": "workspace-1"}, {"clockify_user_id": "user-1"},
+                                             since, until, checkpoint_store=store, checkpoint_identity=state.identity)
         source.write_text(json.dumps(projection))
         run_dir = root / "fresh-run"
         destination = run_dir / "evidence/clockify-native-checkpoint"

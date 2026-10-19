@@ -93,6 +93,16 @@ def _request(workspace_id: str, user_id: str, since: datetime, until: datetime):
     return identity, request
 
 
+def _pinned_identity(document, workspace_id: str, user_id: str, since: datetime, until: datetime):
+    """Accept only either exact trusted request contract; never rewrite v1."""
+    for overlap_history in (False, True):
+        candidate = collector._clockify_checkpoint_identity(
+            workspace_id, user_id, since, until, overlap_history=overlap_history)
+        if document == candidate.document():
+            return candidate
+    raise checkpoints.CheckpointError("checkpoint identity does not match trusted request")
+
+
 class _CapturedStore(checkpoints.PageCheckpointStore):
     """Read-only adapter for the existing collector projection over captured bytes."""
 
@@ -198,11 +208,15 @@ def _validate_with_compatibility(directory: Path, files: dict[str, bytes], evide
     observed = _timestamp(state.metadata.get("snapshot_at"), "snapshot_at")
     collector._clockify_checkpoint_page(state)
     entries, _ = collector._clockify_checkpoint_entries(store, state)
+    overlap_history = identity.compatibility_version == collector.CLOCKIFY_OVERLAP_CHECKPOINT_COMPATIBILITY_VERSION
     for index, page in enumerate(store.iter_pages(state)):
         rows = page["payload"]
-        if len(rows) > collector.CLOCKIFY_PAGE_SIZE or not all(isinstance(row, Mapping) for row in rows):
+        wire_count, _ = collector._clockify_checkpoint_wire_page(page, overlap_history=overlap_history)
+        if (not overlap_history and len(rows) > collector.CLOCKIFY_PAGE_SIZE) or not all(isinstance(row, Mapping) for row in rows):
             raise checkpoints.CheckpointError("checkpoint native page payload is invalid")
-        if index < len(state.pages) - 1 and len(rows) != collector.CLOCKIFY_PAGE_SIZE:
+        if index < len(state.pages) - 1 and (
+                wire_count < collector.CLOCKIFY_PAGE_SIZE
+                or (not overlap_history and wire_count != collector.CLOCKIFY_PAGE_SIZE)):
             raise checkpoints.CheckpointError("checkpoint has a short nonterminal page")
     if len(state.pages) > 100:
         raise checkpoints.CheckpointError("checkpoint exceeds pagination safety limit")
@@ -235,7 +249,7 @@ def _validate_with_compatibility(directory: Path, files: dict[str, bytes], evide
     projection = collector.fetch_clockify(
         {"CLOCKIFY_WORKSPACE_ID": request["workspace_id"]},
         {"clockify_user_id": request["user_id"]}, since, until,
-        snapshot_at=observed, checkpoint_store=store,
+        snapshot_at=observed, checkpoint_store=store, checkpoint_identity=identity,
     )
     bound_projection = _document(evidence)
     legacy_projection = _legacy_minute_projection(projection)
@@ -279,12 +293,13 @@ def capture_checkpoint_snapshot(*, checkpoint_manifest: Path, clockify_evidence:
     for protected in (directory.parent, clockify_evidence.parent.parent):
         if destination.is_relative_to(protected):
             raise checkpoints.CheckpointError("snapshot destination cannot alter original cache or source run")
-    if checkpoint_manifest.name != "manifest.json" or directory.name != checkpoints._digest(identity.document())[7:]:
+    if checkpoint_manifest.name != "manifest.json":
         raise checkpoints.CheckpointError("checkpoint locator does not match trusted identity")
     manifest_raw = _read(checkpoint_manifest)
     manifest = _document(manifest_raw)
-    if manifest.get("identity") != identity.document():
-        raise checkpoints.CheckpointError("checkpoint identity does not match trusted request")
+    identity = _pinned_identity(manifest.get("identity"), workspace_id, user_id, since, until)
+    if directory.name != checkpoints._digest(identity.document())[7:]:
+        raise checkpoints.CheckpointError("checkpoint locator does not match trusted identity")
     files = {"manifest.json": manifest_raw}
     references = manifest.get("pages")
     if not isinstance(references, list):
@@ -342,7 +357,8 @@ def load_checkpoint_snapshot(snapshot_dir: Path | None, *, workspace_id: str, us
         expected_keys.add("observation_compatibility")
     if set(proof) != expected_keys or version not in (SCHEMA_VERSION, SCHEMA_VERSION_V2):
         raise checkpoints.CheckpointError("snapshot manifest schema is unsupported")
-    if proof["request"] != request or proof["checkpoint_identity"] != identity.document():
+    identity = _pinned_identity(proof["checkpoint_identity"], workspace_id, user_id, since, until)
+    if proof["request"] != request:
         raise checkpoints.CheckpointError("snapshot identity does not match trusted request")
     count = proof["page_count"]
     if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= 100:

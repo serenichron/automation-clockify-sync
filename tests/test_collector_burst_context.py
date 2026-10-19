@@ -1573,6 +1573,7 @@ class CollectorBurstContextTests(unittest.TestCase):
                     SINCE,
                     UNTIL,
                     checkpoint_store=store,
+                    checkpoint_identity=identity,
                 )
 
         self.assertEqual("error", corrupted["status"])
@@ -1609,6 +1610,7 @@ class CollectorBurstContextTests(unittest.TestCase):
                     SINCE,
                     UNTIL,
                     checkpoint_store=store,
+                    checkpoint_identity=identity,
                 )
 
         self.assertEqual("error", corrupted["status"])

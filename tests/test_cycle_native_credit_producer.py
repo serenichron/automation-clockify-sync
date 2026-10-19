@@ -50,7 +50,8 @@ class CycleNativeCreditProducerTests(unittest.TestCase):
         state = store.mark_complete(state)
         raw = collector.fetch_clockify({"CLOCKIFY_WORKSPACE_ID": "workspace-1"},
             {"clockify_user_id": "user-1"}, SINCE, UNTIL,
-            snapshot_at=dt.datetime.fromisoformat(OBSERVED.replace("Z", "+00:00")), checkpoint_store=store)
+            snapshot_at=dt.datetime.fromisoformat(OBSERVED.replace("Z", "+00:00")),
+            checkpoint_store=store, checkpoint_identity=identity)
         write(source / "evidence/clockify-existing.json", raw)
         original_evidence = root / "original-run/evidence/clockify-existing.json"
         write(original_evidence, raw)

@@ -665,6 +665,8 @@ def classify_noise(event: Mapping[str, Any]) -> str | None:
     kind = str(attrs.get("kind") or "").lower()
     if role == "system":
         return "system_message"
+    if kind == "injected_session_message":
+        return "injected_wrapper"
     if (
         role == "tool"
         or kind == "tool"
@@ -1990,6 +1992,8 @@ def _activity_observed_intervals(
     hermes_groups: dict[tuple[str, str, str], list[dict[str, str]]] = {}
     for event in cited_events:
         source_type = str(event.get("source_type") or "")
+        if _attributes(event).get("kind") == "injected_session_message":
+            continue
         if (
             source_type in POINT_OBSERVATION_GAP_THRESHOLDS_SECONDS
             and collector.is_injected_session_message(str(_attributes(event).get("content") or ""))
@@ -2066,8 +2070,26 @@ def _activity_observed_intervals(
     ]
 
 
+def _session_timing_pool_sources(routing: Mapping[str, Any]) -> tuple[str, ...]:
+    """Opt in per source without changing historical routing or result shapes."""
+    if "session_timing_pool_sources" not in routing:
+        return ("codex_sessions",)
+    sources = routing["session_timing_pool_sources"]
+    if (
+        not isinstance(sources, list)
+        or any(not isinstance(source, str) or source not in {"codex_sessions", "claude_bursts"}
+               for source in sources)
+        or len(sources) != len(set(sources))
+    ):
+        raise WorkAccountingError(
+            "session_timing_pool_sources must be a unique list of codex_sessions/claude_bursts source types"
+        )
+    return tuple(sources)
+
+
 def _session_timing_contexts(
     events: Iterable[dict[str, Any]],
+    *, pool_sources: Sequence[str] = ("codex_sessions",),
 ) -> dict[str, dict[str, Any]]:
     """Index bounded human pools separately from atomic outcome citations.
 
@@ -2121,15 +2143,15 @@ def _session_timing_contexts(
             pools.setdefault(group, []).append((start, end, context))
             for evidence_id in ids:
                 contexts[evidence_id] = context
-    # Reviewed Codex outcomes can cite only the assistant result point. Index
+    # Enabled outcomes can cite only the assistant result point. Index
     # that point into its unique containing human pool without adding assistant
     # runtime to the bounds or relabelling human anchors as outcome citations.
     for event in event_list:
         source = event.get("source_ref") or {}
         attrs = _attributes(event)
         if (
-            event.get("source_type") != "codex_sessions_event"
-            or source.get("source_type") != "codex_sessions"
+            source.get("source_type") not in pool_sources
+            or event.get("source_type") != str(source.get("source_type")) + "_event"
             or not source.get("machine") or not source.get("session_id")
             or attrs.get("role") != "assistant"
             or attrs.get("kind", "message") != "message" or attrs.get("tool_name")
@@ -2141,7 +2163,7 @@ def _session_timing_contexts(
             (event.get("raw_source_span") or {}).get("timestamp")
             or event.get("observed_at")
         )
-        group = ("codex_sessions_event", str(source["machine"]), str(source["session_id"]))
+        group = (str(event["source_type"]), str(source["machine"]), str(source["session_id"]))
         containing = [context for start, end, context in pools.get(group, [])
                       if point is not None and start <= point <= end]
         if len(containing) == 1:
@@ -3099,6 +3121,8 @@ def run_accounting(
         raise WorkAccountingError(f"ledger member identities are invalid: {exc}") from exc
     analysis_events, noise = _analysis_events(all_events, member_identities)
     routing = _read_json(routing_path or (root / "routing.json"))
+    session_pool_sources = _session_timing_pool_sources(routing)
+    claude_pool_enabled = "claude_bursts" in session_pool_sources
     retry_actor_contract = None
     if failed_review_retry_cache_only:
         from scripts import clockify_review_run as review_run
@@ -3304,7 +3328,9 @@ def run_accounting(
     workstream_envelopes = _workstream_daily_envelopes(
         analysis.get("activities", []), events_by_id
     )
-    session_timing_contexts = _session_timing_contexts(analysis_events)
+    session_timing_contexts = _session_timing_contexts(
+        analysis_events, pool_sources=session_pool_sources,
+    )
     activity_context: dict[str, dict[str, Any]] = {}
     allocation_demands = []
     ambiguous: list[dict[str, Any]] = []
@@ -3469,6 +3495,8 @@ def run_accounting(
                 and _attributes(other).get("kind", "message") == "message"
                 and not _attributes(other).get("tool_name")
                 and str(_attributes(other).get("content") or "").strip()
+                and (not claude_pool_enabled or event.get("source_type") != "claude_bursts_event"
+                     or not collector.is_injected_session_message(str(_attributes(other).get("content") or "")))
                 for other in cited
             ):
                 # Historical accepted user-only reports do not become new
@@ -3476,6 +3504,15 @@ def run_accounting(
                 continue
             context = session_timing_contexts[evidence_id]
             timing_contexts[context["pool_id"]] = context
+        if (
+            claude_pool_enabled and cited
+            and all(event.get("source_type") == "claude_bursts_event" for event in cited)
+            and (len(timing_contexts) != 1
+                 or any(str(event["evidence_id"]) not in session_timing_contexts for event in cited))
+        ):
+            # The opt-in cannot combine parallel sessions or let one containing
+            # result lend its pool to another result outside the human bounds.
+            timing_contexts = {}
         intervals = _activity_observed_intervals(cited)
         context_intervals = sorted(
             (dict(context["interval"]) for context in timing_contexts.values()),
@@ -3483,21 +3520,29 @@ def run_accounting(
         )
         cited_capacity = _interval_capacity_minutes(intervals)
         requested_minutes = int((activity.get("effort") or {}).get("recommended_minutes") or 0)
-        # Codex result points often follow their human request by only seconds.
+        # Result points often follow their human request by only seconds.
         # Such a citation-local span must not suppress a larger paired human
         # placement pool. This remains estimated, globally shared capacity,
         # never an observed duration of the outcome or assistant runtime.
-        codex_under_capacity = (
+        session_under_capacity = (
             bool(cited) and bool(timing_contexts)
-            and all(event.get("source_type") == "codex_sessions_event" for event in cited)
-            # New result-only aliases fill missing timing, not replace a
-            # positive cited interval. Existing paired human borrowing remains.
-            and any(str(event["evidence_id"]) in context["evidence_ids"]
-                    for context in timing_contexts.values() for event in cited)
+            and (
+                ("codex_sessions" in session_pool_sources
+                 and all(event.get("source_type") == "codex_sessions_event" for event in cited)
+                 # Preserve the historical Codex positive-span restriction:
+                 # only paired human citations may replace a cited interval.
+                 and any(str(event["evidence_id"]) in context["evidence_ids"]
+                         for context in timing_contexts.values() for event in cited))
+                # Claude opt-in fills missing whole-minute capacity only.
+                # Positive observed spans retain their literal bounds and
+                # recovery semantics, including evidence-bound corrections.
+                or (claude_pool_enabled and cited_capacity == 0
+                    and all(event.get("source_type") == "claude_bursts_event" for event in cited))
+            )
             and requested_minutes > cited_capacity
             and _interval_capacity_minutes(context_intervals) > cited_capacity
         )
-        borrowed_timing_context = bool(timing_contexts) and (not intervals or codex_under_capacity)
+        borrowed_timing_context = bool(timing_contexts) and (not intervals or session_under_capacity)
         if borrowed_timing_context:
             intervals = context_intervals
         observed_capacity = _interval_capacity_minutes(intervals)
@@ -3995,6 +4040,8 @@ def run_accounting(
             POINT_OBSERVATION_CLUSTERING_INPUT
         )
     }
+    if "session_timing_pool_sources" in routing:
+        serialized_allocation["deterministic_inputs"]["session_timing_pool_sources"] = list(session_pool_sources)
     review_tombstones = [
         copy.deepcopy(row)
         for row in skipped

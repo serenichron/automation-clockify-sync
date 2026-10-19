@@ -1,5 +1,6 @@
 """Pending raw provenance must not masquerade as old downstream completion."""
 import argparse
+import contextlib
 import copy
 import datetime as dt
 import hashlib
@@ -39,7 +40,7 @@ def write_empty_actor_fixture(path):
         'ledger_event_count':0,'ledger_evidence_digest':semantic_analyzer.stable_digest('led-',[]),
         'analysis_chunks':[{'model':'offline-fixture','tier':'fixture'}]})+'\n')
 
-def pending_fixture(root, *, retain_native=False, multica=None):
+def pending_fixture(root, *, retain_native=False, multica=None, legacy=True):
     runs = root/'runs'; runs.mkdir(exist_ok=True)
     checkpoint_root = root/'checkpoints'
     identity = collector_slices.BacklogIdentity(collector.iso_utc(SINCE),collector.iso_utc(UNTIL),
@@ -48,13 +49,20 @@ def pending_fixture(root, *, retain_native=False, multica=None):
     backlog = collector_slices.BacklogStore(checkpoint_root).open(identity,plan)
     checkpoint_root.chmod(0o700)
     pages = collector_checkpoints.PageCheckpointStore(backlog.directory/'source-checkpoints')
-    ci = collector._clockify_checkpoint_identity('workspace-one','user-one',SINCE,UNTIL)
+    ci = collector._clockify_checkpoint_identity('workspace-one','user-one',SINCE,UNTIL,overlap_history=not legacy)
     state = pages.open(ci,initial_metadata={'snapshot_at':'2026-09-03T00:00:00Z'})
-    state = pages.append_page(state,payload=[],continuation={'page':2},signature=collector._clockify_page_signature([]))
+    metadata = {} if legacy else {'metadata':{'wire_row_count':0,'wire_signature':collector._clockify_page_signature([])}}
+    state = pages.append_page(state,payload=[],continuation={'page':2},signature=collector._clockify_page_signature([]),**metadata)
     pages.mark_complete(state)
     source = collector._slice_run_dir(plan[0],identity.compatibility_version).name
     source = runs/source
-    with mock.patch.object(collector,'collector_runtime_identity',return_value={'git_sha':'original'}), \
+    # Historical tests explicitly emulate the old writer, rather than making
+    # current fresh collection silently reuse its start-filtered checkpoint.
+    identity_constructor = collector._clockify_checkpoint_identity
+    def legacy_identity(workspace,user,since,until,**_kwargs):
+        return identity_constructor(workspace,user,since,until)
+    release = mock.patch.object(collector,'_clockify_checkpoint_identity',side_effect=legacy_identity) if legacy else contextlib.nullcontext()
+    with release, mock.patch.object(collector,'collector_runtime_identity',return_value={'git_sha':'original'}), \
          mock.patch.object(collector,'clockify_get',side_effect=AssertionError('network forbidden')), \
          mock.patch.object(collector,'fetch_fathom',return_value={'status':'ok','complete':True,'meetings':[]}), \
          mock.patch.object(collector,'fetch_multica_issues',return_value=multica or {'status':'ok','complete':True,'issues':[]}):

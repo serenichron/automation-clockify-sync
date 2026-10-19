@@ -117,6 +117,7 @@ FATHOM_MAX_COLLECTION_RETRY_DELAY_SECONDS = 600
 FATHOM_COLLECTION_RETRY_DEADLINE_SECONDS = 1800
 CLOCKIFY_PAGE_SIZE = 200
 CLOCKIFY_CHECKPOINT_COMPATIBILITY_VERSION = "clockify-pagination/v1"
+CLOCKIFY_OVERLAP_CHECKPOINT_COMPATIBILITY_VERSION = "clockify-overlap-pagination/v2"
 FATHOM_CHECKPOINT_COMPATIBILITY_VERSION = "fathom-cursor-pagination/v2"
 MULTICA_PAGE_SIZE = 100
 MULTICA_CHECKPOINT_COMPATIBILITY_VERSION = "multica-offset-pagination/v1"
@@ -692,19 +693,29 @@ def _message_content(content: Any) -> str:
     )
 
 
+def _fresh_session_message_kind(role: str, content: str) -> str:
+    """Freeze automatic hook classification at extraction, not historical replay."""
+    if role == "user" and content.lstrip().casefold().startswith("stop hook feedback:"):
+        return "injected_session_message"
+    return "message"
+
+
 def _message_evidence(content: Any, role: str) -> list[dict[str, Any]]:
     """Normalize text and tool activity while excluding hidden reasoning."""
     if isinstance(content, str):
-        return [{"role": role, "kind": "message", "content": content}]
+        return [{"role": role, "kind": _fresh_session_message_kind(role, content), "content": content}]
     if not isinstance(content, list):
-        return [{"role": role, "kind": "message", "content": str(content or "")}]
+        text = str(content or "")
+        return [{"role": role, "kind": _fresh_session_message_kind(role, text), "content": text}]
+    kind = _fresh_session_message_kind(role, _message_content(content))
     events: list[dict[str, Any]] = []
     for item in content:
         if not isinstance(item, dict):
             continue
         item_type = str(item.get("type") or "")
         if item_type == "text":
-            events.append({"role": role, "kind": "message", "content": str(item.get("text") or "")})
+            text = str(item.get("text") or "")
+            events.append({"role": role, "kind": kind, "content": text})
         elif item_type == "tool_use":
             events.append(
                 {
@@ -776,6 +787,7 @@ def _partition_bursts(events: list[dict[str, Any]]) -> list[list[dict[str, Any]]
     """Group on direct user activity, then attach assistant context without bridging gaps."""
     users = sorted(
         (event for event in events if event.get("timestamp") and event.get("role") == "user"
+         and event.get("kind") != "injected_session_message"
          and not is_injected_session_message(str(event.get("content") or ""))),
         key=lambda event: event["timestamp"],
     )
@@ -794,7 +806,7 @@ def _partition_bursts(events: list[dict[str, Any]]) -> list[list[dict[str, Any]]
     # runtime context must not slide the cutoff and bridge unattended activity.
     cutoffs = [burst[-1]["timestamp"] + dt.timedelta(seconds=BURST_GAP_SECONDS) for burst in bursts]
     for event in events:
-        if event.get("role") == "user" or not event.get("timestamp"):
+        if (event.get("role") == "user" and event.get("kind") != "injected_session_message") or not event.get("timestamp"):
             continue
         index = bisect.bisect_right(starts, event["timestamp"]) - 1
         if index >= 0 and event["timestamp"] <= cutoffs[index]:
@@ -809,7 +821,7 @@ def _burst_context(events: list[dict[str, Any]]) -> tuple[str, str, list[dt.date
     user_timestamps: list[dt.datetime] = []
     for event in events:
         if event["role"] == "user":
-            if is_injected_session_message(str(event.get("content") or "")):
+            if event.get("kind") == "injected_session_message" or is_injected_session_message(str(event.get("content") or "")):
                 continue
             user_timestamps.append(event["timestamp"])
             if not first_user:
@@ -1388,7 +1400,7 @@ def collect_local_sessions(machine: dict[str, Any], since: dt.datetime, until: d
                         {
                             "timestamp": local_dt_string(parse_dt(message.get("timestamp"))),
                             "role": str(message.get("role") or "unknown"),
-                            "kind": "message",
+                            "kind": _fresh_session_message_kind(str(message.get("role") or "unknown"), str(message.get("content") or "")),
                             "content": str(message.get("content") or ""),
                             "ordinal": index,
                         }
@@ -1424,7 +1436,8 @@ def collect_local_sessions(machine: dict[str, Any], since: dt.datetime, until: d
 
 def _remote_claude_contract() -> str:
     """Remote stdlib-only Claude parser, kept behaviorally aligned with local bursts."""
-    return inspect.getsource(is_injected_session_message) + '\n' + r'''def skip_path(p):
+    return (inspect.getsource(is_injected_session_message) + '\n'
+            + inspect.getsource(_fresh_session_message_kind) + '\n') + r'''def skip_path(p):
     return any(f in str(p) for f in ['/subagents/','/multica/','multica-runtime','claude-mem-observer','multica-command'])
 def one_line(v, limit=320):
     v=' '.join(str(v or '').split())
@@ -1469,9 +1482,10 @@ def parse_claude(p):
             t=parse_dt(o.get('timestamp'))
             role=o.get('type')
             if not t or role not in ('user','assistant'): continue
-            events.append({'timestamp':t.astimezone(BUCHAREST),'role':role,'content':message_text(o.get('message',{}).get('content',''))})
+            content=message_text(o.get('message',{}).get('content',''))
+            events.append({'timestamp':t.astimezone(BUCHAREST),'role':role,'kind':_fresh_session_message_kind(role,content),'content':content})
     except Exception: return []
-    users=sorted((event for event in events if event['role']=='user' and not is_injected_session_message(event['content'])), key=lambda event:event['timestamp'])
+    users=sorted((event for event in events if event['role']=='user' and event['kind']!='injected_session_message' and not is_injected_session_message(event['content'])), key=lambda event:event['timestamp'])
     if not users: return []
     bursts=[]
     for user in users:
@@ -1509,7 +1523,8 @@ def parse_claude(p):
 def _remote_codex_contract() -> str:
     """Remote Codex extraction, using the same row-local user-burst context contract."""
     helpers = ("from typing import Any\nimport bisect\n" + f"BURST_GAP_SECONDS={BURST_GAP_SECONDS}\n"
-               + inspect.getsource(is_injected_session_message) + "\n" + inspect.getsource(_codex_message_event)
+               + inspect.getsource(is_injected_session_message) + "\n"
+               + inspect.getsource(_fresh_session_message_kind) + "\n" + inspect.getsource(_codex_message_event)
                + "\n" + inspect.getsource(_deduplicate_codex_messages)
                + "\n" + inspect.getsource(_codex_rollout_objects)
                + "\n" + inspect.getsource(_partition_bursts))
@@ -1534,10 +1549,10 @@ def _remote_codex_contract() -> str:
             burst.sort(key=lambda event:event['timestamp'])
             first_user=''; last_assistant=''; user_ts=[]
             for event in burst:
-                if event['role']=='user':
+                if event['role']=='user' and event.get('kind')!='injected_session_message':
                     user_ts.append(event['timestamp']); candidate=clean_context(event['content'])
                     if not first_user and len(candidate)>=10: first_user=candidate
-                else:
+                elif event['role']=='assistant':
                     candidate=clean_context(event['content'])
                     if candidate: last_assistant=candidate
             if not user_ts: continue
@@ -1592,6 +1607,7 @@ def _remote_hermes_contract() -> str:
         "from typing import Any, Mapping\n"
         f"BURST_GAP_SECONDS={BURST_GAP_SECONDS}\n"
         + inspect.getsource(is_injected_session_message) + "\n"
+        + inspect.getsource(_fresh_session_message_kind) + "\n"
         + inspect.getsource(hermes_user_observed_intervals)
     )
     return helpers + r'''try:
@@ -1625,7 +1641,7 @@ def _remote_hermes_contract() -> str:
             events=[]
             for index,(role,timestamp,content,tool_name) in enumerate(message_rows):
                 event_dt=dt.datetime.fromtimestamp(timestamp,tz=BUCHAREST) if timestamp else None
-                events.append({'timestamp':event_dt.isoformat() if event_dt else None,'role':str(role or 'unknown'),'kind':'tool' if tool_name else 'message','content':str(content or ''),'tool_name':str(tool_name or ''),'ordinal':index})
+                events.append({'timestamp':event_dt.isoformat() if event_dt else None,'role':str(role or 'unknown'),'kind':'tool' if tool_name else _fresh_session_message_kind(str(role or 'unknown'),str(content or '')),'content':str(content or ''),'tool_name':str(tool_name or ''),'ordinal':index})
             first_content=next((event['content'][:300] for event in events if event['role']=='user' and event['content']), '')
             res['hermes_db_sessions'].append({'source':'hermes_db','machine':MACHINE,'session_id':sid,'start':local_str(start_dt),'end':local_str(end_dt),'duration_minutes':max(0,int((end_dt-start_dt).total_seconds()/60)),'message_count':len(events),'source_message_count':source_count,'model':model,'cwd':cwd or '','estimated_cost_usd':cost or 0.0,'input_tokens':in_tok or 0,'output_tokens':out_tok or 0,'title':first_content if (start_clipped or end_clipped) else (title or ''),'first_user_message':first_content,'events':events,'observed_user_intervals':hermes_user_observed_intervals(events),'boundary_clipped':start_clipped or end_clipped,'start_clipped':start_clipped,'end_clipped':end_clipped})
         conn.close()
@@ -1997,7 +2013,7 @@ def collect_hermes_db_sessions(db_path: str, machine: str, since: dt.datetime, u
                     {
                         "timestamp": event_dt.isoformat() if event_dt else None,
                         "role": str(role or "unknown"),
-                        "kind": "tool" if tool_name else "message",
+                        "kind": "tool" if tool_name else _fresh_session_message_kind(str(role or "unknown"), str(content or "")),
                         "content": str(content or ""),
                         "tool_name": str(tool_name or ""),
                         "ordinal": index,
@@ -2087,7 +2103,7 @@ def _codex_message_event(obj: dict[str, Any]) -> dict[str, Any] | None:
         )):
             return None
     return {"timestamp": timestamp.astimezone(BUCHAREST), "role": role,
-            "kind": "message", "content": content, "_transport": transport}
+            "kind": _fresh_session_message_kind(role, content), "content": content, "_transport": transport}
 
 
 def _deduplicate_codex_messages(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2587,6 +2603,8 @@ def _clockify_checkpoint_identity(
     user_id: str,
     since: dt.datetime,
     until: dt.datetime,
+    *,
+    overlap_history: bool = False,
 ) -> CheckpointIdentity:
     request_contract = {
         "endpoint": "/workspaces/{workspace_id}/user/{user_id}/time-entries",
@@ -2595,6 +2613,10 @@ def _clockify_checkpoint_identity(
         "page_size": CLOCKIFY_PAGE_SIZE,
         "query": {"start": iso_utc(since), "end": iso_utc(until)},
     }
+    if overlap_history:
+        # Clockify's start parameter filters entry starts, not overlap. Read
+        # earlier starts too, then retain only rows touching the target window.
+        request_contract["query"] = {"end": iso_utc(until)}
     request_fingerprint = "sha256:" + hashlib.sha256(
         json.dumps(request_contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -2603,8 +2625,51 @@ def _clockify_checkpoint_identity(
         since_utc=iso_utc(since),
         until_utc=iso_utc(until),
         request_fingerprint=request_fingerprint,
-        compatibility_version=CLOCKIFY_CHECKPOINT_COMPATIBILITY_VERSION,
+        compatibility_version=(CLOCKIFY_OVERLAP_CHECKPOINT_COMPATIBILITY_VERSION
+                               if overlap_history else CLOCKIFY_CHECKPOINT_COMPATIBILITY_VERSION),
     )
+
+
+def _clockify_overlap_rows(
+    rows: list[Mapping[str, Any]], since: dt.datetime, until: dt.datetime,
+) -> list[Mapping[str, Any]]:
+    retained = []
+    for row in rows:
+        interval = row.get("timeInterval", {})
+        start = parse_dt(interval.get("start"))
+        end = parse_dt(interval.get("end"))
+        # Keep unknown instants for the existing fail-closed projection rather
+        # than silently excluding a possibly relevant running entry.
+        if start is not None and start >= until:
+            continue
+        if end is not None and end <= since:
+            continue
+        retained.append(row)
+    return retained
+
+
+def _clockify_checkpoint_wire_page(
+    saved_page: Mapping[str, Any], *, overlap_history: bool,
+) -> tuple[int, str]:
+    """v1 pages are native wire rows; v2 payloads are retained overlap rows."""
+    rows = saved_page["payload"]
+    signature = saved_page["signature"]
+    if not isinstance(rows, tuple) or not all(isinstance(row, Mapping) for row in rows):
+        raise CheckpointError("checkpoint Clockify page payload is invalid")
+    if not isinstance(signature, str) or signature != _clockify_page_signature(rows):
+        raise CheckpointError("checkpoint Clockify page signature is invalid")
+    if not overlap_history:
+        return len(rows), signature
+    metadata = saved_page["metadata"]
+    count = metadata.get("wire_row_count")
+    wire_signature = metadata.get("wire_signature")
+    if (set(metadata) != {"wire_row_count", "wire_signature"}
+            or not isinstance(count, int) or isinstance(count, bool) or count < len(rows)
+            or not isinstance(wire_signature, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", wire_signature) is None
+            or (count == len(rows) and wire_signature != signature)):
+        raise CheckpointError("checkpoint Clockify wire page metadata is invalid")
+    return count, wire_signature
 
 
 def _clockify_checkpoint_snapshot(state: CheckpointState) -> dt.datetime:
@@ -2624,24 +2689,21 @@ def _clockify_checkpoint_entries(
     entries: list[Mapping[str, Any]] = []
     seen_pages: set[str] = set()
     final_page_size: int | None = None
+    overlap_history = state.identity.compatibility_version == CLOCKIFY_OVERLAP_CHECKPOINT_COMPATIBILITY_VERSION
     for page_number, saved_page in enumerate(checkpoint_store.iter_pages(state), start=1):
         payload = saved_page["payload"]
-        if not isinstance(payload, tuple):
-            raise CheckpointError("checkpoint Clockify page payload is invalid")
-        rows = [entry for entry in payload if isinstance(entry, Mapping)]
+        wire_count, signature = _clockify_checkpoint_wire_page(saved_page, overlap_history=overlap_history)
+        rows = list(payload)
         continuation = saved_page["continuation"]
         if not isinstance(continuation, Mapping) or dict(continuation) != {
             "page": page_number + 1
         }:
             raise CheckpointError("checkpoint Clockify page continuation is invalid")
-        signature = saved_page["signature"]
-        if not isinstance(signature, str) or signature != _clockify_page_signature(rows):
-            raise CheckpointError("checkpoint Clockify page signature is invalid")
-        if rows and signature in seen_pages:
+        if wire_count and signature in seen_pages:
             raise CheckpointError("checkpoint Clockify pagination repeated a page")
         seen_pages.add(signature)
         entries.extend(rows)
-        final_page_size = len(rows)
+        final_page_size = wire_count
     if state.complete and (
         final_page_size is None or final_page_size >= CLOCKIFY_PAGE_SIZE
     ):
@@ -2670,6 +2732,7 @@ def fetch_clockify(
     *,
     snapshot_at: dt.datetime | None = None,
     checkpoint_store: PageCheckpointStore | None = None,
+    checkpoint_identity: CheckpointIdentity | None = None,
 ) -> dict[str, Any]:
     if cenv.get("_missing"):
         return {
@@ -2692,25 +2755,33 @@ def fetch_clockify(
             while True:
                 page_entries = clockify_get(
                     f"/workspaces/{ws}/user/{user}/time-entries?"
-                    f"start={iso_utc(since)}&end={iso_utc(until)}&page={page}&page-size={CLOCKIFY_PAGE_SIZE}",
+                    f"end={iso_utc(until)}&page={page}&page-size={CLOCKIFY_PAGE_SIZE}",
                     cenv,
                 )
                 if not isinstance(page_entries, list):
                     raise ValueError("Clockify time-entry response did not contain a list")
-                rows = [entry for entry in page_entries if isinstance(entry, dict)]
+                if not all(isinstance(entry, Mapping) for entry in page_entries):
+                    raise ValueError("Clockify time-entry page contains an invalid row")
+                rows = page_entries
                 signature = tuple(str(entry.get("id") or "") for entry in rows)
                 if rows and signature in seen_pages:
                     raise ValueError("Clockify pagination repeated a page")
                 seen_pages.add(signature)
-                entries.extend(rows)
-                if len(rows) < CLOCKIFY_PAGE_SIZE:
+                entries.extend(_clockify_overlap_rows(rows, since, until))
+                if len(page_entries) < CLOCKIFY_PAGE_SIZE:
                     break
                 page += 1
                 if page > 100:
                     raise ValueError("Clockify pagination exceeded safety limit")
             pages_fetched = page
         else:
-            identity = _clockify_checkpoint_identity(ws, user, since, until)
+            # Fresh collection never treats start-filtered v1 history as full
+            # overlap coverage. Historical replay must explicitly pin its v1 identity.
+            identity = checkpoint_identity or _clockify_checkpoint_identity(ws, user, since, until, overlap_history=True)
+            overlap_history = identity.compatibility_version == CLOCKIFY_OVERLAP_CHECKPOINT_COMPATIBILITY_VERSION
+            expected_identity = _clockify_checkpoint_identity(ws, user, since, until, overlap_history=overlap_history)
+            if identity != expected_identity:
+                raise CheckpointError("checkpoint Clockify identity does not match requested collection")
             checkpoint_state = checkpoint_store.open(
                 identity,
                 initial_metadata={"snapshot_at": _clockify_timestamp(observed_at.astimezone(dt.timezone.utc))},
@@ -2724,27 +2795,33 @@ def fetch_clockify(
             while not checkpoint_state.complete:
                 if page > 100:
                     raise ValueError("Clockify pagination exceeded safety limit")
+                start_query = "" if overlap_history else f"start={iso_utc(since)}&"
                 page_entries = clockify_get(
                     f"/workspaces/{ws}/user/{user}/time-entries?"
-                    f"start={iso_utc(since)}&end={iso_utc(until)}&page={page}&page-size={CLOCKIFY_PAGE_SIZE}",
+                    f"{start_query}end={iso_utc(until)}&page={page}&page-size={CLOCKIFY_PAGE_SIZE}",
                     cenv,
                 )
                 if not isinstance(page_entries, list):
                     raise ValueError("Clockify time-entry response did not contain a list")
-                rows = [entry for entry in page_entries if isinstance(entry, Mapping)]
+                if not all(isinstance(entry, Mapping) for entry in page_entries):
+                    raise ValueError("Clockify time-entry page contains an invalid row")
+                rows = page_entries
                 signature = _clockify_page_signature(rows)
                 if rows and signature in seen_pages:
                     raise ValueError("Clockify pagination repeated a page")
                 seen_pages.add(signature)
+                retained_rows = _clockify_overlap_rows(rows, since, until) if overlap_history else rows
                 checkpoint_state = checkpoint_store.append_page(
                     checkpoint_state,
-                    payload=page_entries,
+                    payload=retained_rows,
                     continuation={"page": page + 1},
-                    signature=signature,
+                    signature=_clockify_page_signature(retained_rows),
+                    metadata=({"wire_row_count": len(page_entries), "wire_signature": signature}
+                              if overlap_history else None),
                 )
-                entries.extend(rows)
+                entries.extend(retained_rows)
                 pages_fetched += 1
-                if len(rows) < CLOCKIFY_PAGE_SIZE:
+                if len(page_entries) < CLOCKIFY_PAGE_SIZE:
                     checkpoint_state = checkpoint_store.mark_complete(checkpoint_state)
                     break
                 page += 1
@@ -4562,7 +4639,7 @@ def _collect_slice(
         except ModuleNotFoundError:
             from clockify_checkpoint_snapshot import capture_checkpoint_snapshot
         identity = _clockify_checkpoint_identity(
-            cenv["CLOCKIFY_WORKSPACE_ID"], routing["clockify_user_id"], since, until
+            cenv["CLOCKIFY_WORKSPACE_ID"], routing["clockify_user_id"], since, until, overlap_history=True
         )
         with tempfile.TemporaryDirectory(prefix="native-checkpoint-", dir=run_dir.parent) as staging:
             staged = Path(staging) / "snapshot"

@@ -815,6 +815,37 @@ def build_report(
             accounting_issues.append("Work-accounting stage did not prove external_writes=false")
         if not accounting.get("ledger_manifest", {}).get("manifest_id"):
             accounting_issues.append("Work-accounting result lacks a validated ledger manifest")
+        regression = accounting.get("correction_regression")
+        if isinstance(regression, dict):
+            results = regression.get("results", [])
+            skipped_targets = {
+                (row.get("activity_id"), row.get("evidence_fingerprint"))
+                for row in results
+                if row.get("decision") == "skip" and row.get("status") == "pass"
+                and row.get("activity_id") and row.get("evidence_fingerprint")
+            }
+            applied_skip_cases = {
+                (row.get("id"), row.get("evidence_fingerprint"), case_id)
+                for row in accounting.get("skipped", [])
+                if row.get("reason") == "preserved evidence-bound skip decision"
+                and not any(p.get("activity_id") == row.get("id") for p in proposals)
+                for case_id in row.get("regression_case_ids", [])
+            }
+            failed = [row for row in results if row.get("status") == "fail"]
+            # An explicit evidence-bound skip can intentionally retire an older
+            # presence expectation. It cannot excuse a changed route or duration.
+            unresolved = [row for row in failed if not (
+                (row.get("failures") == ["reviewed activity is missing"]
+                 and (row.get("activity_id"), row.get("evidence_fingerprint")) in skipped_targets)
+                # Accounting applies approved skips after evaluating its saved
+                # regression cases. Check the final effect, not the stale flag.
+                or (row.get("decision") == "skip"
+                    and row.get("failures") == ["previously skipped activity reappeared"]
+                    and (row.get("activity_id"), row.get("evidence_fingerprint"),
+                         row.get("regression_case_id")) in applied_skip_cases)
+            )]
+            if unresolved or regression.get("summary", {}).get("fail", 0) > len(failed):
+                accounting_issues.append("Previously reviewed corrections failed regression checks")
 
     if (
         missing_keys

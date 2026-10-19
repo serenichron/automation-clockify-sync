@@ -73,6 +73,20 @@ remain available for targeted diagnosis. Calendly recordings are first-class,
 read-only meeting evidence; scheduled events without a recording are retained
 only as `scheduled_without_recording` exclusions and never supply billable time.
 
+### Claude session timing
+
+To place reviewed Claude outcomes within observed same-session human windows,
+set `"session_timing_pool_sources": ["codex_sessions", "claude_bursts"]` in the
+routing snapshot. Placement remains estimated: assistant runtime is not human
+attention, gaps are not filled, and outcomes share the available pool. Keep the
+placement and overlap warnings visible for review. Omitting this setting keeps
+the historical Codex-only recipe; replay uses the saved routing, not live config.
+
+Fresh Clockify collection includes entries that started before the requested
+period but overlap it. Only relevant rows are persisted; pagination is based on
+the original response size. Older sealed checkpoints retain their exact request
+contract and are replayed explicitly, never silently reused as fresh coverage.
+
 ## Guarded Google Sheet publication
 
 Google Sheet publication is a separate post-review stage. Collection, analysis,

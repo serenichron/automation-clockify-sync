@@ -107,7 +107,7 @@ class SelectedHistoricalDeliveryTests(unittest.TestCase):
         native_state=store.append_page(native_state,payload=entries,continuation={'page':2},signature=collector._clockify_page_signature(entries))
         native_state=store.mark_complete(native_state)
         evidence=collector.fetch_clockify({'CLOCKIFY_WORKSPACE_ID':'workspace-1'},{'clockify_user_id':'member-1'},since,until,
-            snapshot_at=dt.datetime(2026,10,8,2,2,24,tzinfo=dt.timezone.utc),checkpoint_store=store)
+            snapshot_at=dt.datetime(2026,10,8,2,2,24,tzinfo=dt.timezone.utc),checkpoint_store=store,checkpoint_identity=identity)
         evidence_path=self.packet_dir/'native-evidence.json';write_json(evidence_path,evidence)
         self.packet['fresh_clockify_sha256']=hashlib.sha256(evidence_path.read_bytes()).hexdigest()
         self.packet['native_page_sha256']=hashlib.sha256((native_state.directory/'pages/000001.json').read_bytes()).hexdigest()
