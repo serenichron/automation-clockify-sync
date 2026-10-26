@@ -101,9 +101,11 @@ class BoundedOverlapTests(unittest.TestCase):
         self.assertEqual(4, len(fake.paths))
         self.assertTrue(all("start=" not in path for path in fake.paths))
 
-    def test_non_boolean_flag_fails_closed(self):
-        result = collector.fetch_clockify(ENV, {**ROUTING, "clockify_bounded_overlap": "yes"}, SINCE, UNTIL)
+    def test_non_boolean_flag_fails_closed_before_http(self):
+        with patch.object(collector, "clockify_get", side_effect=AssertionError("must reject before HTTP")) as backend:
+            result = collector.fetch_clockify(ENV, {**ROUTING, "clockify_bounded_overlap": "yes"}, SINCE, UNTIL)
         self.assertEqual("error", result["status"])
+        self.assertEqual(0, backend.call_count)
 
     def test_flagged_collection_uses_v3_and_seals_a_loadable_snapshot(self):
         with tempfile.TemporaryDirectory() as temporary:
