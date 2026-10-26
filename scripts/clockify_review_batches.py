@@ -88,14 +88,43 @@ def _activity(members: list[dict[str, Any]], *, allow_review_overlaps: bool = Fa
     }
 
 
+def group_summary_descriptions(activities: Sequence[Mapping[str, Any]],
+                               group_summaries: Mapping[str, Any]) -> dict[str, str]:
+    """Validate explicit reviewed wording against complete, unchanged groups.
+
+    This proves target/membership binding, not semantic coverage. The caller
+    owns review of every child; no wording is synthesized or certified here.
+    """
+    if not isinstance(group_summaries, Mapping):
+        raise ValueError("review group summaries must be a mapping")
+    groups = {activity["review_id"]: activity for activity in activities}
+    descriptions = {}
+    for identity, summary in group_summaries.items():
+        if not isinstance(identity, str) or identity not in groups:
+            raise ValueError("review group summary targets a foreign or stale parent")
+        if (not isinstance(summary, Mapping) or set(summary) != {"child_review_ids", "description"}
+                or not _strings(summary["child_review_ids"])
+                or summary["child_review_ids"] != groups[identity]["child_review_ids"]):
+            raise ValueError("review group summary child membership differs")
+        description = summary["description"]
+        if (not _text(description) or description != description.strip() or not description.isprintable()
+                or description.count(" — ") > 1):
+            raise ValueError("review group summary is empty, multiline or concatenated wording")
+        descriptions[identity] = description
+    return descriptions
+
+
 def package_review_batches(
     proposals: Sequence[Mapping[str, Any]], *,
     editorial_descriptions: Mapping[str, str], work_contexts: Mapping[str, str],
     protected_ids: Iterable[str] = (), timezone: str = "Europe/Bucharest",
     wording_only_ids: Iterable[str] = (),
+    materialized_correction_ids: Iterable[str] = (),
     allow_review_overlaps: bool = False,
     allow_clockify_overlaps: bool = False,
     natural_batches: bool = False,
+    all_durations: bool = False,
+    group_summaries: Mapping[str, Any] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Consolidate compatible sub-fifteen-minute sources to reviewable batches.
 
@@ -106,14 +135,23 @@ def package_review_batches(
     Explicit ``natural_batches`` presentation instead keeps all eligible
     children in each existing day/project/tags/billable/work-context group in
     one parent. Original child windows and seconds are always retained.
+    Explicit ``all_durations`` also admits positive whole-second sources of
+    fifteen minutes or more; all other eligibility and grouping guards remain.
+    Neither presentation option changes the historical defaults.
+
+    Optional ``group_summaries`` maps an already derived parent ID to its exact
+    ordered ``child_review_ids`` and reviewed ``description``. Only parent
+    wording is replaced, after the historical identity calculation. Omission
+    preserves legacy concatenation; this helper performs no semantic synthesis.
 
     ``work_contexts`` must contain caller-verified work identities, not labels
     synthesized from date/project. ``editorial_descriptions`` must contain the
     already prepared wording; raw source descriptions are never a fallback.
     Explicit protected IDs must include all authoritative approvals, postings
     and human corrections, even if those facts are absent from source objects.
-    Only explicit, source-bound wording-only authority may exempt a source's
-    human_corrected flag; it never overrides protected IDs or other guards.
+    Only explicit, source-bound wording-only or fully materialized correction
+    authority may exempt a source's human_corrected flag; neither overrides
+    protected IDs or other guards. This pure helper does not derive authority.
     The default remains the historic protected-human-correction behavior.
     ``allow_review_overlaps`` preserves the historical review-proposal overlap
     policy. Separate explicit ``allow_clockify_overlaps`` authority permits
@@ -128,6 +166,7 @@ def package_review_batches(
     zone = ZoneInfo(timezone)
     protected = frozenset(protected_ids)
     wording_only = frozenset(wording_only_ids)
+    correction_exemptions = wording_only | frozenset(materialized_correction_ids)
     items: list[dict[str, Any]] = []
     for raw in proposals:
         source = copy.deepcopy(raw)
@@ -150,11 +189,11 @@ def package_review_batches(
         if any(str(source.get(field) or "").strip().casefold() in {"approved", "posted"}
                for field in ("disposition", "review_status", "status")):
             reasons.append("approved_or_posted")
-        if (allow_review_overlaps or allow_clockify_overlaps or natural_batches or review_id in wording_only) and any(
+        if (allow_review_overlaps or allow_clockify_overlaps or natural_batches or all_durations or review_id in correction_exemptions) and any(
                 str(source.get(field) or "").strip().casefold() in {"approve", "skip", "skipped", "rejected", "superseded"}
                 for field in ("disposition", "review_status", "status")):
             reasons.append("protected_terminal_status")
-        if source.get("human_corrected") and review_id not in wording_only:
+        if source.get("human_corrected") and review_id not in correction_exemptions:
             reasons.append("human_corrected")
         provenance = source.get("provenance") or {}
         if not isinstance(provenance, Mapping):
@@ -202,7 +241,7 @@ def package_review_batches(
             if type(seconds) is not int or seconds <= 0 or not elapsed.is_integer() or seconds != elapsed:
                 reasons.append("invalid_duration_seconds")
             else:
-                if seconds >= 900:
+                if seconds >= 900 and not all_durations:
                     reasons.append("not_micro_entry")
                 if "duration_minutes" in source and (type(source["duration_minutes"]) is not int
                                                      or source["duration_minutes"] != seconds // 60):
@@ -280,6 +319,11 @@ def package_review_batches(
         activities.extend(_activity(members, allow_review_overlaps=allow_review_overlaps or allow_clockify_overlaps)
                           for members in partitions)
     activities.sort(key=lambda row: (_time(row["start"]), row["review_id"]))
+    if group_summaries is not None:
+        descriptions = group_summary_descriptions(activities, group_summaries)
+        for activity in activities:
+            if activity["review_id"] in descriptions:
+                activity["description"] = descriptions[activity["review_id"]]
     retained.sort(key=lambda row: (row["review_id"] or "", _canonical(row["proposal"])))
     return {"activities": activities, "retained": retained}
 
@@ -289,9 +333,12 @@ def verify_package(
     work_contexts: Mapping[str, str], protected_ids: Iterable[str] = (),
     timezone: str = "Europe/Bucharest",
     wording_only_ids: Iterable[str] = (),
+    materialized_correction_ids: Iterable[str] = (),
     allow_review_overlaps: bool = False,
     allow_clockify_overlaps: bool = False,
     natural_batches: bool = False,
+    all_durations: bool = False,
+    group_summaries: Mapping[str, Any] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Bind a prepared projection to original sources, not claimed totals.
 
@@ -323,9 +370,12 @@ def verify_package(
     expected = package_review_batches(
         proposals, editorial_descriptions=descriptions, work_contexts=work_contexts,
         protected_ids=protected_ids, timezone=timezone, wording_only_ids=wording_only_ids,
+        materialized_correction_ids=materialized_correction_ids,
         allow_review_overlaps=allow_review_overlaps,
         allow_clockify_overlaps=allow_clockify_overlaps,
         natural_batches=natural_batches,
+        all_durations=all_durations,
+        group_summaries=group_summaries,
     )
     if package["activities"] != expected["activities"]:
         raise ValueError("review batch differs from original sources or preparation")

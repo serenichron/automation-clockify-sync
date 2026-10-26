@@ -139,13 +139,13 @@ class ActorAwareRequestTests(unittest.TestCase):
                 with mock.patch.object(semantic.AnalyzerEndpoint, "from_env", side_effect=[endpoint, None]), mock.patch.dict(os.environ, {"CLOCKIFY_ANALYZER_PRIVATE_TEXT_APPROVED": "approved"}), mock.patch.object(semantic, "analyze_tiered", wraps=lambda events, **options: analyze(events, transport=transport, **options)):
                     result = work_accounting_pipeline.analyze_ledger(rows, review_routing=routing, review_taxonomy=taxonomy, analyzer_cache_path=cache_path)
                 review_payload = json.loads(bodies[-1]["messages"][1]["content"])
-                self.assertEqual("clockify-semantic-review-v8", review_payload["review_prompt_version"])
+                self.assertEqual("clockify-semantic-review-v9", review_payload["review_prompt_version"])
                 self.assertEqual("clockify-semantic-v18", review_payload["extractor_prompt_version"])
                 self.assertEqual(semantic.ACTOR_CONTRACT, review_payload["actor_contract"])
                 self.assertEqual("subject", provider_members(review_payload)[0]["actor"]["subject_relation"])
                 self.assertEqual(writing, provider_members(review_payload)[0]["route_hint"])
                 self.assertEqual(reviewed_route["tag_names"], result["activities"][0]["project_recommendation"]["tag_names"])
-                self.assertEqual("clockify-semantic-review-v8", result["review_prompt_version"])
+                self.assertEqual("clockify-semantic-review-v9", result["review_prompt_version"])
                 replay = analyze(semantic.with_actor_context(rows, subject_binding=self.binding), primary=endpoint,
                                  transport=lambda *_: self.fail("sealed v8 replay inferred"),
                                  review_prompt_version=result["review_prompt_version"], review_taxonomy=taxonomy,

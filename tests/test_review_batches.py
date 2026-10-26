@@ -250,6 +250,46 @@ class ReviewBatchTests(unittest.TestCase):
                 self.assertEqual(source, result["retained"][0]["proposal"])
                 self.assertIn("protected_terminal_status", result["retained"][0]["preparation_reasons"])
 
+    def test_all_durations_opt_in_groups_long_and_short_sources_without_changing_default(self):
+        sources = [proposal(1, end="2026-09-29T10:15:07+03:00", seconds=900),
+                   proposal(2, "2026-09-29T11:00:00+03:00", "2026-09-29T12:00:01+03:00", 3601),
+                   proposal(3, "2026-09-29T13:00:00+03:00", "2026-09-29T13:00:01+03:00", 1)]
+        sources[0]["review_warnings"] = [{"type": "estimated_session_placement", "reason": "Estimated placement; incomplete evidence."}]
+        original = copy.deepcopy(sources)
+        legacy = self.package(sources, natural_batches=True)
+        self.assertEqual([identity(1), identity(2)], [row["review_id"] for row in legacy["retained"]])
+        result = self.package(sources, natural_batches=True, all_durations=True)
+        self.assertEqual([], result["retained"])
+        self.assertEqual(1, len(result["activities"]))
+        group = result["activities"][0]
+        self.assertEqual([identity(1), identity(2), identity(3)], group["child_review_ids"])
+        self.assertEqual(4502, group["duration_seconds"])
+        self.assertEqual([900, 3601, 1], [row["duration_seconds"] for row in group["allocation_segments"]])
+        self.assertEqual(["SC — Prepared task 1", "SC — Prepared task 2", "SC — Prepared task 3"],
+                         [row["description"] for row in group["prepared_descriptions"]])
+        self.assertEqual(sources[0]["review_warnings"], group["child_review_warnings"][0]["warnings"])
+        self.assertEqual(original, sources)
+        contexts = {identity(n): "explicit-task" for n in range(1, 4)}
+        self.assertEqual(result, batches.verify_package(result, proposals=sources,
+            work_contexts=contexts, natural_batches=True, all_durations=True))
+        with self.assertRaises(ValueError):
+            batches.verify_package(result, proposals=sources, work_contexts=contexts, natural_batches=True)
+
+    def test_all_durations_alone_preserves_meetings_terminal_decisions_and_invalid_time(self):
+        variants = [({"disposition": "approved"}, "approved_or_posted"),
+                    ({"review_status": "posted"}, "approved_or_posted"),
+                    ({"disposition": "skip"}, "protected_terminal_status"),
+                    ({"status": "rejected"}, "protected_terminal_status"),
+                    ({"lifecycle": "meeting"}, "meeting"),
+                    ({"duration_seconds": 900.5}, "invalid_duration_seconds")]
+        for changes, reason in variants:
+            with self.subTest(reason=reason, changes=changes):
+                source = {**proposal(1, end="2026-09-29T10:15:07+03:00", seconds=900), **changes}
+                result = self.package([source], all_durations=True)
+                self.assertEqual([], result["activities"])
+                self.assertEqual(source, result["retained"][0]["proposal"])
+                self.assertIn(reason, result["retained"][0]["preparation_reasons"])
+
     def test_protected_human_corrected_meeting_and_unresolved_sources_are_retained(self):
         variants = [
             ({}, {identity(1)}, "protected_review_id"),

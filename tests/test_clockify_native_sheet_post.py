@@ -312,7 +312,7 @@ class NativeSheetPostTests(unittest.TestCase):
             events, receipt_path = Path(directory) / "events.jsonl", Path(directory) / "receipt.json"
             receipt = native.execute_plan(plan, self._approval(plan), events, receipt_path, gateway, now=now)
             self.assertEqual(2, len(gateway.posts))
-            self.assertEqual(["SC — Prepared original guarded publication result", "SC — Verified exact receipt binding result"],
+            self.assertEqual([plan["review_batches_binding"]["package"]["activities"][0]["description"]] * 2,
                              [entry["description"] for entry in gateway.posts])
             self.assertEqual(["created", "created"], [entry["disposition"] for entry in receipt["entries"]])
             self.assertEqual(["created-1", "created-2"], receipt["review_groups"][0]["clockify_entry_ids"])
@@ -379,7 +379,8 @@ class NativeSheetPostTests(unittest.TestCase):
                          [entry["payload"]["start"] for entry in plan["entries"]])
         self.assertEqual(["2026-09-29T07:01:18Z", "2026-09-29T07:01:53Z"],
                          [entry["payload"]["end"] for entry in plan["entries"]])
-        self.assertEqual(descriptions, [entry["payload"]["description"] for entry in plan["entries"]])
+        self.assertEqual([package["activities"][0]["description"]] * 2,
+                         [entry["payload"]["description"] for entry in plan["entries"]])
         self.assertEqual(authority, plan["review_batches_binding"]["preparation_authority"])
         native._validate_review_batch_plan(plan)
         with self.assertRaises(native.NativePostError):

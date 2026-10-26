@@ -158,6 +158,46 @@ class BatchPublicationTests(unittest.TestCase):
         self.assertEqual([71 / 60, 83 / 60], [row[3] for row in gateway.rows[1:3]])
         self.assertTrue(all("Historical display warning remains visible" in row[12] for row in gateway.rows[1:3]))
 
+    def test_v7_staging_consolidates_long_current_children_but_preserves_protected_decisions(self):
+        self.sources = self.sources[:2]
+        self.sources[0].update(end="2026-08-01T10:15:07+03:00", duration_seconds=900, duration_minutes=15)
+        self.sources[1].update(start="2026-08-01T11:00:00+03:00", end="2026-08-01T12:00:01+03:00",
+                               duration_seconds=3601, duration_minutes=60)
+        model, revision = semantic_analyzer.CURRENT_LIVE_FLASH_ROUTE
+        for item in self.sources:
+            item["provenance"].update(semantic_reviewer_model=model, semantic_reviewer_revision=revision)
+        self.write(self.run / "proposals.json", self.sources)
+        self.write(self.run / "semantic-analysis.json", {"activities": [
+            {"activity_id": item["activity_id"], "evidence_ids": item["provenance"]["evidence_ids"],
+             "rendered_description": wording, "semantic_reviewer_model": model,
+             "semantic_reviewer_revision": revision} for item, wording in zip(self.sources,
+                ["SC — Prepared guarded source publication safely", "SC — Verified immutable review receipt binding"])]})
+        self.write(self.run / "routing.json", {"session_routes": [{"project_name": "Example",
+            "project_suffix": "abc123", "prefix": "SC", "tag_names": ["Development"],
+            "tag_suffixes": ["def456"], "billable": True}]})
+        (self.run / "review-corrections.jsonl").write_text("")
+        self.binding = self.root / "long-v7.json"
+        prepared.prepare(source_dir=self.run, output=self.binding, run_id="source-run",
+            spreadsheet_id="sheet", sheet_title="August 2026 review", timezone="Europe/Bucharest", all_durations=True)
+        children = [publisher.proposal_row(p, "source-run", project_allowlist={"abc123": "Example"}) for p in self.sources]
+        path, _capture = self.staging(children)
+        projection = prepared.stage_projection(path)
+        self.assertEqual(1, len(projection["rows"]))
+        self.assertEqual(4501 / 60, projection["rows"][0][3])
+        self.assertEqual(children, list(projection["children"].values()))
+        self.assertEqual(set(row[0] for row in children), set(projection["parents"]))
+        for disposition, status in (("approved", "unposted"), ("skip", "unposted"),
+                                    ("rejected", "unposted"), ("pending", "posted")):
+            with self.subTest(disposition=disposition, status=status):
+                protected = copy.deepcopy(children)
+                protected[0][9], protected[0][13] = disposition, status
+                path, _capture = self.staging(protected)
+                projection = prepared.stage_projection(path)
+                self.assertEqual([children[1][0]], [row[0] for row in projection["rows"]])
+                self.assertEqual({}, projection["parents"])
+                self.assertEqual({}, projection["children"])
+                self.assertEqual(3601 / 60, projection["rows"][0][3])
+
     def test_staging_rejects_unbound_wording_run_financial_identity_and_revision(self):
         baseline = [publisher.proposal_row(p, "source-run") for p in self.sources[:2]]
         for column, value in ((8, "Unbound human wording"), (11, "invented-run"), (4, "Other client"),

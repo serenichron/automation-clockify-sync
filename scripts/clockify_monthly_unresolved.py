@@ -11,6 +11,7 @@ import json
 import math
 import re
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -36,6 +37,29 @@ LEGACY_HEADER = [
     "Precise reason", "Route recommendation", "Sanitized accomplishment",
     "Duration", "Timing status", "Next step", "Disposition", "Evidence digest",
 ]
+
+# Only fixed evaluator failures may become public prose. Never echo an
+# arbitrary reason (or the private values involved in a failed correction).
+_CORRECTION_FAILURE_LABELS = {
+    "description differs from reviewed value": "reviewed description differs",
+    "client_project differs from reviewed value": "reviewed client/project routing differs",
+    "tag_names differs from reviewed value": "reviewed tags differ",
+    "start differs from reviewed value": "reviewed start differs",
+    "end differs from reviewed value": "reviewed end differs",
+    "duration_minutes differs from reviewed value": "reviewed duration differs",
+    "duration_seconds differs from reviewed value": "reviewed duration differs",
+    "billable differs from reviewed value": "reviewed billable state differs",
+    "reviewed activity is missing": "reviewed activity is missing",
+    "previously skipped activity reappeared": "previously skipped activity reappeared",
+    "split correction has no executable structural contract": "reviewed split contract is unavailable",
+    "split correction contract has no evidence": "reviewed split evidence is unavailable",
+    "split correction evidence does not match its reviewed target": "reviewed split evidence target differs",
+    "split child proposal is missing an activity_id": "reviewed split child identity is missing",
+    "split child count differs from reviewed value": "reviewed split child count differs",
+    "split child evidence is duplicated across activities": "reviewed split evidence is duplicated",
+    "split child evidence union differs from reviewed value": "reviewed split evidence union differs",
+    "split child evidence partition differs from reviewed value": "reviewed split evidence partition differs",
+}
 
 
 def rows_for_layout(rows: list[list[Any]], layout: str | None = None) -> list[list[Any]]:
@@ -89,12 +113,102 @@ def validate_target_readback(
             raise ValueError("monthly legacy target readback machine cells differ")
 
 
-def _read(root: Path, relative: str) -> tuple[Any, str]:
+def _read_bytes(root: Path, relative: str) -> tuple[bytes, str]:
     path = root / relative
     if path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(root.resolve()):
         raise ValueError(f"unsafe or missing monthly projection artifact: {relative}")
     content = path.read_bytes()
-    return json.loads(content), "sha256:" + hashlib.sha256(content).hexdigest()
+    return content, "sha256:" + hashlib.sha256(content).hexdigest()
+
+
+def _read(root: Path, relative: str) -> tuple[Any, str]:
+    content, digest = _read_bytes(root, relative)
+    return json.loads(content), digest
+
+
+def _immutable(value: Any) -> Any:
+    if isinstance(value, dict):
+        return MappingProxyType({key: _immutable(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_immutable(item) for item in value)
+    return value
+
+
+class MonthlySourceContext:
+    """One invocation's byte/digest-bound snapshots, never a process cache.
+
+    Derived event maps and row indexes are immutable. A writer must recheck the
+    captured bytes at its prewrite boundary; a consumer creates its own context.
+    """
+    def __init__(self) -> None:
+        self._artifacts: dict[tuple[Path, str], tuple[bytes, str]] = {}
+        self._ledgers: dict[Path, Any] = {}
+        self._rows: dict[tuple[Path, str | None], Any] = {}
+        self._captures: dict[tuple[str, str], bytes] = {}
+        self._locators: dict[tuple[Path, str], Path] = {}
+
+    def _artifact(self, root: Path, relative: str) -> tuple[bytes, str]:
+        key = (Path(root).absolute(), relative)
+        if key not in self._artifacts:
+            self._artifacts[key] = _read_bytes(*key)
+            self._locators[key] = (key[0] / key[1]).resolve()
+        return self._artifacts[key]
+
+    def read(self, root: Path, relative: str) -> tuple[Any, str]:
+        content, digest = self._artifact(root, relative)
+        return json.loads(content), digest
+
+    def digest(self, root: Path, relative: str) -> str:
+        return self._artifact(root, relative)[1]
+
+    def capture(self, handle: dict[str, Any]) -> None:
+        from scripts import clockify_source_adoptions as adoptions
+        content = adoptions._capture(handle, self._captures)
+        path = Path(handle["path"])
+        key = (path.parent.parent, "evidence/" + path.name)
+        captured = (content, handle["sha256"])
+        if key in self._artifacts and self._artifacts[key] != captured:
+            raise ValueError("monthly source context artifact bindings differ")
+        self._artifacts[key] = captured
+        self._locators.setdefault(key, path)
+
+    def ledger(self, root: Path) -> tuple[Any, str, Any]:
+        root = Path(root).absolute()
+        if root not in self._ledgers:
+            document, digest = self.read(root, "evidence/evidence-ledger.json")
+            events, manifest = _validated_ledger(document)
+            self._ledgers[root] = (_immutable(events), digest, manifest)
+        return self._ledgers[root]
+
+    def row_index(self, root: Path, layout: str | None = None) -> Any:
+        key = (Path(root).absolute(), layout)
+        if key not in self._rows:
+            canonical_key = (key[0], None)
+            if canonical_key not in self._rows:
+                self._rows[canonical_key] = MappingProxyType({row[0]: tuple(row)
+                    for row in project_rows(key[0], _context=self)})
+            if key not in self._rows:
+                self._rows[key] = MappingProxyType({row[0]: tuple(row) for row in
+                    rows_for_layout(list(self._rows[canonical_key].values()), layout)})
+        return self._rows[key]
+
+    def assert_unchanged(self) -> None:
+        for (root, relative), (_, digest) in self._artifacts.items():
+            if ((root / relative).resolve() != self._locators[(root, relative)]
+                    or _read_bytes(root, relative)[1] != digest):
+                raise ValueError("monthly source context artifact bytes drifted")
+
+
+def _validated_ledger(document: Any) -> tuple[dict[str, Any], Any]:
+    if document.get("schema_version") != evidence_ledger.SCHEMA_VERSION:
+        raise ValueError("monthly evidence ledger schema is invalid")
+    manifest = evidence_ledger.LedgerManifest.from_document(document["manifest"])
+    ledger = evidence_ledger.EvidenceLedger(
+        tuple(evidence_ledger.EvidenceEvent.from_document(row) for row in document["events"]),
+        manifest.source_inventory, manifest.timezone, manifest.member_identities,
+    )
+    ledger.validate(manifest)
+    return {event.evidence_id: event.document() for event in ledger.events}, manifest
 
 
 def title_for_review(sheet_title: str) -> str:
@@ -134,15 +248,16 @@ def _routing_candidates(proposals: list[dict[str, Any]]) -> list[dict[str, Any]]
     return candidates
 
 
-def project_rows(source_dir: Path) -> list[list[str]]:
+def project_rows(source_dir: Path, *, _context: MonthlySourceContext | None = None) -> list[list[str]]:
     """Render only actual accounting ambiguities and valid unrouted proposals.
 
     All cited IDs must resolve in the immutable ledger; duplicated projection
     identities fail rather than dropping distinct accounting records silently.
     """
     root = Path(source_dir)
-    accounting, accounting_digest = _read(root, "work-accounting-result.json")
-    proposals, proposals_digest = _read(root, "proposals.json")
+    read = _read if _context is None else _context.read
+    accounting, accounting_digest = read(root, "work-accounting-result.json")
+    proposals, proposals_digest = read(root, "proposals.json")
     if proposals != accounting.get("proposals"):
         raise ValueError("monthly proposal artifact differs from accounting")
     ambiguities = accounting.get("ambiguous")
@@ -152,23 +267,18 @@ def project_rows(source_dir: Path) -> list[list[str]]:
     candidates.extend(("routing_gap", row) for row in _routing_candidates(proposals))
     if not candidates:
         return []
-    ambiguous_artifact, ambiguous_digest = _read(root, "ambiguous.json")
+    ambiguous_artifact, ambiguous_digest = read(root, "ambiguous.json")
     if ambiguous_artifact != ambiguities:
         raise ValueError("monthly ambiguity artifact differs from accounting")
-    document, ledger_digest = _read(root, "evidence/evidence-ledger.json")
-    if document.get("schema_version") != evidence_ledger.SCHEMA_VERSION:
-        raise ValueError("monthly evidence ledger schema is invalid")
-    manifest = evidence_ledger.LedgerManifest.from_document(document["manifest"])
-    ledger = evidence_ledger.EvidenceLedger(
-        tuple(evidence_ledger.EvidenceEvent.from_document(row) for row in document["events"]),
-        manifest.source_inventory, manifest.timezone, manifest.member_identities,
-    )
-    ledger.validate(manifest)
-    events = {event.evidence_id: event.document() for event in ledger.events}
-    analysis, analysis_digest = _read(root, "semantic-analysis.json")
+    if _context is None:
+        document, ledger_digest = read(root, "evidence/evidence-ledger.json")
+        events, manifest = _validated_ledger(document)
+    else:
+        events, ledger_digest, manifest = _context.ledger(root)
+    analysis, analysis_digest = read(root, "semantic-analysis.json")
     activities = {row.get("activity_id"): row for row in analysis.get("activities", [])
                   if row.get("activity_id")}
-    report, report_digest = _read(root, "run-report.json")
+    report, report_digest = read(root, "run-report.json")
     period = report["date_range"]
     start = dt.datetime.fromisoformat(period["since"].replace("Z", "+00:00"))
     end = dt.datetime.fromisoformat(period["until"].replace("Z", "+00:00"))
@@ -247,6 +357,25 @@ def project_rows(source_dir: Path) -> list[list[str]]:
         }.get(kind, "Cited evidence does not establish a confirmed positive work interval; accounting exception requires human review.")
         quality = "quality pass; accounting ambiguity; no confirmed interval"
         action = "Confirm activity, project and observed interval; no automatic Clockify posting or additional time claim."
+        # Old reports remain byte-for-byte renderable for historical aliases.
+        # This is a presentation opt-in, not runtime identity or freshness proof.
+        if (kind == "correction_regression"
+                and type(report.get("monthly_unresolved_rendering_revision")) is int
+                and report["monthly_unresolved_rendering_revision"] == 1):
+            raw_reason = item.get("reason")
+            failures = raw_reason.split("; ") if isinstance(raw_reason, str) else []
+            labels = sorted({_CORRECTION_FAILURE_LABELS.get(failure, "other correction validation failure")
+                             for failure in failures}) or ["other correction validation failure"]
+            reason = "Evidence-bound correction regression: " + "; ".join(labels) + "."
+            wording_only = bool(failures) and all(
+                failure == "description differs from reviewed value" for failure in failures)
+            summary = f"{len(ids)} cited evidence records; evidence-bound correction validation failed. This is not a determination of work timing or additional time."
+            quality = "correction regression; timing and allocation require separate review"
+            action = "Review the evidence-bound correction and affected accounting fields; no automatic Clockify posting or additional time claim."
+            if wording_only:
+                summary = f"{len(ids)} cited evidence records; reviewed description correction failed. A wording mismatch does not establish missing work or timing evidence."
+                quality = "correction regression; wording-only mismatch; timing not assessed by this failure"
+                action = "Reconcile the description with the evidence-bound wording correction; no automatic Clockify posting or additional time claim."
         if kind == "contested_time":
             requested, allocated, unplaced = (item.get(field) for field in
                 ("requested_minutes", "allocated_minutes", "unallocated_minutes"))
@@ -421,14 +550,13 @@ def _bound_document(binding: dict[str, Any]) -> tuple[Any, Path]:
     return document, path
 
 
-def _ledger_events(root: Path) -> tuple[dict[str, Any], str]:
+def _ledger_events(root: Path, *, source_context: MonthlySourceContext | None = None) -> tuple[Any, str]:
+    if source_context is not None:
+        events, digest, _ = source_context.ledger(root)
+        return events, digest
     document, digest = _read(root, "evidence/evidence-ledger.json")
-    manifest = evidence_ledger.LedgerManifest.from_document(document["manifest"])
-    ledger = evidence_ledger.EvidenceLedger(tuple(
-        evidence_ledger.EvidenceEvent.from_document(event) for event in document["events"]
-    ), manifest.source_inventory, manifest.timezone, manifest.member_identities)
-    ledger.validate(manifest)
-    return {event.evidence_id: event.document() for event in ledger.events}, digest
+    events, _ = _validated_ledger(document)
+    return events, digest
 
 
 def load_alias_proofs(path: Path, source_dir: Path) -> dict[str, Any]:
@@ -536,13 +664,14 @@ def alias_metadata(rows: list[list[Any]], aliases: dict[str, Any]) -> list[dict[
 HISTORICAL_SOURCES_SCHEMA = "monthly-unresolved-historical-sources/v1"
 
 
-def load_historical_sources(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
+def load_historical_sources(path: Path, *, source_context: MonthlySourceContext | None = None) -> tuple[dict[str, Any], dict[str, str]]:
     """Admit only explicitly pinned original ledger locators, never scan roots."""
     from scripts import clockify_source_adoptions as adoptions
     path = Path(path).absolute()
     if path.resolve() != path:
         raise ValueError("monthly historical source manifest must be an original file")
-    _, digest = _read(path.parent, path.name)
+    read = _read if source_context is None else source_context.read
+    _, digest = read(path.parent, path.name)
     handle = {"path": str(path), "sha256": digest}
     document = json.loads(adoptions._capture(handle, {}))
     if (not isinstance(document, dict) or set(document) != {"schema_version", "sources"}
@@ -558,25 +687,32 @@ def load_historical_sources(path: Path) -> tuple[dict[str, Any], dict[str, str]]
                 or Path(name).name != name or name in sources):
             raise ValueError("monthly historical source name is unsafe or ambiguous")
         ledger = source["source_ledger"]
-        adoptions._capture(ledger, {})
+        if source_context is None:
+            adoptions._capture(ledger, {})
+        else:
+            source_context.capture(ledger)
         ledger_path = Path(ledger["path"])
         if (ledger_path.name != "evidence-ledger.json" or ledger_path.parent.name != "evidence"
                 or ledger_path.parent.parent.name != name):
             raise ValueError("monthly historical source locator differs from its original run")
-        _, ledger_digest = _ledger_events(ledger_path.parent.parent)
+        _, ledger_digest = _ledger_events(ledger_path.parent.parent, source_context=source_context)
         if ledger_digest != ledger["sha256"]:
             raise ValueError("monthly historical source ledger differs")
         sources[name] = dict(ledger)
     return sources, handle
 
 
-def _historical_source(source_dir: Path, name: Any, sources: dict[str, Any] | None = None) -> tuple[Path, dict[str, str] | None]:
+def _historical_source(source_dir: Path, name: Any, sources: dict[str, Any] | None = None, *,
+                       source_context: MonthlySourceContext | None = None) -> tuple[Path, dict[str, str] | None]:
     if not isinstance(name, str) or not name or name in {".", ".."} or Path(name).name != name:
         raise ValueError("canonical alias source is not a direct run name")
     if sources is not None and name in sources:
         from scripts import clockify_source_adoptions as adoptions
         handle = sources[name]
-        adoptions._capture(handle, {})
+        if source_context is None:
+            adoptions._capture(handle, {})
+        else:
+            source_context.capture(handle)
         path = Path(handle["path"])
         if path.name != "evidence-ledger.json" or path.parent.name != "evidence" or path.parent.parent.name != name:
             raise ValueError("canonical alias explicit historical locator differs")
@@ -588,27 +724,31 @@ def _historical_source(source_dir: Path, name: Any, sources: dict[str, Any] | No
 
 
 def canonical_source_alias(source_dir: Path, requested: list[Any], existing: list[Any], *, layout: str | None = None,
-                           historical_sources: dict[str, Any] | None = None) -> dict[str, Any]:
+                           historical_sources: dict[str, Any] | None = None,
+                           source_context: MonthlySourceContext | None = None) -> dict[str, Any]:
     """Reconstruct a canonical sibling row or explicitly pinned original source."""
+    context = source_context if source_context is not None else MonthlySourceContext()
     provenance = json.loads(existing[11])
     if not isinstance(provenance, dict) or set(provenance) != {"source_run_id", "artifacts", "evidence_ids"}:
         raise ValueError("existing row is not canonical monthly provenance")
     name = provenance["source_run_id"]
-    historical, explicit_handle = _historical_source(source_dir, name, historical_sources)
+    historical, explicit_handle = _historical_source(source_dir, name, historical_sources, source_context=context)
     for relative, expected in provenance["artifacts"].items():
-        _, digest = _read(historical, relative)
+        digest = context.digest(historical, relative)
         if digest != expected:
             raise ValueError("canonical alias historical artifact digest differs")
-    historical_rows = {row[0]: row for row in rows_for_layout(project_rows(historical), layout)}
+    historical_rows = context.row_index(historical, layout)
     old = historical_rows.get(requested[0])
     current_provenance = json.loads(requested[11])
     if (old is None or old[3] != requested[3] or provenance["evidence_ids"] != current_provenance["evidence_ids"]
         or old[11] != existing[11] or machine_digest(old) != machine_digest(existing)):
         raise ValueError("canonical alias identity, citations or machine cells differ")
-    old_events, ledger_digest = _ledger_events(historical)
-    current_events, _ = _ledger_events(source_dir)
+    old_events, ledger_digest = _ledger_events(historical, source_context=context)
+    current_events, _ = _ledger_events(source_dir, source_context=context)
     if any(old_events.get(i) != current_events.get(i) or i not in old_events for i in provenance["evidence_ids"]):
         raise ValueError("canonical alias cited ledger content differs")
+    if source_context is None:
+        context.assert_unchanged()
     return {"stable_evidence_id": requested[0], "source_run_id": name,
             "historical_provenance": existing[11], "preserved_machine_digest": machine_digest(existing),
             "historical_ledger_digest": ledger_digest,
@@ -616,10 +756,12 @@ def canonical_source_alias(source_dir: Path, requested: list[Any], existing: lis
 
 
 def validate_canonical_aliases(source_dir: Path, rows: list[list[Any]], aliases: Any, *, layout: str | None = None,
-                               historical_sources: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+                               historical_sources: dict[str, Any] | None = None,
+                               source_context: MonthlySourceContext | None = None) -> list[dict[str, Any]]:
     """Independently reconstruct publisher-reported aliases, without Sheets."""
     if not isinstance(aliases, list) or not aliases:
         raise ValueError("canonical source aliases must be a nonempty list")
+    context = source_context if source_context is not None else MonthlySourceContext()
     requested = {row[0]: row for row in rows}
     seen = set()
     validated = []
@@ -631,14 +773,15 @@ def validate_canonical_aliases(source_dir: Path, rows: list[list[Any]], aliases:
         provenance = json.loads(alias["historical_provenance"])
         name = provenance.get("source_run_id")
         # Validate the name before resolving or reading any producer locator.
-        historical, _ = _historical_source(source_dir, name, historical_sources)
-        old_rows = rows_for_layout(project_rows(historical), layout)
-        old = next((row for row in old_rows if row[0] == identity), None)
+        historical, _ = _historical_source(source_dir, name, historical_sources, source_context=context)
+        old = context.row_index(historical, layout).get(identity)
         if old is None:
             raise ValueError("canonical alias historical identity is absent")
         proof = canonical_source_alias(source_dir, requested[identity], old, layout=layout,
-                                       historical_sources=historical_sources)
+                                       historical_sources=historical_sources, source_context=context)
         if proof != alias:
             raise ValueError("canonical source alias metadata differs from its frozen source")
         validated.append(proof)
+    if source_context is None:
+        context.assert_unchanged()
     return validated

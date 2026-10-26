@@ -144,39 +144,51 @@ class GwsSheetsGateway:
             raise PublicationError("Google Sheets did not confirm the duplicated tab") from exc
 
     def prepare_sheet(self, spreadsheet_id: str, sheet_id: int) -> None:
+        metadata = self.spreadsheet(spreadsheet_id)
+        sheet = next((item for item in metadata.get("sheets", [])
+                      if item.get("properties", {}).get("sheetId") == sheet_id), None)
+        if sheet is None and "sheets" in metadata:
+            raise PublicationError("Google Sheets metadata is missing the target tab")
+        sheet = sheet or {}
+        row_count = sheet.get("properties", {}).get("gridProperties", {}).get("rowCount", 1000)
+        if type(row_count) is not int or row_count < 1:
+            raise PublicationError("Google Sheets target tab has an invalid row count")
+        requests = []
+        if row_count > 1:
+            requests.append({"repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 1,
+                    "endRowIndex": row_count,
+                    "startColumnIndex": 3,
+                    "endColumnIndex": 4,
+                },
+                "cell": {"userEnteredFormat": {
+                    "numberFormat": {"type": "NUMBER", "pattern": "0.######"}
+                }},
+                "fields": "userEnteredFormat.numberFormat",
+            }})
+        if "basicFilter" not in sheet:
+            requests.append({"setBasicFilter": {"filter": {"range": {
+                "sheetId": sheet_id,
+                "startRowIndex": 0,
+                "endRowIndex": row_count,
+                "startColumnIndex": 0,
+                "endColumnIndex": len(HEADER),
+            }}}})
+        if not requests:
+            return
         self._call([
             "spreadsheets", "batchUpdate", "--params",
             json.dumps({"spreadsheetId": spreadsheet_id}), "--json",
-            json.dumps({"requests": [
-                {"repeatCell": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "startRowIndex": 1,
-                        "endRowIndex": 1000,
-                        "startColumnIndex": 3,
-                        "endColumnIndex": 4,
-                    },
-                    "cell": {"userEnteredFormat": {
-                        "numberFormat": {"type": "NUMBER", "pattern": "0.######"}
-                    }},
-                    "fields": "userEnteredFormat.numberFormat",
-                }},
-                {"setBasicFilter": {"filter": {"range": {
-                    "sheetId": sheet_id,
-                    "startRowIndex": 0,
-                    "endRowIndex": 1000,
-                    "startColumnIndex": 0,
-                    "endColumnIndex": len(HEADER),
-                }}}},
-            ]}),
+            json.dumps({"requests": requests}),
         ])
 
     def prepare_new_rows(self, spreadsheet_id: str, sheet_id: int, start_row: int, end_row: int) -> None:
         if start_row < 2 or end_row < start_row:
             raise PublicationError("new row bounds are invalid")
-        self._call([
-            "spreadsheets", "batchUpdate", "--params", json.dumps({"spreadsheetId": spreadsheet_id}), "--json",
-            json.dumps({"requests": [{"repeatCell": {"range": {
+        metadata = self.spreadsheet(spreadsheet_id)
+        requests = [{"repeatCell": {"range": {
                 "sheetId": sheet_id, "startRowIndex": start_row - 1, "endRowIndex": end_row,
                 "startColumnIndex": 0, "endColumnIndex": len(HEADER),
             }, "cell": {"userEnteredFormat": {"backgroundColor": {"red": 1, "green": 1, "blue": 1}}},
@@ -190,7 +202,44 @@ class GwsSheetsGateway:
                 "startColumnIndex": 13, "endColumnIndex": 14,
             }, "rule": {"condition": {"type": "ONE_OF_LIST", "values": [
                 {"userEnteredValue": value} for value in ("pending", "ambiguous", "approved", "posted", "rejected", "superseded", "unposted")
-            ]}, "showCustomUi": True, "strict": True}}}]}),
+            ]}, "showCustomUi": True, "strict": True}}}]
+        criteria = {
+            "9": {"condition": {"type": "TEXT_EQ", "values": [{"userEnteredValue": "pending"}]}},
+            "13": {"condition": {"type": "TEXT_EQ", "values": [{"userEnteredValue": "unposted"}]}},
+        }
+        expected_specs = [{"columnIndex": int(column), "filterCriteria": value}
+                          for column, value in criteria.items()]
+        for sheet in metadata.get("sheets", []):
+            if sheet.get("properties", {}).get("sheetId") != sheet_id:
+                continue
+            for view in sheet.get("filterViews", []):
+                view_range = view.get("range", {})
+                view_id = view.get("filterViewId")
+                previous_end = view_range.get("endRowIndex")
+                specs = view.get("filterSpecs")
+                if (
+                    view.get("title") != "Pending / unposted — review"
+                    or type(view_id) is not int or view_id < 0
+                    or view_range.get("sheetId") != sheet_id
+                    or view_range.get("startRowIndex", 0) != 0
+                    or view_range.get("startColumnIndex", 0) != 0
+                    or view_range.get("endColumnIndex") != len(HEADER)
+                    or view.get("criteria") != criteria
+                    or ("filterSpecs" in view and (
+                        not isinstance(specs, list) or len(specs) != len(expected_specs)
+                        or any(specs.count(spec) != 1 for spec in expected_specs)
+                    ))
+                    or type(previous_end) is not int or previous_end < 1
+                    or previous_end >= end_row
+                ):
+                    continue
+                requests.append({"updateFilterView": {
+                    "filter": {"filterViewId": view_id, "range": {"sheetId": sheet_id, "endRowIndex": end_row}},
+                    "fields": "range.endRowIndex",
+                }})
+        self._call([
+            "spreadsheets", "batchUpdate", "--params", json.dumps({"spreadsheetId": spreadsheet_id}), "--json",
+            json.dumps({"requests": requests}),
         ])
 
     def clear_values(self, spreadsheet_id: str, range_name: str) -> None:
@@ -205,31 +254,95 @@ class GwsSheetsGateway:
     ) -> None:
         if not ranges:
             return
-        self._call([
-            "spreadsheets", "values", "batchUpdate", "--params",
-            json.dumps({"spreadsheetId": spreadsheet_id}), "--json",
-            json.dumps({
+
+        def payload(values: Sequence[Mapping[str, Any]]) -> str:
+            return json.dumps({
                 "valueInputOption": "RAW",
                 "includeValuesInResponse": False,
-                "data": list(ranges),
-            }, ensure_ascii=False),
-        ])
+                "data": list(values),
+            }, ensure_ascii=False)
+
+        encoded = payload(ranges)
+        bodies = [encoded]
+        if len(encoded.encode("utf-8")) > 64 * 1024:
+            # Large calls support complete, explicitly sheet-qualified single
+            # rows only. Never guess how to split arbitrary multirow ranges.
+            row_keys = []
+            for value in ranges:
+                match = re.fullmatch(
+                    r"('(?:[^']|'')+'|[^'!\r\n]+)!\$?[A-Za-z]+\$?([1-9][0-9]*)"
+                    r"(?::\$?[A-Za-z]+\$?([1-9][0-9]*))?", str(value.get("range", "")))
+                values = value.get("values")
+                if (match is None or (match[3] is not None and match[2] != match[3])
+                        or value.get("majorDimension", "ROWS") != "ROWS"
+                        or not isinstance(values, list) or len(values) > 1):
+                    raise PublicationError("oversized update has an unsupported non-row ValueRange")
+                title = match[1]
+                if title.startswith("'"):
+                    title = title[1:-1].replace("''", "'")
+                row_keys.append((title.casefold(), int(match[2])))
+            last = {key: index for index, key in enumerate(row_keys)}
+            groups, group, boundary = [], [], 0
+            for index, (key, value) in enumerate(zip(row_keys, ranges)):
+                group.append(value)
+                boundary = max(boundary, last[key])
+                if index == boundary:
+                    groups.append(group)
+                    group = []
+            # Related A:I/K:M (or individual-cell) ranges stay in one request,
+            # including interleaved ranges. Preflight all groups before writes.
+            bodies, chunk, encoded = [], [], ""
+            for group in groups:
+                candidate = payload([*chunk, *group])
+                if len(candidate.encode("utf-8")) > 64 * 1024:
+                    if chunk:
+                        bodies.append(encoded)
+                    chunk = []
+                    candidate = payload(group)
+                    if len(candidate.encode("utf-8")) > 64 * 1024:
+                        raise PublicationError("single update row exceeds safe gws JSON payload size")
+                chunk.extend(group)
+                encoded = candidate
+            bodies.append(encoded)
+        for body in bodies:
+            self._call([
+                "spreadsheets", "values", "batchUpdate", "--params",
+                json.dumps({"spreadsheetId": spreadsheet_id}), "--json", body,
+            ])
 
     def append_values(
         self, spreadsheet_id: str, range_name: str, rows: Sequence[Sequence[Any]]
     ) -> None:
         if not rows:
             return
-        self._call([
-            "spreadsheets", "values", "append", "--params",
-            json.dumps({
-                "spreadsheetId": spreadsheet_id,
-                "range": range_name,
-                "valueInputOption": "RAW",
-                "insertDataOption": "INSERT_ROWS",
-            }),
-            "--json", json.dumps({"majorDimension": "ROWS", "values": list(rows)}, ensure_ascii=False),
-        ])
+        # Preflight complete rows before the first append. A failed request is
+        # never retried here: callers must reread/replan after a partial append.
+        bodies = []
+        chunk: list[Sequence[Any]] = []
+        encoded = ""
+        for row in rows:
+            candidate = json.dumps({"majorDimension": "ROWS", "values": [*chunk, row]}, ensure_ascii=False)
+            if len(candidate.encode("utf-8")) > 64 * 1024:
+                if chunk:
+                    bodies.append(encoded)
+                chunk = []
+                candidate = json.dumps({"majorDimension": "ROWS", "values": [row]}, ensure_ascii=False)
+                if len(candidate.encode("utf-8")) > 64 * 1024:
+                    raise PublicationError("single review row exceeds safe gws JSON payload size")
+            chunk.append(row)
+            encoded = candidate
+        bodies.append(encoded)
+        for body in bodies:
+            self._call([
+                "spreadsheets", "values", "append", "--params",
+                json.dumps({
+                    "spreadsheetId": spreadsheet_id,
+                    "range": range_name,
+                    "valueInputOption": "RAW",
+                    "insertDataOption": "INSERT_ROWS",
+                }),
+                "--json", body,
+            ])
 
     def append_monthly_rows(
         self, spreadsheet_id: str, sheet_id: int, start_row: int,
@@ -537,6 +650,41 @@ def _validate_review_warning(
         }:
             raise PublicationError("proposal semantic meeting fallback warning is invalid")
         return dict(warning)
+    elif warning_type == "estimated_task_effort":
+        # Timing observations remain private provenance. Publish the explicit
+        # estimate basis, not a misleading human-attention/runtime assertion.
+        if set(warning) != {"type", "timing_recipe", "reason", "observed_intervals"}:
+            raise PublicationError("proposal task effort warning has invalid fields")
+        expected_reason = (
+            "Estimated commissioned task effort bounded by task-owned source observations; "
+            "not human attention or measured agent runtime."
+        )
+        intervals = warning.get("observed_intervals")
+        if (
+            warning.get("timing_recipe") != "task_owned_message_observations/v1"
+            or warning.get("reason") != expected_reason
+            or not isinstance(intervals, list) or not intervals
+        ):
+            raise PublicationError("proposal task effort timing basis is invalid")
+        for interval in intervals:
+            if not isinstance(interval, Mapping) or set(interval) != {"start", "end"}:
+                raise PublicationError("proposal task effort observations are invalid")
+            try:
+                start, end = (
+                    dt.datetime.fromisoformat(_warning_text(interval[field], field).replace("Z", "+00:00"))
+                    for field in ("start", "end")
+                )
+            except ValueError as error:
+                raise PublicationError("proposal task effort observation timestamp is invalid") from error
+            if any(point.tzinfo is None or point.utcoffset() is None for point in (start, end)):
+                raise PublicationError("proposal task effort observations require a timezone")
+            if end <= start:
+                raise PublicationError("proposal task effort observation must be positive")
+        return {
+            "type": warning_type,
+            "timing_recipe": warning["timing_recipe"],
+            "reason": expected_reason,
+        }
     elif warning_type == "estimated_session_placement":
         if set(warning) != {"type", "reason"}:
             raise PublicationError("proposal estimated placement warning has invalid fields")
@@ -713,7 +861,68 @@ def validate_recovery_proposal_groups(
             )
 
 
-def portfolio_row(activity: Mapping[str, Any], run_id: str) -> list[Any]:
+def _compact_portfolio_warnings(
+    activity: Mapping[str, Any], visible_warnings: Sequence[Mapping[str, Any]],
+    source_proposals: Sequence[Mapping[str, Any]] | None,
+) -> dict[str, Any]:
+    """Display-only summary of proven same-parent overlaps; never alter proof."""
+    if source_proposals is None:
+        raise PublicationError("oversized portfolio Reason requires exact source proposals")
+    children = activity["child_review_ids"]
+    matches: dict[str, list[Mapping[str, Any]]] = {identity: [] for identity in children}
+    candidate_counts: dict[str, int] = {}
+    for source in source_proposals:
+        identity = stable_review_id(source)
+        key = source.get("candidate_key")
+        if isinstance(key, str):
+            candidate_counts[key] = candidate_counts.get(key, 0) + 1
+        if identity in matches:
+            matches[identity].append(source)
+    candidates = {}
+    for identity, sources in matches.items():
+        if len(sources) != 1 or type(sources[0].get("allocation_segment")) is not int:
+            raise PublicationError("oversized portfolio Reason source membership differs")
+        key = sources[0].get("candidate_key")
+        if (not isinstance(key, str) or not re.fullmatch(r"wks-[a-f0-9]{24}", key)
+                or candidate_counts[key] != 1):
+            raise PublicationError("oversized portfolio Reason candidate identity differs")
+        candidates[key] = identity
+    for child in activity["child_review_warnings"]:
+        if child["warnings"] != matches[child["review_id"]][0].get("review_warnings", []):
+            raise PublicationError("oversized portfolio Reason differs from source warnings")
+
+    external, internal, affected = [], [], set()
+    for child in visible_warnings:
+        retained = []
+        for warning in child["warnings"]:
+            counterpart = candidates.get(warning.get("counterpart_id"))
+            if warning["type"] in {"review_proposal_overlap", "meeting_proposal_overlap"} and counterpart:
+                internal.append(warning)
+                affected.update((child["review_id"], counterpart))
+            else:
+                retained.append(warning)
+        if retained:
+            external.append({"review_id": child["review_id"], "warnings": retained})
+    if not internal:
+        raise PublicationError("oversized portfolio Reason has no provable internal overlaps to summarize")
+    complete = json.dumps(activity["child_review_warnings"], ensure_ascii=False,
+                          sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {"child_review_warnings": external, "internal_parallel_effort": {
+        "warning_count": len(internal), "affected_child_review_ids": sorted(affected),
+        "span_start": min(internal, key=lambda warning: _warning_timestamp(
+            warning["overlap_start"], "overlap_start"))["overlap_start"],
+        "span_end": max(internal, key=lambda warning: _warning_timestamp(
+            warning["overlap_end"], "overlap_end"))["overlap_end"],
+        "notice": "Internal same-parent proposal overlaps: parallel effort, not financial credit or certified human hours; bounding span is not elapsed effort.",
+        "full_detail_reference": {
+            "immutable_package_field": f"package.activities[review_id='{activity['review_id']}'].child_review_warnings",
+            "sha256": "sha256:" + hashlib.sha256(complete).hexdigest(),
+        },
+    }}
+
+
+def portfolio_row(activity: Mapping[str, Any], run_id: str, *,
+                  source_proposals: Sequence[Mapping[str, Any]] | None = None) -> list[Any]:
     review_id = str(activity.get("review_id") or "").strip()
     if not re.fullmatch(r"pvi-[a-f0-9]{24}", review_id):
         raise PublicationError("portfolio activity lacks a stable review ID")
@@ -756,6 +965,14 @@ def portfolio_row(activity: Mapping[str, Any], run_id: str) -> list[Any]:
         if activity["review_notice"] != OVERLAP_REVIEW_NOTICE:
             raise PublicationError("portfolio review notice is invalid")
         reason += ("\n" if reason else "") + activity["review_notice"]
+    if len(reason.encode("utf-16-le")) // 2 > 50000:
+        compact = _compact_portfolio_warnings(activity, visible_warnings, source_proposals)
+        reason = str(activity.get("validation_status") or "")
+        reason += ("\n" if reason else "") + json.dumps(compact, ensure_ascii=False, sort_keys=True)
+        if "review_notice" in activity:
+            reason += "\n" + activity["review_notice"]
+        if len(reason.encode("utf-16-le")) // 2 > 50000:
+            raise PublicationError("portfolio Reason external detail exceeds the Google Sheets cell limit")
     return [
         review_id,
         _timestamp(activity.get("start")),
@@ -1406,9 +1623,11 @@ def _plan_monthly_unresolved(
     if len(ids) != len(set(ids)):
         raise PublicationError("duplicate monthly stable evidence ID")
     source_handles, sources_handle = {}, None
+    source_context = monthly_unresolved.MonthlySourceContext()
     if historical_sources is not None:
         try:
-            source_handles, sources_handle = monthly_unresolved.load_historical_sources(historical_sources)
+            source_handles, sources_handle = monthly_unresolved.load_historical_sources(
+                historical_sources, source_context=source_context)
         except (OSError, ValueError, TypeError, KeyError) as exc:
             raise PublicationError("monthly historical source bindings are invalid") from exc
     metadata = gateway.spreadsheet(spreadsheet_id)
@@ -1459,7 +1678,8 @@ def _plan_monthly_unresolved(
                 raise PublicationError(f"monthly machine-field conflict: {row[0]}")
             try:
                 canonical_aliases.append(monthly_unresolved.canonical_source_alias(
-                    source_dir, list(row), prior, layout=layout, historical_sources=source_handles))
+                    source_dir, list(row), prior, layout=layout, historical_sources=source_handles,
+                    source_context=source_context))
             except (OSError, KeyError, TypeError, ValueError) as exc:
                 if not retain_provenance_debt or str(exc) != "canonical alias historical source is unsafe":
                     raise PublicationError(f"monthly canonical machine-field conflict: {row[0]}") from exc
@@ -1480,6 +1700,7 @@ def _plan_monthly_unresolved(
     return {"sheet_title": sheet_title, "sheet_id": prop["sheetId"], "grid_rows": grid["rowCount"],
             "existing": existing, "appends": appends, "rows": [list(row) for row in rows], "aliases": aliases,
             "canonical_aliases": canonical_aliases, "layout": layout, "historical_sources": sources_handle,
+            **({"canonical_source_context": source_context} if canonical_aliases else {}),
             **({"retained_provenance_debt": retained_debt, "retained_source_dir": source_dir} if retained_debt else {})}
 
 
@@ -1490,6 +1711,11 @@ def _retained_monthly_preflight(
     existing = plan["existing"]
     padded = lambda row: list(row) + [""] * (12 - len(row))
     retained_digests = None
+    if plan.get("canonical_source_context") is not None:
+        try:
+            plan["canonical_source_context"].assert_unchanged()
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            raise PublicationError("canonical monthly source changed before append") from exc
     if plan.get("retained_provenance_debt"):
         try:
             retained_digests = monthly_unresolved.validate_retained_debt(plan["retained_source_dir"], plan["rows"],

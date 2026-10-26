@@ -51,6 +51,56 @@ def meeting(title: str = "Daily Meet", recording_id: int = 42):
 
 
 class FathomRoutingTests(unittest.TestCase):
+    def test_lds_invitee_domain_routes_sparse_title_in_collector_and_pipeline(self):
+        """Catches an LDS client meeting being assigned to Lens of Alex or internal work."""
+        routing = collector.load_json(MODULE_PATH.parents[1] / "routing.json")
+        item = meeting("Vlad & Andrew - Check-in & Q4 direction", recording_id=191258541)
+        item["calendar_invitees"] = [
+            {"email": "vlad@serenichron.com", "is_external": False},
+            {"email": "andrew@learningdesignsolutions.co.uk", "is_external": True},
+        ]
+        item["calendar_invitees_domains_type"] = "one_or_more_external"
+        item["summary"] = "Compare the Lens of Alex and MAB reports for planning context."
+        before = json.dumps(item, sort_keys=True)
+        route = collector.route_meeting(item, routing)
+        resolved, error = pipeline.resolve_route({}, [{"source_type": "fathom", "attributes": item}], routing)
+        self.assertIsNone(error)
+        for actual in (route, resolved):
+            self.assertEqual("Learning Design Solutions — BD & Growth (Q1 26)", actual["project_name"])
+            self.assertEqual("642507", actual["project_suffix"])
+            self.assertEqual("LDS", actual["prefix"])
+            self.assertEqual(["Project Management"], actual["tag_names"])
+            self.assertEqual(["35aa9aef"], actual["tag_suffixes"])
+            self.assertTrue(actual["billable"])
+        self.assertEqual(before, json.dumps(item, sort_keys=True))
+        self.assertEqual("Learning Design Solutions — BD & Growth (Q1 26)", project_allowlist(routing)["642507"])
+
+    def test_explicit_lds_company_title_routes_without_domain_invitee(self):
+        routing = collector.load_json(MODULE_PATH.parents[1] / "routing.json")
+        item = meeting("Learning Design Solutions — Q4 planning")
+        self.assertEqual("642507", collector.route_meeting(item, routing)["project_suffix"])
+        resolved, error = pipeline.resolve_route({}, [{"source_type": "fathom", "attributes": item}], routing)
+        self.assertIsNone(error)
+        self.assertEqual("642507", resolved["project_suffix"])
+
+    def test_lds_incidental_mentions_and_generic_contact_name_do_not_capture_other_routes(self):
+        routing = collector.load_json(MODULE_PATH.parents[1] / "routing.json")
+        for title, project in (
+            ("Vlad & Andrew — General check-in", "Serenichron Level 1"),
+            ("Review Learning Design Solutions report", "Serenichron Level 1"),
+            ("Lens of Alex — Learning Design Solutions report comparison", "Lens of Alex Retainer"),
+            ("MAB Food Fairy — Review", "MAB Food Fairy PM"),
+            ("TST Prep — Planning", "TST Prep Level 1"),
+        ):
+            with self.subTest(title=title):
+                item = meeting(title)
+                item["summary"] = "Learning Design Solutions report was mentioned."
+                route = collector.route_meeting(item, routing)
+                resolved, error = pipeline.resolve_route({}, [{"source_type": "fathom", "attributes": item}], routing)
+                self.assertIsNone(error)
+                self.assertEqual(project, route["project_name"])
+                self.assertEqual(project, resolved["project_name"])
+
     def test_mab_session_aliases_are_billable_client_work(self):
         """Catches the legacy personal skip and SC fallback for MAB implementation."""
         routing = collector.load_json(MODULE_PATH.parents[1] / "routing.json")
@@ -163,7 +213,7 @@ class FathomRoutingTests(unittest.TestCase):
         self.assertEqual("5f5b5121a551633f6dfa31e6", routing["member_id"])
         self.assertEqual(routing["clockify_user_id"], routing["member_id"])
         self.assertEqual(
-            "e28ab252f630dec9350bc51f9d7037b77a75299638510608ab5dda5606ee0abe",
+            "7b838d02061ce41a220facbc40869aa095c41eb66f40b6ea7dce6b9a46905746",
             hashlib.sha256(raw).hexdigest(),
         )
         self.assertEqual(

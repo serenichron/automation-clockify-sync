@@ -58,6 +58,15 @@ POINT_OBSERVATION_CLUSTERING_INPUT = {
     "source_types": sorted(POINT_OBSERVATION_GAP_THRESHOLDS_SECONDS),
     "user_anchor_source_types": ["hermes_db_sessions_event", "hermes_sessions_event"],
 }
+TASK_EFFORT_TIMING_INPUT = {
+    "recipe": "task_owned_message_observations/v1",
+    "review_prompt_version": semantic_analyzer.COMMISSIONED_REVIEW_PROMPT_VERSION,
+    "max_consecutive_gap_seconds": collector.BURST_GAP_SECONDS,
+    "basis": "estimated_task_effort_bounded_by_cited_observations",
+    "source_types": ["claude_bursts_event", "codex_sessions_event", "hermes_db_sessions_event", "hermes_sessions_event"],
+}
+AUDITED_DAILY_KEY = "audited_daily_recording_intersections"
+AUDITED_DAILY_RECIPE = "audited-daily-recording-intersections/v1"
 NOISE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("heartbeat", re.compile(r"^\s*(?:heartbeat|health[- ]?check)(?:\s*[:—-].*)?\s*$", re.I)),
     ("standing_by", re.compile(r"^\s*(?:standing by|still waiting|no change(?: yet)?)(?:[.!])?\s*$", re.I)),
@@ -78,13 +87,21 @@ class WorkAccountingError(RuntimeError):
     """Invalid or incomplete local accounting input."""
 
 
+def _scoped_extractor_contract_failure(row: Mapping[str, Any]) -> bool:
+    """Recognize the native contract-rejected leaf, never a transport failure."""
+    return (
+        row.get("kind") == "analyzer_failure"
+        and row.get("reason") == "qualified primary rejected this semantic chunk"
+    )
+
+
 def _failed_review_retry_targets(
     source: Mapping[str, Any],
     events: list[dict[str, Any]],
     cache_path: Path,
     selected_digest: str | Sequence[str],
 ) -> dict[tuple[str, ...], str]:
-    """Bind selected failed reviewer groups to one exact source ledger and cache."""
+    """Bind selected semantic failures to one exact source ledger and cache."""
     selected = _canonical_retry_digests(selected_digest)
     ids = sorted(str(event["evidence_id"]) for event in events)
     if (
@@ -114,9 +131,10 @@ def _failed_review_retry_targets(
     semantic_analyzer.AnalyzerResponseCache(cache_path)
     targets: dict[str, tuple[tuple[str, ...], str]] = {}
     for row in source.get("exceptions", []):
-        if not isinstance(row, Mapping) or row.get("kind") not in {
-            "analyzer_review_failure", "analyzer_review_partial_quarantine"
-        }:
+        if not isinstance(row, Mapping) or not (
+            row.get("kind") in {"analyzer_review_failure", "analyzer_review_partial_quarantine"}
+            or _scoped_extractor_contract_failure(row)
+        ):
             continue
         evidence_ids = row.get("evidence_ids")
         if not isinstance(evidence_ids, list) or not evidence_ids:
@@ -125,7 +143,12 @@ def _failed_review_retry_targets(
         if len(set(key)) != len(key) or not set(key) <= set(ids):
             raise WorkAccountingError("failed-review retry source evidence is invalid")
         digest = semantic_analyzer.stable_digest("frt-", list(key), length=64)
-        if row["kind"] == "analyzer_review_partial_quarantine":
+        if _scoped_extractor_contract_failure(row):
+            # Native extraction leaves retain no specific rejection category.
+            # Recover their exact source members, without inventing reviewer
+            # diagnostics or rerunning extraction for unrelated evidence.
+            code = "contract_rejected"
+        elif row["kind"] == "analyzer_review_partial_quarantine":
             # The accepted quarantine may be only a subset of the earlier
             # failed request. Its original failure code is not derivable from
             # this row and must not be guessed.
@@ -281,11 +304,19 @@ def run_scoped_failed_review_retry(
     source_exceptions = source.get("exceptions")
     if not isinstance(source_exceptions, list):
         raise WorkAccountingError("scoped failed-review source exceptions are invalid")
+    for row in source_exceptions:
+        if isinstance(row, Mapping) and _scoped_extractor_contract_failure(row):
+            key = tuple(sorted(str(value) for value in row.get("evidence_ids", [])))
+            if key in targets and targets[key] != "contract_rejected":
+                raise WorkAccountingError("scoped extractor failure requires its generic rejection category")
     source_groups = {
         tuple(sorted(str(value) for value in row.get("evidence_ids", [])))
         for row in source_exceptions
         if isinstance(row, Mapping)
-        and row.get("kind") in {"analyzer_review_failure", "analyzer_review_partial_quarantine"}
+        and (
+            row.get("kind") in {"analyzer_review_failure", "analyzer_review_partial_quarantine"}
+            or _scoped_extractor_contract_failure(row)
+        )
     }
     if any(
         not key or tuple(sorted(set(key))) != key or key not in source_groups
@@ -306,7 +337,10 @@ def run_scoped_failed_review_retry(
             cited = set(str(value) for value in row["evidence_ids"])
             if cited & selected and not (
                 section == "exceptions"
-                and row.get("kind") in {"analyzer_review_failure", "analyzer_review_partial_quarantine"}
+                and (
+                    row.get("kind") in {"analyzer_review_failure", "analyzer_review_partial_quarantine"}
+                    or _scoped_extractor_contract_failure(row)
+                )
                 and tuple(sorted(cited)) in targets
             ):
                 raise WorkAccountingError("scoped failed-review source overlaps a non-target row")
@@ -532,9 +566,8 @@ def _seal_analyzer_cache_snapshot(
     configured_endpoints = tuple(
         endpoint for endpoint in (primary, fallback) if endpoint is not None
     )
-    records = semantic_analyzer.AnalyzerResponseCache(
-        analyzer_cache_path
-    ).records_for_snapshot(
+    cache = semantic_analyzer.AnalyzerResponseCache(analyzer_cache_path)
+    records = cache.records_for_snapshot(
         cache_summary["records"], configured_endpoints=configured_endpoints
     )
     content = b"".join(
@@ -542,6 +575,20 @@ def _seal_analyzer_cache_snapshot(
         for record in records
     )
     target = run_dir / "analyzer-cache-used.jsonl"
+    diagnostic_references = cache_summary.get("review_diagnostic_records")
+    if diagnostic_references:
+        if (analysis.get("review_prompt_version") != semantic_analyzer.COMMISSIONED_REVIEW_PROMPT_VERSION
+                or not isinstance(cache_summary, dict) or not isinstance(diagnostic_references, list)):
+            raise WorkAccountingError("review diagnostics snapshot requires the fresh v9 contract")
+        diagnostic_content = cache.review_diagnostics_for_snapshot(diagnostic_references, used_cache_records=records)
+        diagnostic_target = target.with_name(target.name + ".review-diagnostics.jsonl")
+        _write_bytes(diagnostic_target, diagnostic_content)
+        cache_summary["review_diagnostics_snapshot"] = {
+            "path": diagnostic_target.name,
+            "record_count": len(diagnostic_references),
+            "sha256": hashlib.sha256(diagnostic_content).hexdigest(),
+        }
+        del cache_summary["review_diagnostic_records"]
     _write_bytes(target, content)
     return {
         "path": target.name,
@@ -961,7 +1008,8 @@ def analyze_ledger(
     fallback = semantic_analyzer.AnalyzerEndpoint.from_env("CLOCKIFY_ANALYZER_FALLBACK")
     cache = sealed_cache or (
         semantic_analyzer.AnalyzerResponseCache(
-            analyzer_cache_path, record_review_diagnostics=retry_targets is not None,
+            analyzer_cache_path, record_review_diagnostics=True,
+            use_review_diagnostic_feedback=retry_targets is not None,
         )
         if analyzer_cache_path is not None
         else None
@@ -999,6 +1047,7 @@ def analyze_ledger(
         and tuple(sorted(str(value) for value in row.get("evidence_ids", []))) in retry_targets
         and (
             row.get("kind") == "analyzer_review_partial_quarantine"
+            or _scoped_extractor_contract_failure(row)
             or str(row.get("reason") or "").startswith(
                 "Flash reviewer exhausted bounded structural repair:"
             )
@@ -1035,7 +1084,7 @@ def analyze_ledger(
                 review_prompt_version = semantic_analyzer.REVIEW_PROMPT_VERSION
         else:
             review_prompt_version = (
-                semantic_analyzer.TASK_REVIEW_PROMPT_VERSION if actor_contract is not None
+                semantic_analyzer.COMMISSIONED_REVIEW_PROMPT_VERSION if actor_contract is not None
                 else semantic_analyzer.REVIEW_PROMPT_VERSION
             )
         result = semantic_analyzer.analyze_tiered(
@@ -2070,6 +2119,61 @@ def _activity_observed_intervals(
     ]
 
 
+def _task_owned_observed_intervals(cited_events: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Fresh v9 placement bounds, not human attention or measured agent runtime.
+
+    Only this outcome's actual message points may form source-bound clusters.
+    Non-owning instruction context and session envelopes supply no capacity.
+    """
+    groups: dict[tuple[str, str, str, str], list[dt.datetime]] = {}
+    session_sources = set(TASK_EFFORT_TIMING_INPUT["source_types"])
+    candidates = [
+        (_parse_dt(interval["start"]), _parse_dt(interval["end"]))
+        for interval in _activity_observed_intervals([
+            event for event in cited_events
+            if event.get("source_type") not in session_sources
+            and event.get("source_type") not in {source.removesuffix("_event") for source in session_sources}
+        ])
+    ]
+    for event in cited_events:
+        source_type = str(event.get("source_type") or "")
+        source = event.get("source_ref") or {}
+        attrs = _attributes(event)
+        if (
+            source_type not in session_sources
+            or source.get("source_type") != source_type.removesuffix("_event")
+            or not source.get("machine") or not source.get("session_id")
+            or attrs.get("role") not in {"user", "assistant", "tool"}
+            or attrs.get("kind", "message") != "message"
+            or not str(attrs.get("content") or "").strip()
+            or collector.is_injected_session_message(str(attrs.get("content") or ""))
+        ):
+            continue
+        point = _parse_dt((event.get("raw_source_span") or {}).get("timestamp") or event.get("observed_at"))
+        if point is None:
+            continue
+        point = point.astimezone(collector.BUCHAREST)
+        group = (source_type, str(source["machine"]), str(source["session_id"]), point.date().isoformat())
+        groups.setdefault(group, []).append(point)
+    for points in groups.values():
+        cluster: list[dt.datetime] = []
+        for point in sorted(set(points)):
+            if cluster and (point - cluster[-1]).total_seconds() > collector.BURST_GAP_SECONDS:
+                if len(cluster) > 1:
+                    candidates.append((cluster[0], cluster[-1]))
+                cluster = []
+            cluster.append(point)
+        if len(cluster) > 1:
+            candidates.append((cluster[0], cluster[-1]))
+    merged: list[tuple[dt.datetime, dt.datetime]] = []
+    for start, end in sorted(candidates):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return [{"start": start.isoformat(), "end": end.isoformat()} for start, end in merged]
+
+
 def _session_timing_pool_sources(routing: Mapping[str, Any]) -> tuple[str, ...]:
     """Opt in per source without changing historical routing or result shapes."""
     if "session_timing_pool_sources" not in routing:
@@ -2559,6 +2663,153 @@ def _exact_existing_accomplishment_match(
         and project == block.get("project_id_suffix")
         and description == block.get("description")
     )
+
+
+def _audited_daily_recording_pairs(events: list[dict[str, Any]], manifest: Mapping[str, Any],
+        routing: Mapping[str, Any], collection_snapshot: Any) -> dict[str, dict[str, Any]]:
+    """Validate explicit review-only Daily pairs against preserved native GET facts."""
+    if AUDITED_DAILY_KEY not in routing:
+        return {}
+    declaration = routing[AUDITED_DAILY_KEY]
+    def invalid() -> None:
+        raise WorkAccountingError("audited Daily recording source or declaration differs")
+    if (not isinstance(declaration, Mapping) or set(declaration) != {
+            "schema_version", "workspace_id", "member_id", "collection_snapshot_sha256", "pairs"}
+            or declaration.get("schema_version") != AUDITED_DAILY_RECIPE or collection_snapshot is None):
+        invalid()
+    request = collection_snapshot.manifest.get("request", {})
+    if (declaration["collection_snapshot_sha256"] != collection_snapshot.manifest_sha256
+            or declaration["workspace_id"] != request.get("workspace_id")
+            or declaration["member_id"] != request.get("user_id")
+            or routing.get("workspace_id") != declaration["workspace_id"]
+            or routing.get("clockify_user_id") != declaration["member_id"]
+            or routing.get("member_id", declaration["member_id"]) != declaration["member_id"]
+            or not isinstance(declaration["pairs"], list) or not declaration["pairs"]):
+        invalid()
+    recordings, errors = _recording_events(events, manifest)
+    members = meeting_reconciliation.manifest_member_identities(manifest)
+    by_id = {e["evidence_id"]: e for e in events}
+    blocks = {b["block_id"]: b for b in _existing_blocks(events)}
+    result, used_native = {}, set()
+    day = lambda value: value.astimezone(collector.BUCHAREST).date().isoformat()
+    for pair in declaration["pairs"]:
+        if (not isinstance(pair, Mapping) or set(pair) != {"same_meeting_confirmed", "canonical_meeting_id",
+                "recording_evidence_fingerprint", "clockify_evidence_id", "clockify_entry_id",
+                "clockify_entry_sha256", "local_date", "project_suffix"}
+                or pair.get("same_meeting_confirmed") is not True
+                or any(not isinstance(value, str) or not value.strip() or value != value.strip()
+                       for name, value in pair.items() if name != "same_meeting_confirmed")
+                or pair.get("canonical_meeting_id") in result or pair.get("clockify_entry_id") in used_native):
+            invalid()
+        matching = [r for r in recordings if r["meeting"].canonical_id == pair["canonical_meeting_id"]]
+        native = [e for e in collection_snapshot.entries if e.get("id") == pair["clockify_entry_id"]]
+        if len(matching) != 1 or len(native) != 1:
+            invalid()
+        recording, native_entry = matching[0], native[0]
+        representative = next((e for e in recording["events"] if e.get("source_type") == "fathom"), None)
+        if (representative is None or not _meeting_is_eligible(representative, members)[0]
+                or _attributes(representative).get("semantic_evidence_status") == "title_only"
+                or _normalized_meeting_title(recording["meeting"].title) != "daily meet"
+                or any(set(recording["source_evidence_ids"]) & set(e["source_evidence_ids"]) for e in errors)
+                or review_corrections.evidence_fingerprint(recording["source_evidence_ids"]) != pair["recording_evidence_fingerprint"]
+                or "sha256:" + hashlib.sha256(semantic_analyzer.canonical_json(native_entry).encode()).hexdigest() != pair["clockify_entry_sha256"]
+                or native_entry.get("workspaceId") != declaration["workspace_id"]
+                or native_entry.get("userId") != declaration["member_id"]
+                or native_entry.get("type") != "REGULAR"
+                or _normalized_meeting_title(native_entry.get("description")) != "daily meet"):
+            invalid()
+        start, end = _canonical_meeting_span(recording["meeting"], representative)
+        interval = native_entry.get("timeInterval") or {}
+        lo, hi = _parse_dt(interval.get("start")), _parse_dt(interval.get("end"))
+        event, block = by_id.get(pair["clockify_evidence_id"]), blocks.get(pair["clockify_evidence_id"])
+        if (lo is None or hi is None or hi <= lo or not max(start, lo) < min(end, hi)
+                or {day(t) for t in (start, end, lo, hi)} != {pair["local_date"]}
+                or event is None or block is None or event.get("source_type") != "clockify"):
+            invalid()
+        attrs = _attributes(event)
+        routes = [r for r in _routes_by_selection(routing).values()
+                  if str(r.get("project_name") or "").casefold() == "daily meetings"
+                  and r.get("project_suffix") == pair["project_suffix"]
+                  and native_entry.get("projectId", "").endswith(pair["project_suffix"])
+                  and sorted(r.get("tag_suffixes", [])) == sorted(t[-8:] for t in native_entry.get("tagIds", []))
+                  and r.get("billable", True) is native_entry.get("billable")]
+        if (len(routes) != 1 or not pair["project_suffix"]
+                or attrs.get("id_suffix") != pair["clockify_entry_id"][-8:]
+                or attrs.get("description") != native_entry.get("description")
+                or attrs.get("project_id_suffix") != pair["project_suffix"]
+                or sorted(attrs.get("tag_id_suffixes", [])) != sorted(t[-8:] for t in native_entry.get("tagIds", []))
+                or attrs.get("billable") is not native_entry.get("billable")
+                or (block["start"], block["end"]) != (lo, hi)):
+            invalid()
+        # Explicit declarations cannot resolve ambiguous same-day Daily inventories.
+        daily_recordings = [r for r in recordings if _normalized_meeting_title(r["meeting"].title) == "daily meet"
+                            and day(_parse_dt(r["meeting"].start)) == pair["local_date"]]
+        daily_native = [e for e in collection_snapshot.entries
+            if e.get("workspaceId") == declaration["workspace_id"] and e.get("userId") == declaration["member_id"]
+            and _normalized_meeting_title(e.get("description")) == "daily meet"
+            and e.get("projectId", "").endswith(pair["project_suffix"])
+            and _parse_dt((e.get("timeInterval") or {}).get("start")) is not None
+            and day(_parse_dt(e["timeInterval"]["start"])) == pair["local_date"]]
+        if len(daily_recordings) != 1 or len(daily_native) != 1:
+            invalid()
+        result[pair["canonical_meeting_id"]] = {"pair": copy.deepcopy(dict(pair)), "block": block,
+            "start": start, "end": end, "route": routes[0], "source_evidence_ids": recording["source_evidence_ids"],
+            "declaration": declaration}
+        used_native.add(pair["clockify_entry_id"])
+    return result
+
+
+def _audited_daily_recipe(pair: Mapping[str, Any], credited_seconds: int) -> dict[str, Any]:
+    return {"recipe": AUDITED_DAILY_RECIPE,
+        "routing_declaration_sha256": "sha256:" + hashlib.sha256(semantic_analyzer.canonical_json(pair["declaration"]).encode()).hexdigest(),
+        "canonical_meeting_id": pair["pair"]["canonical_meeting_id"],
+        "clockify_entry_id": pair["pair"]["clockify_entry_id"],
+        "collection_snapshot_sha256": pair["declaration"]["collection_snapshot_sha256"],
+        "original_duration_seconds": int((pair["end"] - pair["start"]).total_seconds()),
+        "credited_seconds": credited_seconds}
+
+
+def _apply_audited_daily_recording_intersections(proposals: list[dict[str, Any]],
+        pairs: Mapping[str, Mapping[str, Any]], existing_blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Subtract exact reviewed intersections; never claim a prior POST or approval."""
+    survivors = list(proposals)
+    replacements = {}
+    for canonical_id, pair in pairs.items():
+        matches = [p for p in survivors if (p.get("provenance") or {}).get("canonical_meeting_id") == canonical_id]
+        if len(matches) != 1:
+            raise WorkAccountingError("audited Daily requires one whole source recording proposal")
+        proposal = matches[0]
+        if ((_parse_dt(proposal["start"]), _parse_dt(proposal["end"])) != (pair["start"], pair["end"])
+                or proposal.get("clockify_project_suffix") != pair["route"]["project_suffix"]
+                or proposal.get("client_project") != pair["route"]["project_name"]
+                or proposal.get("billable") is not pair["route"].get("billable", True)
+                or sorted(proposal.get("tag_suffixes", [])) != sorted(pair["route"].get("tag_suffixes", []))
+                or sorted(proposal["provenance"]["evidence_ids"]) != sorted(pair["source_evidence_ids"])):
+            raise WorkAccountingError("audited Daily proposal differs from the whole source recording")
+        skipped = []
+        sliced = _slice_proposal_around_credits(proposal, [pair["block"]], "existing_clockify_overlap", skipped,
+            fully_credited_reason="audited same Daily recording intersection; review-only preparation")
+        if not sliced:
+            raise WorkAccountingError("audited Daily partial recipe requires an uncredited recording remainder")
+        for residual in sliced:
+            receipt = residual["provenance"]["credited_overlap_receipt"]
+            residual["provenance"]["audited_daily_recording_credit"] = _audited_daily_recipe(pair, receipt["credited_seconds"])
+            # Keep genuine warning facts, clipping only exact source-native overlaps.
+            rebound = []
+            for warning in proposal.get("review_warnings", []):
+                block = next((b for b in existing_blocks if warning.get("type") == "existing_clockify_overlap"
+                    and b["block_id"] == warning.get("counterpart_id")
+                    and warning == _overlap_warning(pair["start"], pair["end"], b, "existing_clockify_overlap")), None)
+                updated = (_overlap_warning(_parse_dt(residual["start"]), _parse_dt(residual["end"]), block,
+                    "existing_clockify_overlap") if block is not None else warning)
+                if updated is not None:
+                    rebound.append(updated)
+            residual["review_warnings"] = rebound
+        survivors.remove(proposal)
+        survivors.extend(sliced)
+        replacements[proposal["candidate_key"]] = [p["candidate_key"] for p in sliced]
+    return sorted(_rebind_credited_proposal_overlaps(proposals, survivors, replacements),
+                  key=lambda p: (str(p.get("start") or ""), str(p.get("candidate_key") or ""))) if pairs else proposals
 
 
 def _normalize_postable_proposals(
@@ -3121,6 +3372,8 @@ def run_accounting(
         raise WorkAccountingError(f"ledger member identities are invalid: {exc}") from exc
     analysis_events, noise = _analysis_events(all_events, member_identities)
     routing = _read_json(routing_path or (root / "routing.json"))
+    daily_pairs = _audited_daily_recording_pairs(all_events, ledger.manifest.document(), routing,
+        _accounting_collection_snapshot(run_dir, all_events) if AUDITED_DAILY_KEY in routing else None)
     session_pool_sources = _session_timing_pool_sources(routing)
     claude_pool_enabled = "claude_bursts" in session_pool_sources
     retry_actor_contract = None
@@ -3513,7 +3766,11 @@ def run_accounting(
             # The opt-in cannot combine parallel sessions or let one containing
             # result lend its pool to another result outside the human bounds.
             timing_contexts = {}
-        intervals = _activity_observed_intervals(cited)
+        task_effort = activity.get("review_prompt_version") == semantic_analyzer.COMMISSIONED_REVIEW_PROMPT_VERSION
+        if task_effort:
+            # Commission context is semantic support, never a shared human pool.
+            timing_contexts = {}
+        intervals = _task_owned_observed_intervals(cited) if task_effort else _activity_observed_intervals(cited)
         context_intervals = sorted(
             (dict(context["interval"]) for context in timing_contexts.values()),
             key=lambda interval: (interval["start"], interval["end"]),
@@ -3582,6 +3839,13 @@ def run_accounting(
         requested_effort = dict(activity.get("effort") or {})
         requested_minutes = int(requested_effort.get("recommended_minutes") or 0)
         review_warnings: list[dict[str, Any]] = list(routing_warnings)
+        if task_effort:
+            review_warnings.append({
+                "type": "estimated_task_effort",
+                "timing_recipe": TASK_EFFORT_TIMING_INPUT["recipe"],
+                "reason": "Estimated commissioned task effort bounded by task-owned source observations; not human attention or measured agent runtime.",
+                "observed_intervals": copy.deepcopy(intervals),
+            })
         demand_effort = requested_effort
         if requested_minutes > observed_capacity:
             demand_effort = {
@@ -3890,6 +4154,7 @@ def run_accounting(
     )
 
     proposals = _normalize_postable_proposals(proposals, existing, skipped)
+    proposals = _apply_audited_daily_recording_intersections(proposals, daily_pairs, existing)
     # Match sealed credits against the same recovery warning shape as finalized proposals.
     _refresh_capacity_recovery_warnings(proposals, skipped, recovery_records)
     collection_snapshot = (_accounting_collection_snapshot(run_dir, all_events)
@@ -4042,6 +4307,12 @@ def run_accounting(
     }
     if "session_timing_pool_sources" in routing:
         serialized_allocation["deterministic_inputs"]["session_timing_pool_sources"] = list(session_pool_sources)
+    if AUDITED_DAILY_KEY in routing:
+        serialized_allocation["deterministic_inputs"][AUDITED_DAILY_KEY] = copy.deepcopy(routing[AUDITED_DAILY_KEY])
+    if (analysis.get("review_prompt_version") == semantic_analyzer.COMMISSIONED_REVIEW_PROMPT_VERSION
+            or any(activity.get("review_prompt_version") == semantic_analyzer.COMMISSIONED_REVIEW_PROMPT_VERSION
+                   for activity in analysis.get("activities", []))):
+        serialized_allocation["deterministic_inputs"]["task_effort_timing"] = copy.deepcopy(TASK_EFFORT_TIMING_INPUT)
     review_tombstones = [
         copy.deepcopy(row)
         for row in skipped

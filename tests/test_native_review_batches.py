@@ -61,7 +61,7 @@ class NativeReviewBatchTests(unittest.TestCase):
                                      "wording_only_ids": []})
         self.assertEqual(legacy["entries"], fresh["entries"])
         self.assertEqual({identity(1), identity(2)}, native._independent_review_ids(fresh))
-        self.assertEqual(["SC — Prepared one", "SC — Prepared two"],
+        self.assertEqual([self.group["description"]] * 2,
                          [entry["payload"]["description"] for entry in fresh["entries"]])
         self.assertEqual(["2026-09-29T07:00:07Z", "2026-09-29T07:10:00Z"],
                          [entry["payload"]["start"] for entry in fresh["entries"]])
@@ -83,7 +83,7 @@ class NativeReviewBatchTests(unittest.TestCase):
         self.assertEqual(34, len(plan["entries"]))
         self.assertEqual(9120, sum(entry["duration_minutes"] * 60 for entry in plan["entries"]))
         self.assertEqual([identity(n) for n in range(1, 35)], [entry["review_id"] for entry in plan["entries"]])
-        self.assertEqual([descriptions[identity(n)] for n in range(1, 35)],
+        self.assertEqual([group["description"]] * 34,
                          [entry["payload"]["description"] for entry in plan["entries"]])
         self.assertEqual([dt.datetime.fromisoformat(p["start"]).astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
                           for p in self.sources], [entry["payload"]["start"] for entry in plan["entries"]])
@@ -115,7 +115,7 @@ class NativeReviewBatchTests(unittest.TestCase):
                          [entry["payload"]["start"] for entry in plan["entries"]])
         self.assertEqual(["2026-09-29T07:01:18Z", "2026-09-29T07:11:23Z"],
                          [entry["payload"]["end"] for entry in plan["entries"]])
-        self.assertEqual(["SC — Prepared one", "SC — Prepared two"],
+        self.assertEqual([group["description"]] * 2,
                          [entry["payload"]["description"] for entry in plan["entries"]])
         independent = native._independent_review_ids(plan)
         self.assertEqual({identity(1), identity(2)}, independent)
@@ -130,6 +130,36 @@ class NativeReviewBatchTests(unittest.TestCase):
         self.assertEqual(2, len(gateway.posts))
         self.assertEqual(["created", "created"], [entry["disposition"] for entry in receipt["entries"]])
         self.assertEqual(154, receipt["review_groups"][0]["duration_seconds"])
+
+    def test_v7_long_parent_reconstructs_exact_child_windows_wording_and_independence(self):
+        self.sources[0].update(end="2026-09-29T10:15:07+03:00", duration_seconds=900, duration_minutes=15)
+        self.sources[1].update(start="2026-09-29T11:00:00+03:00", end="2026-09-29T12:00:01+03:00",
+                               duration_seconds=3601, duration_minutes=60)
+        package = batches.package_review_batches(self.sources,
+            editorial_descriptions={identity(1): "SC — Prepared one", identity(2): "SC — Prepared two"},
+            work_contexts=self.contexts, natural_batches=True, all_durations=True)
+        group = package["activities"][0]
+        plan = self.plan(sheet_row=publisher.portfolio_row(group, "source-run"), package=package,
+            authority={"consolidation_policy": "approved-daily-project-presentation/v7", "wording_only_ids": []})
+        self.assertEqual(1, plan["row_count"])
+        self.assertEqual([identity(1), identity(2)], [entry["review_id"] for entry in plan["entries"]])
+        self.assertEqual(["2026-09-29T07:00:07Z", "2026-09-29T08:00:00Z"],
+                         [entry["payload"]["start"] for entry in plan["entries"]])
+        self.assertEqual(["2026-09-29T07:15:07Z", "2026-09-29T09:00:01Z"],
+                         [entry["payload"]["end"] for entry in plan["entries"]])
+        self.assertEqual([group["description"]] * 2,
+                         [entry["payload"]["description"] for entry in plan["entries"]])
+        self.assertEqual({identity(1), identity(2)}, native._independent_review_ids(plan))
+        with self.assertRaises(native.NativePostError):
+            self.plan(sheet_row=publisher.portfolio_row(group, "source-run"), package=package,
+                authority={"consolidation_policy": "approved-daily-project-presentation/v6", "wording_only_ids": []})
+        self.sources[0].update(start="2026-09-29T10:00:07.123+03:00", end="2026-09-29T10:15:07.123+03:00")
+        fractional = batches.package_review_batches(self.sources,
+            editorial_descriptions={identity(1): "SC — Prepared one", identity(2): "SC — Prepared two"},
+            work_contexts=self.contexts, natural_batches=True, all_durations=True)
+        with self.assertRaises(native.NativePostError):
+            self.plan(sheet_row=publisher.portfolio_row(fractional["activities"][0], "source-run"), package=fractional,
+                authority={"consolidation_policy": "approved-daily-project-presentation/v7", "wording_only_ids": []})
 
     def test_multitag_batch_routes_by_tag_identity_not_config_order(self):
         for source in self.sources:

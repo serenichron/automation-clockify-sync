@@ -45,6 +45,14 @@ class AutomaticPreparationTests(unittest.TestCase):
         self.write(self.run / "work-accounting-result.json", {"schema_version": 1,
             "allocation_mode": "non_overlapping_v1", "proposals": self.sources,
             "ambiguous": [], "skipped": []})
+        # Existing orchestration tests stay local: substitute only the external
+        # semantic boundary, leaving preparation, projection and receipts real.
+        summary = mock.patch.object(cycle, "_summarize_review_groups", side_effect=lambda groups, _state: {
+            item["review_id"]: {"child_review_ids": item["child_review_ids"],
+                "description": "SC — Prepared source publication and verified its review receipt"}
+            for item in groups if len({child["description"] for child in item["prepared_descriptions"]}) > 1})
+        summary.start()
+        self.addCleanup(summary.stop)
 
     @staticmethod
     def write(path, value):
@@ -55,6 +63,41 @@ class AutomaticPreparationTests(unittest.TestCase):
         self.assertIsNotNone(function, "automatic editorial preparation is missing")
         return function(source_dir=self.run, output=self.root / "prepared.json", run_id="source-run",
             spreadsheet_id="sheet", sheet_title="August 2026 review", timezone="Europe/Bucharest")
+
+    def test_singleton_only_delivery_receives_client_facing_editorial_review(self):
+        self.sources = self.sources[:1]
+        self.analysis["activities"] = self.analysis["activities"][:1]
+        noisy = "SC — Restored SER-1801 receipt comparison"
+        self.sources[0]["description"] = noisy
+        self.analysis["activities"][0]["rendered_description"] = noisy
+        self.write(self.run / "proposals.json", self.sources)
+        self.write(self.run / "semantic-analysis.json", self.analysis)
+        source_before = (self.run / "proposals.json").read_bytes()
+        output = self.root / "singleton.json"
+        clean = "SC — Restored receipt comparison"
+
+        def review(groups):
+            return {item["review_id"]: {"child_review_ids": item["child_review_ids"],
+                    "description": clean} for item in groups}
+
+        prepared.prepare(source_dir=self.run, output=output, run_id="source-run",
+            spreadsheet_id="sheet", sheet_title="August 2026 review", timezone="Europe/Bucharest",
+            summary_provider=review)
+        projection = prepared.project(path=output, source_dir=self.run, proposals=self.sources,
+            run_id="source-run", spreadsheet_id="sheet", sheet_title="August 2026 review",
+            project_allowlist={"abc123": "Example"})
+        self.assertEqual([clean], [row[8] for row in projection["rows"]])
+        self.assertEqual([71 / 60], [row[3] for row in projection["rows"]])
+        self.assertEqual(source_before, (self.run / "proposals.json").read_bytes())
+        binding_before = output.read_bytes()
+
+        def no_new_review(groups):
+            self.fail("an existing immutable binding must not request fresh editorial review")
+
+        prepared.prepare(source_dir=self.run, output=output, run_id="source-run",
+            spreadsheet_id="sheet", sheet_title="August 2026 review", timezone="Europe/Bucharest",
+            summary_provider=no_new_review)
+        self.assertEqual(binding_before, output.read_bytes())
 
     def test_untagged_reviewed_time_publishes_natively_without_invalid_portfolio_parent(self):
         # Native proposals permit no tags; portfolio parents require at least
@@ -99,6 +142,48 @@ class AutomaticPreparationTests(unittest.TestCase):
             {"run_dir": str(self.run), "run_id": "source-run"}, sheet_title="August 2026 review",
             publication_profile=None)
         self.assertEqual(expected[0], {key: result["publications"][0][key] for key in expected[0]})
+
+    def test_all_duration_preparation_opt_in_projects_long_sources_and_replays_v1_to_v6_bytes(self):
+        self.sources[0].update(end="2026-08-01T10:15:07+03:00", duration_seconds=900, duration_minutes=15)
+        self.sources[1].update(start="2026-08-01T11:00:00+03:00", end="2026-08-01T12:00:01+03:00",
+                               duration_seconds=3601, duration_minutes=60)
+        self.write(self.run / "proposals.json", self.sources)
+        authority = {name: prepared.artifact_handle(self.run / filename) for name, filename in prepared.AUTHORITY_FILES.items()}
+        for version in range(1, 7):
+            with self.subTest(version=version):
+                policy = f"approved-daily-project-presentation/v{version}"
+                fields = prepared._auto_fields(self.sources, authority, self.run, "Europe/Bucharest",
+                                              consolidation_policy=policy)
+                self.assertEqual([], fields["package"]["activities"])
+                legacy = {"schema_version": prepared.AUTO_SCHEMA, "run_id": "source-run", "spreadsheet_id": "sheet",
+                    "sheet_title": "August 2026 review", "source_proposals": prepared.artifact_handle(self.run / "proposals.json"),
+                    "timezone": "Europe/Bucharest", "authority": authority, "consolidation_policy": policy, **fields}
+                path = self.root / f"legacy-v{version}.json"
+                self.write(path, legacy)
+                before = path.read_bytes()
+                prepared.prepare(source_dir=self.run, output=path, run_id="source-run", spreadsheet_id="sheet",
+                    sheet_title="August 2026 review", timezone="Europe/Bucharest")
+                self.assertEqual(before, path.read_bytes())
+        default = self.prepare()
+        self.assertEqual(4501, default["prepared_seconds"])
+        self.assertEqual("approved-daily-project-presentation/v6", prepared.load(self.root / "prepared.json")[0]["consolidation_policy"])
+        output = self.root / "all-durations.json"
+        result = prepared.prepare(source_dir=self.run, output=output, run_id="source-run", spreadsheet_id="sheet",
+            sheet_title="August 2026 review", timezone="Europe/Bucharest", all_durations=True)
+        document, _ = prepared.load(output)
+        self.assertEqual("approved-daily-project-presentation/v7", document["consolidation_policy"])
+        self.assertEqual(4501, result["prepared_seconds"])
+        self.assertEqual([], document["package"]["retained"])
+        self.assertEqual(1, len(document["package"]["activities"]))
+        projection = prepared.project(path=output, source_dir=self.run, proposals=self.sources,
+            run_id="source-run", spreadsheet_id="sheet", sheet_title="August 2026 review",
+            project_allowlist={"abc123": "Example"})
+        self.assertEqual(1, len(projection["rows"]))
+        self.assertEqual(4501 / 60, projection["rows"][0][3])
+        before = output.read_bytes()
+        prepared.prepare(source_dir=self.run, output=output, run_id="source-run", spreadsheet_id="sheet",
+            sheet_title="August 2026 review", timezone="Europe/Bucharest")
+        self.assertEqual(before, output.read_bytes())
 
     def test_fresh_natural_batch_does_not_reinterpret_existing_v5_threshold_package(self):
         self.sources = natural_batch_sources(34)

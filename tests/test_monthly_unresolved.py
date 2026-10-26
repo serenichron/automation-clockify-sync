@@ -70,6 +70,89 @@ class MonthlyGateway:
 
 
 class MonthlyTests(unittest.TestCase):
+    def test_correction_rendering_requires_exact_integer_revision_and_preserves_legacy_cells(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            documents = frozen_run(root, 1)
+            documents["ambiguous.json"][0].update(
+                exception_kind="correction_regression", reason="description differs from reviewed value")
+            for name in ("ambiguous.json", "work-accounting-result.json"):
+                (root / name).write_text(json.dumps(documents[name]))
+            legacy = next(row for row in monthly.project_rows(root) if row[3] == "correction_regression")
+            self.assertEqual([
+                "correction_regression",
+                "Cited evidence does not establish a confirmed positive work interval; accounting exception requires human review.",
+                "", "1 cited evidence records; correction_regression accounting exception. No confirmed additional work interval.",
+                "", "quality pass; accounting ambiguity; no confirmed interval",
+                "Confirm activity, project and observed interval; no automatic Clockify posting or additional time claim.",
+                "needs_review",
+            ], legacy[3:11])
+            for revision in (None, True, False, "1", 1.0, 0, 2, [], {}):
+                with self.subTest(revision=revision):
+                    report = {**documents["run-report.json"], "monthly_unresolved_rendering_revision": revision}
+                    (root / "run-report.json").write_text(json.dumps(report))
+                    row = next(row for row in monthly.project_rows(root) if row[3] == "correction_regression")
+                    self.assertEqual(legacy[:11], row[:11])
+
+    def test_marked_correction_failures_are_truthful_bounded_and_private(self):
+        cases = [
+            ("description differs from reviewed value", "reviewed description differs", True),
+            ("client_project differs from reviewed value", "reviewed client/project routing differs", False),
+            ("tag_names differs from reviewed value", "reviewed tags differ", False),
+            ("start differs from reviewed value", "reviewed start differs", False),
+            ("end differs from reviewed value", "reviewed end differs", False),
+            ("duration_minutes differs from reviewed value", "reviewed duration differs", False),
+            ("duration_seconds differs from reviewed value", "reviewed duration differs", False),
+            ("billable differs from reviewed value", "reviewed billable state differs", False),
+            ("reviewed activity is missing", "reviewed activity is missing", False),
+            ("previously skipped activity reappeared", "previously skipped activity reappeared", False),
+            ("split correction has no executable structural contract", "reviewed split contract is unavailable", False),
+            ("split correction contract has no evidence", "reviewed split evidence is unavailable", False),
+            ("split correction evidence does not match its reviewed target", "reviewed split evidence target differs", False),
+            ("split child proposal is missing an activity_id", "reviewed split child identity is missing", False),
+            ("split child count differs from reviewed value", "reviewed split child count differs", False),
+            ("split child evidence is duplicated across activities", "reviewed split evidence is duplicated", False),
+            ("split child evidence union differs from reviewed value", "reviewed split evidence union differs", False),
+            ("split child evidence partition differs from reviewed value", "reviewed split evidence partition differs", False),
+            ("description differs from reviewed value; start differs from reviewed value", "reviewed start differs", False),
+            ("description differs from reviewed value; Private Person / Secret title", "other correction validation failure", False),
+            ("Private Person / Secret title", "other correction validation failure", False),
+            (None, "other correction validation failure", False),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            documents = frozen_run(root, 1)
+            legacy_other = [row[:11] for row in monthly.project_rows(root) if row[3] != "low_confidence"]
+            documents["run-report.json"]["monthly_unresolved_rendering_revision"] = 1
+            (root / "run-report.json").write_text(json.dumps(documents["run-report.json"]))
+            for failure, expected, wording_only in cases:
+                with self.subTest(failure=failure):
+                    documents["ambiguous.json"][0].update(exception_kind="correction_regression", reason=failure)
+                    for name in ("ambiguous.json", "work-accounting-result.json"):
+                        (root / name).write_text(json.dumps(documents[name]))
+                    rows = monthly.project_rows(root)
+                    row = next(row for row in rows if row[3] == "correction_regression")
+                    self.assertIn(expected, row[4])
+                    self.assertEqual(wording_only, "wording-only" in row[8])
+                    self.assertIn("correction", row[6])
+                    self.assertIn("correction", row[9])
+                    self.assertIn("no automatic Clockify posting", row[9])
+                    public = json.dumps(row[:11])
+                    for forbidden in ("no confirmed interval", "No confirmed additional work interval",
+                                      "does not establish a confirmed positive work interval",
+                                      "Synthetic work", "Private Person", "Secret title", "quality pass"):
+                        self.assertNotIn(forbidden, public)
+                    self.assertEqual(legacy_other, [other[:11] for other in rows if other[3] != "correction_regression"])
+
+    def test_rendering_opt_in_does_not_change_other_exception_or_routing_cells(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            documents = frozen_run(root, 1)
+            before = [row[:11] for row in monthly.project_rows(root)]
+            documents["run-report.json"]["monthly_unresolved_rendering_revision"] = 1
+            (root / "run-report.json").write_text(json.dumps(documents["run-report.json"]))
+            self.assertEqual(before, [row[:11] for row in monthly.project_rows(root)])
+
     def test_provenance_only_debt_preserves_native_row_and_publishes_independent_rows(self):
         # Catches one unavailable old producer suppressing otherwise valid new rows.
         for header in (monthly.HEADER, LEGACY_HEADER):

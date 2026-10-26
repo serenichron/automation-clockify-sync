@@ -459,7 +459,22 @@ def latest_clockify_entry(cenv: dict[str, str], user_id: str) -> dt.datetime | N
     return latest
 
 
+def parse_until_exclusive(value: str) -> dt.datetime:
+    """Require an explicit instant; never silently interpret a naive cutoff."""
+    try:
+        result = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("--until-exclusive requires a timezone-aware ISO timestamp") from exc
+    if result.tzinfo is None or result.utcoffset() is None:
+        raise ValueError("--until-exclusive requires a timezone-aware ISO timestamp")
+    return result.astimezone(dt.timezone.utc)
+
+
 def compute_range(args: argparse.Namespace, routing: dict[str, Any], cenv: dict[str, str]) -> tuple[dt.datetime, dt.datetime, str]:
+    exclusive = getattr(args, "until_exclusive", None)
+    if exclusive is not None and args.until:
+        raise ValueError("--until and --until-exclusive are mutually exclusive")
+    exact_until = parse_until_exclusive(exclusive) if exclusive is not None else None
     if args.since:
         since = dt.datetime.strptime(args.since, "%Y-%m-%d").replace(tzinfo=BUCHAREST)
         reason = "explicit --since"
@@ -476,7 +491,11 @@ def compute_range(args: argparse.Namespace, routing: dict[str, Any], cenv: dict[
         else:
             since = (dt.datetime.now(BUCHAREST) - dt.timedelta(days=3)).replace(hour=0, minute=0, second=0, microsecond=0)
             reason = "fallback last 3 days"
-    if args.until:
+    if exact_until is not None:
+        until = exact_until.astimezone(BUCHAREST)
+        if until <= since:
+            raise ValueError("--until-exclusive must be after the collection start")
+    elif args.until:
         until = dt.datetime.strptime(args.until, "%Y-%m-%d").replace(tzinfo=BUCHAREST) + dt.timedelta(days=1)
     else:
         until = dt.datetime.now(BUCHAREST)
@@ -4600,7 +4619,10 @@ def _collect_slice(
     report = {
         "run_id": run_id,
         "runtime_identity": runtime_identity,
+        "monthly_unresolved_rendering_revision": 1,
         "date_range": {"since": local_dt_string(since), "until": local_dt_string(until), "reason": reason},
+        **({"requested_until_exclusive": iso_utc(until)}
+           if getattr(args, "until_exclusive", None) is not None else {}),
         "collection_mode": {
             "calendly_optional": calendly_optional,
             "coordinator": coordinator,
@@ -4899,6 +4921,7 @@ def main() -> int:
     )
     r.add_argument("--since", help="YYYY-MM-DD")
     r.add_argument("--until", help="YYYY-MM-DD inclusive")
+    r.add_argument("--until-exclusive", help="Timezone-aware ISO timestamp, exclusive; incompatible with --until")
     r.add_argument("--enrich", action="store_true", default=True,
                     help="Extract user message context (prev/next assistant) for enriched descriptions (default: on)")
     r.add_argument("--no-enrich", action="store_false", dest="enrich",

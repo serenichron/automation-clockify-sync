@@ -40,7 +40,7 @@ def write_empty_actor_fixture(path):
         'ledger_event_count':0,'ledger_evidence_digest':semantic_analyzer.stable_digest('led-',[]),
         'analysis_chunks':[{'model':'offline-fixture','tier':'fixture'}]})+'\n')
 
-def pending_fixture(root, *, retain_native=False, multica=None, legacy=True):
+def pending_fixture(root, *, retain_native=False, multica=None, legacy=True, fresh_rendering=False):
     runs = root/'runs'; runs.mkdir(exist_ok=True)
     checkpoint_root = root/'checkpoints'
     identity = collector_slices.BacklogIdentity(collector.iso_utc(SINCE),collector.iso_utc(UNTIL),
@@ -74,9 +74,12 @@ def pending_fixture(root, *, retain_native=False, multica=None, legacy=True):
     # checkpoint stays available, complete and bound to sanitized evidence.
     if not retain_native:
         shutil.rmtree(source/'evidence/clockify-native-checkpoint')
-        report = json.loads((source/'run-report.json').read_bytes())
+    report = json.loads((source/'run-report.json').read_bytes())
+    if not retain_native:
         report.pop('clockify_native_checkpoint')
-        (source/'run-report.json').write_text(json.dumps(report)+'\n')
+    if not fresh_rendering:
+        report.pop('monthly_unresolved_rendering_revision', None)
+    (source/'run-report.json').write_text(json.dumps(report)+'\n')
     collector._write_pending_slice_finalization(source,identity,plan[0])
     period = reconciliation_manifest.PeriodIdentity('user-one','workspace-one','Europe/Bucharest',SINCE,UNTIL,1)
     unsigned={'schema_version':reconciliation_manifest.MANIFEST_COMPATIBILITY_VERSION,
@@ -105,6 +108,50 @@ class PendingDerivationTests(unittest.TestCase):
     def prepare(self):
         return review._prepare_collector_derivation_run(self.source,self.snapshots,
             executor_runtime_identity=self.executor,environment={},pending_checkpoint_root=self.checkpoints)
+
+    def test_rendering_opt_in_is_inherited_but_never_backfilled_in_offline_copy_flows(self):
+        for fresh in (False, True):
+            with self.subTest(fresh=fresh):
+                root = self.root / ('marked' if fresh else 'historical')
+                root.mkdir()
+                runs, source, checkpoints, snapshots = pending_fixture(root, fresh_rendering=fresh)
+                original = inventory(source)
+                fixture = root / 'analysis.json'
+                write_empty_actor_fixture(fixture)
+                environment = {**os.environ, 'CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT': str(checkpoints),
+                    'PYTHONDONTWRITEBYTECODE': '1', 'CLOCKIFY_ANALYZER_PRIMARY_URL': 'http://127.0.0.1:1/forbidden'}
+                result = subprocess.run([sys.executable, '-B', str(Path(review.__file__)),
+                    '--runs-root', str(runs), '--derive-pending-from', str(source),
+                    '--routing', str(snapshots['routing.json']), '--analysis-fixture', str(fixture),
+                    '--state', str(root / 'review-state.json')], env=environment, capture_output=True, text=True)
+                self.assertEqual(0, result.returncode, result.stderr + result.stdout)
+                child = Path(result.stdout.strip().splitlines()[-1]).parent
+                with mock.patch.object(review, 'RUNS', runs), \
+                     mock.patch.object(collector, 'clockify_get', side_effect=AssertionError('network forbidden')), \
+                     mock.patch.object(semantic_analyzer, 'http_transport', side_effect=AssertionError('provider forbidden')):
+                    replay = review._prepare_replay_run(child)
+                    repair = review._prepare_repair_run(child)
+                    for copied in (child, replay, repair):
+                        report = json.loads((copied / 'run-report.json').read_bytes())
+                        self.assertEqual(fresh, 'monthly_unresolved_rendering_revision' in report)
+                        if fresh:
+                            self.assertIs(type(report['monthly_unresolved_rendering_revision']), int)
+                            self.assertEqual(1, report['monthly_unresolved_rendering_revision'])
+                    review._verified_collector_derivation(child)
+                    path = source / 'run-report.json'
+                    raw = path.read_bytes()
+                    try:
+                        report = json.loads(raw)
+                        if fresh:
+                            report.pop('monthly_unresolved_rendering_revision')
+                        else:
+                            report['monthly_unresolved_rendering_revision'] = 1
+                        path.write_text(json.dumps(report))
+                        with self.assertRaises(ValueError):
+                            review._verified_collector_derivation(child)
+                    finally:
+                        path.write_bytes(raw)
+                self.assertEqual(original, inventory(source))
 
     def cycle_config(self):
         return {'root':str(self.root),'runs_dir':str(self.runs),'state_dir':str(self.root),

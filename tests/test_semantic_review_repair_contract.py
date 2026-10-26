@@ -385,6 +385,83 @@ class RepairContractTests(unittest.TestCase):
             )
             self.assertNotIn(secret, diagnostics.read_text())
 
+    def test_local_quarantine_preserves_original_private_partitions_before_cache_replay(self):
+        # Dropping the pre-quarantine diagnostic loses duplicate member 2 and
+        # missing member 4 even though the accepted result still quarantines both.
+        events = [event(f"ev-private-{number}") for number in range(1, 5)]
+        ids = {row["evidence_id"] for row in events}
+        secret = "PRIVATE-PROVIDER-PROSE secret=hidden /private/source/path"
+        for duplicate in (True, False):
+            for diagnostics_enabled in (True, False):
+                with self.subTest(duplicate=duplicate, diagnostics=diagnostics_enabled), tempfile.TemporaryDirectory() as tmp:
+                    path = Path(tmp) / "cache.jsonl"
+                    diagnostics = path.with_name(path.name + ".review-diagnostics.jsonl")
+
+                    def review(transport, cache):
+                        return semantic._call_semantic_review_once(
+                            self.endpoint, events, candidate=self.candidate,
+                            taxonomy=self.taxonomy, tier="primary", transport=transport,
+                            known_evidence_ids=ids,
+                            evidence_time_spans={value: {"start": "2026-07-10 10:00", "end": "2026-07-10 10:10"} for value in ids},
+                            cache=cache, before_transport=None, cancelled=None,
+                            failed_review_retry_code="contract_rejected_omitted_evidence",
+                            local_coverage_repair=True,
+                        )
+
+                    def transport(_endpoint, body):
+                        payload = json.loads(body["messages"][1]["content"])
+                        members = provider_members(payload)
+                        selections = ([0, 1], [1], [2]) if duplicate else ([0, 1], [2])
+                        rows = [provider_response(payload, [members[index] for index in selection])["activities"][0]
+                                for selection in selections]
+                        for row in rows:
+                            row["object"] = "PRIVATE PROVIDER OBJECT PROSE"
+                        return {"activities": rows, "exceptions": [], "omissions": [], "private_note": secret}
+
+                    result = review(transport, semantic.AnalyzerResponseCache(path, record_review_diagnostics=diagnostics_enabled))
+                    self.assertCountEqual([["ev-private-3"]] if duplicate else [["ev-private-1", "ev-private-2"], ["ev-private-3"]],
+                                          [row["evidence_ids"] for row in result["activities"]])
+                    self.assertEqual(["ev-private-1", "ev-private-2", "ev-private-4"] if duplicate else ["ev-private-4"],
+                                     result["exceptions"][0]["evidence_ids"])
+                    self.assertEqual("analyzer_review_partial_quarantine", result["exceptions"][0]["kind"])
+                    self.assertNotIn("effort", result["exceptions"][0])
+                    self.assertEqual([], result["omissions"])
+                    self.assertEqual(["accepted"], [json.loads(line)["status"] for line in path.read_text().splitlines()])
+                    self.assertEqual(diagnostics_enabled, diagnostics.exists(), "local quarantine must preserve the original opt-in diagnostic")
+                    if diagnostics_enabled:
+                        records = [json.loads(line) for line in diagnostics.read_text().splitlines()]
+                        self.assertEqual(1, len(records))
+                        record = records[0]
+                        self.assertEqual(0o600, diagnostics.stat().st_mode & 0o777)
+                        self.assertEqual({"cache_key", "body_digest", "failure_code", "review_scope", "coverage_contract",
+                                          "activities", "exceptions", "omissions"}, set(record))
+                        # Missing coverage is rejected first, even when a
+                        # duplicate also exists; preserve that original code.
+                        self.assertEqual("contract_rejected_omitted_evidence", record["failure_code"])
+                        self.assertEqual("extraction", record["review_scope"])
+                        self.assertEqual([{"bundle_ref": "b-0001", "allowed_member_range": [1, 4]}], record["coverage_contract"])
+                        ranges = ([[1, 2]], [[2, 2]], [[3, 3]]) if duplicate else ([[1, 2]], [[3, 3]])
+                        self.assertEqual([{"evidence_partitions": [{"bundle_ref": "b-0001", "member_ranges": bounds}]} for bounds in ranges], record["activities"])
+                        self.assertEqual([], record["exceptions"])
+                        self.assertEqual([], record["omissions"])
+                        if duplicate:
+                            self.assertEqual({
+                                "citation_conflicts": [{"bundle_ref": "b-0001", "member_ranges": [[2, 2]],
+                                    "assigned_rows": [{"section": "activities", "row_index": 0},
+                                                      {"section": "activities", "row_index": 1}]}],
+                                "coverage_counts": {"expected_members": 4, "unique_cited_members": 3,
+                                                    "duplicate_members": 1, "missing_members": 1},
+                            }, semantic._review_citation_conflicts(record, events=events))
+                        for forbidden in (secret, "PRIVATE PROVIDER OBJECT PROSE", "ev-private-", "private_note", "object"):
+                            self.assertNotIn(forbidden, diagnostics.read_text())
+                    sealed_cache = path.read_bytes()
+                    sealed_diagnostics = diagnostics.read_bytes() if diagnostics_enabled else None
+                    replay = review(lambda *_: self.fail("accepted quarantine replay must not call transport"),
+                                    semantic.AnalyzerResponseCache(path, record_review_diagnostics=True))
+                    self.assertEqual(result, replay)
+                    self.assertEqual(sealed_cache, path.read_bytes())
+                    self.assertEqual(sealed_diagnostics, diagnostics.read_bytes() if diagnostics.exists() else None)
+
     def test_accepted_and_cache_only_reviews_never_write_diagnostics(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "cache.jsonl"

@@ -355,6 +355,9 @@ def validate(config: Mapping[str, Any], source_stage: Mapping[str, Any],
         if selection.get('schema_version')=='native-pending-review-availability/v1':
             from scripts import clockify_native_pending_review_availability as available
             return available.verify(config,source_stage,replay_stage,proofs,title=title)
+        if selection.get('schema_version')=='recorded-attendance-review-availability/v1':
+            from scripts import clockify_recorded_attendance_availability as attendance
+            return attendance.verify(config,source_stage,replay_stage,proofs,title=title)
     core = {'publication_packet','publication_receipt','selection','live_readback',
             'native_evidence','native_checkpoint_manifest','native_checkpoint_page'}
     optional = {'unresolved_packet','unresolved_receipt','diagnostic_aliases','header_readback','editorial_projection'}

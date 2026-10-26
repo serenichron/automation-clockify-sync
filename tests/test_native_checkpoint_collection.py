@@ -50,6 +50,8 @@ class NativeCheckpointCollectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             run, since, until, checkpoint = self.collect(Path(temporary))
             report = json.loads((run / 'run-report.json').read_bytes())
+            self.assertIs(type(report.get('monthly_unresolved_rendering_revision')), int)
+            self.assertEqual(1, report['monthly_unresolved_rendering_revision'])
             self.assertIn('clockify_native_checkpoint', report,
                           'fresh collector discards the complete native checkpoint proof')
             proof = report['clockify_native_checkpoint']

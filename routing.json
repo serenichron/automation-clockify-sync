@@ -741,6 +741,21 @@
       "billable": true
     },
     {
+      "email_domain": "learningdesignsolutions.co.uk",
+      "title_regex": "^\\s*Learning\\s+Design\\s+Solutions\\b\\s*(?:[-–—:|]|$)",
+      "prefix": "LDS",
+      "project_name": "Learning Design Solutions — BD & Growth (Q1 26)",
+      "project_suffix": "642507",
+      "tag_suffixes": [
+        "35aa9aef"
+      ],
+      "tag_names": [
+        "Project Management"
+      ],
+      "billable": true,
+      "confidence": "high"
+    },
+    {
       "email_domain": "kontas.ro",
       "prefix": "Kontas",
       "project_name": "Kontas Level 1",

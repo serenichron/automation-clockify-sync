@@ -89,6 +89,21 @@ contract and are replayed explicitly, never silently reused as fresh coverage.
 
 ## Guarded Google Sheet publication
 
+Grouped review entries need one client-facing summary covering all included
+issues, not concatenated child descriptions. Keep the original child wording,
+evidence and exact time segments separately; changing a parent summary must not
+change its identity, duration, routing or approval. Prepared publication accepts
+an explicit reviewed `group_summaries` map bound to the exact parent and ordered
+children. For fresh recurring deliveries, the cycle synthesizes groups with
+distinct child descriptions using the current pinned Flash route and existing
+analyzer cache. A separate semantic review sees every child; rejected summaries
+get one targeted repair. Only prepared client-facing wording and project context
+are transmitted, not raw evidence. Missing or unaccepted summaries cannot fall
+back to concatenation. Identical wording needs no inference. The accepted summary
+is frozen in the existing publication binding; retries and historical bindings
+replay offline without changing child wording, time, approvals or IDs. Direct
+historical callers of the pure adapter retain their previous default behavior.
+
 Google Sheet publication is a separate post-review stage. Collection, analysis,
 quality checks and replay do not publish. The recurring review cycle can invoke
 publication after source quality and immutable replay pass, using the explicit
@@ -791,6 +806,26 @@ keeps unrelated work visible. Missing or mismatched proof does not hide time.
 Repair may append effective credits without replacing parent corrections or
 reusing a prior entry; replay reads only sealed facts and copied snapshots.
 This does not automatically discover equivalences or authorize Clockify writes.
+
+New cycle-generated review bindings also retain original proposal/ledger handles
+and the cycle's private post-proof destination. Pass that original binding to
+`clockify_native_sheet_post.py plan --review-batches`; approved execution then
+saves a `clockify-native-credit-input/v1` packet automatically after exact
+Clockify readback. A retry after a packet-write interruption reuses the confirmed
+posting events, without another POST. Aliases and ordinary session work do not
+become original recording proofs.
+
+Fresh recurring slices select those local packets against their sealed Clockify
+checkpoint and exact provider recording identities. They freeze even an empty
+selection before replay; later history/configuration changes cannot replace it.
+Only proved interval intersections are credited, preserving exact residual
+seconds. Different proposed versus posted project/tag routing remains a full
+review proposal with its overlap warning and explicit local routing debt, not a
+silent client reclassification. Source recovery archives the old selection and
+creates a new one for the replacement source. Legacy bindings and deliveries
+remain unchanged; existing off-path posting receipts require a finite verified
+bootstrap inventory, not an archive scan. This local code is not evidence that
+an installed autopilot has been deployed or restored.
 
 Native posting accepts explicit source-accounted declarations through
 `--source-adoptions`. The `clockify-source-accounted-adoptions/v1` schema keeps
