@@ -238,6 +238,9 @@ def run_scoped_failed_review_retry(
     """Review only selected sealed failures, retaining every other decision."""
     if actor_contract not in {None, semantic_analyzer.ACTOR_CONTRACT}:
         raise WorkAccountingError("scoped semantic actor contract is invalid")
+    transport = semantic_analyzer._RateLimitGate(
+        deadline=semantic_analyzer._child_deadline()
+    ).wrap(transport)
     if actor_contract is not None:
         events = semantic_analyzer.with_actor_context(events, subject_binding=actor_subject_binding)
     elif actor_subject_binding is not None or semantic_analyzer._actor_aware(events):
@@ -4406,6 +4409,10 @@ def main(argv: list[str] | None = None) -> int:
             failed_review_retry_cache_only=args.failed_review_retry_cache_only,
             failed_review_retry_scoped_mode=args.failed_review_retry_scoped_mode,
         )
+    except semantic_analyzer.AnalyzerQuotaDeferred as exc:
+        # Nothing was sealed for the limited request; the next wake reruns it.
+        print(f"work accounting deferred: {exc}", file=sys.stderr)
+        return semantic_analyzer.QUOTA_DEFERRED_EXIT_CODE
     except (WorkAccountingError, semantic_analyzer.AnalyzerError, work_allocator.AllocationError, ValueError) as exc:
         print(f"work accounting blocked: {exc}", file=sys.stderr)
         return 2

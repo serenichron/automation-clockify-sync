@@ -22,6 +22,7 @@ import string
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any, Iterator, Mapping, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -2234,6 +2235,11 @@ def _run_budgeted_child(
     child_environment = dict(os.environ)
     child_environment["CLOCKIFY_AUTOPILOT_RUNS_ROOT"] = str(
         (runs_dir or root / "runs").resolve()
+    )
+    # The analyzer waits out provider rate limits only while it can still
+    # finish before this child is terminated; otherwise it defers (exit 75).
+    child_environment[semantic_analyzer.CHILD_DEADLINE_ENV] = (
+        f"{time.time() + total:.3f}"
     )
     if checkpoint_root is not None:
         _ensure_collector_checkpoint_root(checkpoint_root)

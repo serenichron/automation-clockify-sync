@@ -3542,6 +3542,15 @@ def _process_run(
         if value is not None:
             accounting_command.extend([option, str(value)])
     accounted = _run(accounting_command)
+    if accounted.returncode == semantic_analyzer.QUOTA_DEFERRED_EXIT_CODE:
+        # A provider usage limit deferred analysis without sealing a decision.
+        # Publish no blocked result: like a timed-out child, the slice stays
+        # incomplete and the next wake reruns the identical requests.
+        print(
+            "clockify review run: semantic analysis deferred by provider usage limit",
+            file=sys.stderr,
+        )
+        return semantic_analyzer.QUOTA_DEFERRED_EXIT_CODE, run_dir / "autopilot-result.json"
     if accounted.returncode != 0:
         quality = {
             "status": "blocked",
