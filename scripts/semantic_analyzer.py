@@ -11,6 +11,7 @@ available merely because its name appears in repository documentation.
 from __future__ import annotations
 
 import argparse
+import contextlib
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 import copy
 import dataclasses
@@ -24,6 +25,7 @@ import re
 import stat
 import sys
 import threading
+import time
 from typing import Any, Callable, Iterable, Mapping
 import urllib.error
 import urllib.request
@@ -4088,8 +4090,96 @@ class AnalyzerResponseCache:
             }
 
 
+CALL_DIAGNOSTICS_SCHEMA_VERSION = "clockify-analyzer-call-diagnostics/v1"
+_CALL_DIAGNOSTICS_PATH: Path | None = None
+_CALL_DIAGNOSTICS_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def call_diagnostics(path: Path | None):
+    """Record per-call latency and token usage to a file beside the cache.
+
+    The file is never part of the sealed cache or any replay input; it holds
+    only numeric fields, route identity and the request body digest.
+    """
+    global _CALL_DIAGNOSTICS_PATH
+    previous = _CALL_DIAGNOSTICS_PATH
+    _CALL_DIAGNOSTICS_PATH = path
+    try:
+        yield
+    finally:
+        _CALL_DIAGNOSTICS_PATH = previous
+
+
+def _usage_counts(response: Any) -> dict[str, int]:
+    usage = response.get("usage") if isinstance(response, Mapping) else None
+    if not isinstance(usage, Mapping):
+        return {}
+    counts = {
+        key: usage[key] for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+        if type(usage.get(key)) is int
+    }
+    for group, key, name in (("prompt_tokens_details", "cached_tokens", "cached_tokens"),
+                             ("completion_tokens_details", "reasoning_tokens", "reasoning_tokens")):
+        details = usage.get(group)
+        if isinstance(details, Mapping) and type(details.get(key)) is int:
+            counts[name] = details[key]
+    return counts
+
+
+def _record_call_diagnostic(
+    endpoint: AnalyzerEndpoint, body: Mapping[str, Any], *, started: float,
+    outcome: str, response: Any = None, status_code: int | None = None,
+) -> None:
+    path = _CALL_DIAGNOSTICS_PATH
+    if path is None:
+        return
+    try:
+        encoded = canonical_json(body).encode("utf-8")
+        try:
+            payload = json.loads(body["messages"][1]["content"])
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+            payload = {}
+        payload = payload if isinstance(payload, Mapping) else {}
+        repair = payload.get("repair_feedback")
+        record = {
+            "schema_version": CALL_DIAGNOSTICS_SCHEMA_VERSION,
+            "recorded_at": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+            "route": endpoint.name,
+            "model": endpoint.model,
+            "revision": endpoint.revision,
+            "mode": "probe" if "probe" in payload else str(payload.get("mode") or "unknown"),
+            "review_scope": payload.get("review_scope") if isinstance(payload.get("review_scope"), str) else None,
+            "repair_failure_code": (repair.get("failure_code") if isinstance(repair, Mapping)
+                                    and isinstance(repair.get("failure_code"), str) else None),
+            "body_digest": hashlib.sha256(encoded).hexdigest(),
+            "body_bytes": len(encoded),
+            "latency_ms": int((time.monotonic() - started) * 1000),
+            "outcome": outcome,
+            "status_code": status_code,
+            "usage": _usage_counts(response),
+        }
+        with _CALL_DIAGNOSTICS_LOCK:
+            descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
+                metadata = os.fstat(handle.fileno())
+                if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+                        or metadata.st_mode & 0o777 != 0o600):
+                    return
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    handle.write(canonical_json(record) + "\n")
+                    handle.flush()
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except (OSError, ValueError, TypeError):
+        # Diagnostics must never change an accounting decision.
+        return
+
+
 def http_transport(endpoint: AnalyzerEndpoint, body: dict[str, Any]) -> dict[str, Any]:
     require_current_live_flash_route(endpoint)
+    started = time.monotonic()
     transport_body = dict(body)
     if endpoint.reasoning_effort:
         transport_body["reasoning_effort"] = endpoint.reasoning_effort
@@ -4117,8 +4207,11 @@ def http_transport(endpoint: AnalyzerEndpoint, body: dict[str, Any]) -> dict[str
     )
     try:
         with urllib.request.urlopen(request, timeout=endpoint.timeout_seconds) as response:
-            return json.loads(response.read().decode("utf-8"))
+            decoded = json.loads(response.read().decode("utf-8"))
+        _record_call_diagnostic(endpoint, body, started=started, outcome="ok", response=decoded)
+        return decoded
     except TimeoutError as exc:
+        _record_call_diagnostic(endpoint, body, started=started, outcome="timeout")
         # A timeout has no usable provider response. Keep it distinguishable so
         # extraction can seal the exact failed request and bisect only at safe
         # conversation-turn boundaries; no identical request is retried.
@@ -4127,6 +4220,8 @@ def http_transport(endpoint: AnalyzerEndpoint, body: dict[str, Any]) -> dict[str
         ) from exc
     except urllib.error.HTTPError as exc:
         status_code = int(exc.code)
+        _record_call_diagnostic(endpoint, body, started=started, outcome="http_error",
+                                status_code=status_code)
         if status_code in {408, 425, 429} or 500 <= status_code <= 599:
             raise AnalyzerRetryableHTTPError(
                 f"analyzer endpoint {endpoint.name} failed: retryable HTTPError",
@@ -4138,6 +4233,10 @@ def http_transport(endpoint: AnalyzerEndpoint, body: dict[str, Any]) -> dict[str
             f"analyzer endpoint {endpoint.name} failed: HTTPError"
         ) from exc
     except urllib.error.URLError as exc:
+        _record_call_diagnostic(
+            endpoint, body, started=started,
+            outcome="timeout" if isinstance(exc.reason, TimeoutError) else "transport_error",
+        )
         if isinstance(exc.reason, TimeoutError):
             raise AnalyzerTimeoutError(
                 f"analyzer endpoint {endpoint.name} failed: TimeoutError"
@@ -4147,6 +4246,7 @@ def http_transport(endpoint: AnalyzerEndpoint, body: dict[str, Any]) -> dict[str
             f"analyzer endpoint {endpoint.name} failed: URLError"
         ) from exc
     except json.JSONDecodeError as exc:
+        _record_call_diagnostic(endpoint, body, started=started, outcome="invalid_json")
         # Never include request headers/body: they can contain credentials or evidence.
         raise AnalyzerError(f"analyzer endpoint {endpoint.name} failed: {type(exc).__name__}") from exc
 
