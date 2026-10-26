@@ -2100,6 +2100,45 @@ def _pending_resume_command(config: Mapping[str, Any], child: Path) -> list[str]
             "--analyzer-cache", str(_path(config, "cache"))]
 
 
+def _pending_launch_authority(
+    config: Mapping[str, Any], record: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], str]:
+    """Runtime, effective config and routing that must have launched this child.
+
+    An active launch is resumed by the current runtime, so it must match the
+    current release exactly. Once its child has produced the recorded source,
+    the launch is history: it is checked against the archived release that
+    the fresh input binding recorded, which must still authenticate beside the
+    current release. The old binding itself is never rewritten.
+    """
+    runtime = config.get("_runtime_identity")
+    current = (dict(runtime), dict(config), _digest(_path(config, "routing", file=True)))
+    fresh = record.get("fresh_input_binding")
+    if record.get("source") is None or not isinstance(fresh, Mapping):
+        return current
+    recorded = fresh.get("runtime_identity")
+    snapshots = fresh.get("snapshot_digests")
+    release = Path(str(fresh.get("release_root") or ""))
+    if (not isinstance(recorded, Mapping) or not isinstance(snapshots, Mapping)
+        or not release.is_absolute() or recorded.get("canonical_root") != str(release)
+        or recorded.get("git_dirty") not in (None, False)
+        or release.parent != _path(config, "root").parent):
+        raise CycleError("pending derivation launch binding drifted")
+    try:
+        helper_path = Path(__file__).resolve().parents[1] / "ops/systemd/user/clockify_review_cycle_release.py"
+        spec = importlib.util.spec_from_file_location("clockify_pending_launch_release", helper_path)
+        if spec is None or spec.loader is None:
+            raise ValueError("release identity validator is unavailable")
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        identity = helper._identity(release, release.name)
+    except (OSError, ValueError) as exc:
+        raise CycleError("pending derivation launch binding drifted") from exc
+    if recorded.get("git_sha") not in (None, identity["git_sha"]):
+        raise CycleError("pending derivation launch binding drifted")
+    return dict(recorded), {**config, "root": str(release)}, str(snapshots.get("routing.json"))
+
+
 def _prepare_pending_derivation_launch(
     config: Mapping[str, Any], record: dict[str, Any], since: str, until: str,
 ) -> dict[str, Any] | None:
@@ -2121,7 +2160,8 @@ def _prepare_pending_derivation_launch(
             source, identity, lineage = clockify_review_run._verified_collector_derivation(child)
         except (OSError, ValueError) as exc:
             raise CycleError("pending derivation ancestor changed") from exc
-        command = _pending_resume_command(config, child)
+        launch_runtime, launch_config, launch_routing = _pending_launch_authority(config, record)
+        command = _pending_resume_command(launch_config, child)
         if (set(body) != {"schema_version", "source_run_dir", "source_digest", "child_run_dir", "lineage_digest",
                          "command", "command_digest", "runtime_identity_digest", "snapshot_digests"}
             or body.get("schema_version") != "pending-derivation-launch/v1"
@@ -2130,12 +2170,12 @@ def _prepare_pending_derivation_launch(
             or lineage.get("schema_version") != "collector-derivation/pending-v1"
             or lineage["pending_source_binding"]["checkpoint_root"] != str(checkpoint_root)
             or lineage["pending_source_binding"]["original_snapshot_digests"] != _stored_snapshot_digests(record)
-            or lineage["executor_runtime_identity"] != dict(runtime)
+            or lineage["executor_runtime_identity"] != launch_runtime
             or _digest(child / "collector-source.json") != body.get("lineage_digest")
-            or body.get("runtime_identity_digest") != _value_digest(dict(runtime))
+            or body.get("runtime_identity_digest") != _value_digest(launch_runtime)
             or body.get("command") != command or body.get("command_digest") != _value_digest(command)
             or body.get("snapshot_digests") != lineage["snapshot_digests"]
-            or _digest(_path(config, "routing", file=True)) != lineage["snapshot_digests"]["routing.json"]):
+            or launch_routing != lineage["snapshot_digests"]["routing.json"]):
             raise CycleError("pending derivation launch binding drifted")
         return dict(prior)
     interval = _generic_interval(config, since, until)
