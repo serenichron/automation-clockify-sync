@@ -1010,6 +1010,7 @@ def analyze_ledger(
         semantic_analyzer.AnalyzerResponseCache(
             analyzer_cache_path, record_review_diagnostics=True,
             use_review_diagnostic_feedback=retry_targets is not None,
+            partition_normalization=True,
         )
         if analyzer_cache_path is not None
         else None

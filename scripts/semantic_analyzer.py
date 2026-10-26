@@ -84,6 +84,10 @@ DEFAULT_CHUNK_BODY_BYTES = 250_000
 DEFAULT_MAX_EVENTS_PER_CHUNK = 250
 DEFAULT_ANALYZER_WORKERS = 4
 MAX_CONTRACT_REPAIR_ATTEMPTS = 2
+PARTITION_NORMALIZATION_VERSION = "review_partition_normalization_v1"
+# Above this share of quarantined members a model repair is still cheaper than
+# the manual review the quarantine would create.
+PARTITION_NORMALIZATION_MAX_ROUTED_SHARE = 0.25
 MAX_TIMEOUT_RECOVERY_ATTEMPTS = 3
 MAX_CONNECTION_RECOVERY_ATTEMPTS = 3
 # A dual contract rejection can be caused by a request that is semantically too
@@ -1270,6 +1274,173 @@ def _quarantine_review_citation_conflicts(
         ),
     })
     return replacement
+
+
+def _compressed_partitions(members: Iterable[tuple[str, int]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[int]] = {}
+    for bundle_ref, position in sorted(set(members)):
+        grouped.setdefault(bundle_ref, []).append(position)
+    partitions = []
+    for bundle_ref, positions in grouped.items():
+        ranges: list[list[int]] = []
+        for position in positions:
+            if ranges and position == ranges[-1][1] + 1:
+                ranges[-1][1] = position
+            else:
+                ranges.append([position, position])
+        partitions.append({"bundle_ref": bundle_ref, "member_ranges": ranges})
+    return partitions
+
+
+def normalize_review_partitions(
+    response: Mapping[str, Any], *, member_counts: Mapping[str, int],
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Repair partition bookkeeping deterministically, never dropping evidence.
+
+    Lossless fixes come first: partitions naming no supplied bundle and ranges
+    with no supplied member are dropped (they cite nothing), ranges are clipped
+    to the bundle, and repeated refs or overlapping ranges inside one row are
+    merged. A row left citing nothing is dropped, since it has no evidence.
+    Rows still sharing a member with another row are quarantined whole, as in
+    the retry-time citation quarantine, and those rows' members plus every
+    unassigned member go to one explicit, versioned quarantine exception
+    without effort. Returns None when the partitions are already an exact
+    cover, else the replacement provider response and a numeric-only report.
+    """
+    sections = ("activities", "exceptions", "omissions")
+    counts = dict.fromkeys((
+        "partitions_dropped", "partitions_reshaped", "ranges_dropped",
+        "ranges_clipped", "members_merged", "rows_dropped_ungrounded",
+        "rows_quarantined",
+    ), 0)
+    cleaned: dict[str, list[tuple[Mapping[str, Any], set[tuple[str, int]]]]] = {}
+    for section in sections:
+        rows = response.get(section)
+        if not isinstance(rows, list):
+            return None
+        cleaned[section] = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                return None
+            owned: set[tuple[str, int]] = set()
+            partitions = row.get("evidence_partitions")
+            for partition in partitions if isinstance(partitions, list) else []:
+                bundle_ref = partition.get("bundle_ref") if isinstance(partition, Mapping) else None
+                ranges = partition.get("member_ranges") if isinstance(partition, Mapping) else None
+                if (not isinstance(bundle_ref, str) or bundle_ref not in member_counts
+                        or not isinstance(ranges, list) or not ranges):
+                    counts["partitions_dropped"] += 1
+                    continue
+                if set(partition) != {"bundle_ref", "member_ranges"}:
+                    counts["partitions_reshaped"] += 1
+                for bounds in ranges:
+                    if (not isinstance(bounds, list) or len(bounds) != 2
+                            or any(type(value) is not int for value in bounds)
+                            or bounds[0] > bounds[1]):
+                        counts["ranges_dropped"] += 1
+                        continue
+                    start = max(1, bounds[0])
+                    end = min(int(member_counts[bundle_ref]), bounds[1])
+                    if start > end:
+                        counts["ranges_dropped"] += 1
+                        continue
+                    if [start, end] != bounds:
+                        counts["ranges_clipped"] += 1
+                    positions = {(bundle_ref, number) for number in range(start, end + 1)}
+                    counts["members_merged"] += len(owned & positions)
+                    owned.update(positions)
+            if not owned:
+                counts["rows_dropped_ungrounded"] += 1
+                continue
+            cleaned[section].append((row, owned))
+
+    owners: dict[tuple[str, int], int] = {}
+    for section in sections:
+        for _row, owned in cleaned[section]:
+            for member in owned:
+                owners[member] = owners.get(member, 0) + 1
+    contested = {member for member, total in owners.items() if total > 1}
+    expected = {
+        (bundle_ref, number)
+        for bundle_ref, total in member_counts.items()
+        for number in range(1, int(total) + 1)
+    }
+    replacement: dict[str, Any] = {}
+    routed: set[tuple[str, int]] = set()
+    assigned: set[tuple[str, int]] = set()
+    for section in sections:
+        replacement[section] = []
+        for row, owned in cleaned[section]:
+            if owned & contested:
+                counts["rows_quarantined"] += 1
+                routed.update(owned)
+                continue
+            assigned.update(owned)
+            replacement[section].append({
+                **copy.deepcopy(dict(row)),
+                "evidence_partitions": _compressed_partitions(owned),
+            })
+    routed.update(expected - assigned)
+    if not routed and not any(counts.values()):
+        return None
+    if routed:
+        replacement["exceptions"].append({
+            "kind": "analyzer_review_partial_quarantine",
+            "evidence_partitions": _compressed_partitions(routed),
+            "reason": (
+                f"Locally derived {PARTITION_NORMALIZATION_VERSION} quarantine for "
+                "contested or unassigned evidence; manual review required and no "
+                "effort assigned"
+            ),
+        })
+    report = {
+        "version": PARTITION_NORMALIZATION_VERSION,
+        **counts,
+        "members_total": len(expected),
+        "members_routed": len(routed),
+    }
+    return replacement, report
+
+
+def _review_partition_replacement(
+    response: Mapping[str, Any], *, events: list[dict[str, Any]],
+    taxonomy: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Return a normalized review response when the repair is small enough."""
+    _bundles, manifest = _semantic_evidence_bundles(events)
+    normalized = normalize_review_partitions(
+        response,
+        member_counts={bundle["bundle_ref"]: bundle["member_count"] for bundle in manifest},
+    )
+    if normalized is None:
+        return None
+    replacement, report = normalized
+    if report["members_routed"] > PARTITION_NORMALIZATION_MAX_ROUTED_SHARE * report["members_total"]:
+        return None
+    try:
+        # Quarantine must not hide a project-selection failure on a dropped row.
+        _validate_review_taxonomy(response, taxonomy)
+    except AnalyzerError:
+        return None
+    return replacement
+
+
+def _review_partition_failure_code(
+    response: Mapping[str, Any], *, events: list[dict[str, Any]],
+    known_evidence_ids: set[str], evidence_time_spans: dict[str, dict[str, str]] | None,
+) -> str:
+    """Name the rejection the unnormalized provider response would have had."""
+    try:
+        restored = _restore_extraction_partitions(response, events=events)
+        restored = bind_activity_evidence_spans(restored, evidence_time_spans=evidence_time_spans)
+        validate_result(
+            restored, known_evidence_ids=known_evidence_ids, provider_model="",
+            analyzer_tier="", evidence_time_spans=evidence_time_spans,
+            semantic_validation=False,
+        )
+    except AnalyzerError as exc:
+        return _contract_failure_code(exc)
+    return "contract_rejected_other"
 
 
 def _normalize_provider_response(
@@ -3105,10 +3276,14 @@ class AnalyzerResponseCache:
     """
 
     def __init__(self, path: Path, *, record_review_diagnostics: bool = False,
-                 use_review_diagnostic_feedback: bool = True):
+                 use_review_diagnostic_feedback: bool = True,
+                 partition_normalization: bool = False):
         self.path = path
         self.record_review_diagnostics = record_review_diagnostics
         self.use_review_diagnostic_feedback = use_review_diagnostic_feedback
+        # Opt-in: fresh review responses get deterministic partition repair
+        # before rejection. Sealed decisions replay unchanged either way.
+        self.partition_normalization = partition_normalization
         self._lock = threading.RLock()
         self._records: dict[str, dict[str, Any]] = {}
         self.hits = 0
@@ -4082,12 +4257,20 @@ def _call_semantic_review_once(
     reviewer_model, reviewer_revision = _response_provider_identity(
         response, endpoint
     )
+    provider_response: Mapping[str, Any] | None = None
     try:
         response = _normalize_provider_response(response, mode="extract")
         _provider_response_cache_safe(
             response,
             original_evidence_ids=known_evidence_ids,
         )
+        if (cache is not None and cache.partition_normalization and cache_miss
+                and not local_coverage_repair):
+            normalized = _review_partition_replacement(
+                response, events=events, taxonomy=taxonomy,
+            )
+            if normalized is not None:
+                provider_response, response = response, normalized
         restored = _restore_extraction_partitions(response, events=events)
         restored = bind_activity_evidence_spans(
             restored,
@@ -4167,13 +4350,25 @@ def _call_semantic_review_once(
             )
             cache.record_rejected_review(
                 endpoint, body, failure_code=_contract_failure_code(exc),
-                review_scope=review_scope, response=response,
+                review_scope=review_scope,
+                response=provider_response if provider_response is not None else response,
             )
         error = AnalyzerContractError(str(exc))
         error.review_rejection_body = body
         raise error from exc
     _raise_if_cancelled(cancelled)
     if cache is not None and cache_miss:
+        if provider_response is not None:
+            # Keep the numeric skeleton of what the provider actually sent.
+            cache.record_rejected_review(
+                endpoint, body,
+                failure_code=_review_partition_failure_code(
+                    provider_response, events=events,
+                    known_evidence_ids=known_evidence_ids,
+                    evidence_time_spans=evidence_time_spans,
+                ),
+                review_scope=review_scope, response=provider_response,
+            )
         cache.store_accepted(endpoint, body, response)
     for activity in result["activities"]:
         activity["extractor_model"] = extractor_model or reviewer_model
