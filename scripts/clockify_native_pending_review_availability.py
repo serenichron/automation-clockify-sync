@@ -108,13 +108,26 @@ def warning_repetition_projection(actual,current,rows):
         'current_projection_sha256':current['native_projection_rows_sha256'],
         'boundary':'Only identical repetitions removed in current native warning projection; source, intervals, allocations, routing and every other historical proof field are unchanged.'}
 
-def historical_acceptance(actual,verified,raw):
-    """Fixed original producer's duplicated warnings, not a generic ignored field."""
-    current=verified['receipt'];roles=actual.get('runtime_artifacts',{})
+def producer_runtime(roles,current,archived):
+    """Fixed original consumer; companions exact to the release that recorded them.
+
+    Without an authenticated archived release the companions must equal the
+    current runtime. With one, they must equal that immutable release's bytes:
+    the archive replaces the comparison, it never widens it.
+    """
+    names={'pipeline':'scripts/'+Path(pending.pipeline.__file__).name,
+           'allocator':'scripts/'+Path(pending.allocator.__file__).name}
+    expected={k:(current[k]['sha256'] if archived is None else archived['files'].get(names[k])) for k in names}
     require(set(roles)=={'consumer','pipeline','allocator'}
         and roles['consumer']['sha256']==REPEATED_WARNING_PRODUCER
-        and all(roles[k]['sha256']==current['runtime_artifacts'][k]['sha256'] for k in ('pipeline','allocator')),
+        and all(roles[k]['sha256']==expected[k] for k in names),
         'historical repeated-warning producer runtime differs')
+    return expected
+
+def historical_acceptance(actual,verified,raw,archived=None):
+    """Fixed original producer's duplicated warnings, not a generic ignored field."""
+    current=verified['receipt'];roles=actual.get('runtime_artifacts',{})
+    producer_runtime(roles,current['runtime_artifacts'],archived)
     for h in roles.values():raw(h)
     drift=warning_repetition_projection(actual,current,verified['rows'])
     reconstructed=copy.deepcopy(current)
@@ -149,7 +162,9 @@ def verify(config,source_stage,replay_stage,proofs,*,title):
     verified=pending.verify(bindings_path=Path(doc['selection']['path']),source_dir=root,proposals=current['proposals'],
         spreadsheet_id=spreadsheet,sheet_title=title,run_id=root.name,project_allowlist=publisher.project_allowlist(current['routing']))
     require(all(p['disposition']=='retain' for p in verified['prior']), 'selection has non-retained predecessors')
-    accepted=load(doc['acceptance']);checks,warning_drift=historical_acceptance(accepted,verified,raw)
+    accepted=load(doc['acceptance'])
+    checks,warning_drift=historical_acceptance(
+        accepted,verified,raw,config.get('_historical_runtime_release'))
     expected={r[0]:r for r in verified['rows']}
     require(len(expected)==len(verified['rows']),'native selection duplicates accepted identity')
     new_ids=verified['new_ids'];retained={p['review_id']:p for p in verified['prior']}

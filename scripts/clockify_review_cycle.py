@@ -6437,12 +6437,70 @@ def _selected_delivery_document(config: Mapping[str,Any], since: str, until: str
     return {**body,"receipt_digest":_value_digest(body)}
 
 
+_HISTORICAL_RUNTIME_FIELDS = ("consumer_runtime", "native_consumer_runtime")
+
+
+def _historical_runtime_release(
+    config: Mapping[str, Any], recorded: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Authenticate the immutable archived release a receipt's runtime names.
+
+    Releases stay sealed and read-only beside the running one. Only a release
+    whose identity and tree manifest still verify may vouch for the historical
+    runtime bytes it recorded; anything else is no authority, and verification
+    keeps comparing against the current runtime bytes.
+    """
+    handles = [recorded[field] for field in _HISTORICAL_RUNTIME_FIELDS
+               if isinstance(recorded, Mapping) and isinstance(recorded.get(field), Mapping)]
+    if not handles:
+        return None
+    paths = [Path(str(handle.get("path") or "")) for handle in handles]
+    if any(not path.is_absolute() or path.parent.name != "scripts" for path in paths):
+        return None
+    releases = {path.parent.parent for path in paths}
+    if len(releases) != 1:
+        raise CycleError("historical runtime locators must name one archived release")
+    release = releases.pop()
+    if release.parent != _path(config, "root").parent:
+        return None
+    try:
+        helper_path = Path(__file__).resolve().parents[1] / "ops/systemd/user/clockify_review_cycle_release.py"
+        spec = importlib.util.spec_from_file_location("clockify_historical_runtime_release", helper_path)
+        if spec is None or spec.loader is None:
+            raise ValueError("release identity validator is unavailable")
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        identity = helper._identity(release, release.name)
+    except (OSError, ValueError):
+        return None
+    files = {entry["path"]: "sha256:" + entry["sha256"]
+             for entry in identity["tree_manifest"] if entry.get("type") == "file"}
+    for path, handle in zip(paths, handles):
+        if files.get(path.relative_to(release).as_posix()) != handle.get("sha256"):
+            raise CycleError("historical runtime differs from its archived release")
+    return {"root": str(release), "git_sha": identity["git_sha"], "files": files}
+
+
+def _historical_runtime_scope(
+    config: Mapping[str, Any], archived: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    scoped = dict(config)
+    if archived is not None:
+        scoped["_historical_runtime_release"] = dict(archived)
+    return scoped
+
+
 def _selected_delivery_recorded_runtime(
     delivery: Mapping[str, Any], recorded: Mapping[str, Any],
+    archived: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Preserve an authentic original locator only for byte-identical code."""
+    """Preserve an authentic original locator for identical or archived code.
+
+    Different current bytes are accepted only when the original locator is a
+    file of the authenticated archived release that recorded the receipt.
+    """
     current = dict(delivery)
-    for field in ("consumer_runtime", "native_consumer_runtime"):
+    for field in _HISTORICAL_RUNTIME_FIELDS:
         if field not in current or field not in recorded:
             continue
         from scripts import clockify_source_adoptions as artifacts
@@ -6450,7 +6508,12 @@ def _selected_delivery_recorded_runtime(
         runtime = current[field]
         artifacts._capture(historical, {})
         artifacts._capture(runtime, {})
-        if historical["sha256"] != runtime["sha256"]:
+        if historical["sha256"] != runtime["sha256"] and not (
+            archived is not None
+            and Path(historical["path"]).parent.parent == Path(archived["root"])
+            and Path(historical["path"]).name == Path(runtime["path"]).name
+            and archived["files"].get("scripts/" + Path(historical["path"]).name) == historical["sha256"]
+        ):
             raise ValueError("selected historical consumer runtime bytes differ")
         current[field] = historical
     return current
@@ -6472,9 +6535,11 @@ def _verify_selected_delivery(config: Mapping[str,Any], document: Mapping[str,An
     source: Mapping[str,Any], replay: Mapping[str,Any]) -> None:
     from scripts import clockify_selected_delivery_adoption as selected
     try:
-        delivery = selected.validate(config,source,replay,document["selected_delivery"]["proofs"],
+        archived = _historical_runtime_release(config, document["selected_delivery"])
+        delivery = selected.validate(_historical_runtime_scope(config, archived),source,replay,
+            document["selected_delivery"]["proofs"],
             title=_sheet_title(config["monthly_sheet_title_template"],since=since))
-        delivery = _selected_delivery_recorded_runtime(delivery, document["selected_delivery"])
+        delivery = _selected_delivery_recorded_runtime(delivery, document["selected_delivery"], archived)
         expected = _selected_delivery_document(config,since,until,source,replay,delivery)
     except (OSError,ValueError,TypeError,KeyError,IndexError) as exc:
         raise CycleError("selected historical delivery proof drifted or is missing") from exc
@@ -6496,10 +6561,12 @@ def _verify_selected_adoption(config: Mapping[str,Any], document: Mapping[str,An
         source,replay = _selected_stages(validation,request,prior_record=document.get("superseded_record"))
         if document.get("source") != source or document.get("replay") != replay:
             raise CycleError("selected historical adoption stage drifted")
+        archived = _historical_runtime_release(config, document.get("selected_delivery"))
         try:
-            delivery = selected.validate(validation,source,replay,request["selected_delivery_proofs"],
+            delivery = selected.validate(_historical_runtime_scope(validation, archived),source,replay,
+                request["selected_delivery_proofs"],
                 title=_sheet_title(config["monthly_sheet_title_template"],since=request["since"]))
-            delivery = _selected_delivery_recorded_runtime(delivery, document["selected_delivery"])
+            delivery = _selected_delivery_recorded_runtime(delivery, document["selected_delivery"], archived)
         except (OSError,ValueError,TypeError,KeyError,IndexError) as exc:
             raise CycleError("selected historical adoption proof drifted or is missing") from exc
         if document.get("selected_delivery") != delivery or delivery["diagnostics"]["status"] != "complete":
