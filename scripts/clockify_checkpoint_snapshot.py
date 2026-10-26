@@ -95,9 +95,10 @@ def _request(workspace_id: str, user_id: str, since: datetime, until: datetime):
 
 def _pinned_identity(document, workspace_id: str, user_id: str, since: datetime, until: datetime):
     """Accept only either exact trusted request contract; never rewrite v1."""
-    for overlap_history in (False, True):
+    for overlap_history, bounded in ((False, False), (True, False), (True, True)):
         candidate = collector._clockify_checkpoint_identity(
-            workspace_id, user_id, since, until, overlap_history=overlap_history)
+            workspace_id, user_id, since, until, overlap_history=overlap_history,
+            bounded_lookback=bounded)
         if document == candidate.document():
             return candidate
     raise checkpoints.CheckpointError("checkpoint identity does not match trusted request")
@@ -208,7 +209,7 @@ def _validate_with_compatibility(directory: Path, files: dict[str, bytes], evide
     observed = _timestamp(state.metadata.get("snapshot_at"), "snapshot_at")
     collector._clockify_checkpoint_page(state)
     entries, _ = collector._clockify_checkpoint_entries(store, state)
-    overlap_history = identity.compatibility_version == collector.CLOCKIFY_OVERLAP_CHECKPOINT_COMPATIBILITY_VERSION
+    overlap_history = identity.compatibility_version in collector.CLOCKIFY_OVERLAP_COMPATIBILITY_VERSIONS
     for index, page in enumerate(store.iter_pages(state)):
         rows = page["payload"]
         wire_count, _ = collector._clockify_checkpoint_wire_page(page, overlap_history=overlap_history)

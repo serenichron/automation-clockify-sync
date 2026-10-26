@@ -129,6 +129,60 @@ def cache_rejections(repo: Path) -> dict[str, Any]:
             "bookkeeping_share_of_records": round(bookkeeping / max(1, total), 4)}
 
 
+def _run_analysis_events(run_dir: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Rebuild the events analyze_ledger would send, without any inference."""
+    from scripts import meeting_reconciliation
+    from scripts import work_accounting_pipeline as pipeline
+
+    ledger, events = pipeline.load_ledger(run_dir / "evidence" / "evidence-ledger.json")
+    identities = meeting_reconciliation.manifest_member_identities(ledger.manifest.document())
+    analysis_events, noise = pipeline._analysis_events(events, identities)
+    routing = json.loads((run_dir / "routing.json").read_text(encoding="utf-8"))
+    actor_contract = routing.get("semantic_actor_contract")
+    hinted = pipeline._with_semantic_route_hints(
+        analysis_events, routing, normalize_meeting_domains_type=actor_contract is not None,
+    )
+    if actor_contract is not None:
+        hinted = semantic.with_actor_context(
+            hinted, subject_binding=routing.get("semantic_subject_binding"))
+    return hinted, {"ledger_events": len(events), "noise_events": len(noise),
+                    "analysis_events": len(analysis_events)}
+
+
+def projection(run_dirs: list[Path]) -> dict[str, Any]:
+    """Item 2: extraction request bytes under the historical and v2 projection."""
+    model = semantic.CURRENT_LIVE_FLASH_ROUTE[0]
+    output: dict[str, Any] = {"runs": {}}
+    totals = {"v1": 0, "v2": 0}
+    for run_dir in run_dirs:
+        events, counts = _run_analysis_events(run_dir)
+        row: dict[str, Any] = dict(counts)
+        for variant, variant_events in (("v1", events), ("v2", semantic.with_projection_contract(events))):
+            chunks = semantic.chunk_events(
+                variant_events, model=model, target_body_bytes=semantic.DEFAULT_CHUNK_BODY_BYTES,
+                private_text_approved=True,
+            )
+            body_bytes = sum(
+                len(semantic.canonical_json(semantic._body_for(
+                    chunk, model=model, mode="extract", private_text_approved=True)).encode("utf-8"))
+                for chunk in chunks
+            )
+            sizes = [len(semantic.project_event(dict(event))["content"].encode("utf-8"))
+                     for event in variant_events]
+            members = sum(len(chunk) for chunk in chunks)
+            if members != len(variant_events):
+                raise SystemExit("projection lost an evidence member")
+            row[variant] = {"chunks": len(chunks), "extract_body_bytes": body_bytes,
+                            "content_bytes": sum(sizes), "members": members,
+                            "members_over_32kb": sum(size > 32_768 for size in sizes)}
+            totals[variant] += body_bytes
+        row["saved_extract_body_bytes"] = row["v1"]["extract_body_bytes"] - row["v2"]["extract_body_bytes"]
+        output["runs"][run_dir.name] = row
+    output["total_extract_body_bytes"] = totals
+    output["saved_share"] = round(1 - totals["v2"] / max(1, totals["v1"]), 4)
+    return output
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, default=Path.cwd(),
@@ -138,9 +192,13 @@ def main(argv: list[str] | None = None) -> int:
     item1.add_argument("--threshold", type=float,
                        default=semantic.PARTITION_NORMALIZATION_MAX_ROUTED_SHARE)
     sub.add_parser("cache-rejections")
+    item2 = sub.add_parser("projection")
+    item2.add_argument("runs", nargs="+", help="run directory names under runs/")
     args = parser.parse_args(argv)
     if args.command == "partitions":
         result = partitions(args.repo, args.threshold)
+    elif args.command == "projection":
+        result = projection([args.repo / "runs" / name for name in args.runs])
     else:
         result = cache_rejections(args.repo)
     print(json.dumps(result, indent=2, sort_keys=True))
