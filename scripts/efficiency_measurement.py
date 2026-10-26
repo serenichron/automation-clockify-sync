@@ -183,6 +183,108 @@ def projection(run_dirs: list[Path]) -> dict[str, Any]:
     return output
 
 
+def clockify_overlap(repo: Path) -> dict[str, Any]:
+    """Item 3: replay saved overlap checkpoints under the v3 start bound."""
+    import datetime as dt
+    import math
+    from scripts import clockify_sync_collect as collector
+
+    def instant(value: Any) -> dt.datetime | None:
+        return collector.parse_dt(value) if isinstance(value, str) and value else None
+
+    lookback = collector.CLOCKIFY_OVERLAP_LOOKBACK
+    overlap: list[dict[str, Any]] = []
+    per_day: list[float] = []
+    durations: list[float] = []
+    for manifest_path in sorted(glob.glob(str(repo / "state" / "collector-checkpoints" / "*" /
+                                               "source-checkpoints" / "*" / "manifest.json"))):
+        manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+        identity = manifest.get("identity", {})
+        if identity.get("source") != "clockify" or not manifest.get("complete"):
+            continue
+        since, until = instant(identity["since_utc"]), instant(identity["until_utc"])
+        rows: list[dict[str, Any]] = []
+        wire = 0
+        for page in manifest["pages"]:
+            saved = json.loads((Path(manifest_path).parent / page["path"]).read_text(encoding="utf-8"))
+            rows.extend(saved["payload"])
+            wire += (saved.get("metadata") or {}).get("wire_row_count", len(saved["payload"]))
+        for row in rows:
+            start, end = instant(row["timeInterval"].get("start")), instant(row["timeInterval"].get("end"))
+            if start and end:
+                durations.append((end - start).total_seconds())
+        version = identity["compatibility_version"]
+        if version == collector.CLOCKIFY_CHECKPOINT_COMPATIBILITY_VERSION:
+            per_day.append(len(rows) / max(1e-9, (until - since).total_seconds() / 86400))
+            continue
+        bound = since - lookback
+        retained_v3 = [row for row in rows if (instant(row["timeInterval"].get("start")) or bound) >= bound]
+        elapsed = None
+        if manifest.get("completed_at") and (manifest.get("metadata") or {}).get("snapshot_at"):
+            elapsed = (instant(manifest["completed_at"]) - instant(manifest["metadata"]["snapshot_at"])).total_seconds()
+        overlap.append({
+            "window": [identity["since_utc"], identity["until_utc"]], "version": version,
+            "pages": len(manifest["pages"]), "wire_rows": wire, "retained_rows": len(rows),
+            "retained_rows_under_v3_bound": len(retained_v3),
+            "overlap_set_identical": sorted(map(json.dumps, rows)) == sorted(map(json.dumps, retained_v3)),
+            "collection_seconds": elapsed,
+        })
+    density = max(per_day) if per_day else 0.0
+    window_days = lookback.total_seconds() / 86400 + 2
+    estimated_rows = math.ceil(density * window_days)
+    return {
+        "lookback_days": lookback.total_seconds() / 86400,
+        "longest_saved_entry_hours": round(max(durations) / 3600, 2) if durations else None,
+        "saved_entries_with_duration": len(durations),
+        "overlap_checkpoints": overlap,
+        "max_entries_per_day_in_saved_v1_windows": round(density, 1),
+        "estimated_v3_rows_for_two_day_slice": estimated_rows,
+        "estimated_v3_pages": max(1, math.ceil((estimated_rows + 1) / collector.CLOCKIFY_PAGE_SIZE)),
+    }
+
+
+def circuit_breaker(journal: Path, threshold: int, cooldown_hours: float) -> dict[str, Any]:
+    """Item 4: replay recorded failed cycles of one slice through the breaker.
+
+    The journal is `journalctl --user -u clockify-review-cycle.service -o
+    short-iso` text. Each failed run is paired with its "Consumed" CPU line and
+    the slice it printed.
+    """
+    import datetime as dt
+    import re
+
+    consumed = re.compile(r"^(\S+) .*Consumed (?:(\d+)min )?([\d.]+)s CPU time")
+    printed = re.compile(r'^\S+ .*\{"slices": \[\{"since": "([0-9-]+)"')
+    runs: list[tuple[dt.datetime, float, str | None]] = []
+    since: str | None = None
+    for line in journal.read_text(encoding="utf-8").splitlines():
+        if match := printed.match(line):
+            since = match.group(1) if '"status": "failed"' in line else None
+        elif match := consumed.match(line):
+            seconds = float(match.group(2) or 0) * 60 + float(match.group(3))
+            runs.append((dt.datetime.fromisoformat(match.group(1)), seconds, since))
+            since = None
+    failing = [(at, cpu) for at, cpu, slice_since in runs if slice_since is not None]
+    executed: list[tuple[dt.datetime, float]] = []
+    failures, last_failure = 0, None
+    cooldown = dt.timedelta(hours=cooldown_hours)
+    for at, cpu in failing:
+        if failures >= threshold and last_failure is not None and at - last_failure < cooldown:
+            continue
+        executed.append((at, cpu))
+        failures += 1
+        last_failure = at
+    return {
+        "threshold": threshold, "cooldown_hours": cooldown_hours,
+        "failed_cycles_recorded": len(failing),
+        "failed_cycle_cpu_minutes_recorded": round(sum(cpu for _, cpu in failing) / 60, 1),
+        "cycles_with_breaker": len(executed),
+        "cpu_minutes_with_breaker": round(sum(cpu for _, cpu in executed) / 60, 1),
+        "first_failure": failing[0][0].isoformat() if failing else None,
+        "last_failure": failing[-1][0].isoformat() if failing else None,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, default=Path.cwd(),
@@ -194,9 +296,18 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("cache-rejections")
     item2 = sub.add_parser("projection")
     item2.add_argument("runs", nargs="+", help="run directory names under runs/")
+    sub.add_parser("clockify-overlap")
+    item4 = sub.add_parser("circuit-breaker")
+    item4.add_argument("journal", type=Path)
+    item4.add_argument("--threshold", type=int, default=2)
+    item4.add_argument("--cooldown-hours", type=float, default=72)
     args = parser.parse_args(argv)
     if args.command == "partitions":
         result = partitions(args.repo, args.threshold)
+    elif args.command == "circuit-breaker":
+        result = circuit_breaker(args.journal, args.threshold, args.cooldown_hours)
+    elif args.command == "clockify-overlap":
+        result = clockify_overlap(args.repo)
     elif args.command == "projection":
         result = projection([args.repo / "runs" / name for name in args.runs])
     else:

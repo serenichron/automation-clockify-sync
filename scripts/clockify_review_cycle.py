@@ -1329,6 +1329,8 @@ def _select_work(
             continue
         if not _eligible_stored_dates(config, since, until, today=today):
             continue
+        if _circuit_open(config, record):
+            continue
         delivery.append((since, until, "delivery", None))
         selected_intervals.add((since, until))
     # Finish cached work before admitting another collection/inference slice.
@@ -1343,6 +1345,8 @@ def _select_work(
         if isinstance(record, Mapping) and record.get("status") in {
             "delivered", "delivered_with_exceptions",
         }:
+            continue
+        if _circuit_open(config, record):
             continue
         ordinary.append((since, until, "routine", None))
         selected_intervals.add((since, until))
@@ -2823,6 +2827,88 @@ def _verify_delivery_receipt(
         if document == expected:
             return
     raise CycleError("delivery receipt target or immutable inputs have drifted") from error
+
+
+_CIRCUIT_SCHEMA_VERSION = "review-cycle-circuit-breaker/v1"
+_CIRCUIT_DEFAULT_FAILURES = 2
+_CIRCUIT_DEFAULT_COOLDOWN_HOURS = 72
+# Config consumed by the replay and publisher children. The whole mapping is
+# not stable within a run (consumed keys are popped), so only these count.
+_CIRCUIT_CONFIG_KEYS = (
+    "root", "_runtime_identity", "cache", "state_dir", "spreadsheet_id",
+    "monthly_sheet_title_template", "monthly_unresolved_alias_proof",
+    "monthly_unresolved_historical_sources", "timezone",
+)
+
+
+def _circuit_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def _circuit_inputs(config: Mapping[str, Any], record: Mapping[str, Any]) -> str:
+    """Digest everything a rerun of a failed stage would consume.
+
+    A new release (root or runtime identity), config, source, or replay
+    changes the digest and so closes the breaker without operator action.
+    """
+    value: dict[str, Any] = {key: record.get(key) for key in ("until", "source", "replay", "replay_return")}
+    value["config"] = {key: config.get(key) for key in _CIRCUIT_CONFIG_KEYS}
+    for key in ("routing", "corrections", "acceptance"):
+        try:
+            value[f"{key}_digest"] = _digest(Path(str(config[key])))
+        except (KeyError, OSError):
+            value[f"{key}_digest"] = None
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _record_stage_failure(
+    config: Mapping[str, Any], record: dict[str, Any], stage: str, child: Any,
+) -> None:
+    inputs = _circuit_inputs(config, record)
+    prior = record.get("circuit_breaker")
+    repeated = (isinstance(prior, Mapping) and prior.get("inputs_digest") == inputs
+                and prior.get("stage") == stage and isinstance(prior.get("failures"), int))
+    record["circuit_breaker"] = {
+        "schema_version": _CIRCUIT_SCHEMA_VERSION,
+        "stage": stage,
+        "inputs_digest": inputs,
+        "failures": prior["failures"] + 1 if repeated else 1,
+        "last_failure_at": _circuit_now().isoformat().replace("+00:00", "Z"),
+        "returncode": child.returncode,
+        "timed_out": bool(child.timed_out),
+    }
+
+
+def _circuit_open(config: Mapping[str, Any], record: Any) -> bool:
+    """True while a failed slice would rerun the same inputs within cooldown."""
+    if not isinstance(record, Mapping) or record.get("status") != "failed":
+        return False
+    breaker = record.get("circuit_breaker")
+    if not isinstance(breaker, Mapping) or breaker.get("schema_version") != _CIRCUIT_SCHEMA_VERSION:
+        return False
+    threshold = int(config.get("circuit_breaker_failures", _CIRCUIT_DEFAULT_FAILURES))
+    cooldown = dt.timedelta(hours=float(
+        config.get("circuit_breaker_cooldown_hours", _CIRCUIT_DEFAULT_COOLDOWN_HOURS)))
+    try:
+        failed_at = dt.datetime.fromisoformat(str(breaker["last_failure_at"]).replace("Z", "+00:00"))
+    except (KeyError, ValueError):
+        return False
+    return (
+        int(breaker.get("failures") or 0) >= threshold
+        and breaker.get("inputs_digest") == _circuit_inputs(config, record)
+        and _circuit_now() - failed_at < cooldown
+    )
+
+
+def _open_circuits(config: Mapping[str, Any], state: Mapping[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {"since": since, "until": record.get("until"),
+         "stage": record["circuit_breaker"]["stage"],
+         "failures": record["circuit_breaker"]["failures"]}
+        for since, record in sorted(state.get("slices", {}).items())
+        if _circuit_open(config, record)
+    ]
 
 
 def _persist_state(path: Path, state: dict[str, Any], since: str, record: dict[str, Any]) -> None:
@@ -6114,8 +6200,10 @@ def _run_slice(
                 return {"status": "incomplete", "reason": "total_child_budget_exhausted", "slice": {"since": since, "until": until}}
             if child.timed_out or child.returncode != 0:
                 record["status"] = "failed"
+                _record_stage_failure(config, record, "replay", child)
                 _persist_state(state_path, state, since, record)
                 return {"status": "failed", "slice": {"since": since, "until": until}}
+            record.pop("circuit_breaker", None)
             result_path = _result(child.stdout, _runs_dir(config))
             body = {"schema_version":"review-cycle-replay-return/v1", "source_digest":_value_digest(source), "command_digest":_value_digest(command), "result_path":str(result_path), "result_digest":_digest(result_path)}
             returned = {**body, "return_digest":_value_digest(body)}
@@ -6205,8 +6293,10 @@ def _run_slice(
             return {"status": "incomplete", "reason": "total_child_budget_exhausted", "slice": {"since": since, "until": until}}
         if child.timed_out or child.returncode != 0:
             record["status"] = "failed"
+            _record_stage_failure(config, record, "publish", child)
             _persist_state(state_path, state, since, record)
             return {"status": "failed", "slice": {"since": since, "until": until}}
+        record.pop("circuit_breaker", None)
         publication_readbacks = _publisher_result(
             child.stdout, _runs_dir(config), receipt["publication_receipts"], source_dir=Path(str(source["run_dir"])),
         )
@@ -6904,6 +6994,7 @@ def run_cycle(config: Mapping[str, Any], *, enable_sheet_write: bool, today: dt.
                     {"since": since, "until": until}
                     for since, until, _kind, _generic in selected
                 ],
+                **({"circuit_open": circuits} if (circuits := _open_circuits(config, state)) else {}),
             }
         _reconcile_verified_attempts(config, state, state_path, debt_store, debt_path)
         selected = _select_work(
@@ -6912,8 +7003,11 @@ def run_cycle(config: Mapping[str, Any], *, enable_sheet_write: bool, today: dt.
             debt_store,
             today=today or dt.datetime.now(ZoneInfo(str(config["timezone"]))).date(),
         )
+        circuits = _open_circuits(config, state)
         if not selected:
             _atomic(state_path, state)
+            if circuits:
+                return {"status": "circuit_open", "slices": [], "circuit_open": circuits}
             return {"status": "idle", "slices": []}
         if int(config.get("max_slices", 1)) == 1:
             routine_pick = _select_work(
@@ -6977,6 +7071,8 @@ def run_cycle(config: Mapping[str, Any], *, enable_sheet_write: bool, today: dt.
         result: dict[str, Any] = {"status": final_status, "slices": attempted}
         if final_reason is not None:
             result["reason"] = final_reason
+        if circuits := _open_circuits(config, state):
+            result["circuit_open"] = circuits
         return result
 
 
@@ -7027,7 +7123,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"clockify review cycle blocked: {exc}", file=sys.stderr)
         return 2
     if result.get("status") in {
-        "incomplete", "failed", "recovery_blocked",
+        "incomplete", "failed", "recovery_blocked", "circuit_open",
     }:
         return 75
     if result.get("status") in {
