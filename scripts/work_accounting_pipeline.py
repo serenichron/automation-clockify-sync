@@ -1043,6 +1043,11 @@ def analyze_ledger(
     hinted_events = _with_semantic_route_hints(
         events, routing, normalize_meeting_domains_type=actor_contract is not None,
     )
+    projection_contract = routing.get("semantic_projection_contract")
+    if projection_contract not in {None, semantic_analyzer.PROJECTION_CONTRACT}:
+        raise WorkAccountingError("semantic projection contract is invalid")
+    if projection_contract is not None:
+        hinted_events = semantic_analyzer.with_projection_contract(hinted_events)
     scoped_retry = retry_targets is not None and (failed_review_retry_selected_evidence_ids is not None or any(
         isinstance(row, Mapping)
         and tuple(sorted(str(value) for value in row.get("evidence_ids", []))) in retry_targets

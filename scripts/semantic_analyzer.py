@@ -42,6 +42,17 @@ PORTFOLIO_VALIDATION_PROMPT_VERSION = "clockify-portfolio-validation-v1"
 ANALYZER_CACHE_SCHEMA_VERSION = "clockify-analyzer-cache/v2"
 EVIDENCE_BUNDLE_SCHEMA_VERSION = "clockify-semantic-evidence-bundle/v1"
 ACTOR_CONTRACT = "clockify-semantic-actors/v1"
+# Opt-in projection that elides diffs/code blocks and excerpts long user
+# bodies. Unmarked events keep the historical projection and request bytes.
+PROJECTION_CONTRACT = "clockify-semantic-projection/v2"
+PROJECTION_EXCERPT_HEAD_CHARS = 3000
+PROJECTION_EXCERPT_TAIL_CHARS = 1000
+PROJECTION_INSTRUCTIONS = (
+    "\n\nPROJECTION: Long user bodies are shown as a head and tail excerpt "
+    "around an [elided N characters] marker, and diffs or code blocks as "
+    "[diff elided: N lines] or [code block elided: N lines]. Classify from "
+    "the visible prose; do not infer work from what was elided."
+)
 ACTOR_PROMPT_VERSION = "clockify-semantic-v18"
 ACTOR_REVIEW_PROMPT_VERSION = "clockify-semantic-review-v7"
 TASK_REVIEW_PROMPT_VERSION = "clockify-semantic-review-v8"
@@ -679,6 +690,74 @@ def with_actor_context(
     return output
 
 
+def with_projection_contract(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Opt NEW requests into the trimmed projection; sources stay unchanged."""
+    return [{**event, "semantic_projection_contract": PROJECTION_CONTRACT} for event in events]
+
+
+def _projection_trimmed(events: Iterable[dict[str, Any]]) -> bool:
+    contracts = {event.get("semantic_projection_contract") for event in events}
+    if contracts - {None, PROJECTION_CONTRACT} or len(contracts) > 1:
+        raise AnalyzerError("semantic projection contracts differ")
+    return contracts == {PROJECTION_CONTRACT}
+
+
+DIFF_HUNK_START_RE = re.compile(
+    r"^(?:diff --git |@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@|--- (?:a/|/dev/null)|\+\+\+ (?:b/|/dev/null))"
+)
+DIFF_HUNK_LINE_RE = re.compile(
+    r"^(?:[ +\-\\]|@@ |diff --git |index [0-9a-f]|new file mode|deleted file mode|"
+    r"similarity index|rename (?:from|to) )"
+)
+
+
+def _elide_text_blocks(value: Any) -> Any:
+    """Replace unified-diff hunks and fenced code blocks with line counts."""
+    if not isinstance(value, str):
+        return value
+    output: list[str] = []
+    block: tuple[str, int] | None = None
+    for line in value.splitlines():
+        fence = line.lstrip().startswith(("```", "~~~"))
+        if block is not None and block[0] == "code block":
+            block = (block[0], block[1] + 1)
+            if fence:
+                output.append(f"[code block elided: {block[1]} lines]")
+                block = None
+            continue
+        if block is not None and DIFF_HUNK_LINE_RE.match(line):
+            block = (block[0], block[1] + 1)
+            continue
+        if block is not None:
+            output.append(f"[diff elided: {block[1]} lines]")
+            block = None
+        if fence:
+            block = ("code block", 1)
+        elif DIFF_HUNK_START_RE.match(line):
+            block = ("diff", 1)
+        else:
+            output.append(line)
+    if block is not None:
+        output.append(f"[{block[0]} elided: {block[1]} lines]")
+    return "\n".join(output)
+
+
+def _excerpt(content: str) -> str:
+    """Keep a head and tail excerpt on whitespace so no token is split."""
+    limit = PROJECTION_EXCERPT_HEAD_CHARS + PROJECTION_EXCERPT_TAIL_CHARS
+    if len(content) <= limit:
+        return content
+    head = content[:PROJECTION_EXCERPT_HEAD_CHARS]
+    head = head.rsplit(" ", 1)[0] if " " in head else ""
+    tail = content[-PROJECTION_EXCERPT_TAIL_CHARS:]
+    tail = tail.split(" ", 1)[-1] if " " in tail else ""
+    elided = len(content) - len(head) - len(tail)
+    excerpt = _one_line(f"{head} [elided {elided} characters] {tail}")
+    if any(pattern.search(excerpt) for pattern in (URL_RE, EMAIL_RE, PATH_RE, BEARER_RE, SECRET_RE, HASH_RE, COMMAND_RE, TRANSPORT_RE)):
+        raise AnalyzerError("semantic projection excerpt contains unsafe text")
+    return excerpt
+
+
 def _actor_aware(events: Iterable[dict[str, Any]]) -> bool:
     contracts = {event.get("semantic_actor_contract") for event in events}
     if contracts - {None, ACTOR_CONTRACT} or len(contracts) > 1:
@@ -720,7 +799,12 @@ def project_event(event: dict[str, Any]) -> dict[str, Any]:
         attributes.get("label"), attributes.get("reason"), attributes.get("first_user_message"),
         attributes.get("last_assistant_message"), attributes.get("subject"),
     ]
+    trimmed = _projection_trimmed([event])
+    if trimmed:
+        content_values = [_elide_text_blocks(value) for value in content_values]
     content = _one_line(" ".join(filter(None, (_safe_text(value) for value in content_values))))
+    if trimmed and role == "user":
+        content = _excerpt(content)
     artifact_names = _safe_artifact_names(attributes.get("artifacts"))
     if artifact_names:
         content = _one_line(f"{content} Artifacts: {', '.join(artifact_names)}")
@@ -1642,6 +1726,9 @@ Output object:
     if _actor_aware(events):
         system += ACTOR_INSTRUCTIONS
         payload["actor_contract"] = ACTOR_CONTRACT
+    if _projection_trimmed(events):
+        system += PROJECTION_INSTRUCTIONS
+        payload["projection_contract"] = PROJECTION_CONTRACT
     if repair_failure_code is not None:
         payload["repair_feedback"] = {
             "failure_code": repair_failure_code,
@@ -2042,6 +2129,9 @@ Do not infer duration from a session envelope or reuse a prior disputed citation
     if _actor_aware(events):
         system += ACTOR_INSTRUCTIONS
         payload["actor_contract"] = ACTOR_CONTRACT
+    if _projection_trimmed(events):
+        system += PROJECTION_INSTRUCTIONS
+        payload["projection_contract"] = PROJECTION_CONTRACT
     if review_scope != "extraction":
         payload["review_scope"] = review_scope
     if repair_failure_code is not None:
