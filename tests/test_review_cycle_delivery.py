@@ -33,16 +33,25 @@ def write_json(path: Path, value: object) -> None:
 
 def proposal() -> dict[str, object]:
     return {
-        "review_activity_key": "wka-alpha",
+        "review_activity_key": "wka-000000000000000000000001",
         "allocation_segment": 1,
         "start": "2026-09-07T09:00:00+03:00",
         "end": "2026-09-07T10:00:00+03:00",
         "duration_minutes": 60,
+        "duration_seconds": 3600,
         "client_project": "Serenichron Level 2",
+        "clockify_project_suffix": "775f9f",
         "tag_names": ["Delivery"],
+        "tag_suffixes": ["111111"],
+        "billable": True,
         "activity_id": "activity-alpha",
         "confidence": "high",
-        "description": "SC — review-cycle delivery",
+        "description": "SC — Prepared review-cycle delivery documentation",
+        "provenance": {"source_type": "semantic_activity", "evidence_ids": ["ev-" + "1" * 64],
+                       "semantic_reviewer_model": semantic_analyzer.DEFAULT_PRIMARY_MODEL,
+                       "semantic_reviewer_revision": semantic_analyzer.DEFAULT_PRIMARY_REVISION},
+        "semantic_reviewer_model": semantic_analyzer.DEFAULT_PRIMARY_MODEL,
+        "semantic_reviewer_revision": semantic_analyzer.DEFAULT_PRIMARY_REVISION,
     }
 
 
@@ -58,6 +67,8 @@ def publisher_result_for_command(
         "run_id": command[command.index("--run-id") + 1],
     }
     title = command[command.index("--sheet-title") + 1]
+    if "--review-batch-publication" in command:
+        config = {**config, "review_batch_publication": command[command.index("--review-batch-publication") + 1]}
     publications = cycle._expected_publication_receipts(
         config, source, sheet_title=title,
     )
@@ -98,7 +109,16 @@ def make_run(
 ) -> Path:
     run_dir = (runs_dir or root / "runs") / name
     run_dir.mkdir(parents=True, exist_ok=True)
-    proposals = [proposal()] if proposals is None else proposals
+    if proposals is None:
+        generated = proposal()
+        routing_input = snapshots_from / "routing.json" if snapshots_from is not None else root / "routing.json"
+        routing = json.loads(routing_input.read_text())
+        routes = [r for r in routing.get("session_routes", [])
+                  if r.get("project_name") == generated["client_project"]
+                  and r.get("tag_names") == generated["tag_names"]]
+        if len(routes) == 1:
+            generated["clockify_project_suffix"] = routes[0]["project_suffix"]
+        proposals = [generated]
     # Monthly evidence fixtures must cite real content-addressed ledger events;
     # older routed-only scenarios intentionally keep their minimal fixture.
     candidates = [*(ambiguous or []), *(p for p in proposals if p.get("routing_disposition") == "unresolved-routing")]
@@ -171,9 +191,16 @@ def make_run(
             "evidence_bundle_schema_version": "clockify-semantic-evidence-bundle/v1",
             "evidence_bundle_manifest": bundle_manifest,
             "ledger_evidence_digest": "sha256:" + "c" * 64,
-            "activities": [
-                {"analyzer_model": "fixture-model", "analyzer_tier": analyzer_tier}
-            ],
+            "activities": list({
+                (p.get("activity_id"), tuple(p.get("provenance", {}).get("evidence_ids", []))): {
+                    "activity_id": p.get("activity_id"),
+                    "evidence_ids": p.get("provenance", {}).get("evidence_ids", []),
+                    "rendered_description": p.get("description"),
+                    "semantic_reviewer_model": p.get("semantic_reviewer_model"),
+                    "semantic_reviewer_revision": p.get("semantic_reviewer_revision"),
+                    "analyzer_model": "fixture-model", "analyzer_tier": analyzer_tier,
+                } for p in proposals
+            }.values()) or [{"analyzer_model": "fixture-model", "analyzer_tier": analyzer_tier}],
             "analysis_chunks": [],
             "analyzer_cache": {"records": []},
         },
@@ -371,11 +398,11 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
         write_json(self.state_dir / "review-cycle-state.json", state)
         return config, record, manifest
 
-    def make_modern_raw_source(self, config, *, name="source-run", attest=True, incomplete_peer=False):
+    def make_modern_raw_source(self, config, *, name="source-run", attest=True, incomplete_peer=False, peer_collector_digest=None):
         result = make_run(self.root, name, replay=False, runtime_identity=config["_runtime_identity"], analyzer_tier="fixture", record_checkpoint=False)
         run = result.parent
         runtime = config["_runtime_identity"]
-        collector_digest = hashlib.sha256(Path(runtime["collector_path"]).read_bytes()).hexdigest()
+        collector_digest = peer_collector_digest or hashlib.sha256(Path(runtime["collector_path"]).read_bytes()).hexdigest()
         host = {"machine": "macbook", "status": "ok", "complete": True,
             "collector_contract": "canonical_export_v1", "claude_bursts": [], "hermes_sessions": [],
             "hermes_db_sessions": [], "codex_sessions": [], "repository_events": [],
@@ -413,6 +440,40 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
         backlog=store.open(backlog_identity,planned)
         store.record_complete(backlog,finalization["slice_id"],(run/"completion-bundle.json").resolve(),"sha256:"+hashlib.sha256((run/"completion-bundle.json").read_bytes()).hexdigest())
         return result
+
+    def assert_fleet_export_snapshot_delivers_and_revalidates(self, peer_digest):
+        config, _, _ = self.fresh_routing_fixture()
+        def child(command, **_kwargs):
+            if "--replay-from" in command:
+                path = make_run(self.root, "replay-run", replay=True,
+                    snapshots_from=self.root / "runs/source-run", runtime_identity=config["_runtime_identity"],
+                    analyzer_tier="fixture", ledger_from=self.root / "runs/source-run")
+            elif "clockify_sheet_publish.py" in command[1]:
+                return publisher_result_for_command(config, command)
+            else:
+                path = self.make_modern_raw_source(config, peer_collector_digest=peer_digest)
+            return ChildResult(0, str(path) + "\n", "", False, 0.1)
+        try:
+            with mock.patch.object(cycle, "run_child_bounded", side_effect=child):
+                result = cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 10))
+        except cycle.CycleError as exc:
+            self.fail(f"Content-pinned fleet source must remain admissible: {exc}")
+        self.assertEqual("delivered", result["status"])
+        source_snapshot = self.root / "runs/source-run/evidence/sessions.json"
+        before = source_snapshot.read_bytes()
+        state = json.loads((self.state_dir / "review-cycle-state.json").read_text())
+        cycle._validate_delivered_state(config, state)
+        self.assertEqual(before, source_snapshot.read_bytes())
+
+    def test_fresh_source_accepts_verified_modern_peer_with_newer_coordinator(self):
+        """Catches live modern admission being rejected by native source validation."""
+        self.assert_fleet_export_snapshot_delivers_and_revalidates(
+            "a7519dd43c6a7f1ab554b997812d13822bae7ac9497534811c6391212fb4b00e")
+
+    def test_delivered_source_preserves_historical_peer_exporter_receipt(self):
+        """Catches tightening live admission invalidating a sealed historical peer snapshot."""
+        self.assert_fleet_export_snapshot_delivers_and_revalidates(
+            "6550287f05bd8bdd8bf1e133a6edd6d0d58be469e47f9d0c54c6811d16f4c240")
 
     def test_fresh_routing_attempt_binds_before_child_and_preserves_legacy_history(self):
         """Catches stale no-runner legacy bindings stopping the next modern collection."""
@@ -570,7 +631,7 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
         write_json(Path(config["corrections"]), {"unapproved":"change"})
         with mock.patch.object(cycle, "run_child_bounded", side_effect=AssertionError("child")), self.assertRaisesRegex(cycle.CycleError, "terminal legacy"):
             cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 10))
-        write_json(Path(config["corrections"]), {})
+        Path(config["corrections"]).write_text("", encoding="utf-8")
         with mock.patch.object(cycle, "run_child_bounded", side_effect=RuntimeError("detached child")), self.assertRaises(RuntimeError):
             cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 10))
         changed = {**config, "_runtime_identity": {**config["_runtime_identity"], "git_sha":"b"*40}}
@@ -825,7 +886,7 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
         write_json(Path(config["corrections"]), {"unauthorized": "change"})
         with self.assertRaisesRegex(cycle.CycleError, "immutable inputs"):
             cycle._routing_transition_source(config, record, "2026-09-07", "2026-09-09", manifest)
-        write_json(Path(config["corrections"]), {})
+        Path(config["corrections"]).write_text("", encoding="utf-8")
         record["runner_attempt"]["runtime_identity_digest"] = "sha256:" + "f" * 64
         with self.assertRaisesRegex(cycle.CycleError, "unique"):
             cycle._routing_transition_source(config, record, "2026-09-07", "2026-09-09", manifest)
@@ -896,6 +957,7 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
                 "session_routes": [{
                     "project_suffix": "775f9f",
                     "project_name": "Serenichron Level 2",
+                    "prefix": "SC", "tag_names": ["Delivery"], "tag_suffixes": ["111111"],
                 }],
                 "meeting_routes": [],
                 "evidence_routes": [],
@@ -904,6 +966,7 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
             ("acceptance.jsonl", {}),
         ):
             write_json(self.root / filename, value)
+        (self.root / "corrections.jsonl").write_text("", encoding="utf-8")
         self.config = {
             "root": str(self.root),
             "state_dir": str(self.state_dir),
@@ -940,7 +1003,7 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
                 self.config, result, "2026-09-07", "2026-09-09", replay=False,
                 expected_snapshot_digests=cycle._expected_snapshot_digests(self.config, manifest),
             )
-        self.assertEqual(["wka-alpha-s01"], stage["review_ids"])
+        self.assertEqual(["wka-000000000000000000000001-s01"], stage["review_ids"])
         self.assertEqual({"status": "complete", "incomplete_sources": []}, stage["coverage"])
         self.assertEqual(2, len(verifications))
 
@@ -1247,7 +1310,7 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
         self.assertEqual("delivered", delivered["status"])
         self.assertEqual("source-run", delivered["source_run_id"])
         self.assertEqual("replay-run", delivered["replay_run_id"])
-        self.assertEqual(["wka-alpha-s01"], delivered["review_ids"])
+        self.assertEqual(["wka-000000000000000000000001-s01"], delivered["review_ids"])
         receipt = Path(delivered["delivery_receipt"])
         self.assertTrue(receipt.is_file())
         self.assertEqual(
@@ -1339,7 +1402,7 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
         """A monthly-only receipt must not hide unresolved-tab durability."""
         routed = proposal()
         unresolved = {**proposal(),
-            "review_activity_key": "wka-unresolved",
+            "review_activity_key": "wka-000000000000000000000002",
             "allocation_segment": 2,
             "client_project": "",
             "clockify_project_suffix": "",
@@ -1363,9 +1426,12 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
             result = cycle.run_cycle(
                 self.config, enable_sheet_write=True, today=dt.date(2026, 9, 10)
             )
-        self.assertEqual("delivered", result["status"])
-        receipt_path = self.state_dir / "delivery-receipts" / "2026-09-07.json"
+        self.assertEqual("published_with_preparation_gaps", result["status"])
+        receipt_path = self.state_dir / "partial-publication-receipts" / "2026-09-07-source-run.json"
         receipt = json.loads(receipt_path.read_text())
+        self.assertNotIn("source_completeness", receipt)
+        self.assertEqual("incomplete", receipt["review_preparation"]["outcome"]["status"])
+        self.assertIsNone(json.loads((self.state_dir / "review-cycle-state.json").read_text())["completed_through"])
         self.assertEqual(
             ["September 2026 portfolio review", "September 2026 unresolved evidence"],
             [item["sheet_title"] for item in receipt["publication_receipts"]],
@@ -1414,7 +1480,7 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
     def test_mixed_publisher_readback_mismatch_blocks_durable_receipt(self):
         """The scheduler must parse both publisher readbacks, not infer success."""
         unresolved = {**proposal(),
-            "review_activity_key": "wka-unresolved",
+            "review_activity_key": "wka-000000000000000000000002",
             "allocation_segment": 2,
             "client_project": "", "clockify_project_suffix": "",
             "tag_suffixes": [], "tag_names": [], "billable": False,
@@ -1894,19 +1960,22 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
             "type": "review_proposal_overlap",
         }], ensure_ascii=False, sort_keys=True)
         expected_row = [[
-            "wka-alpha-s01", "2026-09-07 09:00", "2026-09-07 10:00", 60,
+            "wka-000000000000000000000001-s01", "2026-09-07 09:00", "2026-09-07 10:00", 60,
             "Serenichron Level 2", "Delivery", "activity-alpha", "high",
-            "SC — review-cycle delivery", "pending", 1, "source-run",
+            "SC — Prepared review-cycle delivery documentation", "pending", 1, "source-run",
             expected_warning, "unposted", "",
         ]]
-        self.assertEqual(
-            cycle._publication_receipt(
-                spreadsheet_id="sheet-1",
-                sheet_title="September 2026 portfolio review",
-                rows=expected_row,
-            ),
-            receipt["publication_receipts"][0],
-        )
+        expected = cycle._publication_receipt(
+            spreadsheet_id="sheet-1", sheet_title="September 2026 portfolio review", rows=expected_row)
+        actual = receipt["publication_receipts"][0]
+        self.assertEqual(expected, {key: actual[key] for key in expected})
+        self.assertEqual(set(expected) | {"review_batches"}, set(actual))
+        prepared_handle = actual["review_batches"]["binding"]
+        self.assertEqual(str(self.state_dir / "prepared-review-publications/source-run.json"), prepared_handle["path"])
+        self.assertEqual("sha256:" + hashlib.sha256(Path(prepared_handle["path"]).read_bytes()).hexdigest(), prepared_handle["sha256"])
+        proposals_path = self.root / "runs/source-run/proposals.json"
+        self.assertEqual({"path": str(proposals_path), "sha256": "sha256:" + hashlib.sha256(proposals_path.read_bytes()).hexdigest()},
+                         actual["review_batches"]["source_proposals"])
         publisher = commands[-1]
         self.assertEqual(
             str((self.root / "runs" / "source-run" / "routing.json").resolve()),

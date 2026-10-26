@@ -11,6 +11,7 @@ import sqlite3
 import tempfile
 import unittest
 import urllib.error
+import urllib.parse
 from pathlib import Path
 from unittest import mock
 
@@ -41,6 +42,86 @@ def event(timestamp: str, event_type: str, message: str) -> dict:
 
 
 class CollectorBurstContextTests(unittest.TestCase):
+    def test_clockify_carry_in_survives_both_collection_modes_and_reaches_review_warnings(self):
+        cases = [
+            ("2026-09-26T09:13:00Z", "2026-09-26T09:14:00Z", "2026-09-26T08:25:00Z", "2026-09-26T09:14:00Z"),
+            ("2026-09-25T21:00:00Z", "2026-09-26T21:00:00Z", "2026-09-25T20:25:00Z", "2026-09-25T21:14:00Z"),
+        ]
+        for start, end, native_start, native_end in cases:
+            since, until = collector.parse_dt(start), collector.parse_dt(end)
+            entries = [{"id": "carry-in", "description": "Completed review", "projectId": "project-abc123",
+                        "tagIds": [], "billable": True,
+                        "timeInterval": {"start": native_start, "end": native_end, "duration": "PT49M"}},
+                       {"id": "outer", "timeInterval": {"start": "2016-01-01T00:00:00Z", "end": "2026-10-01T00:00:00Z"}},
+                       {"id": "touch-left", "timeInterval": {"start": "2016-01-01T00:00:00Z", "end": start}},
+                       {"id": "touch-right", "timeInterval": {"start": end, "end": "2026-10-01T00:00:00Z"}}]
+            def backend(path, _env):
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+                rows = entries
+                if "start" in query:
+                    rows = [item for item in rows if collector.parse_dt(item["timeInterval"]["start"]) >= collector.parse_dt(query["start"][0])]
+                if "end" in query:
+                    rows = [item for item in rows if collector.parse_dt(item["timeInterval"]["start"]) < collector.parse_dt(query["end"][0])]
+                page, size = int(query["page"][0]), int(query["page-size"][0])
+                return rows[(page - 1) * size:page * size]
+            for stored in (False, True):
+                with self.subTest(start=start, stored=stored), tempfile.TemporaryDirectory() as directory:
+                    store = checkpoints.PageCheckpointStore(Path(directory)) if stored else None
+                    with mock.patch.object(collector, "clockify_get", side_effect=backend):
+                        result = collector.fetch_clockify({"CLOCKIFY_WORKSPACE_ID": "workspace"},
+                            {"clockify_user_id": "user"}, since, until, snapshot_at=until, checkpoint_store=store)
+                    self.assertTrue(result["complete"])
+                    self.assertEqual(["carry-in", "outer"], [item["id_suffix"] for item in result["entries"]])
+                    self.assertEqual(native_start, result["entries"][0]["start"])
+                    self.assertEqual(native_end, result["entries"][0]["end"])
+                    if stored:
+                        with mock.patch.object(collector, "clockify_get", side_effect=AssertionError("no replay HTTP")):
+                            self.assertEqual(result, collector.fetch_clockify({"CLOCKIFY_WORKSPACE_ID": "workspace"},
+                                {"clockify_user_id": "user"}, since, until, checkpoint_store=store))
+                    events = [event.document() for event in evidence_ledger.normalize_collector_snapshot({"clockify": result})]
+                    blocks = accounting._existing_blocks(events)
+                    proposed_start = collector.parse_dt(native_end) - dt.timedelta(minutes=1)
+                    proposal = accounting._proposal({"activity_id": "act-fixture", "workstream_id": "ws-fixture"},
+                        {"project_name": "Example", "project_suffix": "abc123"}, "Completed review",
+                        proposed_start, proposed_start + dt.timedelta(minutes=1), ["ev-fixture"], 1)
+                    normalized = accounting._normalize_postable_proposals([proposal], blocks, [])
+                    self.assertEqual([60, 60], [warning["overlap_duration_seconds"] for warning in normalized[0]["review_warnings"]])
+
+    def test_clockify_checkpoint_retains_only_target_rows_but_resumes_past_full_unrelated_pages(self):
+        unrelated = [{"id": f"unrelated-{index}", "description": "do not persist unrelated history",
+                      "timeInterval": {"start": "2016-01-01T00:00:00Z", "end": "2016-01-01T01:00:00Z"}}
+                     for index in range(1000)]
+        carry = {"id": "carry-in", "timeInterval": {"start": "2026-07-20T20:25:00Z", "end": "2026-07-20T21:14:00Z"}}
+        env, routing = {"CLOCKIFY_WORKSPACE_ID": "workspace"}, {"clockify_user_id": "user"}
+        with tempfile.TemporaryDirectory() as directory:
+            store = checkpoints.PageCheckpointStore(Path(directory))
+            with mock.patch.object(collector, "clockify_get", side_effect=[unrelated, OSError("offline")]):
+                failed = collector.fetch_clockify(env, routing, SINCE, UNTIL, snapshot_at=UNTIL, checkpoint_store=store)
+            self.assertFalse(failed["complete"])
+            first_page = next(Path(directory).glob("*/pages/000001.json"))
+            self.assertEqual([], json.loads(first_page.read_bytes())["payload"])
+            self.assertNotIn(b"do not persist unrelated history", first_page.read_bytes())
+            def resume(path, _env):
+                self.assertIn("page=2&", path)
+                return [carry]
+            with mock.patch.object(collector, "clockify_get", side_effect=resume):
+                resumed = collector.fetch_clockify(env, routing, SINCE, UNTIL, checkpoint_store=store)
+            self.assertTrue(resumed["complete"])
+            self.assertEqual(["carry-in"], [item["id_suffix"] for item in resumed["entries"]])
+
+    def test_clockify_malformed_full_and_final_wire_pages_never_claim_completeness(self):
+        outside = {"id": "outside", "timeInterval": {"start": "2016-01-01T00:00:00Z", "end": "2016-01-01T01:00:00Z"}}
+        for stored in (False, True):
+            for page in ([outside] * 999 + [None], [outside, None]):
+                with self.subTest(stored=stored, page_size=len(page)), tempfile.TemporaryDirectory() as directory:
+                    store = checkpoints.PageCheckpointStore(Path(directory)) if stored else None
+                    with mock.patch.object(collector, "clockify_get", return_value=page):
+                        result = collector.fetch_clockify({"CLOCKIFY_WORKSPACE_ID": "workspace"},
+                            {"clockify_user_id": "user"}, SINCE, UNTIL, checkpoint_store=store)
+                    self.assertFalse(result["complete"])
+                    self.assertEqual("error", result["status"])
+                    self.assertEqual([], result["entries"])
+
     def test_prefixed_teammate_notifications_supply_no_human_capacity(self) -> None:
         for content in (WRAPPED, ' \n' + WRAPPED.upper(),
                         '<teammate-message teammate_id="synthetic-worker">Ready</teammate-message>'):
@@ -1573,6 +1654,7 @@ class CollectorBurstContextTests(unittest.TestCase):
                     SINCE,
                     UNTIL,
                     checkpoint_store=store,
+                    checkpoint_identity=identity,
                 )
 
         self.assertEqual("error", corrupted["status"])
@@ -1609,6 +1691,7 @@ class CollectorBurstContextTests(unittest.TestCase):
                     SINCE,
                     UNTIL,
                     checkpoint_store=store,
+                    checkpoint_identity=identity,
                 )
 
         self.assertEqual("error", corrupted["status"])
@@ -2085,6 +2168,7 @@ class CollectorBurstContextTests(unittest.TestCase):
 
         self.assertEqual("canonical_export_v1", result["collector_contract"])
         self.assertEqual("git_worktree", result["canonical_export"]["bundle_provenance"])
+        self.assertEqual(1, run.call_count)
         command = run.call_args.args[0][-1]
         self.assertIn("--expected-collector-sha256 expected-digest", command)
         self.assertIn("--coordinator-git-sha coordinator-sha", command)
@@ -2207,7 +2291,8 @@ class CollectorBurstContextTests(unittest.TestCase):
         self.assertEqual(1, run.call_count)
         self.assertIn("script digest mismatch", result["errors"][0])
 
-    def test_canonical_export_attestation_negotiates_unsynchronized_bab6_exporter(self) -> None:
+    def test_live_canonical_export_rejects_bab6_without_modern_message_capability(self) -> None:
+        """Catches historical wire compatibility being treated as current parser capability."""
         machine = {
             "name": "precision",
             "host": "precision.example.test",
@@ -2270,18 +2355,14 @@ class CollectorBurstContextTests(unittest.TestCase):
                 },
             )
 
-        self.assertEqual(2, run.call_count)
-        self.assertEqual("ok", result["status"])
-        self.assertEqual(
-            compatible_digest,
-            result["canonical_export"]["collector_script_sha256"],
-        )
-        self.assertFalse(
-            result["canonical_export"]["collector_digest_match"]
-        )
-        self.assertFalse(result["canonical_export"]["git_sha_match"])
+        self.assertEqual("unavailable", result["status"])
+        self.assertEqual(1, run.call_count)
+        self.assertEqual("capability_mismatch", result["canonical_export"]["status"])
+        self.assertNotIn("collector_contract", result)
+        self.assertIn("no legacy metadata fallback", result["errors"][0])
 
-    def test_canonical_export_attestation_negotiates_f3dd189_fleet_exporter(self) -> None:
+    def test_live_canonical_export_rejects_f3dd_without_modern_message_capability(self) -> None:
+        """Catches the attested old exporter silently admitting modern-message complete-zero."""
         machine = {
             "name": "desktop",
             "host": "desktop.example.test",
@@ -2343,12 +2424,64 @@ class CollectorBurstContextTests(unittest.TestCase):
                 },
             )
 
-        self.assertEqual(2, run.call_count)
+        self.assertEqual("unavailable", result["status"])
+        self.assertEqual(1, run.call_count)
+        self.assertEqual("capability_mismatch", result["canonical_export"]["status"])
+        self.assertNotIn("collector_contract", result)
+        self.assertIn("no legacy metadata fallback", result["errors"][0])
+
+        # Real completeness consumers must retain debt-bearing gaps, not treat
+        # the rejected export's empty arrays as complete zero observations.
+        inventory = evidence_ledger.source_inventory_from_collector({"sessions": [result]})
+        coverage = evidence_ledger.source_completeness(inventory)
+        self.assertEqual("unavailable", inventory["sessions/desktop"]["status"])
+        self.assertEqual("partial", inventory["repositories/desktop"]["status"])
+        self.assertEqual("incomplete", coverage["status"])
+        self.assertIn("sessions/desktop", coverage["incomplete_sources"])
+        self.assertIn("repositories/desktop", coverage["incomplete_sources"])
+
+    def test_live_canonical_export_rejects_first_approved_legacy_parser(self) -> None:
+        """Catches retaining another old parser when the f3dd admission hole is fixed."""
+        machine = {"name": "macbook", "host": "macbook.example.test", "collector_root": "/work/clockify"}
+        handshake = {"machine": "macbook", "status": "unavailable", "canonical_export_attestation": {
+            "collector_script_sha256": "fd8d72d4f3469a91087568da1a953c1f8bb09a45bef572a0a4390476101053bb",
+            "runtime_identity": {"git_sha": "historical-sha", "git_dirty": False},
+        }}
+        completed = collector.subprocess.CompletedProcess(["ssh"], 0, json.dumps(handshake), "")
+        with mock.patch.object(collector, "collector_script_sha256", return_value="current-digest"), \
+             mock.patch.object(collector.subprocess, "run", return_value=completed) as run:
+            result = collector.collect_remote_sessions(machine, SINCE, UNTIL, [],
+                coordinator_identity={"git_sha": "current-sha", "git_dirty": False})
+        self.assertEqual("unavailable", result["status"])
+        self.assertEqual(1, run.call_count)
+        self.assertEqual("capability_mismatch", result["canonical_export"]["status"])
+        self.assertNotIn("collector_contract", result)
+
+    def test_live_canonical_export_negotiates_verified_modern_parser(self) -> None:
+        """Catches unrelated coordinator changes rejecting a content-pinned modern exporter."""
+        machine = {"name": "macbook", "host": "macbook.example.test", "collector_root": "/work/clockify"}
+        modern_digest = "a7519dd43c6a7f1ab554b997812d13822bae7ac9497534811c6391212fb4b00e"
+        attestation = {"collector_script_sha256": modern_digest,
+                       "runtime_identity": {"git_sha": "modern-host-sha", "git_dirty": False}}
+        handshake = {"machine": "macbook", "status": "unavailable", "canonical_export_attestation": attestation}
+        exported = {"machine": "macbook", "status": "ok", "claude_bursts": [],
+                    "hermes_sessions": [], "hermes_db_sessions": [],
+                    "codex_sessions": [{"session_id": "synthetic-modern", "user_messages": 2}],
+                    "repository_events": [], "repository_evidence_status": "complete",
+                    "errors": [], "canonical_export_attestation": attestation}
+        responses = [collector.subprocess.CompletedProcess(["ssh"], 0, json.dumps(p), "")
+                     for p in (handshake, exported)]
+        with mock.patch.object(collector, "collector_script_sha256", return_value="new-current-digest"), \
+             mock.patch.object(collector.subprocess, "run", side_effect=responses) as run:
+            result = collector.collect_remote_sessions(machine, SINCE, UNTIL, [],
+                coordinator_identity={"git_sha": "new-current-sha", "git_dirty": False})
         self.assertEqual("ok", result["status"])
-        self.assertEqual(
-            fleet_digest,
-            result["canonical_export"]["collector_script_sha256"],
-        )
+        self.assertEqual("canonical_export_v1", result["collector_contract"])
+        self.assertEqual("synthetic-modern", result["codex_sessions"][0]["session_id"])
+        self.assertEqual(2, run.call_count)
+        self.assertEqual(modern_digest, result["canonical_export"]["collector_script_sha256"])
+        self.assertFalse(result["canonical_export"]["collector_digest_match"])
+        self.assertIn(modern_digest, run.call_args_list[1].args[0][-1])
 
     def test_canonical_export_attestation_accepts_sha_drift_and_records_dirty_worktree(self) -> None:
         machine = {"name": "precision", "host": "precision.example.test", "collector_root": "/work/clockify"}

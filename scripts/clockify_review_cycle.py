@@ -13,6 +13,7 @@ import fcntl
 import hashlib
 import importlib.util
 import json
+import re
 import os
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
@@ -21,7 +22,7 @@ import string
 import subprocess
 import sys
 import tempfile
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Mapping, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # systemd executes this file directly with cwd=/ and no PYTHONPATH.  Make
@@ -70,6 +71,7 @@ SCHEMA_VERSION = "clockify-review-cycle/v1"
 _RECOVERY_DERIVED_FIELDS = (
     "replay", "replay_return", "publication_receipt", "delivery_receipt",
     "historical_adoption_receipt", "source_run_id", "replay_run_id", "review_ids",
+    "native_credit_snapshot", "native_credit_transition",
 )
 _FINISHED_REPAIR_REQUEST = "review-cycle-finished-recovery-repair-request/v1"
 _FINISHED_REPAIR_RECEIPT = "review-cycle-finished-recovery-repair-receipt/v1"
@@ -309,6 +311,12 @@ def _recovery_source_history(
     )
     if source is None:
         raise CycleError("recovery publication history has no verified source")
+    if record.get("native_credit_snapshot") is not None:
+        original = (record["native_credit_transition"]["original_source"]
+            if record.get("native_credit_transition") is not None else source)
+        # Authenticate the old selection before archiving and retiring it.
+        # A frozen selection never discovers history or writes state here.
+        _freeze_native_credit_input(config, {}, Path(), dict(record), since, original)
     replay = _stage_from_state(
         config, record, "replay", since, until, replay=True,
         expected_snapshot_digests=source["snapshot_digests"],
@@ -741,7 +749,7 @@ def load_config(path: Path) -> dict[str, Any]:
         raise CycleError("config must be valid JSON") from exc
     if not isinstance(config, dict) or not _REQUIRED.issubset(config):
         raise CycleError("config is missing required review-cycle fields")
-    if set(config) - (_REQUIRED | {"runs_dir", "catchup_until", "max_slices", "total_child_budget_seconds", "monthly_unresolved_alias_proof", "monthly_unresolved_historical_sources", "meeting_publication_bindings", "native_credit_input", "private_routing", "publication_presentation", "pending_review_selection"}):
+    if set(config) - (_REQUIRED | {"runs_dir", "catchup_until", "max_slices", "total_child_budget_seconds", "monthly_unresolved_alias_proof", "monthly_unresolved_historical_sources", "meeting_publication_bindings", "native_credit_input", "private_routing", "publication_presentation", "pending_review_selection", "review_batch_publication"}):
         raise CycleError("config contains unsupported review-cycle fields")
     if "native_credit_input" in config:
         handle = config["native_credit_input"]
@@ -751,7 +759,7 @@ def load_config(path: Path) -> dict[str, Any]:
         _canonical_runtime_path(handle["path"], label="native credit input")
     if "meeting_publication_bindings" in config:
         _canonical_runtime_path(config["meeting_publication_bindings"], label="meeting publication bindings")
-    for key in ("publication_presentation", "pending_review_selection"):
+    for key in ("publication_presentation", "pending_review_selection", "review_batch_publication"):
         if key in config:
             _canonical_runtime_path(config[key], label=key)
     if "monthly_unresolved_historical_sources" in config:
@@ -2229,6 +2237,7 @@ def _publisher_command(
         "--run-id", str(source["run_id"]),
         "--result-output", str(result_path),
         "--monthly-unresolved",
+        "--retain-provenance-debt",
         "--enable-write",
     ]
     if config.get("monthly_unresolved_alias_proof"):
@@ -2239,7 +2248,8 @@ def _publisher_command(
     if meeting_bindings is not None:
         command.extend(["--meeting-publication-bindings", str(meeting_bindings)])
     for key, flag in (("publication_presentation", "--publication-presentation"),
-                      ("pending_review_selection", "--pending-review-selection")):
+                      ("pending_review_selection", "--pending-review-selection"),
+                      ("review_batch_publication", "--review-batch-publication")):
         optional = _source_publication_input(config, source, sheet_title=sheet_title, key=key)
         if optional is not None:
             command.extend([flag, str(optional)])
@@ -2252,6 +2262,13 @@ def _source_publication_input(config: Mapping[str, Any], source: Mapping[str, An
     from scripts import clockify_publication_presentation as display, clockify_source_adoptions as adoptions
     path = Path(str(config[key]))
     try:
+        if key == "review_batch_publication":
+            from scripts import clockify_review_batch_publication as prepared_batches
+            document, _handle = prepared_batches.load(path)
+            if document["spreadsheet_id"] != config["spreadsheet_id"]:
+                raise ValueError("prepared review publication destination differs")
+            return path if (document["sheet_title"] == sheet_title and document["run_id"] == source["run_id"]
+                and document["source_proposals"]["path"] == str(Path(str(source["run_dir"])) / "proposals.json")) else None
         if key == "publication_presentation":
             return display.for_source(path, source_dir=Path(str(source["run_dir"])), run_id=str(source["run_id"]),
                 spreadsheet_id=str(config["spreadsheet_id"]), sheet_title=sheet_title)
@@ -2296,7 +2313,8 @@ def _receipt_publication_config(config: Mapping[str, Any], document: Mapping[str
     records = document.get("publication_receipts", document.get("publications", []))
     from scripts import clockify_source_adoptions as adoptions
     for key, field, handle_field in (("publication_presentation", "presentation", "manifest"),
-                                      ("pending_review_selection", "pending_selection", "selection")):
+                                      ("pending_review_selection", "pending_selection", "selection"),
+                                      ("review_batch_publication", "review_batches", "binding")):
         handles = [item[field][handle_field] for item in records if isinstance(item, Mapping) and field in item] if isinstance(records, list) else []
         if handles:
             try:
@@ -2308,6 +2326,22 @@ def _receipt_publication_config(config: Mapping[str, Any], document: Mapping[str
                 raise CycleError("delivery publication input artifact has drifted") from exc
         elif key in config:
             config = {name: value for name, value in config.items() if name != key}
+    if "review_preparation" in document:
+        try:
+            from scripts import clockify_review_batch_publication as prepared
+            proof = document["review_preparation"]
+            if not isinstance(proof, Mapping) or set(proof) != {"binding", "outcome"}:
+                raise ValueError("partial editorial preparation proof differs")
+            adoptions._capture(proof["binding"], {})
+            frozen, _handle = prepared.load(Path(proof["binding"]["path"]))
+            if (frozen["schema_version"] != prepared.AUTO_SCHEMA or proof["outcome"] != frozen["preparation_outcome"]
+                    or proof["outcome"]["status"] != "incomplete" or proof["outcome"]["unprepared_seconds"] <= 0):
+                raise ValueError("partial editorial preparation outcome differs")
+            if config.get("review_batch_publication") not in {None, proof["binding"]["path"]}:
+                raise ValueError("partial editorial preparation bindings differ")
+            config = {**config, "review_batch_publication": proof["binding"]["path"]}
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            raise CycleError("delivery partial editorial preparation proof has drifted") from exc
     historical_handles = [item["historical_sources"] for item in records
                           if isinstance(item, Mapping) and "historical_sources" in item] if isinstance(records, list) else []
     if historical_handles:
@@ -2391,6 +2425,20 @@ def _expected_publication_receipts(
     partition_rows = {title: [receipt_row(item) for item in members]
                       for title, members in partitions if members and (
                           publication_profile is None or title != "unresolved-evidence")}
+    batch_path = _source_publication_input(config, source, sheet_title=sheet_title, key="review_batch_publication")
+    batch_projection = None
+    if batch_path is not None:
+        if timestamp_projection is not None or any(config.get(key) for key in (
+                "meeting_publication_bindings", "pending_review_selection", "publication_presentation")):
+            raise CycleError("prepared review batches conflict with another primary projection")
+        try:
+            from scripts import clockify_review_batch_publication as prepared_batches
+            batch_projection = prepared_batches.project(path=batch_path, source_dir=source_dir,
+                proposals=proposals, run_id=str(source["run_id"]), spreadsheet_id=str(config["spreadsheet_id"]),
+                sheet_title=sheet_title, project_allowlist=projects)
+            partition_rows = {sheet_title: batch_projection["rows"]}
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            raise CycleError("prepared review publication source projection differs") from exc
     meeting_bindings = _meeting_bindings_for_target(config, sheet_title)
     aliases = []
     if meeting_bindings is not None:
@@ -2447,6 +2495,8 @@ def _expected_publication_receipts(
             receipt["presentation"] = presentation_proof
         if selection is not None and title == sheet_title:
             receipt["pending_selection"] = selection["receipt"]
+        if batch_projection is not None and title == sheet_title:
+            receipt["review_batches"] = batch_projection["receipt"]
         receipts.append(receipt)
     if publication_profile in (clockify_monthly_unresolved.PROFILE, clockify_monthly_unresolved.ALIAS_PROFILE):
         rows = clockify_monthly_unresolved.project_rows(source_dir)
@@ -2500,16 +2550,47 @@ def _validated_publication_document(
          **({"source_aliases": item["source_aliases"]} if "source_aliases" in item else {}),
          **({"meeting_aliases": item["meeting_aliases"]} if "meeting_aliases" in item else {}),
          **({"historical_sources": item["historical_sources"]} if "historical_sources" in item else {}),
-         **({field: item[field] for field in ("presentation", "pending_selection") if field in item}),
+         **({field: item[field] for field in ("presentation", "pending_selection", "review_batches") if field in item}),
          **({field: item.get(field) for field in ("monthly_layout", "monthly_target_readback")}
-            if "monthly_layout" in item or "monthly_target_readback" in item else {})}
+            if "monthly_layout" in item or "monthly_target_readback" in item else {}),
+         **({field: item.get(field) for field in ("retained_provenance_debt", "retained_target_readback")}
+            if "retained_provenance_debt" in item or "retained_target_readback" in item else {})}
         for item in publications if isinstance(item, Mapping)
     ]
     base_expected = [{key: value for key, value in item.items() if key != "canonical_source_aliases"} for item in expected]
     legacy_rows = {}
+    retained_rows = {}
+    # Independent consumer snapshot: never accept the publisher's in-memory context.
+    monthly_source_context = clockify_monthly_unresolved.MonthlySourceContext()
     if len(retained) != len(publications) or len(publications) != len(expected):
         raise CycleError("publisher result destinations or readbacks differ")
     for index, item in enumerate(publications):
+        if "retained_provenance_debt" in item or "retained_target_readback" in item:
+            try:
+                if source_dir is None or "presentation" in expected[index]:
+                    raise ValueError("retained provenance source context differs")
+                proof = item["retained_target_readback"]
+                debt = item["retained_provenance_debt"]
+                canonical = [list(row) for row in monthly_source_context.row_index(source_dir).values()]
+                canonical_receipt = _publication_receipt(spreadsheet_id=expected[index]["spreadsheet_id"],
+                    sheet_title=expected[index]["sheet_title"], rows=canonical)
+                if (not expected[index]["sheet_title"].endswith(" unresolved evidence")
+                        or any(expected[index].get(field) != value for field, value in canonical_receipt.items())):
+                    raise ValueError("retained provenance does not bind expected monthly source")
+                rows = clockify_monthly_unresolved.rows_for_layout(canonical, proof["layout"])
+                digests = clockify_monthly_unresolved.validate_retained_debt(source_dir, rows, debt,
+                    spreadsheet_id=expected[index]["spreadsheet_id"], sheet_title=expected[index]["sheet_title"],
+                    layout=proof["layout"])
+                clockify_monthly_unresolved.validate_retained_readback(proof, debt,
+                    spreadsheet_id=expected[index]["spreadsheet_id"], sheet_title=expected[index]["sheet_title"])
+                base_expected[index] = {**base_expected[index],
+                    **_publication_receipt(spreadsheet_id=expected[index]["spreadsheet_id"],
+                        sheet_title=expected[index]["sheet_title"], rows=rows,
+                        rows_digest=clockify_monthly_unresolved.retained_rows_digest([row[0] for row in rows], digests)),
+                    "retained_provenance_debt": debt, "retained_target_readback": proof}
+                retained_rows[index] = rows
+            except (OSError, KeyError, TypeError, ValueError) as exc:
+                raise CycleError("publisher retained provenance debt differs") from exc
         if "pending_selection" in item and "pending_selection" in expected[index]:
             try:
                 from scripts import clockify_pending_runtime_proof as pending_runtime
@@ -2523,7 +2604,7 @@ def _validated_publication_document(
         if item.get("monthly_layout") != clockify_monthly_unresolved.LEGACY_LAYOUT or source_dir is None:
             raise CycleError("publisher monthly legacy layout or source context differs")
         try:
-            canonical_rows = clockify_monthly_unresolved.project_rows(source_dir)
+            canonical_rows = [list(row) for row in monthly_source_context.row_index(source_dir).values()]
             if "presentation" in expected[index]:
                 from scripts import clockify_publication_presentation as display
                 proof = expected[index]["presentation"]
@@ -2579,11 +2660,15 @@ def _validated_publication_document(
                 from scripts import clockify_source_adoptions
                 handle = expected[index]["historical_sources"]
                 clockify_source_adoptions._capture(handle, {})
-                historical_sources, _ = clockify_monthly_unresolved.load_historical_sources(Path(handle["path"]))
+                historical_sources, _ = clockify_monthly_unresolved.load_historical_sources(
+                    Path(handle["path"]), source_context=monthly_source_context)
+            alias_rows = retained_rows.get(index, legacy_rows.get(index))
+            if alias_rows is None:
+                alias_rows = [list(row) for row in monthly_source_context.row_index(source_dir).values()]
             aliases = clockify_monthly_unresolved.validate_canonical_aliases(
-                source_dir, legacy_rows.get(index, clockify_monthly_unresolved.project_rows(source_dir)),
-                item["canonical_source_aliases"], layout=item.get("monthly_layout"),
-                historical_sources=historical_sources,
+                source_dir, alias_rows,
+                item["canonical_source_aliases"], layout=item.get("monthly_layout", item.get("retained_target_readback", {}).get("layout")),
+                historical_sources=historical_sources, source_context=monthly_source_context,
             )
         except (OSError, KeyError, TypeError, ValueError) as exc:
             raise CycleError("publisher canonical alias proof differs") from exc
@@ -2604,6 +2689,10 @@ def _validated_publication_document(
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise CycleError("publisher monthly legacy target readback differs") from exc
+    try:
+        monthly_source_context.assert_unchanged()
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        raise CycleError("publisher monthly source changed during validation") from exc
     return retained
 
 
@@ -2668,6 +2757,17 @@ def _delivery_document(
     if source.get("coverage", {}).get("status") == "incomplete":
         unsigned["schema_version"] = PARTIAL_RECEIPT_SCHEMA_VERSION
         unsigned["source_completeness"] = dict(source["coverage"])
+    prepared_path = _source_publication_input(config, source, sheet_title=sheet_title, key="review_batch_publication")
+    if prepared_path is not None:
+        from scripts import clockify_review_batch_publication as prepared
+        frozen, handle = prepared.load(prepared_path)
+        if frozen.get("preparation_outcome", {}).get("status") == "incomplete":
+            unsigned["schema_version"] = PARTIAL_RECEIPT_SCHEMA_VERSION
+            unsigned["review_preparation"] = {"binding": handle, "outcome": frozen["preparation_outcome"]}
+    retained_debt = [entry for receipt in publication_receipts for entry in receipt.get("retained_provenance_debt", [])]
+    if retained_debt:
+        unsigned["schema_version"] = PARTIAL_RECEIPT_SCHEMA_VERSION
+        unsigned["retained_provenance_debt"] = retained_debt
     if publication_profile is not None:
         unsigned["publication_profile"] = publication_profile
     meeting_bindings = _meeting_bindings_for_target(config, sheet_title)
@@ -2993,41 +3093,168 @@ def _verify_credit_adoption_transition(
         raise CycleError("credit adoption does not descend from frozen corrections")
 
 
+def _native_credit_basis(config: Mapping[str, Any], source: Mapping[str, Any]) -> tuple[Any, Any, Any, Any]:
+    """One original completed collection is the basis for selection and credit."""
+    from scripts import clockify_checkpoint_snapshot
+    if source.get("coverage", {}).get("status") != "complete" or source["coverage"].get("incomplete_sources") != []:
+        raise ValueError("native credit source is not complete")
+    run_dir = _canonical_runtime_path(source["run_dir"], label="native credit source")
+    proposals = _json_file(run_dir / "proposals.json", "native credit proposals")
+    if _digest(run_dir / "proposals.json") != source["proposals_digest"]:
+        raise ValueError("native credit source proposals differ")
+    report, artifacts = collector_receipts.verified_run_native_checkpoint(run_dir)
+    if not artifacts:
+        raise ValueError("native credit requires sealed completed collection proof")
+    metadata = report["clockify_native_checkpoint"]
+    request = metadata["request"]
+    if (request["workspace_id"], request["user_id"]) != (config["workspace_id"], config["member_id"]):
+        raise ValueError("native credit target differs from collection")
+    proof = clockify_checkpoint_snapshot.load_checkpoint_snapshot(run_dir / collector_receipts.NATIVE_CHECKPOINT_PREFIX,
+        workspace_id=request["workspace_id"], user_id=request["user_id"],
+        since=dt.datetime.fromisoformat(request["since_utc"].replace("Z", "+00:00")),
+        until=dt.datetime.fromisoformat(request["until_utc"].replace("Z", "+00:00")),
+        expected_manifest_sha256=metadata["manifest_sha256"])
+    ledger_path = run_dir / "evidence/evidence-ledger.json"
+    if _digest(ledger_path) != source["artifact_digests"]["evidence_ledger"]:
+        raise ValueError("native credit ledger differs from completed source")
+    return proposals, _json_file(ledger_path, "native credit ledger"), proof, metadata
+
+
+def _freeze_native_credit_input(config: Mapping[str, Any], state: dict[str, Any], state_path: Path,
+        record: dict[str, Any], since: str, source: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Fresh-only selection from this cycle's post-success packets; resume is offline."""
+    from scripts import clockify_source_adoptions as adoptions
+    if "native_credit_input" in config and "native_credit_snapshot" not in record:
+        # Explicit historical adapter retains its contract, but cannot replace
+        # a selection already frozen by this fresh cycle.
+        return config
+    frozen = record.get("native_credit_snapshot")
+    if frozen is None and "state_dir" not in config:
+        return config  # Standalone legacy no-credit callers have no history owner.
+    if frozen is None and any(record.get(key) is not None for key in (
+            "replay", "replay_return", "publication_receipt", "delivery_receipt")):
+        return config  # Never reinterpret a historical delivery using new history.
+    try:
+        source_digest = _value_digest(source)
+        if frozen is not None:
+            if (not isinstance(frozen, Mapping) or set(frozen) != {"source_digest", "input_handle", "routing_debt"}
+                    or frozen["source_digest"] != source_digest):
+                raise ValueError("native credit snapshot source differs")
+            adoptions._capture(frozen["input_handle"], {})
+            return {**config, "native_credit_input": dict(frozen["input_handle"])}
+        directory = _path(config, "state_dir") / "native-credit-inputs"
+        directory = _canonical_runtime_path(str(directory), label="native credit history")
+        proposals, ledger, proof = [], {}, None
+        # Missing optional historical metadata means no automatic credit, not
+        # loss of otherwise reviewable legacy work. Invalid opted-in metadata
+        # still goes through the full sealed checkpoint verifier.
+        if directory.exists() and "clockify_native_checkpoint" in _json_file(
+                Path(source["run_dir"]) / "run-report.json", "native credit source report"):
+            proposals, ledger, proof, _metadata = _native_credit_basis(config, source)
+        identities: dict[Any, list[Any]] = {}
+        for proposal in proposals:
+            try:
+                identity = adoptions._native_meeting_identity(adoptions._source_events(proposal, ledger), proposal)
+                identities.setdefault(identity, []).append(proposal)
+            except adoptions.AdoptionError:
+                continue
+        native_ids = {entry.get("id") for entry in proof.entries} if proof is not None else set()
+        selected = {}
+        routing_debt = []
+        cache: dict[tuple[str, str], bytes] = {}
+        for child in sorted(directory.iterdir()) if identities else []:
+            if not re.fullmatch(r"[0-9a-f]{64}", child.name):
+                continue
+            child = _canonical_runtime_path(str(child), label="native credit packet directory")
+            path = child / "packet.json"
+            if not path.exists():
+                continue  # An interrupted producer has not yet committed its packet.
+            packet = json.loads(adoptions._capture({"path": str(path), "sha256": _digest(path)}, cache))
+            if (not isinstance(packet, dict) or set(packet) != {"schema_version", "posted"}
+                    or packet["schema_version"] != "clockify-native-credit-input/v1"
+                    or not isinstance(packet["posted"], list) or len(packet["posted"]) > 512):
+                raise ValueError("native credit history packet differs")
+            for item in packet["posted"]:
+                if not isinstance(item, dict) or set(item) != {"receipt", "prior_review_id", "clockify_entry_id", "artifacts"}:
+                    raise ValueError("native credit history row differs")
+                native_id = item["clockify_entry_id"]
+                if native_id not in native_ids:
+                    continue  # Posts outside this collection's window are not credit candidates.
+                prior = adoptions.verify_prior_native_proof(item["artifacts"], item["prior_review_id"], native_id,
+                    workspace_id=config["workspace_id"], member_id=config["member_id"], capture_cache=cache)
+                try:
+                    identity = adoptions._native_meeting_identity(prior["source_events"], prior["prior_proposal"])
+                except adoptions.AdoptionError:
+                    continue
+                if identity not in identities:
+                    continue
+                payload = prior["payload"]
+                for current in identities[identity]:
+                    suffix = current.get("clockify_project_suffix")
+                    tags = current.get("tag_suffixes")
+                    posted_tags = payload.get("tagIds") or []
+                    same_route = (isinstance(suffix, str) and bool(suffix)
+                        and str(payload.get("projectId") or "").endswith(suffix)
+                        and isinstance(tags, list) and len(tags) == len(posted_tags)
+                        and all(isinstance(tag, str) and bool(tag)
+                            and sum(str(native_tag).endswith(tag) for native_tag in posted_tags) == 1 for tag in tags)
+                        and all(sum(str(native_tag).endswith(tag) for tag in tags) == 1 for native_tag in posted_tags)
+                        and payload.get("billable") is current.get("billable")
+                        and payload.get("taskId") is None)
+                    if not same_route:
+                        routing_debt.append({"review_id": stable_review_id(current), "clockify_entry_id": native_id,
+                            "recording_provider": identity[0], "recording_id": identity[1],
+                            "posted_project_suffix": str(payload.get("projectId") or "")[-6:],
+                            "proposed_project_suffix": suffix,
+                            "reason": "same_recording_requires_routing_reconciliation"})
+                        break
+                else:
+                    if native_id in selected and selected[native_id] != item:
+                        raise ValueError("native credit history repeats conflicting original proof")
+                    selected[native_id] = item
+                # A routing mismatch remains a full review proposal with its
+                # existing Clockify overlap warning, never silently credited.
+        packet = {"schema_version": "clockify-native-credit-input/v1", "posted": [selected[key] for key in sorted(selected)]}
+        if len(packet["posted"]) > 512:
+            raise ValueError("selected native credit packet exceeds existing finite consumer limit")
+        output = _path(config, "state_dir") / "native-credit-snapshots" / (
+            _value_digest({"source": source_digest, "packet": packet}).removeprefix("sha256:") + ".json")
+        output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _canonical_runtime_path(str(output.parent), label="native credit snapshots")
+        clockify_review_run._write_snapshot(output,
+            (json.dumps(packet, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode(), label="native credit input")
+        handle = {"path": str(output), "sha256": _digest(output)}
+        effective = {**config, "native_credit_input": handle}
+        # Authenticate receipt and current native payload BEFORE committing the
+        # selected inventory to state. This calls no network or inference.
+        _native_credit_plan(effective, source)
+        record["native_credit_snapshot"] = {"source_digest": source_digest, "input_handle": handle,
+            "routing_debt": routing_debt}
+        _persist_state(state_path, state, since, record)
+        return effective
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise CycleError("automatic native credit history or snapshot is invalid") from exc
+
+
 def _native_credit_plan(config: Mapping[str, Any], source: Mapping[str, Any]) -> dict[str, Any] | None:
     """Produce recording-only credits from an explicit finite original-proof packet."""
     if "native_credit_input" not in config:
         return None
-    from scripts import clockify_source_adoptions as adoptions, clockify_checkpoint_snapshot
+    from scripts import clockify_source_adoptions as adoptions
     from scripts import work_accounting_pipeline as pipeline
     try:
-        if source.get("coverage", {}).get("status") != "complete" or source["coverage"].get("incomplete_sources") != []:
-            raise ValueError("native credit source is not complete")
         cache: dict[tuple[str, str], bytes] = {}
         packet = json.loads(adoptions._capture(config["native_credit_input"], cache))
         if (not isinstance(packet, dict) or set(packet) != {"schema_version", "posted"}
                 or packet["schema_version"] != "clockify-native-credit-input/v1"
                 or not isinstance(packet["posted"], list) or len(packet["posted"]) > 512):
             raise ValueError("finite native credit input shape differs")
+        if not packet["posted"]:
+            return {"credits": [], "collection_snapshot": None, "input_handle": dict(config["native_credit_input"]),
+                    "checkpoint_sha256": None}
         run_dir = _canonical_runtime_path(source["run_dir"], label="native credit source")
-        proposals = _json_file(run_dir / "proposals.json", "native credit proposals")
-        if _digest(run_dir / "proposals.json") != source["proposals_digest"]:
-            raise ValueError("native credit source proposals differ")
-        report, artifacts = collector_receipts.verified_run_native_checkpoint(run_dir)
-        if not artifacts:
-            raise ValueError("native credit requires sealed completed collection proof")
-        metadata = report["clockify_native_checkpoint"]
-        request = metadata["request"]
-        if (request["workspace_id"], request["user_id"]) != (config["workspace_id"], config["member_id"]):
-            raise ValueError("native credit target differs from collection")
-        proof = clockify_checkpoint_snapshot.load_checkpoint_snapshot(run_dir / collector_receipts.NATIVE_CHECKPOINT_PREFIX,
-            workspace_id=request["workspace_id"], user_id=request["user_id"],
-            since=dt.datetime.fromisoformat(request["since_utc"].replace("Z", "+00:00")),
-            until=dt.datetime.fromisoformat(request["until_utc"].replace("Z", "+00:00")),
-            expected_manifest_sha256=metadata["manifest_sha256"])
+        proposals, ledger_doc, proof, metadata = _native_credit_basis(config, source)
         ledger_path = run_dir / "evidence/evidence-ledger.json"
-        if _digest(ledger_path) != source["artifact_digests"]["evidence_ledger"]:
-            raise ValueError("native credit ledger differs from completed source")
-        ledger_doc = _json_file(ledger_path, "native credit ledger")
         current_by_recording: dict[tuple[str, str, str], list[str]] = {}
         for proposal in proposals:
             review_id = stable_review_id(proposal)
@@ -3137,6 +3364,7 @@ def _adopt_native_credit(config: Mapping[str, Any], state: dict[str, Any], state
     """Prepare once, resume one exact offline repair, then adopt before replay."""
     from scripts import review_corrections, work_accounting_pipeline as pipeline
     if "native_credit_transition" not in record:
+        config = _freeze_native_credit_input(config, state, state_path, record, since, source)
         plan = _native_credit_plan(config, source)
         if plan is None or not plan["credits"]:
             return dict(source)
@@ -4572,7 +4800,10 @@ def _verify_fresh_native_source(config: Mapping[str, Any], record: Mapping[str, 
                     host.get("collector_contract") != "canonical_export_v1"
                     or not isinstance(attestation, Mapping) or not isinstance(export, Mapping)
                     or export.get("provenance") != "full_context_remote_export"
-                    or attestation.get("collector_script_sha256") not in {digest, *collector.COMPATIBLE_CANONICAL_EXPORT_DIGESTS}
+                    or attestation.get("collector_script_sha256") not in {
+                        digest, *collector.COMPATIBLE_CANONICAL_EXPORT_DIGESTS,
+                        *collector.MODERN_CANONICAL_EXPORT_DIGESTS,
+                    }
                     or export.get("collector_script_sha256") != attestation.get("collector_script_sha256")
                     or not isinstance(attestation.get("runtime_identity"), Mapping)
                 ):
@@ -4708,7 +4939,7 @@ def _validate_delivered_state(config: Mapping[str, Any], state: Mapping[str, Any
         raise CycleError("cycle state slices are invalid")
     for since, raw_record in slices.items():
         if not isinstance(raw_record, Mapping) or raw_record.get("status") not in {
-            "delivered", "delivered_with_exceptions", "published_with_source_gaps",
+            "delivered", "delivered_with_exceptions", "published_with_source_gaps", "published_with_preparation_gaps",
         }:
             continue
         until = raw_record.get("until")
@@ -4783,8 +5014,11 @@ def _validate_delivered_state(config: Mapping[str, Any], state: Mapping[str, Any
                 _verify_historical_adoption(
                     stage_config, raw_record, adoption, since, until, source, replay,
                 )
-            partial = raw_record.get("status") == "published_with_source_gaps"
-            if partial != (source["coverage"].get("status") != "complete"):
+            source_partial = source["coverage"].get("status") != "complete"
+            preparation_partial = raw_record.get("status") == "published_with_preparation_gaps"
+            partial = raw_record.get("status") == "published_with_source_gaps" or preparation_partial
+            if ((raw_record.get("status") == "published_with_source_gaps" and not source_partial)
+                    or (not partial and source_partial)):
                 raise CycleError("publication status differs from source coverage")
             receipt = raw_record.get("publication_receipt" if partial else "delivery_receipt")
             if not isinstance(receipt, str):
@@ -4793,6 +5027,21 @@ def _validate_delivered_state(config: Mapping[str, Any], state: Mapping[str, Any
             _verify_delivery_receipt(
                 Path(receipt), graph_config, since, until, source, replay, sheet_title=title
             )
+            document = _json_file(Path(receipt), "delivered publication receipt")
+            proof = document.get("review_preparation")
+            retained_debt = document.get("retained_provenance_debt")
+            if preparation_partial != (proof is not None or bool(retained_debt)):
+                raise CycleError("publication status differs from immutable preparation outcome")
+            if preparation_partial and raw_record.get("exceptions_complete") is not False:
+                raise CycleError("stored preparation debt differs from immutable publication proof")
+            if proof is not None:
+                stored = raw_record.get("review_preparation")
+                if (not isinstance(stored, Mapping) or stored.get("binding") != proof["binding"]
+                        or any(stored.get(key) != value for key, value in proof["outcome"].items())
+                        or raw_record.get("exceptions_complete") is not False):
+                    raise CycleError("stored preparation debt differs from immutable publication proof")
+            if retained_debt and raw_record.get("retained_provenance_debt") != retained_debt:
+                raise CycleError("stored retained provenance debt differs from immutable publication proof")
 
 
 def _attempt_id(debt_id: str, ordinal: int) -> str:
@@ -5404,6 +5653,71 @@ def _run_exact_recovery(
     )
 
 
+def _summarize_review_groups(activities: Sequence[Mapping[str, Any]], cache_path: Path) -> Mapping[str, Any]:
+    """Use the existing semantic response cache only for fresh group wording."""
+    from scripts import clockify_review_group_summary, semantic_analyzer
+    return clockify_review_group_summary.summarize_groups(activities,
+        cache=semantic_analyzer.AnalyzerResponseCache(cache_path))
+
+
+def _prepare_new_publication(
+    config: Mapping[str, Any], source: Mapping[str, Any], *, sheet_title: str, state_dir: Path,
+) -> tuple[Mapping[str, Any], dict[str, Any]]:
+    """New-delivery-only preparation; never called to reconstruct old receipts."""
+    from scripts import clockify_review_batch_publication as prepared
+    source_dir = Path(str(source["run_dir"]))
+    # These adapters have their own immutable representation/retirement proofs.
+    # Combining them with automatic batches needs an explicit integration, not
+    # silently dropping a configured safeguard or reverting to raw proposals.
+    effective = dict(config)
+    exclusions = []
+    if config.get("meeting_publication_bindings"):
+        if _meeting_bindings_for_target(config, sheet_title) is not None:
+            exclusions.append("meeting_publication_bindings")
+        else:
+            effective.pop("meeting_publication_bindings", None)
+    for key in ("pending_review_selection", "publication_presentation"):
+        if config.get(key):
+            if _source_publication_input(config, source, sheet_title=sheet_title, key=key) is not None:
+                exclusions.append(key)
+            else:
+                effective.pop(key, None)
+    config = effective
+    tombstone_path = source_dir / "review-tombstones.json"
+    if tombstone_path.exists() and _json_file(tombstone_path, "native review tombstones"):
+        exclusions.append("native_review_tombstones")
+    if exclusions:
+        return config, {"status": "incomplete", "reason": "prepared_projection_integration_gap", "exclusions": exclusions}
+    explicit = _source_publication_input(config, source, sheet_title=sheet_title, key="review_batch_publication")
+    if explicit is not None:
+        document, handle = prepared.load(explicit)
+        proposals, _exceptions = _validate_accounting(source_dir)
+        prepared.project(path=explicit, source_dir=source_dir, proposals=proposals, run_id=str(source["run_id"]),
+            spreadsheet_id=str(config["spreadsheet_id"]), sheet_title=sheet_title,
+            project_allowlist=project_allowlist(_json_file(source_dir / "routing.json", "source routing snapshot")))
+        # Operator-directed immutable v1 captures remain compatible. They did
+        # not claim automatic full preparation, and this consumer cannot invent it.
+        outcome = document.get("preparation_outcome", {"status": "complete", "basis": "operator_directed_v1"})
+        return config, {**outcome, "binding": handle}
+    output = state_dir / "prepared-review-publications" / f"{source['run_id']}.json"
+    try:
+        outcome = prepared.prepare(source_dir=source_dir, output=output, run_id=str(source["run_id"]),
+            spreadsheet_id=str(config["spreadsheet_id"]), sheet_title=sheet_title, timezone=str(config["timezone"]),
+            consolidate_materialized_corrections=True,
+            native_credit_directory=(state_dir / "native-credit-inputs"
+                if source.get("artifact_digests", {}).get("evidence_ledger")
+                and "clockify_native_checkpoint" in _json_file(source_dir / "run-report.json", "source report") else None),
+            summary_provider=lambda activities: _summarize_review_groups(activities,
+                _path(config, "cache") if config.get("cache") else state_dir / "analyzer-cache-v2.jsonl"))
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        # No raw source content is placed in state or error reporting. Preserve
+        # the already verified replay and require an explicit repair/retry.
+        if output.exists():
+            raise CycleError("immutable automatic review preparation drifted") from exc
+        return config, {"status": "incomplete", "reason": "editorial_authority_unavailable"}
+    return {**config, "review_batch_publication": outcome["binding"]["path"]}, outcome
+
+
 def _run_slice(
     config: Mapping[str, Any], state: dict[str, Any], state_path: Path,
     state_dir: Path, root: Path, since: str, until: str,
@@ -5831,19 +6145,47 @@ def _run_slice(
         record.update({"status": "replay_verified", "replay": replay})
         _persist_state(state_path, state, since, record)
 
-    receipt_path = (
-        state_dir / "partial-publication-receipts" / f"{since}-{source['run_id']}.json"
-        if partial_publication else state_dir / "delivery-receipts" / f"{since}.json"
-    )
+    partial_receipt_path = state_dir / "partial-publication-receipts" / f"{since}-{source['run_id']}.json"
+    receipt_path = (partial_receipt_path if partial_publication or partial_receipt_path.exists()
+                    else state_dir / "delivery-receipts" / f"{since}.json")
     publisher_result_path = (
         _runs_dir(config) / f"publication-{source['run_id']}" / "autopilot-result.json"
     )
+    preparation_partial = False
+    retained_only = False
     if receipt_path.exists():
         _verify_delivery_receipt(
             receipt_path, config, since, until, source, replay,
             sheet_title=sheet_title,
         )
+        historical = _json_file(receipt_path, "existing publication receipt")
+        if "review_preparation" in historical:
+            preparation_partial = True
+            record["review_preparation"] = {**historical["review_preparation"]["outcome"],
+                "binding": historical["review_preparation"]["binding"]}
+        if historical.get("retained_provenance_debt"):
+            preparation_partial = True
+            record["retained_provenance_debt"] = historical["retained_provenance_debt"]
+            retained_only = "review_preparation" not in historical
     else:
+        config, preparation = _prepare_new_publication(config, source, sheet_title=sheet_title, state_dir=state_dir)
+        record["review_preparation"] = preparation
+        if preparation["status"] != "complete":
+            ready = preparation.get("prepared_seconds", 0) > 0
+            if not ready and preparation.get("binding"):
+                # Existing native monthly evidence remains visible even when
+                # no routed primary row is publication-ready.
+                ready = bool(clockify_monthly_unresolved.project_rows(Path(str(source["run_dir"]))))
+            if not ready:
+                record["status"] = "incomplete"
+                record["exceptions_complete"] = False
+                _persist_state(state_path, state, since, record)
+                return {"status": "incomplete", "reason": preparation.get("reason", "review_preparation_incomplete"),
+                        "preparation": preparation, "slice": {"since": since, "until": until},
+                        "advance_frontier": False}
+            preparation_partial = True
+            receipt_path = partial_receipt_path
+        _persist_state(state_path, state, since, record)
         receipt = _delivery_document(
             config, since, until, source, replay, sheet_title=sheet_title
         )
@@ -5886,10 +6228,16 @@ def _run_slice(
         receipt = _delivery_document(
             config, since, until, source, replay, sheet_title=sheet_title, publication_readbacks=publication_readbacks,
         )
+        if receipt.get("retained_provenance_debt"):
+            preparation_partial = True
+            receipt_path = partial_receipt_path
+            record["retained_provenance_debt"] = receipt["retained_provenance_debt"]
+            retained_only = "review_preparation" not in receipt
         _write_delivery_receipt(receipt_path, receipt)
 
     record.update({
         "status": (
+            "published_with_preparation_gaps" if preparation_partial else
             "published_with_source_gaps" if partial_publication else
             "delivered_with_exceptions" if source["exception_ids"] else "delivered"
         ),
@@ -5897,14 +6245,16 @@ def _run_slice(
         "replay_run_id": replay["run_id"],
         "review_ids": source["review_ids"],
         "exception_ids": source["exception_ids"],
-        "exceptions_complete": not source["exception_ids"],
+        "exceptions_complete": not source["exception_ids"] and not preparation_partial,
     })
-    record["publication_receipt" if partial_publication else "delivery_receipt"] = str(receipt_path.resolve())
+    record["publication_receipt" if partial_publication or preparation_partial else "delivery_receipt"] = str(receipt_path.resolve())
     _persist_state(state_path, state, since, record)
     return {
         "status": record["status"],
         "slice": {"since": since, "until": until, "exception_ids": source["exception_ids"]},
-        "advance_frontier": _record_advances_frontier(record, advance_frontier),
+        # Provenance debt holds completed_through, not independent routine
+        # scheduling: exact source/replay are already sealed and need no retry.
+        "advance_frontier": False if preparation_partial and not retained_only else _record_advances_frontier(record, advance_frontier),
     }
 
 
@@ -6110,7 +6460,7 @@ def _verify_selected_partial_predecessor(
     config: Mapping[str, Any], prior: Mapping[str, Any], since: str, until: str,
 ) -> None:
     """Authenticate only this retained partial graph, without inventing recovery."""
-    if prior.get("status") != "published_with_source_gaps":
+    if prior.get("status") not in {"published_with_source_gaps", "published_with_preparation_gaps"}:
         return
     if (prior.get("until") != until or prior.get("delivery_receipt") is not None
         or prior.get("historical_adoption_receipt") is not None):
@@ -6188,9 +6538,9 @@ def _adopt_selected_historical_slice(config: Mapping[str,Any], request: Mapping[
             raise CycleError("selected historical frozen period proof differs")
         # A partial publication may be superseded only after authenticating its
         # native graph. Its complete original record and receipt remain retained.
-        partial = prior.get("status") == "published_with_source_gaps"
+        partial = prior.get("status") in {"published_with_source_gaps", "published_with_preparation_gaps"}
         if (any(prior.get(k) is not None for k in ("delivery_receipt","historical_adoption_receipt"))
-            or not partial and any(prior.get(k) is not None for k in ("replay","publication_receipt"))):
+            or not partial and prior.get("publication_receipt") is not None):
             raise CycleError("selected historical recovery cannot overwrite delivery history")
         _verify_selected_partial_predecessor(config, prior, since, until)
         with _selected_runs_config(config,request["runs_root"]) as validation:
@@ -6200,6 +6550,17 @@ def _adopt_selected_historical_slice(config: Mapping[str,Any], request: Mapping[
                     title=_sheet_title(config["monthly_sheet_title_template"],since=since))
             except (OSError,ValueError,TypeError,KeyError,IndexError) as exc:
                 raise CycleError("selected historical delivery proof is invalid") from exc
+        if not partial and prior.get("replay") is not None:
+            # A failed delivery may already retain this exact authenticated
+            # pair. Nonfinancial availability adopts that history unchanged;
+            # it cannot replace either stage or an existing publication.
+            if not (prior.get("status") == "failed" and prior.get("source") == source
+                and prior["replay"] == replay and delivery.get("review_availability_only") is True
+                and all(delivery.get(k) is False for k in ("source_debt_resolution_claimed",
+                    "diagnostic_resolution_claimed","financial_coverage_claimed","financial_equivalence_claimed"))
+                and all(type(delivery.get(k)) is int and delivery[k] == 0 for k in (
+                    "additional_credited_seconds","posted_credits_created","adoption_provider_writes"))):
+                raise CycleError("selected historical recovery cannot overwrite replay history")
         if delivery["diagnostics"]["status"] != "complete":
             return {"status":"diagnostic_proof_missing","slice":{"since":since,"until":until},"selected_delivery":delivery}
         debt_path = state_dir/"source-coverage.json"
@@ -6215,6 +6576,10 @@ def _adopt_selected_historical_slice(config: Mapping[str,Any], request: Mapping[
         resolved = []
         bundle = collector_receipts.load_completion_bundle(Path(source["run_dir"])/"completion-bundle.json",run_dir=Path(source["run_dir"]))
         for item in tuple(store.active()):
+            # Factual review availability is not recovery of other source debt.
+            # Legacy selected-delivery contracts retain their existing behavior.
+            if delivery.get("source_debt_resolution_claimed") is False:
+                continue
             interval = item.interval
             if (interval.since_utc,interval.until_utc,interval.slice_id) != (bundle.since_utc,bundle.until_utc,bundle.slice_id):
                 continue
@@ -6572,6 +6937,7 @@ def run_cycle(config: Mapping[str, Any], *, enable_sheet_write: bool, today: dt.
         final_status = "delivered"
         final_reason: str | None = None
         any_exceptions = False
+        any_preparation_gaps = False
         budget = [float(config.get("total_child_budget_seconds", 7200))]
         for since, until, kind, generic in selected:
             if kind == "exact":
@@ -6592,6 +6958,7 @@ def run_cycle(config: Mapping[str, Any], *, enable_sheet_write: bool, today: dt.
             if outcome.get("reason") == "total_child_budget_exhausted":
                 final_reason = "total_child_budget_exhausted"
             any_exceptions = any_exceptions or final_status == "delivered_with_exceptions"
+            any_preparation_gaps = any_preparation_gaps or final_status == "published_with_preparation_gaps"
             if (
                 kind == "routine" and outcome.get("advance_frontier") is not False
             ) or outcome.get("advance_frontier") is True:
@@ -6601,8 +6968,10 @@ def run_cycle(config: Mapping[str, Any], *, enable_sheet_write: bool, today: dt.
                     state["scheduled_through"] = until
             _recompute_completed_through(config, state)
             _atomic(state_path, state)
-        if final_status not in {"incomplete", "failed", "recovery_blocked"} and any_exceptions:
+        if final_status not in {"incomplete", "failed", "recovery_blocked", "published_with_preparation_gaps"} and any_exceptions:
             final_status = "delivered_with_exceptions"
+        if any_preparation_gaps and final_status not in {"incomplete", "failed", "recovery_blocked"}:
+            final_status = "published_with_preparation_gaps"
         if final_reason == "total_child_budget_exhausted":
             final_status = "incomplete"
         result: dict[str, Any] = {"status": final_status, "slices": attempted}
@@ -6663,7 +7032,7 @@ def main(argv: list[str] | None = None) -> int:
         return 75
     if result.get("status") in {
         "idle", "locked", "delivered", "delivered_with_exceptions", "plan",
-        "published_with_source_gaps",
+        "published_with_source_gaps", "published_with_preparation_gaps",
     }:
         return 0
     print("clockify review cycle blocked: unsupported result status", file=sys.stderr)

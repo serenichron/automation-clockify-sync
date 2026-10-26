@@ -170,6 +170,68 @@ def _cited_timing_contexts(cited, timing):
     return contexts
 
 
+def _audited_daily_recording_credit(item: Mapping[str, Any]) -> dict[str, Any]:
+    """Reprove a saved review-only Daily remainder, never financial adoption."""
+    from scripts import clockify_sheet_publish as publisher
+    proposal, source = item["proposal"], item["source"]
+    try:
+        accounting, ledger, routing = source["accounting"], source["ledger"], source["routing"]
+        saved = accounting["proposals"]
+        if adoptions._source(saved, ledger, publisher.stable_review_id(proposal)) != proposal:
+            raise ValueError("selected Daily remainder differs from native output")
+        declaration = routing[pipeline.AUDITED_DAILY_KEY]
+        if accounting["allocation"]["deterministic_inputs"].get(pipeline.AUDITED_DAILY_KEY) != declaration:
+            raise ValueError("saved Daily recipe differs from frozen routing")
+        # This is the existing completed native source closure, not an external
+        # mutable GET or a financial/approval declaration supplied by the caller.
+        run = Path(source["artifacts"]["receipt"]["path"]).parent
+        pairs = pipeline._audited_daily_recording_pairs(ledger["events"], ledger["manifest"], routing,
+            pipeline._accounting_collection_snapshot(run, ledger["events"]))
+        canonical_id = proposal["provenance"]["canonical_meeting_id"]
+        pair = pairs[canonical_id]
+        siblings = sorted((p for p in saved if p.get("provenance", {}).get("canonical_meeting_id") == canonical_id),
+                          key=lambda p: _time(p["start"]))
+        reconciliation = [r for r in accounting["fathom_reconciliation"] if r.get("canonical_id") == canonical_id]
+        activities = {p["activity_id"] for p in siblings}
+        if (len(activities) != 1 or len(reconciliation) != 1 or reconciliation[0].get("status") != "proposed"
+                or reconciliation[0].get("source_evidence_ids") != pair["source_evidence_ids"]
+                or set(reconciliation[0].get("activity_ids", [reconciliation[0].get("activity_id")])) != activities
+                or any(d["activity_id"] in activities for d in accounting["allocation"]["evidence"])):
+            raise ValueError("saved Daily canonical membership differs")
+        template = copy.deepcopy(siblings[0])
+        original = pipeline._proposal({"activity_id": template["activity_id"], "workstream_id": template["workstream_id"]},
+            {}, "", pair["start"], pair["end"], pair["source_evidence_ids"], 1)
+        for field in ("start", "end", "duration_seconds", "duration_minutes", "candidate_key",
+                      "review_activity_key", "allocation_segment"):
+            template[field] = original[field]
+        expected = pipeline._slice_proposal_around_credits(template, [pair["block"]], "existing_clockify_overlap", [],
+            fully_credited_reason="audited same Daily recording intersection; review-only preparation")
+        if len(expected) != len(siblings) or not expected:
+            raise ValueError("saved Daily uncredited partition differs")
+        for actual, residual in zip(siblings, expected):
+            receipt = residual["provenance"]["credited_overlap_receipt"]
+            if (any(actual.get(field) != residual.get(field) for field in ("start", "end", "duration_seconds", "duration_minutes",
+                    "candidate_key", "review_activity_key", "allocation_segment"))
+                    or actual["provenance"].get("credited_overlap_receipt") != receipt
+                    or actual["provenance"].get("audited_daily_recording_credit") != pipeline._audited_daily_recipe(pair, receipt["credited_seconds"])
+                    or sorted(actual["provenance"]["evidence_ids"]) != sorted(pair["source_evidence_ids"])
+                    or actual.get("clockify_project_suffix") != pair["route"]["project_suffix"]
+                    or actual.get("client_project") != pair["route"]["project_name"]
+                    or sorted(actual.get("tag_suffixes", [])) != sorted(pair["route"].get("tag_suffixes", []))
+                    or actual.get("billable") is not pair["route"].get("billable", True)
+                    or "verified_posted_credit" in actual["provenance"]):
+                raise ValueError("saved Daily timing or source receipt differs")
+        credited = expected[0]["provenance"]["credited_overlap_receipt"]["credited_seconds"]
+        if credited + sum(p["duration_seconds"] for p in siblings) != original["duration_seconds"]:
+            raise ValueError("saved Daily source time is not conserved")
+        return {"recipe": pipeline.AUDITED_DAILY_RECIPE, "canonical_meeting_id": canonical_id,
+            "activity_id": proposal["activity_id"], "source_evidence_ids": pair["source_evidence_ids"],
+            "canonical_duration_seconds": original["duration_seconds"], "saved_duration_seconds": proposal["duration_seconds"],
+            "credited_seconds": credited, "collection_snapshot_sha256": declaration["collection_snapshot_sha256"]}
+    except (ValueError, KeyError, TypeError, AttributeError, OSError, pipeline.WorkAccountingError) as exc:
+        raise ValueError("pending selection audited Daily recording proof differs: " + str(exc)) from exc
+
+
 def _fixed_recording_credit(item: Mapping[str, Any]) -> dict[str, Any]:
     """Validate saved fixed source time, not inferred effort or financial credit.
 
@@ -180,6 +242,8 @@ def _fixed_recording_credit(item: Mapping[str, Any]) -> dict[str, Any]:
     """
     from scripts import clockify_sheet_publish as publisher, meeting_reconciliation as meetings
     proposal, source = item["proposal"], item["source"]
+    if "audited_daily_recording_credit" in proposal.get("provenance", {}):
+        return _audited_daily_recording_credit(item)
     try:
         accounting, ledger = source["accounting"], source["ledger"]
         saved = accounting["proposals"]
@@ -333,6 +397,25 @@ def _canonical_pool_events(all_sources: Mapping[str, Any]) -> dict[tuple[Any, ..
     return union
 
 
+def _saved_session_timing_pool_sources(source: Mapping[str, Any]) -> tuple[str, ...]:
+    """Read one immutable producer recipe, never the consumer's current routing."""
+    inputs = source["accounting"]["allocation"].get("deterministic_inputs", {})
+    if not isinstance(inputs, Mapping):
+        raise ValueError("pending selection saved timing recipe is invalid")
+    try:
+        sources = pipeline._session_timing_pool_sources(inputs)
+        if "routing" in source:
+            routing = source["routing"]
+            key = "session_timing_pool_sources"
+            if (not isinstance(routing, Mapping)
+                    or (key in routing) != (key in inputs)
+                    or routing.get(key) != inputs.get(key)):
+                raise ValueError("pending selection saved timing recipe differs from source routing")
+    except pipeline.WorkAccountingError as exc:
+        raise ValueError(f"pending selection saved timing recipe is invalid: {exc}") from exc
+    return sources
+
+
 def _credits(selected: list[dict[str, Any]], all_sources: Mapping[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Re-execute native final helpers on saved commitments, not reallocate."""
     union = _canonical_pool_events(all_sources)
@@ -373,6 +456,7 @@ def _credits(selected: list[dict[str, Any]], all_sources: Mapping[str, Any]) -> 
         checks.append({"activity_id": activity, "credited_minutes": credited, "native_requested_minutes": demand.effort.recommended_minutes,
                        "native_residual_minutes": residual, "recoverable_minutes": 0})
     timing = pipeline._session_timing_contexts(union.values())
+    union_timing = {("codex_sessions",): timing}
     borrowers = {}
     source_timing = {}
     estimated_activities = set()
@@ -390,14 +474,27 @@ def _credits(selected: list[dict[str, Any]], all_sources: Mapping[str, Any]) -> 
             if contexts and not demand.evidence_spans:
                 raise ValueError("pending selection saved native placement proof is absent")
             continue
-        if not all(estimated) or demand.evidence_spans or not contexts:
+        if not all(estimated) or demand.evidence_spans:
             raise ValueError("pending selection saved native placement contradicts original demand")
+        contexts = {}
         for item in items:
             source = item["source"]
             source_key = id(source)
             if source_key not in source_timing:
-                source_timing[source_key] = pipeline._session_timing_contexts(source["ledger"]["events"])
-            original_contexts = _cited_timing_contexts(adoptions._source_events(item["proposal"], source["ledger"]), source_timing[source_key])
+                pool_sources = _saved_session_timing_pool_sources(source)
+                source_timing[source_key] = (pool_sources, pipeline._session_timing_contexts(
+                    source["ledger"]["events"], pool_sources=pool_sources))
+            pool_sources, original_timing = source_timing[source_key]
+            if pool_sources not in union_timing:
+                union_timing[pool_sources] = pipeline._session_timing_contexts(
+                    union.values(), pool_sources=pool_sources)
+            source_events = adoptions._source_events(item["proposal"], source["ledger"])
+            # Different saved recipes may coexist only through their own
+            # reproducible aliases. Canonical pool IDs still share one debit;
+            # opting one source in must not upgrade a legacy result-only claim.
+            contexts.update(_cited_timing_contexts(
+                [union[_pool_event_key(event)] for event in source_events], union_timing[pool_sources]))
+            original_contexts = _cited_timing_contexts(source_events, original_timing)
             intervals = [original_contexts[key]["interval"] for key in sorted(original_contexts)]
             evidence_ids = sorted({value for context in original_contexts.values() for value in context["evidence_ids"]})
             provenance = item["proposal"]["provenance"]

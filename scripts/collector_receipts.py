@@ -1074,23 +1074,51 @@ def load_pending_collector_source(run_dir: Path, *, checkpoint_root: Path,
         )
         coverage_digest, _ = _completion_identities_from_documents(report, ledger_doc,
             since_utc=pending["since_utc"], until_utc=pending["until_utc"])
-        ci, request = native._request(period.identity.workspace_id, period.identity.member_id, since, until)
+        legacy_ci, request = native._request(period.identity.workspace_id, period.identity.member_id, since, until)
         page_store = checkpoints.PageCheckpointStore(backlog.directory / "source-checkpoints")
-        directory = page_store._directory_for(ci)
-        checkpoint_path = _safe_path(directory / "manifest.json", run_dir=checkpoint_root)
-        page_files = {"manifest.json": native._read(checkpoint_path)}
-        page_manifest = native._document(page_files["manifest.json"])
-        if page_manifest.get("identity") != ci.document():
-            raise ValueError("pending native identity differs")
-        for i, reference in enumerate(page_manifest["pages"], 1):
-            relative = f"pages/{i:06d}.json"
-            if reference.get("path") != relative:
-                raise ValueError("pending native locator differs")
-            page_files[relative] = native._read(directory / relative)
         evidence = contents["evidence/clockify-existing.json"]
-        entries, observed, _, compatibility = native._validate_with_compatibility(directory, page_files, evidence,
-            identity=ci, request=request, since=since, until=until,
-            allow_stopped_only_legacy_observation_variance=allow_stopped_only_legacy_observation_variance)
+        original_native = _verified_native_checkpoint(report, run_dir=run_dir,
+            since_utc=pending["since_utc"], until_utc=pending["until_utc"], clockify_evidence=evidence)
+
+        def read_candidate(ci):
+            directory = page_store._directory_for(ci)
+            checkpoint_path = _safe_path(directory / "manifest.json", run_dir=checkpoint_root)
+            page_files = {"manifest.json": native._read(checkpoint_path)}
+            page_manifest = native._document(page_files["manifest.json"])
+            if page_manifest.get("identity") != ci.document():
+                raise ValueError("pending native identity differs")
+            for i, reference in enumerate(page_manifest["pages"], 1):
+                relative = f"pages/{i:06d}.json"
+                if reference.get("path") != relative:
+                    raise ValueError("pending native locator differs")
+                page_files[relative] = native._read(directory / relative)
+            entries, observed, _, compatibility = native._validate_with_compatibility(directory, page_files, evidence,
+                identity=ci, request=request, since=since, until=until,
+                allow_stopped_only_legacy_observation_variance=allow_stopped_only_legacy_observation_variance)
+            return ci, directory, checkpoint_path, page_files, page_manifest, entries, observed, compatibility
+
+        if original_native:
+            # A sealed copied proof pins the exact original request identity,
+            # even if both cache generations happen to exist for this period.
+            pinned = native._document(original_native[NATIVE_CHECKPOINT_PREFIX + "snapshot.json"])
+            ci = native._pinned_identity(pinned["checkpoint_identity"],
+                period.identity.workspace_id, period.identity.member_id, since, until)
+            selected = read_candidate(ci)
+        else:
+            # An interruption may precede copied proof creation. Read-only
+            # admission needs one unambiguous cache whose projection matches
+            # the exact original raw evidence, never merely a preferred version.
+            candidates = []
+            for ci in (legacy_ci, collector._clockify_checkpoint_identity(
+                    period.identity.workspace_id, period.identity.member_id, since, until, overlap_history=True)):
+                try:
+                    candidates.append(read_candidate(ci))
+                except (OSError, ValueError, TypeError, KeyError, StopIteration):
+                    continue
+            if len(candidates) != 1:
+                raise ValueError("pending native checkpoint identity is absent or ambiguous")
+            selected = candidates[0]
+        ci, directory, checkpoint_path, page_files, page_manifest, entries, observed, compatibility = selected
         checkpoint_relative = f"checkpoint/{directory.name}"
         native_files = {f"{checkpoint_relative}/{name}": value for name, value in page_files.items()}
         native_files["clockify-existing.json"] = evidence
@@ -1105,8 +1133,6 @@ def load_pending_collector_source(run_dir: Path, *, checkpoint_root: Path,
         native_files["snapshot.json"] = proof_bytes
         native_metadata = {"manifest_sha256": native._hash(proof_bytes), "request": request}
         if "clockify_native_checkpoint" in report:
-            original_native = _verified_native_checkpoint(report, run_dir=run_dir,
-                since_utc=pending["since_utc"], until_utc=pending["until_utc"], clockify_evidence=evidence)
             if report["clockify_native_checkpoint"]["request"] != request:
                 raise ValueError("pending copied native request differs")
             for name, content in original_native.items():

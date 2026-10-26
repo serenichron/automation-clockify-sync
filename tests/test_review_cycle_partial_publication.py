@@ -3,11 +3,17 @@ from __future__ import annotations
 import datetime as dt
 import importlib.util
 import json
+import copy
+import contextlib
+import io
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from scripts import clockify_review_cycle as cycle
+from scripts import clockify_sheet_publish as publisher
+from scripts import evidence_ledger
+from test_monthly_unresolved import MonthlyGateway
 
 
 _SPEC = importlib.util.spec_from_file_location(
@@ -20,6 +26,98 @@ _SPEC.loader.exec_module(_FIXTURES)
 
 
 class PartialPublicationTests(unittest.TestCase):
+    def test_provenance_debt_publishes_partial_and_does_not_reschedule_inference_for_later_work(self):
+        self._provenance_debt_scheduling(missing_peer=False)
+
+    def test_provenance_debt_with_missing_peer_advances_scheduling_and_preserves_source_recovery(self):
+        self._provenance_debt_scheduling(missing_peer=True)
+
+    def _provenance_debt_scheduling(self, *, missing_peer):
+        # Catches publication failure, false full completion, or replay loops hiding later periods.
+        fixture = self.fixture()
+        commands = []
+        base_child = fixture.child_for_runs(commands, source_options={"proposals": [], "ambiguous": [
+            {"id": "a-1", "exception_kind": "low_confidence"},
+            {"id": "a-2", "exception_kind": "low_confidence"}]})
+        gateway = None
+        initial = None
+        original_ledger = evidence_ledger.EvidenceLedger
+
+        def ledger_with_missing_peer(*args, **kwargs):
+            if len(args) < 2 and "source_inventory" not in kwargs:
+                kwargs["source_inventory"] = self.coverage()["sources"]
+            return original_ledger(*args, **kwargs)
+
+        def child(command, **options):
+            nonlocal gateway, initial
+            if "clockify_sheet_publish.py" not in command[1]:
+                if missing_peer:
+                    with mock.patch.object(evidence_ledger, "EvidenceLedger", side_effect=ledger_with_missing_peer):
+                        return base_child(command, **options)
+                return base_child(command, **options)
+            commands.append(list(command))
+            source_dir = Path(command[command.index("--proposals") + 1]).parent
+            rows = cycle.clockify_monthly_unresolved.project_rows(source_dir)
+            old = list(rows[0])
+            provenance = json.loads(old[11])
+            provenance["source_run_id"] = "missing-original"
+            old[11] = json.dumps(provenance)
+            old[10] = "Keep this human decision"
+            gateway = MonthlyGateway([cycle.clockify_monthly_unresolved.HEADER, old])
+            initial = copy.deepcopy(gateway.rows)
+            try:
+                with mock.patch.object(publisher, "GwsSheetsGateway", return_value=gateway), contextlib.redirect_stdout(io.StringIO()):
+                    code = publisher.main(command[2:])
+            except publisher.PublicationError:
+                return _FIXTURES.ChildResult(2, "", "", False, 0.1)
+            path = Path(command[command.index("--result-output") + 1])
+            return _FIXTURES.ChildResult(code, str(path) + "\n", "", False, 0.1)
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=child):
+            outcome = cycle.run_cycle(fixture.config, enable_sheet_write=True, today=dt.date(2026, 9, 10))
+        self.assertEqual("published_with_preparation_gaps", outcome["status"])
+        self.assertEqual(initial, gateway.rows[:2])
+        self.assertEqual(1, len(gateway.writes))
+        state = json.loads((fixture.state_dir / "review-cycle-state.json").read_text())
+        record = state["slices"]["2026-09-07"]
+        self.assertFalse(record["exceptions_complete"])
+        self.assertIsNone(state["completed_through"])
+        self.assertEqual("2026-09-09", state["scheduled_through"])
+        receipt = json.loads(Path(record["publication_receipt"]).read_text())
+        self.assertEqual(cycle.PARTIAL_RECEIPT_SCHEMA_VERSION, receipt["schema_version"])
+        self.assertEqual(record["retained_provenance_debt"], receipt["retained_provenance_debt"])
+        cycle._validate_delivered_state(fixture.config, state)
+        store, _ = cycle._source_debt(fixture.state_dir / "source-coverage.json")
+        if missing_peer:
+            self.assertEqual("incomplete", record["source_completeness"]["status"])
+            self.assertIn("peer/macbook", {debt.interval.source for debt in store.active()})
+        later_config = {**fixture.config, "catchup_until": "2026-09-11"}
+        selected = cycle._select_work(later_config, state, store, today=dt.date(2026, 9, 12))
+        self.assertEqual(("2026-09-09", "2026-09-11", "routine"), selected[0][:3])
+        if missing_peer:
+            recovery_commands = []
+
+            def offline_peer(command, **_options):
+                recovery_commands.append(list(command))
+                return _FIXTURES.ChildResult(None, "", "peer unavailable", True, 0.1)
+
+            with mock.patch.object(cycle, "run_child_bounded", side_effect=offline_peer):
+                repeated = cycle.run_cycle(fixture.config, enable_sheet_write=True, today=dt.date(2026, 9, 10))
+            self.assertEqual("incomplete", repeated["status"])
+            self.assertEqual(1, len(recovery_commands))
+            self.assertIn("--recover-source-debt-from", recovery_commands[0])
+            self.assertEqual("peer/macbook", recovery_commands[0][recovery_commands[0].index("--recover-source") + 1])
+            self.assertNotIn("--period-manifest", recovery_commands[0])
+            self.assertNotIn("--replay-from", recovery_commands[0])
+            self.assertNotIn("clockify_sheet_publish.py", recovery_commands[0][1])
+        else:
+            with mock.patch.object(cycle, "run_child_bounded", side_effect=AssertionError("sealed partial replay launched a child")):
+                repeated = cycle.run_cycle(fixture.config, enable_sheet_write=True, today=dt.date(2026, 9, 10))
+            self.assertEqual("idle", repeated["status"])
+        bad = copy.deepcopy(state)
+        bad["slices"]["2026-09-07"]["status"] = "delivered"
+        with self.assertRaises(cycle.CycleError):
+            cycle._validate_delivered_state(fixture.config, bad)
+
     def fixture(self):
         fixture = _FIXTURES.ReviewCycleDeliveryTests(methodName="runTest")
         fixture.setUp()
@@ -70,7 +168,7 @@ class PartialPublicationTests(unittest.TestCase):
         self.assertEqual("published", document["status"])
         self.assertEqual(0, document["clockify_writes"])
         self.assertIn(
-            "wka-alpha-s01",
+            "wka-000000000000000000000001-s01",
             document["publications"][0]["row_ids"],
         )
         state = json.loads((fixture.state_dir / "review-cycle-state.json").read_text())

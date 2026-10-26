@@ -174,6 +174,7 @@ def build_decision(
     rationale: str,
     field_patch: Mapping[str, Any] | None = None,
     split_expectation: Mapping[str, Any] | None = None,
+    supersedes_digest: str | None = None,
     _allow_legacy_split_without_expectation: bool = False,
 ) -> dict[str, Any]:
     """Build a decision from a current state item, retaining its evidence binding."""
@@ -208,6 +209,15 @@ def build_decision(
     }
     if split is not None:
         record["split_expectation"] = split
+    if supersedes_digest is not None:
+        if not isinstance(supersedes_digest, str) or not _SHA256_RE.fullmatch(supersedes_digest):
+            raise ReviewDecisionError("supersedes_digest must be an exact canonical content digest")
+        if decision != "modify" or correction_categories != ["wording"] or set(patch) != {"description"}:
+            raise ReviewDecisionError("supersession permits only a description-only wording replacement")
+        _one_line(patch["description"]["value"], "superseding description")
+        if not patch["description"]["value"].isprintable():
+            raise ReviewDecisionError("superseding description must be printable")
+        record["supersedes_digest"] = supersedes_digest
     record["decision_id"] = "rdec-" + canonical_digest(record)[7:31]
     return record
 
@@ -241,6 +251,7 @@ def validate_decision(record: Mapping[str, Any], *, item: Mapping[str, Any] | No
         rationale=record["rationale"],
         field_patch=record["field_patch"],
         split_expectation=split_expectation,
+        supersedes_digest=record.get("supersedes_digest"),
         _allow_legacy_split_without_expectation=True,
     )
     # The temporary evidence above only verifies shape. Restore and verify the
@@ -269,6 +280,29 @@ def validate_decision(record: Mapping[str, Any], *, item: Mapping[str, Any] | No
     }:
         raise ReviewDecisionError("review decision is stale for the current activity evidence")
     return result
+
+
+def _validate_wording_predecessor(record: Mapping[str, Any], preceding: Iterable[Mapping[str, Any]]) -> None:
+    """Allow only the latest explicit local wording predecessor for this evidence."""
+    digest = record.get("supersedes_digest")
+    if digest is None:
+        return
+    target = (record["activity_id"], record["evidence_fingerprint"])
+    matching = [prior for prior in preceding
+                if prior.get("record_type") not in {VERIFIED_POSTED_CREDIT, SOURCE_BOUND_TIMING_CORRECTION}
+                and (prior.get("activity_id"), prior.get("evidence_fingerprint")) == target]
+    prior = matching[-1] if matching else None
+    # Loaded records carry the digest verified against the raw serialized line.
+    # Normalization may omit legacy metadata, so rehashing that projection loses
+    # the original identity. Unsealed builder records still use their content.
+    if prior is None or prior.get("canonical_digest", canonical_digest(_without_integrity(prior))) != digest:
+        raise ReviewDecisionError("wording supersession requires its exact latest predecessor in this ledger")
+    if (prior.get("decision") != "modify"
+            or "wording" not in prior.get("correction_categories", [])
+            or not set(prior.get("correction_categories", [])) <= {"wording", "routing"}
+            or "description" not in prior.get("field_patch", {})
+            or not set(prior["field_patch"]) <= {"description", "client_project", "tag_names"}):
+        raise ReviewDecisionError("wording supersession cannot replace a non-editorial decision")
 
 
 def validate_verified_posted_credit(record: Mapping[str, Any]) -> dict[str, Any]:
@@ -415,6 +449,8 @@ def _read_log(path: Path) -> list[dict[str, Any]]:
             raise ReviewDecisionError(f"decision log integrity failure at line {number}")
         normalized["canonical_digest"] = digest
         normalized["previous_digest"] = previous
+        if normalized.get("supersedes_digest") is not None:
+            _validate_wording_predecessor(normalized, records)
         records.append(normalized)
         previous = digest
     return records
@@ -514,6 +550,10 @@ def append_decision(path: Path, record: Mapping[str, Any], *, item: Mapping[str,
     normalized = validate_decision(record, item=item)
     existing = _read_log(path)
     target = tuple(normalized[key] for key in ("review_item_id", "activity_id", "evidence_fingerprint"))
+    # Exact retries remain idempotent even after their predecessor ceased to be latest.
+    if any(_without_integrity(prior) == normalized for prior in existing):
+        return False
+    _validate_wording_predecessor(normalized, existing)
     for prior in existing:
         if prior.get("record_type") in {VERIFIED_POSTED_CREDIT, SOURCE_BOUND_TIMING_CORRECTION}:
             continue
@@ -522,7 +562,8 @@ def append_decision(path: Path, record: Mapping[str, Any], *, item: Mapping[str,
             continue
         if canonical_json(_without_integrity(prior)) == canonical_json(_without_integrity(normalized)):
             return False
-        raise ReviewDecisionError("conflicting immutable decision already exists for this evidence-bound target")
+        if normalized.get("supersedes_digest") is None:
+            raise ReviewDecisionError("conflicting immutable decision already exists for this evidence-bound target")
     previous = existing[-1]["canonical_digest"] if existing else None
     line = dict(normalized)
     line["previous_digest"] = previous
@@ -569,17 +610,35 @@ def derive_regression_cases(decisions: Iterable[Mapping[str, Any]]) -> list[dict
     into an analyzer request.
     """
     cases: list[dict[str, Any]] = []
+    records = []
     for record in decisions:
         normalized = validate_decision(record)
+        # Preserve _read_log's verified original identity through normalization.
+        normalized["canonical_digest"] = record.get(
+            "canonical_digest", canonical_digest(_without_integrity(record)),
+        )
+        records.append(normalized)
+    for index, normalized in enumerate(records):
+        _validate_wording_predecessor(normalized, records[:index])
+    superseded = {record["supersedes_digest"] for record in records if "supersedes_digest" in record}
+    for normalized in records:
+        patch = copy.deepcopy(normalized["field_patch"])
+        categories = list(normalized["correction_categories"])
+        if normalized["canonical_digest"] in superseded:
+            # Supersede only wording; routing remains executable and immutable.
+            patch.pop("description", None)
+            categories.remove("wording")
+            if not categories:
+                continue
         case = {
             "schema_version": SCHEMA_VERSION,
             "local_only": True,
             "activity_id": normalized["activity_id"],
             "evidence_fingerprint": normalized["evidence_fingerprint"],
             "decision": normalized["decision"],
-            "correction_categories": list(normalized["correction_categories"]),
+            "correction_categories": categories,
             "expected_presence": normalized["decision"] != "skip",
-            "expected_field_patch": copy.deepcopy(normalized["field_patch"]),
+            "expected_field_patch": patch,
         }
         if "split" in normalized["correction_categories"]:
             if "split_expectation" in normalized:

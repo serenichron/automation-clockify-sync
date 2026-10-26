@@ -28,7 +28,7 @@ def handle(path):
 
 
 class CycleNativeCreditProducerTests(unittest.TestCase):
-    def fixture(self, *, attrs=None, warnings=None):
+    def fixture(self, *, attrs=None, warnings=None, prepared_editorial=False):
         transport = transport_fixtures.NativeCheckpointRunTransportTests()
         transport.setUp()
         self.addCleanup(transport.temporary.cleanup)
@@ -50,7 +50,8 @@ class CycleNativeCreditProducerTests(unittest.TestCase):
         state = store.mark_complete(state)
         raw = collector.fetch_clockify({"CLOCKIFY_WORKSPACE_ID": "workspace-1"},
             {"clockify_user_id": "user-1"}, SINCE, UNTIL,
-            snapshot_at=dt.datetime.fromisoformat(OBSERVED.replace("Z", "+00:00")), checkpoint_store=store)
+            snapshot_at=dt.datetime.fromisoformat(OBSERVED.replace("Z", "+00:00")),
+            checkpoint_store=store, checkpoint_identity=identity)
         write(source / "evidence/clockify-existing.json", raw)
         original_evidence = root / "original-run/evidence/clockify-existing.json"
         write(original_evidence, raw)
@@ -58,6 +59,26 @@ class CycleNativeCreditProducerTests(unittest.TestCase):
             clockify_evidence=original_evidence, destination=transport.snapshot_dir,
             workspace_id="workspace-1", user_id="user-1", since=SINCE, until=UNTIL)
         current_ledger = json.loads(Path(declaration["artifacts"]["current_source_ledger"]["path"]).read_text())
+        if prepared_editorial:
+            # This delivery scenario needs the same reviewed wording and frozen
+            # route authority consumed by the real automatic preparation step.
+            for index, proposal in enumerate(current):
+                proposal.update(
+                    review_activity_key=f"wka-{index + 1:024x}",
+                    description="SC — Reviewed client discovery meeting",
+                    clockify_project_suffix="775f9f",
+                    tag_names=[], tag_suffixes=[], billable=True,
+                )
+                proposal["provenance"].update(
+                    semantic_reviewer_model=run.semantic_analyzer.DEFAULT_PRIMARY_MODEL,
+                    semantic_reviewer_revision=run.semantic_analyzer.DEFAULT_PRIMARY_REVISION,
+                )
+            write(source / "routing.json", {
+                "workspace_id": "workspace-1", "member_id": "user-1",
+                "session_routes": [{"project_name": "Example Project",
+                    "project_suffix": current[0]["clockify_project_suffix"], "prefix": "SC",
+                    "tag_names": [], "tag_suffixes": [], "billable": True}],
+            })
         if warnings is not None:
             current[0]["review_warnings"] = copy.deepcopy(warnings)
         events = [evidence_ledger.EvidenceEvent.from_document(event) for event in current_ledger["events"]]
@@ -74,6 +95,15 @@ class CycleNativeCreditProducerTests(unittest.TestCase):
         write(source / "quality_report.json", {"status": "pass"})
         (source / "analyzer-cache-used.jsonl").write_bytes(b"")
         analysis = json.loads((source / "semantic-analysis.json").read_text())
+        if prepared_editorial:
+            analysis["activities"] = [{
+                "activity_id": proposal["activity_id"],
+                "evidence_ids": proposal["provenance"]["evidence_ids"],
+                "rendered_description": proposal["description"],
+                "semantic_reviewer_model": run.semantic_analyzer.DEFAULT_PRIMARY_MODEL,
+                "semantic_reviewer_revision": run.semantic_analyzer.DEFAULT_PRIMARY_REVISION,
+                "analyzer_model": "offline-fixture", "analyzer_tier": "fixture",
+            } for proposal in current]
         analyzed, _ = pipeline._analysis_events([event.document() for event in ledger.events],
             pipeline.meeting_reconciliation.manifest_member_identities(ledger.manifest.document()))
         analysis["ledger_evidence_digest"] = run.semantic_analyzer.stable_digest("led-", sorted(event["evidence_id"] for event in analyzed))
@@ -302,7 +332,7 @@ class CycleNativeCreditProducerTests(unittest.TestCase):
         self.assertEqual([], self.plan(config, source)["credits"])
 
     def test_delivery_late_validation_uses_adopted_corrections_not_frozen_parent(self):
-        transport, config, original, _manifest, _ = self.fixture()
+        transport, config, original, _manifest, _ = self.fixture(prepared_editorial=True)
         config.update(monthly_sheet_title_template="{month_name} {year} portfolio review", calendly_optional=True,
             spreadsheet_id="sheet-1")
         record = {"source": original, "until": "2026-10-01", "expected_snapshot_digests": original["snapshot_digests"]}
@@ -328,7 +358,9 @@ class CycleNativeCreditProducerTests(unittest.TestCase):
             else:
                 parent = Path(command[command.index("--proposals") + 1]).parent
                 result_path = Path(command[command.index("--result-output") + 1])
-                publications = cycle._expected_publication_receipts(config, {"run_dir": str(parent), "run_id": parent.name},
+                publication_config = {**config, "review_batch_publication":
+                    command[command.index("--review-batch-publication") + 1]}
+                publications = cycle._expected_publication_receipts(publication_config, {"run_dir": str(parent), "run_id": parent.name},
                     sheet_title="September 2026 portfolio review")
                 write(result_path, {"schema_version": "sheet-publication-result/v1", "status": "published",
                     "external_writes": True, "clockify_writes": 0, "publications": publications})
@@ -341,6 +373,10 @@ class CycleNativeCreditProducerTests(unittest.TestCase):
         saved = json.loads(state_path.read_text())["slices"]["2026-09-01"]
         self.assertNotEqual(original["run_id"], saved["source"]["run_id"])
         self.assertEqual(original["snapshot_digests"], saved["expected_snapshot_digests"])
+        prepared_rows = json.loads((Path(saved["source"]["run_dir"]) / "proposals.json").read_text())
+        self.assertEqual([4], [row["duration_seconds"] for row in prepared_rows])
+        self.assertEqual(4, saved["review_preparation"]["prepared_seconds"])
+        self.assertEqual(0, saved["review_preparation"]["unprepared_seconds"])
 
 
 if __name__ == "__main__":

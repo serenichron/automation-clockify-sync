@@ -34,7 +34,12 @@ class ReviewCycleSourceDebtEndToEndTests(unittest.TestCase):
         self.checkpoints = self.state_dir / "collector-checkpoints"
         self.routing = {
             "workspace_id": "workspace-1", "member_id": "member-1",
-            "skip_rules": {}, "session_routes": [], "meeting_routes": [],
+            "skip_rules": {},
+            "session_routes": [{
+                "project_suffix": "775f9f", "project_name": "Serenichron Level 2",
+                "prefix": "SC", "tag_names": ["Delivery"], "tag_suffixes": ["111111"],
+            }],
+            "meeting_routes": [], "evidence_routes": [],
         }
         self.fleet = {
             "machines": [{"name": "macbook", "enabled": True, "kind": "ssh"}],
@@ -42,7 +47,7 @@ class ReviewCycleSourceDebtEndToEndTests(unittest.TestCase):
         }
         write_json(self.root / "routing.json", self.routing)
         write_json(self.root / "fleet.json", self.fleet)
-        write_json(self.root / "corrections.jsonl", {})
+        (self.root / "corrections.jsonl").write_text("", encoding="utf-8")
         write_json(self.root / "acceptance.jsonl", {})
         self.config = {
             "root": str(self.root), "state_dir": str(self.state_dir),

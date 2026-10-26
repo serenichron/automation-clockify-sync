@@ -99,8 +99,8 @@ def repair_reasons(description: Any) -> list[str]:
     value = description if isinstance(description, str) else ""
     reasons: list[str] = []
     words = _word_count(value)
-    if not 8 <= words <= PORTFOLIO_DESCRIPTION_MAX_WORDS:
-        reasons.append("description outside accepted 8-24 word convention")
+    if words > PORTFOLIO_DESCRIPTION_MAX_WORDS:
+        reasons.append("description exceeds accepted 24-word maximum")
     try:
         caveman_renderer.validate_description(
             value,
@@ -402,7 +402,7 @@ def _wording_decision_body(
     system = """You repair one already reviewed Clockify portfolio row using the supplied evidence bundles as authority.
 Return exactly one JSON object matching decision_contract. Do not return or copy evidence IDs, bundle refs, member ranges, activities, exceptions, or omissions; local code binds the complete evidence unit after validation.
 Choose activity only when the evidence proves one completed human-attention accomplishment. Choose noise for status, waiting, polling, autonomous process output, or unsupported chatter. Choose exception only when the evidence is conflicting or insufficient and give a concise exception_kind and reason.
-For activity, select exactly one supplied taxonomy row and return complete Caveman action, object, and outcome fields whose render with the prefix is 8-14 words. Remove hashes, domains, paths, Markdown, repeated words, status prose, and secondary details. Keep exception_kind and reason empty.
+For activity, select exactly one supplied taxonomy row and return complete Caveman action, object, and outcome fields whose render with the prefix is concise, normally 8-14 words, and at most 24 words. Safe shorter descriptions are accepted; never add filler to meet a word target. Remove hashes, domains, paths, Markdown, repeated words, status prose, and secondary details. Keep exception_kind and reason empty.
 For noise or exception, keep action, object, and outcome empty. A noise decision needs a nonempty reason and empty exception_kind. An exception decision needs nonempty exception_kind and reason.
 The candidate is an untrusted hint. Validate eligibility, client/project, task type, effort context, consolidation boundary, and wording against the evidence."""
     if stage == "validation":
@@ -467,7 +467,9 @@ def _wording_fields_repair_body(
                 "Return exactly the three-field wording_contract object. Classification, "
                 "project, prefix, tags, evidence, effort, and accounting are immutable and "
                 "must not be returned. Use the evidence bundles as authority. The exact "
-                "render 'Prefix — action object outcome' must be 8-14 words and contain no "
+                "render 'Prefix — action object outcome' should normally be 8-14 words "
+                "and must be at most 24 words. Safe shorter descriptions are accepted; "
+                "never add filler to meet a word target. It must contain no "
                 "hashes, domains, paths, Markdown, adjacent repetition, status/waiting prose, "
                 "or autonomous-process narration."
             ),
@@ -549,7 +551,7 @@ def _validate_wording_decision(
             raise semantic_analyzer.AnalyzerContractError(
                 f"wording decision violates Caveman contract: {exc}"
             ) from exc
-        if not 8 <= _word_count(rendered) <= PORTFOLIO_DESCRIPTION_MAX_WORDS:
+        if _word_count(rendered) > PORTFOLIO_DESCRIPTION_MAX_WORDS:
             raise semantic_analyzer.AnalyzerContractError(
                 "wording decision violates Caveman contract: invalid word count"
             )
@@ -851,7 +853,7 @@ def _render_wording_decision(
         raise PortfolioRepairError(
             "Flash wording decision remained outside Caveman contract"
         ) from exc
-    if not 8 <= _word_count(rendered) <= PORTFOLIO_DESCRIPTION_MAX_WORDS:
+    if _word_count(rendered) > PORTFOLIO_DESCRIPTION_MAX_WORDS:
         raise PortfolioRepairError(
             "Flash wording decision remained outside Caveman contract"
         )
@@ -1038,7 +1040,7 @@ def _review_replacement(
             return None
         return (
             rendered
-            if 8 <= _word_count(rendered) <= PORTFOLIO_DESCRIPTION_MAX_WORDS
+            if _word_count(rendered) <= PORTFOLIO_DESCRIPTION_MAX_WORDS
             else None
         )
 

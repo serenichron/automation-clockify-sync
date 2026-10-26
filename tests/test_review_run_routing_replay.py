@@ -121,6 +121,43 @@ class RoutingRepairReplayTests(unittest.TestCase):
 
 
 class ActorContractReplayTests(unittest.TestCase):
+    def test_native_entrypoint_replays_new_task_review_contract_without_inference(self):
+        # Catches replay falling back to v7 when its sealed source was reviewed with v8.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runs = root / "runs"
+            analyze = semantic.analyze_tiered
+            def new_review(events, **options):
+                return analyze(events, review_prompt_version="clockify-semantic-review-v8", **options)
+            with mock.patch.object(semantic, "analyze_tiered", side_effect=new_review):
+                source = fixtures.ReviewRunResultTests._write_real_offline_replay_source(runs, root, actor_contract=True)
+            before = fixtures.run_tree_snapshot(source)
+            self.assertEqual("clockify-semantic-review-v8", json.loads((source / "semantic-analysis.json").read_bytes())["review_prompt_version"])
+            with mock.patch.object(review, "RUNS", runs), mock.patch.object(socket.socket, "connect", side_effect=AssertionError("replay network forbidden")):
+                replay = review._prepare_replay_run(source)
+                accounting.run_accounting(replay, root=fixtures.ROOT, routing_path=replay / "routing.json", corrections_path=replay / "review-corrections.jsonl", analysis_fixture=review._replay_analysis_fixture(source, replay), analyzer_cache_path=review._replay_analyzer_cache(replay))
+                self.assertEqual("pass", review._verify_replay_integrity(source, replay)["status"])
+            self.assertEqual(before, fixtures.run_tree_snapshot(source))
+            self.assertEqual((source / "proposals.json").read_bytes(), (replay / "proposals.json").read_bytes())
+
+    def test_sealed_actor_v7_replay_pins_review_version_when_fresh_default_advances(self):
+        # Catches replay reconstructing a fresh contract instead of the sealed request.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runs = root / "runs"
+            source = fixtures.ReviewRunResultTests._write_real_offline_replay_source(runs, root, actor_contract=True)
+            before = fixtures.run_tree_snapshot(source)
+            analyze = semantic.analyze_tiered
+            def fresh_default(events, **options):
+                options.setdefault("review_prompt_version", "clockify-semantic-review-v8")
+                return analyze(events, **options)
+            with mock.patch.object(review, "RUNS", runs), mock.patch.object(semantic, "analyze_tiered", side_effect=fresh_default), mock.patch.object(socket.socket, "connect", side_effect=AssertionError("replay network forbidden")):
+                replay = review._prepare_replay_run(source)
+                accounting.run_accounting(replay, root=fixtures.ROOT, routing_path=replay / "routing.json", corrections_path=replay / "review-corrections.jsonl", analysis_fixture=review._replay_analysis_fixture(source, replay), analyzer_cache_path=review._replay_analyzer_cache(replay))
+                self.assertEqual("pass", review._verify_replay_integrity(source, replay)["status"])
+            self.assertEqual(before, fixtures.run_tree_snapshot(source))
+            self.assertEqual((source / "proposals.json").read_bytes(), (replay / "proposals.json").read_bytes())
+
     def test_native_entrypoint_replays_sealed_actor_binding_and_corrected_hints_without_transport(self):
         # Catches reconstruction silently using v17 projection or frozen hints.
         with tempfile.TemporaryDirectory() as temporary:

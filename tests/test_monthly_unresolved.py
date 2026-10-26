@@ -70,6 +70,304 @@ class MonthlyGateway:
 
 
 class MonthlyTests(unittest.TestCase):
+    def test_correction_rendering_requires_exact_integer_revision_and_preserves_legacy_cells(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            documents = frozen_run(root, 1)
+            documents["ambiguous.json"][0].update(
+                exception_kind="correction_regression", reason="description differs from reviewed value")
+            for name in ("ambiguous.json", "work-accounting-result.json"):
+                (root / name).write_text(json.dumps(documents[name]))
+            legacy = next(row for row in monthly.project_rows(root) if row[3] == "correction_regression")
+            self.assertEqual([
+                "correction_regression",
+                "Cited evidence does not establish a confirmed positive work interval; accounting exception requires human review.",
+                "", "1 cited evidence records; correction_regression accounting exception. No confirmed additional work interval.",
+                "", "quality pass; accounting ambiguity; no confirmed interval",
+                "Confirm activity, project and observed interval; no automatic Clockify posting or additional time claim.",
+                "needs_review",
+            ], legacy[3:11])
+            for revision in (None, True, False, "1", 1.0, 0, 2, [], {}):
+                with self.subTest(revision=revision):
+                    report = {**documents["run-report.json"], "monthly_unresolved_rendering_revision": revision}
+                    (root / "run-report.json").write_text(json.dumps(report))
+                    row = next(row for row in monthly.project_rows(root) if row[3] == "correction_regression")
+                    self.assertEqual(legacy[:11], row[:11])
+
+    def test_marked_correction_failures_are_truthful_bounded_and_private(self):
+        cases = [
+            ("description differs from reviewed value", "reviewed description differs", True),
+            ("client_project differs from reviewed value", "reviewed client/project routing differs", False),
+            ("tag_names differs from reviewed value", "reviewed tags differ", False),
+            ("start differs from reviewed value", "reviewed start differs", False),
+            ("end differs from reviewed value", "reviewed end differs", False),
+            ("duration_minutes differs from reviewed value", "reviewed duration differs", False),
+            ("duration_seconds differs from reviewed value", "reviewed duration differs", False),
+            ("billable differs from reviewed value", "reviewed billable state differs", False),
+            ("reviewed activity is missing", "reviewed activity is missing", False),
+            ("previously skipped activity reappeared", "previously skipped activity reappeared", False),
+            ("split correction has no executable structural contract", "reviewed split contract is unavailable", False),
+            ("split correction contract has no evidence", "reviewed split evidence is unavailable", False),
+            ("split correction evidence does not match its reviewed target", "reviewed split evidence target differs", False),
+            ("split child proposal is missing an activity_id", "reviewed split child identity is missing", False),
+            ("split child count differs from reviewed value", "reviewed split child count differs", False),
+            ("split child evidence is duplicated across activities", "reviewed split evidence is duplicated", False),
+            ("split child evidence union differs from reviewed value", "reviewed split evidence union differs", False),
+            ("split child evidence partition differs from reviewed value", "reviewed split evidence partition differs", False),
+            ("description differs from reviewed value; start differs from reviewed value", "reviewed start differs", False),
+            ("description differs from reviewed value; Private Person / Secret title", "other correction validation failure", False),
+            ("Private Person / Secret title", "other correction validation failure", False),
+            (None, "other correction validation failure", False),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            documents = frozen_run(root, 1)
+            legacy_other = [row[:11] for row in monthly.project_rows(root) if row[3] != "low_confidence"]
+            documents["run-report.json"]["monthly_unresolved_rendering_revision"] = 1
+            (root / "run-report.json").write_text(json.dumps(documents["run-report.json"]))
+            for failure, expected, wording_only in cases:
+                with self.subTest(failure=failure):
+                    documents["ambiguous.json"][0].update(exception_kind="correction_regression", reason=failure)
+                    for name in ("ambiguous.json", "work-accounting-result.json"):
+                        (root / name).write_text(json.dumps(documents[name]))
+                    rows = monthly.project_rows(root)
+                    row = next(row for row in rows if row[3] == "correction_regression")
+                    self.assertIn(expected, row[4])
+                    self.assertEqual(wording_only, "wording-only" in row[8])
+                    self.assertIn("correction", row[6])
+                    self.assertIn("correction", row[9])
+                    self.assertIn("no automatic Clockify posting", row[9])
+                    public = json.dumps(row[:11])
+                    for forbidden in ("no confirmed interval", "No confirmed additional work interval",
+                                      "does not establish a confirmed positive work interval",
+                                      "Synthetic work", "Private Person", "Secret title", "quality pass"):
+                        self.assertNotIn(forbidden, public)
+                    self.assertEqual(legacy_other, [other[:11] for other in rows if other[3] != "correction_regression"])
+
+    def test_rendering_opt_in_does_not_change_other_exception_or_routing_cells(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            documents = frozen_run(root, 1)
+            before = [row[:11] for row in monthly.project_rows(root)]
+            documents["run-report.json"]["monthly_unresolved_rendering_revision"] = 1
+            (root / "run-report.json").write_text(json.dumps(documents["run-report.json"]))
+            self.assertEqual(before, [row[:11] for row in monthly.project_rows(root)])
+
+    def test_provenance_only_debt_preserves_native_row_and_publishes_independent_rows(self):
+        # Catches one unavailable old producer suppressing otherwise valid new rows.
+        for header in (monthly.HEADER, LEGACY_HEADER):
+            with self.subTest(header=header[0]), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "current"
+                frozen_run(root, 1)
+                rows = monthly.project_rows(root)
+                layout = monthly.LEGACY_LAYOUT if header == LEGACY_HEADER else None
+                old = monthly.rows_for_layout(rows, layout)[0]
+                provenance = json.loads(old[11])
+                provenance["source_run_id"] = "missing-original"
+                old[11] = json.dumps(provenance)
+                old[10] = "Human decision stays untouched"
+                gateway = MonthlyGateway([list(header), old])
+                before = copy.deepcopy(gateway.rows)
+                inputs = {path: path.read_bytes() for path in root.rglob("*.json")}
+                kwargs = dict(spreadsheet_id="test", sheet_title="September 2026 unresolved evidence",
+                              rows=rows, source_dir=root, retain_provenance_debt=True)
+                result = publisher.publish_monthly_unresolved(gateway, **kwargs)
+                self.assertEqual(before, gateway.rows[:2])
+                self.assertEqual(2, result["appended"])
+                self.assertEqual(rows[0][0], result["retained_provenance_debt"][0]["stable_evidence_id"])
+                self.assertNotIn("Human decision", json.dumps(result))
+                self.assertNotIn("missing-original", json.dumps(result))
+                self.assertNotIn("canonical_source_aliases", result)
+                gateway.rows[1][10] = "A later human decision also stays"
+                retry_before = copy.deepcopy(gateway.rows)
+                repeated = publisher.publish_monthly_unresolved(gateway, **kwargs)
+                self.assertEqual(0, repeated["appended"])
+                self.assertEqual(retry_before, gateway.rows)
+                self.assertEqual(result["retained_provenance_debt"], repeated["retained_provenance_debt"])
+                self.assertEqual(result["receipt_id"], repeated["receipt_id"])
+                self.assertEqual(inputs, {path: path.read_bytes() for path in inputs})
+
+    def test_retained_debt_rejects_other_conflicts_and_unbound_projection_before_any_write(self):
+        for defect in ("prefix", "citations", "bad_provenance", "symlink", "existing_source", "subset", "requested_prefix"):
+            with self.subTest(defect=defect), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "current"
+                frozen_run(root, 1)
+                rows = monthly.project_rows(root)
+                old = list(rows[0])
+                provenance = json.loads(old[11])
+                provenance["source_run_id"] = "missing-original"
+                if defect == "citations":
+                    provenance["evidence_ids"] = ["unknown-evidence"]
+                old[11] = json.dumps(provenance)
+                if defect == "prefix":
+                    old[5] = "different project"
+                elif defect == "bad_provenance":
+                    old[11] = "invalid JSON"
+                elif defect == "symlink":
+                    (root.parent / "missing-original").symlink_to(root.parent / "absent")
+                elif defect == "existing_source":
+                    (root.parent / "missing-original").mkdir()
+                elif defect == "subset":
+                    rows = rows[:1]
+                elif defect == "requested_prefix":
+                    old[5] = rows[0][5] = "unbound changed project"
+                gateway = MonthlyGateway([monthly.HEADER, old])
+                before = copy.deepcopy(gateway.rows)
+                with self.assertRaises(publisher.PublicationError):
+                    publisher.publish_monthly_unresolved(gateway, spreadsheet_id="test",
+                        sheet_title="September 2026 unresolved evidence", rows=rows, source_dir=root,
+                        retain_provenance_debt=True)
+                self.assertEqual([], gateway.writes)
+                self.assertEqual(before, gateway.rows)
+
+    def test_retained_preimage_is_reread_before_append_but_human_edits_are_preserved(self):
+        # Catches stale preimages causing writes before conflict detection, or ownership of K.
+        for column in (5, 10, 11, "source"):
+            with self.subTest(column=column), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "current"
+                frozen_run(root, 1)
+                rows = monthly.project_rows(root)
+                old = list(rows[0])
+                provenance = json.loads(old[11])
+                provenance["source_run_id"] = "missing-original"
+                old[11] = json.dumps(provenance)
+                gateway = MonthlyGateway([monthly.HEADER, old])
+                plan = publisher._plan_monthly_unresolved(gateway, spreadsheet_id="test",
+                    sheet_title="September 2026 unresolved evidence", rows=rows, source_dir=root,
+                    retain_provenance_debt=True)
+                if column == "source":
+                    path = root / "run-report.json"
+                    path.write_text(path.read_text() + " ")
+                else:
+                    gateway.rows[1][column] = "Changed after planning"
+                before = copy.deepcopy(gateway.rows)
+                if column == 10:
+                    result = publisher._apply_monthly_unresolved(gateway, spreadsheet_id="test", plan=plan)
+                    self.assertEqual(2, result["appended"])
+                    self.assertEqual(before, gateway.rows[:2])
+                else:
+                    with self.assertRaises(publisher.PublicationError):
+                        publisher._apply_monthly_unresolved(gateway, spreadsheet_id="test", plan=plan)
+                    self.assertEqual([], gateway.writes)
+                    self.assertEqual(before, gateway.rows)
+
+    def test_partition_debt_preflight_protects_all_destinations_before_first_write(self):
+        # Catches primary writes preceding detection of retained/source drift.
+        for drift in (5, 11, "source", 10):
+            with self.subTest(drift=drift), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "current"
+                frozen_run(root, 1)
+                rows = monthly.project_rows(root)
+                old = list(rows[0])
+                provenance = json.loads(old[11])
+                provenance["source_run_id"] = "missing-original"
+                old[11] = json.dumps(provenance)
+
+                class Gateway(MultiSheetGateway):
+                    def __init__(self):
+                        super().__init__()
+                        self.sheets["September 2026 unresolved evidence"] = {
+                            "sheet_id": 7, "rows": [list(monthly.HEADER), old]}
+                        self.monthly_writes = []
+
+                    def spreadsheet(self, spreadsheet_id):
+                        metadata = super().spreadsheet(spreadsheet_id)
+                        for sheet in metadata["sheets"]:
+                            sheet["properties"]["gridProperties"]["columnCount"] = 15
+                        return metadata
+
+                    def values(self, spreadsheet_id, range_name):
+                        if ":L" in range_name:
+                            return copy.deepcopy(self.sheets[self._title(range_name)]["rows"])
+                        return super().values(spreadsheet_id, range_name)
+
+                    def append_monthly_rows(self, _id, sheet_id, start_row, grid_rows, appended):
+                        self.monthly_writes.append(appended)
+                        self.sheets["September 2026 unresolved evidence"]["rows"].extend(copy.deepcopy(appended))
+
+                gateway = Gateway()
+                real_plan = publisher._plan_monthly_unresolved
+
+                def plan_then_drift(*args, **kwargs):
+                    plan = real_plan(*args, **kwargs)
+                    if drift == "source":
+                        path = root / "run-report.json"
+                        path.write_text(path.read_text() + " ")
+                    else:
+                        gateway.sheets["September 2026 unresolved evidence"]["rows"][1][drift] = "Changed after planning"
+                    return plan
+
+                kwargs = dict(spreadsheet_id="test", sheet_title="September 2026 portfolio review",
+                    template_title="Proposals", proposals=[proposal()], run_id="current", project_allowlist={},
+                    monthly_rows=rows, monthly_source_dir=root, retain_provenance_debt=True)
+                with mock.patch.object(publisher, "_plan_monthly_unresolved", side_effect=plan_then_drift):
+                    if drift == 10:
+                        publisher.publish_proposal_partitions(gateway, **kwargs)
+                        self.assertEqual(2, len(gateway.sheets["September 2026 portfolio review"]["rows"]))
+                        self.assertEqual("Changed after planning", gateway.sheets["September 2026 unresolved evidence"]["rows"][1][10])
+                    else:
+                        with self.assertRaises(publisher.PublicationError):
+                            publisher.publish_proposal_partitions(gateway, **kwargs)
+                        self.assertNotIn("September 2026 portfolio review", gateway.sheets)
+                        self.assertEqual([], gateway.appended)
+                        self.assertEqual([], gateway.monthly_writes)
+
+    def test_debt_receipt_consumer_reconstructs_retained_projection_and_rejects_false_full_claims(self):
+        # Catches a skip/ignore path falsely claiming canonical/full delivery.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "current"
+            frozen_run(root, 1)
+            (root / "routing.json").write_text("{}")
+            rows = monthly.project_rows(root)
+            old = list(rows[0])
+            provenance = json.loads(old[11])
+            provenance["source_run_id"] = "missing-original"
+            old[11] = json.dumps(provenance)
+            old[10] = "preserve human text"
+            gateway = MonthlyGateway([monthly.HEADER, old])
+            result = publisher.publish_monthly_unresolved(gateway, spreadsheet_id="test",
+                sheet_title="September 2026 unresolved evidence", rows=rows, source_dir=root,
+                retain_provenance_debt=True)
+            source = {"run_dir": str(root), "run_id": root.name, "review_ids": [],
+                      "coverage": {"status": "complete", "incomplete_sources": []},
+                      **{key: "fixture" for key in ("result_digest", "bundle_digest", "artifact_digests",
+                          "snapshot_digests", "proposals_digest", "accounting_digest", "quality_digest")}}
+            replay = {**source, "replay_integrity_digest": "fixture"}
+            config = {"spreadsheet_id": "test"}
+            expected = cycle._expected_publication_receipts(config, source, sheet_title="September 2026 portfolio review")
+            document = {"schema_version": "sheet-publication-result/v1", "status": "published",
+                        "external_writes": True, "clockify_writes": 0, "publications": [result]}
+            validated = cycle._validated_publication_document(document, expected, source_dir=root)
+            self.assertEqual(result["retained_provenance_debt"], validated[0]["retained_provenance_debt"])
+            for mutation in ("omit", "change_requested", "change_retained", "duplicate"):
+                bad = copy.deepcopy(document)
+                debt = bad["publications"][0]["retained_provenance_debt"]
+                if mutation == "omit":
+                    del bad["publications"][0]["retained_provenance_debt"]
+                elif mutation == "duplicate":
+                    debt.append(copy.deepcopy(debt[0]))
+                elif mutation == "change_requested":
+                    debt[0]["requested_machine_digest"] = "sha256:" + "0" * 64
+                else:
+                    debt[0]["retained_provenance_digest"] = "not a digest"
+                with self.subTest(mutation=mutation), self.assertRaises(cycle.CycleError):
+                    cycle._validated_publication_document(bad, expected, source_dir=root)
+            delivery = cycle._delivery_document(config, "2026-09-09", "2026-09-11", source, replay,
+                sheet_title="September 2026 portfolio review", publication_readbacks=validated)
+            self.assertEqual(cycle.PARTIAL_RECEIPT_SCHEMA_VERSION, delivery["schema_version"])
+            self.assertEqual(result["retained_provenance_debt"], delivery["retained_provenance_debt"])
+            path = root / "partial.json"
+            path.write_text(json.dumps(delivery))
+            cycle._verify_delivery_receipt(path, config, "2026-09-09", "2026-09-11", source, replay,
+                sheet_title="September 2026 portfolio review")
+            bad = copy.deepcopy(delivery)
+            bad["schema_version"] = cycle.RECEIPT_SCHEMA_VERSION
+            bad["receipt_digest"] = cycle._value_digest({key: value for key, value in bad.items() if key != "receipt_digest"})
+            path.write_text(json.dumps(bad))
+            with self.assertRaises(cycle.CycleError):
+                cycle._verify_delivery_receipt(path, config, "2026-09-09", "2026-09-11", source, replay,
+                    sheet_title="September 2026 portfolio review")
+
     def test_legacy_receipt_consumer_reconstructs_source_and_rejects_target_tampering(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

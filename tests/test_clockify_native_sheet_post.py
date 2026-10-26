@@ -6,8 +6,11 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
+import urllib.parse
 
 from scripts import clockify_native_sheet_post as native
+from scripts import clockify_review_batches as batches
+from scripts import clockify_sheet_publish as publisher
 
 
 def cell(value):
@@ -108,6 +111,285 @@ class DelayedDirectGetGateway(FakeGateway):
 
 
 class NativeSheetPostTests(unittest.TestCase):
+    def test_gateway_discovers_carry_in_and_outer_overlaps_without_backend_date_filters(self):
+        entries = [
+            live("left", "2026-09-26T08:25:00Z", "2026-09-26T09:14:00Z"),
+            live("outer", "2016-01-01T00:00:00Z", "2026-09-26T09:15:00Z"),
+            live("right", "2026-09-26T09:13:30Z", "2026-09-26T09:15:00Z"),
+            live("inside", "2026-09-26T09:13:10Z", "2026-09-26T09:13:20Z"),
+            live("touch-left", "2026-09-26T08:00:00Z", "2026-09-26T09:13:00Z"),
+            live("touch-right", "2026-09-26T09:14:00Z", "2026-09-26T10:00:00Z"),
+        ]
+        entries[0]["taskId"] = "original-task"
+        entries[0]["customFieldValues"] = [{"customFieldId": "field", "value": "retained"}]
+        gateway = native.ClockifyGateway("fixture-key", 45)
+        gateway.bind_target("workspace-1", "user-1")
+        for mode in ("start-range", "fully-contained"):
+            with self.subTest(mode=mode):
+                def request(path, key, *, timeout_seconds):
+                    parsed = urllib.parse.urlparse(path)
+                    self.assertEqual("/workspaces/workspace-1/user/user-1/time-entries", parsed.path)
+                    self.assertEqual(("fixture-key", 45), (key, timeout_seconds))
+                    query = urllib.parse.parse_qs(parsed.query)
+                    rows = entries
+                    if "start" in query:
+                        rows = [entry for entry in rows
+                                if entry["timeInterval"]["start"] >= query["start"][0]]
+                    if "end" in query:
+                        field = "start" if mode == "start-range" else "end"
+                        rows = [entry for entry in rows
+                                if entry["timeInterval"][field] < query["end"][0]]
+                    page, size = int(query["page"][0]), int(query["page-size"][0])
+                    return rows[(page - 1) * size:page * size]
+                with mock.patch.object(native.legacy, "_request", side_effect=request):
+                    actual = gateway.period_entries("2026-09-26T09:13:00Z", "2026-09-26T09:14:00Z")
+                self.assertEqual(["left", "outer", "right", "inside"], [entry["id"] for entry in actual])
+                self.assertIs(entries[0], actual[0])
+                plan = self._plan(capture(row("review-a", "2026-09-26 12:13", "2026-09-26 12:14", 1)),
+                                  existing=actual)
+                self.assertEqual([60, 60, 30, 10],
+                                 [value["overlap_seconds"] for value in plan["entries"][0]["live_overlaps"]])
+
+    def test_gateway_does_not_cache_inventory_across_fresh_reads(self):
+        carry_in = live("new-carry-in", "2026-09-26T08:25:00Z", "2026-09-26T09:14:00Z")
+        gateway = native.ClockifyGateway("fixture-key", 45)
+        gateway.bind_target("workspace-1", "user-1")
+        with mock.patch.object(native.legacy, "_request", side_effect=[[], [carry_in]]):
+            first = gateway.period_entries("2026-09-26T09:13:00Z", "2026-09-26T09:14:00Z")
+            second = gateway.period_entries("2026-09-26T09:13:00Z", "2026-09-26T09:14:00Z")
+        self.assertEqual([], first)
+        self.assertEqual(["new-carry-in"], [entry["id"] for entry in second])
+
+    def test_gateway_running_carry_in_cannot_be_declared_free_capacity(self):
+        running = live("running", "2026-09-26T08:25:00Z", None)
+        gateway = native.ClockifyGateway("fixture-key", 45)
+        gateway.bind_target("workspace-1", "user-1")
+        with mock.patch.object(native.legacy, "_request", return_value=[running]):
+            with self.assertRaisesRegex(native.NativePostError, "running"):
+                gateway.period_entries("2026-09-26T09:13:00Z", "2026-09-26T09:14:00Z")
+
+    def test_native_pagination_reaches_later_thousand_entry_page(self):
+        outside = live("outside", "2026-09-26T08:00:00Z", "2026-09-26T09:00:00Z")
+        carry_in = live("later-carry-in", "2026-09-26T08:25:00Z", "2026-09-26T09:14:00Z")
+        gateway = native.ClockifyGateway("fixture-key", 45)
+        gateway.bind_target("workspace-1", "user-1")
+        with mock.patch.object(native.legacy, "_request", side_effect=[[outside] * 1000, [carry_in]]) as request:
+            actual = gateway.period_entries("2026-09-26T09:13:00Z", "2026-09-26T09:14:00Z")
+        self.assertEqual(["later-carry-in"], [entry["id"] for entry in actual])
+        self.assertEqual("/workspaces/workspace-1/user/user-1/time-entries?page=2&page-size=1000",
+                         request.call_args.args[0])
+
+    def test_legacy_pagination_default_preserves_two_hundred_entry_url(self):
+        with mock.patch.object(native.legacy, "_request", return_value=[]) as request:
+            self.assertEqual([], native.legacy._paged("/workspaces/workspace-1/projects?archived=false",
+                                                     "fixture-key", timeout_seconds=45))
+        self.assertEqual("/workspaces/workspace-1/projects?archived=false&page=1&page-size=200",
+                         request.call_args.args[0])
+
+    def test_native_inventory_rejects_malformed_items_on_full_and_final_pages(self):
+        outside = live("outside", "2026-09-26T08:00:00Z", "2026-09-26T09:00:00Z")
+        carry_in = live("later-carry-in", "2026-09-26T08:25:00Z", "2026-09-26T09:14:00Z")
+        gateway = native.ClockifyGateway("fixture-key", 45)
+        gateway.bind_target("workspace-1", "user-1")
+        for first_page in ([outside] * 999 + [None], [outside, None]):
+            with self.subTest(wire_page_size=len(first_page)):
+                with mock.patch.object(native.legacy, "_request", side_effect=[first_page, [carry_in]]):
+                    with self.assertRaisesRegex(native.legacy.PortfolioPostError, "item"):
+                        gateway.period_entries("2026-09-26T09:13:00Z", "2026-09-26T09:14:00Z")
+
+    def test_legacy_item_filtering_keeps_later_rows_after_full_wire_page(self):
+        first = {"id": "first"}
+        later = {"id": "later"}
+        with mock.patch.object(native.legacy, "_request", side_effect=[[first] * 199 + [None], [later]]):
+            actual = native.legacy._paged("/workspaces/workspace-1/projects", "fixture-key", timeout_seconds=45)
+        self.assertEqual(200, len(actual))
+        self.assertIs(later, actual[-1])
+        self.assertNotIn(None, actual)
+
+    def test_pagination_budget_never_returns_partial_overlap_inventory(self):
+        carry_in = live("carry-in", "2026-09-26T08:25:00Z", "2026-09-26T09:14:00Z")
+        gateway = native.ClockifyGateway("fixture-key", 45)
+        gateway.bind_target("workspace-1", "user-1")
+        with mock.patch.object(native.legacy, "_request", return_value=[carry_in] * 1000) as request:
+            with self.assertRaisesRegex(native.legacy.PortfolioPostError, "pagination"):
+                gateway.period_entries("2026-09-26T09:13:00Z", "2026-09-26T09:14:00Z")
+        self.assertEqual(100, request.call_count)
+
+    def test_later_contiguous_grid_block_is_not_silently_omitted(self):
+        first = row("review-first", "2026-09-07 12:00", "2026-09-07 12:30", 30)
+        later = row("review-later", "2026-09-07 13:00", "2026-09-07 13:30", 30)
+        document = capture(first)
+        document["structuredContent"]["sheets"][0]["data"].append({
+            "startRow": 2, "startColumn": 0,
+            "rowData": [{"values": [cell(value) for value in later]}],
+        })
+        plan = self._plan(document)
+        self.assertEqual([("review-first", 2), ("review-later", 3)],
+                         [(entry["review_id"], entry["row_number"]) for entry in plan["entries"]])
+        self.assertEqual(60, plan["total_minutes"])
+
+    def test_sparse_header_and_row_839_keep_actual_physical_row_number(self):
+        current = row("review-current", "2026-09-07 12:00", "2026-09-07 12:30", 30)
+        document = capture()
+        document["structuredContent"]["sheets"][0]["data"].append({
+            "startRow": 838, "startColumn": 0,
+            "rowData": [{"values": [cell(value) for value in current]}],
+        })
+        plan = self._plan(document)
+        self.assertEqual(1, plan["row_count"])
+        self.assertEqual([839], [entry["row_number"] for entry in plan["entries"]])
+        _, _, all_rows = native._sheet_rows(document, pending_only=False)
+        self.assertEqual([839], [number for number, _ in all_rows])
+
+    def test_out_of_order_blocks_preserve_physical_order_and_pending_filter(self):
+        posted = row("review-posted", "2026-09-07 12:00", "2026-09-07 12:30", 30)
+        posted[9], posted[13] = "Approved", "posted"
+        pending = row("review-pending", "2026-09-07 13:00", "2026-09-07 13:30", 30)
+        document = capture(posted)
+        data = document["structuredContent"]["sheets"][0]["data"]
+        data.insert(0, {"startRow": 838, "rowData": [
+            {"values": [cell(value) for value in pending]},
+        ]})
+        _, _, pending_rows = native._sheet_rows(document)
+        self.assertEqual([(839, "review-pending")],
+                         [(number, value["Review ID"]) for number, value in pending_rows])
+        _, _, all_rows = native._sheet_rows(document, pending_only=False)
+        self.assertEqual([(2, "review-posted"), (839, "review-pending")],
+                         [(number, value["Review ID"]) for number, value in all_rows])
+
+    def test_overlapping_blocks_are_rejected_even_when_rows_match(self):
+        document = capture(row("review-a", "2026-09-07 12:00", "2026-09-07 12:30", 30))
+        data = document["structuredContent"]["sheets"][0]["data"]
+        data.append({"startRow": 1, "rowData": [copy.deepcopy(data[0]["rowData"][1])]})
+        with self.assertRaises(native.NativePostError):
+            native._sheet_rows(document)
+
+    def test_invalid_grid_positions_are_rejected_in_every_block(self):
+        for block_index in (0, 1):
+            for field, value in (("startRow", -1), ("startRow", True), ("startRow", 0.5),
+                                 ("startRow", "0"), ("startColumn", 1),
+                                 ("startColumn", -1), ("startColumn", False),
+                                 ("startColumn", "0"), ("startColumn", None)):
+                with self.subTest(block_index=block_index, field=field, value=value):
+                    document = capture(row("review-a", "2026-09-07 12:00", "2026-09-07 12:30", 30))
+                    data = document["structuredContent"]["sheets"][0]["data"]
+                    data.append({"startRow": 838, "rowData": [{"values": []}]})
+                    data[block_index][field] = value
+                    with self.assertRaises(native.NativePostError):
+                        native._sheet_rows(document)
+
+    def test_contract_header_must_be_at_physical_row_one(self):
+        document = capture(row("review-a", "2026-09-07 12:00", "2026-09-07 12:30", 30))
+        document["structuredContent"]["sheets"][0]["data"][0]["startRow"] = 838
+        with self.assertRaises(native.NativePostError):
+            native._sheet_rows(document)
+
+    def same_window_v3_plan(self, descriptions=None):
+        from test_review_batches import proposal, identity
+        descriptions = descriptions or ["SC — Prepared original guarded publication result",
+                                        "SC — Verified exact receipt binding result"]
+        sources = [proposal(1), proposal(2)]
+        for source, description in zip(sources, descriptions):
+            source.update(clockify_project_suffix="123456", tag_names=["Process"], tag_suffixes=["654321"],
+                          human_corrected=True, description=description)
+        ids = [identity(1), identity(2)]
+        contexts = dict.fromkeys(ids, "approved-daily-project-presentation/v1")
+        package = batches.package_review_batches(sources,
+            editorial_descriptions=dict(zip(ids, descriptions)), work_contexts=contexts,
+            wording_only_ids=ids, allow_review_overlaps=True)
+        document = capture(publisher.portfolio_row(package["activities"][0], "source-run"))
+        return native.build_plan(document, capture_sha256="c" * 64, routing=route(), routing_sha256="r" * 64,
+            timezone="Europe/Bucharest", workspace_id="workspace-1", member_id="user-1",
+            projects=[{"id": "project-123456"}], tags=[{"id": "tag-654321"}], live_entries=[],
+            review_batches=package, review_batch_sources=sources, review_batch_work_contexts=contexts,
+            review_batch_authority={"consolidation_policy": "approved-daily-project-presentation/v3", "wording_only_ids": ids})
+
+    def test_distinct_same_window_children_post_and_read_back_all_142_seconds_not_payload_alias_credit(self):
+        plan = self.same_window_v3_plan()
+        gateway = FakeGateway()
+        now = dt.datetime(2026, 10, 4, 11, tzinfo=dt.timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            events, receipt_path = Path(directory) / "events.jsonl", Path(directory) / "receipt.json"
+            receipt = native.execute_plan(plan, self._approval(plan), events, receipt_path, gateway, now=now)
+            self.assertEqual(2, len(gateway.posts))
+            self.assertEqual([plan["review_batches_binding"]["package"]["activities"][0]["description"]] * 2,
+                             [entry["description"] for entry in gateway.posts])
+            self.assertEqual(["created", "created"], [entry["disposition"] for entry in receipt["entries"]])
+            self.assertEqual(["created-1", "created-2"], receipt["review_groups"][0]["clockify_entry_ids"])
+            self.assertEqual(142, receipt["review_groups"][0]["duration_seconds"])
+            readbacks = [gateway.entry_by_id(entry["clockify_entry_id"]) for entry in receipt["entries"]]
+            self.assertEqual(142, sum(int((dt.datetime.fromisoformat(entry["timeInterval"]["end"].replace("Z", "+00:00"))
+                - dt.datetime.fromisoformat(entry["timeInterval"]["start"].replace("Z", "+00:00"))).total_seconds())
+                for entry in readbacks))
+            retry = native.execute_plan(plan, self._approval(plan), events, receipt_path, gateway, now=now)
+            self.assertEqual(receipt, retry)
+            self.assertEqual(2, len(gateway.posts))
+
+    def test_same_window_v3_distinct_claims_recover_ambiguous_creates_without_reusing_one_entry(self):
+        plan = self.same_window_v3_plan()
+        gateway = FakeGateway(ambiguous=True)
+        now = dt.datetime(2026, 10, 4, 11, tzinfo=dt.timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            events, receipt_path = Path(directory) / "events.jsonl", Path(directory) / "receipt.json"
+            receipt = native.execute_plan(plan, self._approval(plan), events, receipt_path, gateway, now=now)
+            self.assertEqual(2, len(gateway.posts))
+            self.assertEqual(["created-1", "created-2"], [entry["clockify_entry_id"] for entry in receipt["entries"]])
+            self.assertEqual(["recovered_after_ambiguous_response"] * 2,
+                             [entry["disposition"] for entry in receipt["entries"]])
+            self.assertEqual(142, receipt["review_groups"][0]["duration_seconds"])
+            self.assertEqual(receipt, native.execute_plan(plan, self._approval(plan), events, receipt_path, gateway, now=now))
+            self.assertEqual(2, len(gateway.posts))
+
+    def test_identical_native_payloads_for_distinct_v3_claims_remain_unready_until_source_equivalence_verified(self):
+        with self.assertRaisesRegex(native.NativePostError, "identical native payloads; verify source equivalence"):
+            self.same_window_v3_plan(["SC — Same reviewed accomplishment description"] * 2)
+
+    def test_v3_independent_claims_cannot_alias_or_share_one_native_credit_identity(self):
+        plan = self.same_window_v3_plan()
+        independent = native._independent_review_ids(plan)
+        entries = copy.deepcopy(plan["entries"])
+        entries[1]["payload"] = copy.deepcopy(entries[0]["payload"])
+        self.assertEqual({}, native._batch_alias_leaders(entries, independent_review_ids=independent))
+        with self.assertRaisesRegex(native.NativePostError, "distinct Clockify entries"):
+            native._check_unique_native_ids(entries, ["one-entry", "one-entry"], independent_review_ids=independent)
+
+    def test_frozen_presentation_authority_plans_corrected_overlapping_children_without_posts(self):
+        from test_review_batches import proposal, identity
+        sources = [proposal(1), proposal(2, "2026-09-29T10:00:30+03:00", "2026-09-29T10:01:53+03:00", 83)]
+        descriptions = ["SC — Prepared original guarded publication result", "SC — Verified exact receipt binding result"]
+        for source, description in zip(sources, descriptions):
+            source.update(clockify_project_suffix="123456", tag_names=["Process"], tag_suffixes=["654321"],
+                          human_corrected=True, description=description)
+        ids = [identity(1), identity(2)]
+        contexts = dict.fromkeys(ids, "approved-daily-project-presentation/v1")
+        package = batches.package_review_batches(sources,
+            editorial_descriptions=dict(zip(ids, descriptions)), work_contexts=contexts,
+            wording_only_ids=ids, allow_review_overlaps=True)
+        document = capture(publisher.portfolio_row(package["activities"][0], "source-run"))
+        inputs = dict(capture_sha256="c" * 64, routing=route(), routing_sha256="r" * 64,
+            timezone="Europe/Bucharest", workspace_id="workspace-1", member_id="user-1",
+            projects=[{"id": "project-123456"}], tags=[{"id": "tag-654321"}], live_entries=[],
+            review_batches=package, review_batch_sources=sources, review_batch_work_contexts=contexts)
+        authority = {"consolidation_policy": "approved-daily-project-presentation/v3", "wording_only_ids": ids}
+        plan = native.build_plan(document, **inputs, review_batch_authority=authority)
+        self.assertEqual(1, plan["row_count"])
+        self.assertEqual(154 / 60, plan["total_minutes"])
+        self.assertEqual(ids, [entry["review_id"] for entry in plan["entries"]])
+        self.assertEqual(["2026-09-29T07:00:07Z", "2026-09-29T07:00:30Z"],
+                         [entry["payload"]["start"] for entry in plan["entries"]])
+        self.assertEqual(["2026-09-29T07:01:18Z", "2026-09-29T07:01:53Z"],
+                         [entry["payload"]["end"] for entry in plan["entries"]])
+        self.assertEqual([package["activities"][0]["description"]] * 2,
+                         [entry["payload"]["description"] for entry in plan["entries"]])
+        self.assertEqual(authority, plan["review_batches_binding"]["preparation_authority"])
+        native._validate_review_batch_plan(plan)
+        with self.assertRaises(native.NativePostError):
+            native.build_plan(document, **inputs)
+        tampered = copy.deepcopy(plan)
+        tampered["review_batches_binding"]["preparation_authority"]["wording_only_ids"] = []
+        with self.assertRaises(native.NativePostError):
+            native._validate_review_batch_plan(tampered)
+
     def _plan(self, document, routing=None, existing=None, projects=None, tags=None):
         raw = json.dumps(document, sort_keys=True).encode()
         routing = routing or route()

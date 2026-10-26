@@ -20,11 +20,14 @@ class NativeCheckpointCollectionTests(unittest.TestCase):
         environment = {'CLOCKIFY_WORKSPACE_ID': 'workspace-one'}
         checkpoint = None
         if not missing:
-            identity = collector._clockify_checkpoint_identity('workspace-one', 'user-one', since, until)
+            identity = collector._clockify_checkpoint_identity('workspace-one', 'user-one', since, until,
+                                                               overlap_history=True)
             state = store.open(identity, initial_metadata={'snapshot_at': '2026-09-03T00:00:00Z'})
             entries = entries or []
             state = store.append_page(state, payload=entries, continuation={'page': 2},
-                                      signature=collector._clockify_page_signature(entries))
+                                      signature=collector._clockify_page_signature(entries),
+                                      metadata={'wire_row_count': len(entries),
+                                                'wire_signature': collector._clockify_page_signature(entries)})
             state = store.mark_complete(state)
             checkpoint = state.directory
         else:
@@ -47,6 +50,8 @@ class NativeCheckpointCollectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             run, since, until, checkpoint = self.collect(Path(temporary))
             report = json.loads((run / 'run-report.json').read_bytes())
+            self.assertIs(type(report.get('monthly_unresolved_rendering_revision')), int)
+            self.assertEqual(1, report['monthly_unresolved_rendering_revision'])
             self.assertIn('clockify_native_checkpoint', report,
                           'fresh collector discards the complete native checkpoint proof')
             proof = report['clockify_native_checkpoint']

@@ -1729,6 +1729,9 @@ def _preflight_replay_analyzer_cache(
             hinted_events = semantic_analyzer.with_actor_context(
                 hinted_events, subject_binding=routing.get("semantic_subject_binding"),
             )
+        review_prompt_version = source_analysis.get("review_prompt_version")
+        if review_prompt_version is None:
+            review_prompt_version = semantic_analyzer.REVIEW_PROMPT_VERSION
         replayed = semantic_analyzer.analyze_tiered(
             hinted_events,
             primary=primary,
@@ -1739,6 +1742,7 @@ def _preflight_replay_analyzer_cache(
             cache=cache,
             max_workers=1,
             review_taxonomy=taxonomy,
+            review_prompt_version=review_prompt_version,
             **({"failed_review_retry_targets": retry_targets} if retry_targets is not None else {}),
             **tuning,
         )
@@ -1904,6 +1908,51 @@ def _verified_replay_inference_context(source: Path) -> Path:
         current = parent
 
 
+def _review_diagnostics_snapshot(
+    directory: Path, analysis: Mapping[str, Any], cache_content: bytes,
+) -> bytes | None:
+    """Authenticate the optional, source-bound numeric repair feedback artifact."""
+    summary = analysis.get("analyzer_cache")
+    if not isinstance(summary, Mapping) or "review_diagnostics_snapshot" not in summary:
+        return None  # Historical caches never consult an unbound sibling file.
+    descriptor = summary["review_diagnostics_snapshot"]
+    name = "analyzer-cache-used.jsonl.review-diagnostics.jsonl"
+    if (not isinstance(descriptor, Mapping) or set(descriptor) != {"path", "record_count", "sha256"}
+            or descriptor.get("path") != name
+            or type(descriptor.get("record_count")) is not int or descriptor["record_count"] < 1
+            or not isinstance(descriptor.get("sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", descriptor["sha256"]) is None):
+        raise ReviewRunError("review diagnostic snapshot descriptor is invalid")
+    path = directory / name
+    if not directory.is_absolute() or directory != directory.resolve() or path != path.resolve():
+        raise ReviewRunError("review diagnostic snapshot path is not canonical")
+    content = _read_snapshot_source(path, label="review diagnostic snapshot")
+    if hashlib.sha256(content).hexdigest() != descriptor["sha256"]:
+        raise ReviewRunError("review diagnostic snapshot digest differs")
+    try:
+        rows = [json.loads(line) for line in content.splitlines()]
+        cache_records = [json.loads(line) for line in cache_content.splitlines() if line.strip()]
+        rejected = {row["cache_key"]: row for row in cache_records
+                    if row.get("status") == "rejected"
+                    and row.get("failure_code") == "contract_rejected_duplicate_evidence"}
+        if (len(rows) != descriptor["record_count"]
+                or not all(isinstance(row, Mapping) for row in rows)):
+            raise ValueError("diagnostic count or shape differs")
+        for row in rows:
+            semantic_analyzer.validate_review_diagnostic_record(row)
+            record = rejected.get(row["cache_key"])
+            if record is None or any(row[key] != record.get(key) for key in (
+                    "cache_key", "body_digest", "failure_code")):
+                raise ValueError("diagnostic is not bound to a used rejected request")
+        keys = [row["cache_key"] for row in rows]
+        canonical = b"".join((semantic_analyzer.canonical_json(row) + "\n").encode() for row in rows)
+        if keys != sorted(set(keys)) or canonical != content:
+            raise ValueError("diagnostic records are not canonical or unique")
+    except (KeyError, TypeError, ValueError, semantic_analyzer.AnalyzerError) as exc:
+        raise ReviewRunError("review diagnostic snapshot records are invalid or foreign") from exc
+    return content
+
+
 def _prepare_replay_run(source: Path) -> Path:
     """Create a distinct run with immutable ledger and semantic fixture copies."""
     source = _run_child(source, label="replay source")
@@ -1940,11 +1989,13 @@ def _prepare_replay_run(source: Path) -> Path:
     cache_content: bytes | None = None
     cache_sha256: str | None = None
     reused_cache_records: list[dict[str, str]] = []
+    diagnostic_content: bytes | None = None
     inference_backed = _analysis_is_inference_backed(source_analysis)
     if inference_backed and not cache_source.is_file():
         raise ValueError("inference-backed replay requires its sealed analyzer cache")
     if cache_source.is_file():
         cache_content = _read_snapshot_source(cache_source, label="replay analyzer cache")
+        diagnostic_content = _review_diagnostics_snapshot(source, source_analysis, cache_content)
         semantic_analyzer.AnalyzerResponseCache(cache_source)
         records: list[dict[str, Any]] = []
         for line in cache_content.splitlines():
@@ -2033,6 +2084,9 @@ def _prepare_replay_run(source: Path) -> Path:
         if cache_content is not None:
             cache_fixture = target / "replay-fixture" / "analyzer-cache-used.jsonl"
             _write_snapshot(cache_fixture, cache_content, label="replay analyzer cache")
+            if diagnostic_content is not None:
+                _write_snapshot(cache_fixture.with_name(cache_fixture.name + ".review-diagnostics.jsonl"),
+                                diagnostic_content, label="replay review diagnostic snapshot")
         for filename, content in reconciliation_snapshots.items():
             _write_snapshot(target / filename, content, label=f"replay {filename}")
         if meeting_content is not None:
@@ -2122,6 +2176,11 @@ def _replay_analyzer_cache(replay: Path) -> Path | None:
     content = _read_snapshot_source(cache, label="replay analyzer cache")
     if hashlib.sha256(content).hexdigest() != expected:
         raise ValueError("replay analyzer cache differs from its immutable source")
+    analysis, _analysis_content, _digest = _read_snapshot_json(
+        replay / str(provenance.get("semantic_analysis_fixture") or ""),
+        label="replay semantic analysis fixture",
+    )
+    _review_diagnostics_snapshot(cache.parent, analysis, content)
     semantic_analyzer.AnalyzerResponseCache(cache)
     return cache
 
@@ -2397,6 +2456,9 @@ def _validate_repair_credit_transition(
             fields = set(patch) if isinstance(patch, Mapping) else set()
             has_wording = "description" in fields
             has_routing = "client_project" in fields or "tag_names" in fields
+            # _read_log has already proved the latest explicit predecessor and
+            # description-only shape. No other duplicate decision gains authority.
+            wording_supersession = record.get("supersedes_digest") is not None
             expected_fields = ({"description"} if has_wording else set()) | (
                 {"client_project", "tag_names"} if has_routing else set()
             )
@@ -2417,8 +2479,8 @@ def _validate_repair_credit_transition(
                 or (target not in proposal_targets and not (
                     has_routing and _unresolved_repair_target(source, target)
                 ))
-                or target in prior_decision_targets
-                or target in appended_decision_targets
+                or (target in prior_decision_targets and not wording_supersession)
+                or (target in appended_decision_targets and not wording_supersession)
             ):
                 raise ReviewRunError("repair editorial decision is not exact source-bound replacement")
             if has_routing:
@@ -2655,6 +2717,10 @@ def _prepare_repair_run(
             cache_content,
             label="repair analyzer cache",
         )
+        diagnostic_content = _review_diagnostics_snapshot(source, semantic_document, cache_content)
+        if diagnostic_content is not None:
+            _write_snapshot(target / "analyzer-cache-used.jsonl.review-diagnostics.jsonl",
+                            diagnostic_content, label="repair review diagnostic snapshot")
         cache_provenance = {
             "analyzer_cache_path": "analyzer-cache-used.jsonl",
             "analyzer_cache_sha256": cache_digest,
@@ -2662,6 +2728,9 @@ def _prepare_repair_run(
         if scoped_recovery is not None:
             _write_snapshot(target / "repair-fixture/analyzer-cache-used.jsonl", cache_content,
                             label="immutable scoped retry source cache")
+            if diagnostic_content is not None:
+                _write_snapshot(target / "repair-fixture/analyzer-cache-used.jsonl.review-diagnostics.jsonl",
+                                diagnostic_content, label="immutable scoped retry review diagnostics")
     if scoped_recovery is not None:
         (target / "scoped-recovery").mkdir()
         for name, content in scoped_recovery["files"].items():
@@ -2732,6 +2801,11 @@ def _repair_analysis_fixture(repair: Path) -> Path:
             or hashlib.sha256(source_cache.read_bytes()).hexdigest() != cache_expected
         ):
             raise ReviewRunError("repair analyzer cache differs from its source")
+        semantic_document = _read_snapshot_json(fixture, label="repair semantic analysis fixture")[0]
+        _review_diagnostics_snapshot(source, semantic_document,
+                                     _read_snapshot_source(source_cache, label="repair source analyzer cache"))
+        _review_diagnostics_snapshot(repair_cache.parent, semantic_document,
+                                     _read_snapshot_source(repair_cache, label="repair analyzer cache"))
     return fixture
 
 
@@ -3291,6 +3365,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--since", help="YYYY-MM-DD")
     parser.add_argument("--until", help="YYYY-MM-DD inclusive")
+    parser.add_argument("--until-exclusive", help="Timezone-aware ISO timestamp, exclusive; fresh runs only")
     parser.add_argument(
         "--runs-root",
         type=Path,
@@ -3359,6 +3434,57 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--analyzer-max-events-per-chunk", type=int)
     parser.add_argument("--analyzer-workers", type=int)
     return parser.parse_args(argv)
+
+
+def _validate_exclusive_period(args: argparse.Namespace, manifest_path: Path) -> None:
+    """Bind a fresh exact cutoff to the immutable period before external reads."""
+    if getattr(args, "until_exclusive", None) is None:
+        return
+    if not args.since:
+        raise ReviewRunError("--until-exclusive requires an explicit --since")
+    since, until, _reason = clockify_sync_collect.compute_range(args, {}, {"_missing": True})
+    _document, manifest, _bundles, _content = _validated_period_manifest(
+        manifest_path, allow_collecting_bootstrap=True,
+    )
+    identity = manifest.identity.document()
+    if (clockify_sync_collect.iso_utc(since), clockify_sync_collect.iso_utc(until)) != (
+        identity["since_utc"], identity["until_utc"],
+    ):
+        raise ReviewRunError("exclusive collection bounds do not match the exact period manifest")
+
+
+def _validate_exclusive_proposal_bound(
+    run_dir: Path, manifest_path: Path, until_exclusive: str | None = None,
+) -> None:
+    """Fail closed on over-bound accounting, without clipping evidence or effort.
+
+    Only explicitly capped collections carry this marker. Historical replay and
+    repair retain their established behavior; new capped sources retain the guard
+    when resumed or replayed without a command-line range override.
+    """
+    report = _read_json(run_dir / "run-report.json")
+    recorded = report.get("requested_until_exclusive")
+    raw = recorded if recorded is not None else until_exclusive
+    if raw is None:
+        return
+    cutoff = clockify_sync_collect.parse_until_exclusive(raw)
+    if until_exclusive is not None and cutoff != clockify_sync_collect.parse_until_exclusive(until_exclusive):
+        raise ReviewRunError("exclusive collection cutoff differs from its source snapshot")
+    _document, manifest, _bundles, _content = _validated_period_manifest(
+        manifest_path, allow_collecting_bootstrap=True,
+    )
+    if manifest.identity.document()["until_utc"] != clockify_sync_collect.iso_utc(cutoff):
+        raise ReviewRunError("exclusive collection cutoff differs from its period manifest")
+    proposals = _read_json(run_dir / "proposals.json")
+    if not isinstance(proposals, list):
+        raise ReviewRunError("exclusive collection proposals must be a list")
+    for proposal in proposals:
+        if not isinstance(proposal, Mapping):
+            raise ReviewRunError("exclusive collection proposal is invalid")
+        start = clockify_sync_collect.parse_until_exclusive(proposal.get("start"))
+        end = clockify_sync_collect.parse_until_exclusive(proposal.get("end"))
+        if start >= end or end > cutoff:
+            raise ReviewRunError("accounting proposal exceeds the exclusive collection cutoff")
 
 
 def _process_run(
@@ -3438,6 +3564,23 @@ def _process_run(
         _write_json(result_path, result)
         write_summary(summary_path, result)
         return accounted.returncode or 2, result_path
+
+    try:
+        _validate_exclusive_proposal_bound(
+            run_dir, getattr(args, "period_manifest", run_dir / "period-manifest.json"),
+            getattr(args, "until_exclusive", None),
+        )
+    except (OSError, ValueError, ReviewRunError) as exc:
+        quality = {"status": "blocked", "summary": {
+            "exclusive_collection_cutoff": "failed", "reason": str(exc),
+        }}
+        _write_json(run_dir / "quality_report.json", quality)
+        result = build_result(run_dir, quality, None, review_mode=args.review_mode,
+                              acceptance_gate=acceptance_gate)
+        result_path = run_dir / "autopilot-result.json"
+        _write_json(result_path, result)
+        write_summary(run_dir / "autopilot-summary.md", result)
+        return 2, result_path
 
     if replay_source is not None:
         try:
@@ -3748,6 +3891,19 @@ def _adopt_completed_recovery(source: Path) -> Path | None:
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(raw_argv)
+    if args.until_exclusive is not None:
+        if (args.until or args.replay_from or args.resume_from or args.repair_from
+                or args.materialize_frozen_from or args.derive_pending_from
+                or args.recover_source_debt_from):
+            print("clockify review run: --until-exclusive is a fresh-only bound and conflicts with --until", file=sys.stderr)
+            return 2
+        try:
+            clockify_sync_collect.parse_until_exclusive(args.until_exclusive)
+            if not args.since:
+                raise ReviewRunError("--until-exclusive requires an explicit --since")
+        except (ValueError, ReviewRunError) as exc:
+            print(f"clockify review run: {exc}", file=sys.stderr)
+            return 2
     if args.allow_stopped_only_legacy_observation_variance and args.derive_pending_from is None:
         print("clockify review run: stopped-only observation compatibility requires --derive-pending-from", file=sys.stderr)
         return 2
@@ -3868,7 +4024,8 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 for filename, source in _reconciliation_input_sources(args).items()
             }
-        except ReviewRunError as exc:
+            _validate_exclusive_period(args, args.period_manifest)
+        except (ValueError, ReviewRunError) as exc:
             print(f"clockify review run: {exc}", file=sys.stderr)
             return 2
         if args.review_mode == "exceptions_only":
@@ -4102,6 +4259,8 @@ def main(argv: list[str] | None = None) -> int:
             collector.extend(["--since", args.since])
         if args.until:
             collector.extend(["--until", args.until])
+        if args.until_exclusive is not None:
+            collector.extend(["--until-exclusive", args.until_exclusive])
         if args.calendly_optional:
             collector.append("--calendly-optional")
         collector.append("--no-enrich" if args.no_enrich else "--enrich")
@@ -4167,7 +4326,8 @@ def main(argv: list[str] | None = None) -> int:
             _validated_period_manifest(
                 run_args.period_manifest, allow_collecting_bootstrap=True,
             )
-        except ReviewRunError as exc:
+            _validate_exclusive_period(run_args, run_args.period_manifest)
+        except (ValueError, ReviewRunError) as exc:
             print(
                 f"clockify review run: period manifest preflight failed: {exc}",
                 file=sys.stderr,

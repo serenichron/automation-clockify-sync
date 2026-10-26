@@ -107,7 +107,7 @@ class SelectedHistoricalDeliveryTests(unittest.TestCase):
         native_state=store.append_page(native_state,payload=entries,continuation={'page':2},signature=collector._clockify_page_signature(entries))
         native_state=store.mark_complete(native_state)
         evidence=collector.fetch_clockify({'CLOCKIFY_WORKSPACE_ID':'workspace-1'},{'clockify_user_id':'member-1'},since,until,
-            snapshot_at=dt.datetime(2026,10,8,2,2,24,tzinfo=dt.timezone.utc),checkpoint_store=store)
+            snapshot_at=dt.datetime(2026,10,8,2,2,24,tzinfo=dt.timezone.utc),checkpoint_store=store,checkpoint_identity=identity)
         evidence_path=self.packet_dir/'native-evidence.json';write_json(evidence_path,evidence)
         self.packet['fresh_clockify_sha256']=hashlib.sha256(evidence_path.read_bytes()).hexdigest()
         self.packet['native_page_sha256']=hashlib.sha256((native_state.directory/'pages/000001.json').read_bytes()).hexdigest()
@@ -166,7 +166,10 @@ class SelectedHistoricalDeliveryTests(unittest.TestCase):
             {name:source/name for name in review._RECONCILIATION_INPUTS.values()},executor_runtime_identity={'git_sha':'fixture-sha'},environment={})
         files=('semantic-analysis.json','work-accounting-result.json','quality_report.json','review-snapshot.json','proposals.json','ambiguous.json','fathom-reconciliation.json')
         for name in files:(derived/name).write_bytes((source/name).read_bytes())
-        analysis=json.loads((derived/'semantic-analysis.json').read_text());analysis['activities'][0]['analyzer_tier']='fixture'
+        analysis=json.loads((derived/'semantic-analysis.json').read_text())
+        # All selected targets are synthetic fixture activities, not cached inference.
+        for activity in analysis['activities']:
+            activity['analyzer_tier']='fixture'
         write_json(derived/'semantic-analysis.json',analysis)
         bundle=review._finalize_collector_derivation_completion(derived)
         document=json.loads((previous/'autopilot-result.json').read_text())
@@ -236,6 +239,86 @@ class SelectedHistoricalDeliveryTests(unittest.TestCase):
         debt=source_coverage.SourceDebtStore.from_document(source_coverage.read(self.state_dir/'source-coverage.json'))
         self.assertEqual('resolved',debt.get(self.peer_debt_ids[0]).status)
         self.assertEqual('active',debt.get(self.peer_debt_ids[1]).status)
+
+    def saved_failed_pair(self):
+        """An existing failed predecessor already retains the requested exact pair."""
+        with cycle._selected_runs_config(self.config,self.request['runs_root']) as validation:
+            source,replay=cycle._selected_stages(validation,self.request,prior_record=self.prior)
+        self.prior.update(status='failed',source=source,replay=replay,
+            publication_receipt=None,delivery_receipt=None,historical_adoption_receipt=None,
+            publication_attempt={'status':'failed','reason':'Review representation previously unavailable'})
+        self.persist_failed_predecessor()
+        return source,replay
+
+    def persist_failed_predecessor(self):
+        path=self.state_dir/'review-cycle-state.json'
+        state=json.loads(path.read_text())
+        state['slices'][self.since]=copy.deepcopy(self.prior)
+        write_json(path,state)
+        self.request['prior_record_digest']=cycle._value_digest(self.prior)
+
+    def availability_boundary(self):
+        # All sealed source/replay/delivery verification stays real. Only the
+        # newly independently tested consumer's output boundary is supplied to
+        # this coordinator/history regression fixture (which has legacy rows).
+        actual=selected.validate
+        def verify(*args,**kwargs):
+            delivery=actual(*args,**kwargs)
+            return {**delivery,'review_availability_only':True,
+                'source_debt_resolution_claimed':False,'diagnostic_resolution_claimed':False,
+                'financial_coverage_claimed':False,'financial_equivalence_claimed':False,
+                'additional_credited_seconds':0,'posted_credits_created':0,'adoption_provider_writes':0}
+        return mock.patch.object(selected,'validate',side_effect=verify)
+
+    def test_failed_same_saved_pair_availability_adopts_once_without_debt_or_provider_changes(self):
+        source,replay=self.saved_failed_pair()
+        predecessor=copy.deepcopy(self.prior)
+        debt_path=self.state_dir/'source-coverage.json'
+        debt_bytes=debt_path.read_bytes()
+        with self.availability_boundary():
+            try:
+                first=self.adopt()
+            except cycle.CycleError as error:
+                self.fail(f'Exact saved failed pair availability must preserve rather than overwrite history: {error}')
+            self.assertEqual('delivered_with_exceptions',first['status'])
+            state_path=self.state_dir/'review-cycle-state.json'
+            state_bytes=state_path.read_bytes()
+            record=json.loads(state_bytes)['slices'][self.since]
+            receipt=json.loads(Path(record['historical_adoption_receipt']).read_bytes())
+            self.assertEqual(predecessor,receipt['superseded_record'])
+            self.assertEqual(source,receipt['source'])
+            self.assertEqual(replay,receipt['replay'])
+            self.assertEqual(first,self.adopt())
+            self.assertEqual(state_bytes,state_path.read_bytes())
+        self.assertEqual(debt_bytes,debt_path.read_bytes())
+        self.assertEqual(self.before_artifacts,{str(p):(p.read_bytes(),p.stat().st_mtime_ns)
+            for p in self.source.parent.rglob('*') if p.is_file()})
+
+    def test_failed_saved_pair_foreign_stage_or_publication_history_is_not_adopted(self):
+        self.saved_failed_pair()
+        genuine=copy.deepcopy(self.prior)
+        for field in ('source','replay','publication_receipt','delivery_receipt','historical_adoption_receipt','status'):
+            with self.subTest(field=field):
+                self.prior=copy.deepcopy(genuine)
+                if field in {'source','replay'}:
+                    self.prior[field]['result_digest']='sha256:'+'f'*64
+                elif field=='status':
+                    self.prior[field]='recovery_blocked'
+                else:
+                    self.prior[field]='existing-authentic-history'
+                self.persist_failed_predecessor()
+                before={p:p.read_bytes() for p in (self.state_dir/'review-cycle-state.json',self.state_dir/'source-coverage.json')}
+                with self.availability_boundary(), self.assertRaisesRegex(cycle.CycleError,'history|replay'):
+                    self.adopt()
+                self.assertEqual(before,{p:p.read_bytes() for p in before})
+                self.assertFalse((self.state_dir/'historical-adoption-receipts'/f'{self.since}.json').exists())
+
+    def test_legacy_selected_contract_still_rejects_failed_predecessor_existing_replay(self):
+        self.saved_failed_pair()
+        before=(self.state_dir/'review-cycle-state.json').read_bytes()
+        with self.assertRaisesRegex(cycle.CycleError,'history|replay'):
+            self.adopt()
+        self.assertEqual(before,(self.state_dir/'review-cycle-state.json').read_bytes())
 
     def test_receipts_and_completed_debts_resume_after_final_state_write_interrupt(self):
         state_path=self.state_dir/'review-cycle-state.json'

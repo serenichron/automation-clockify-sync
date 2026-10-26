@@ -144,39 +144,51 @@ class GwsSheetsGateway:
             raise PublicationError("Google Sheets did not confirm the duplicated tab") from exc
 
     def prepare_sheet(self, spreadsheet_id: str, sheet_id: int) -> None:
+        metadata = self.spreadsheet(spreadsheet_id)
+        sheet = next((item for item in metadata.get("sheets", [])
+                      if item.get("properties", {}).get("sheetId") == sheet_id), None)
+        if sheet is None and "sheets" in metadata:
+            raise PublicationError("Google Sheets metadata is missing the target tab")
+        sheet = sheet or {}
+        row_count = sheet.get("properties", {}).get("gridProperties", {}).get("rowCount", 1000)
+        if type(row_count) is not int or row_count < 1:
+            raise PublicationError("Google Sheets target tab has an invalid row count")
+        requests = []
+        if row_count > 1:
+            requests.append({"repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 1,
+                    "endRowIndex": row_count,
+                    "startColumnIndex": 3,
+                    "endColumnIndex": 4,
+                },
+                "cell": {"userEnteredFormat": {
+                    "numberFormat": {"type": "NUMBER", "pattern": "0.######"}
+                }},
+                "fields": "userEnteredFormat.numberFormat",
+            }})
+        if "basicFilter" not in sheet:
+            requests.append({"setBasicFilter": {"filter": {"range": {
+                "sheetId": sheet_id,
+                "startRowIndex": 0,
+                "endRowIndex": row_count,
+                "startColumnIndex": 0,
+                "endColumnIndex": len(HEADER),
+            }}}})
+        if not requests:
+            return
         self._call([
             "spreadsheets", "batchUpdate", "--params",
             json.dumps({"spreadsheetId": spreadsheet_id}), "--json",
-            json.dumps({"requests": [
-                {"repeatCell": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "startRowIndex": 1,
-                        "endRowIndex": 1000,
-                        "startColumnIndex": 3,
-                        "endColumnIndex": 4,
-                    },
-                    "cell": {"userEnteredFormat": {
-                        "numberFormat": {"type": "NUMBER", "pattern": "0.######"}
-                    }},
-                    "fields": "userEnteredFormat.numberFormat",
-                }},
-                {"setBasicFilter": {"filter": {"range": {
-                    "sheetId": sheet_id,
-                    "startRowIndex": 0,
-                    "endRowIndex": 1000,
-                    "startColumnIndex": 0,
-                    "endColumnIndex": len(HEADER),
-                }}}},
-            ]}),
+            json.dumps({"requests": requests}),
         ])
 
     def prepare_new_rows(self, spreadsheet_id: str, sheet_id: int, start_row: int, end_row: int) -> None:
         if start_row < 2 or end_row < start_row:
             raise PublicationError("new row bounds are invalid")
-        self._call([
-            "spreadsheets", "batchUpdate", "--params", json.dumps({"spreadsheetId": spreadsheet_id}), "--json",
-            json.dumps({"requests": [{"repeatCell": {"range": {
+        metadata = self.spreadsheet(spreadsheet_id)
+        requests = [{"repeatCell": {"range": {
                 "sheetId": sheet_id, "startRowIndex": start_row - 1, "endRowIndex": end_row,
                 "startColumnIndex": 0, "endColumnIndex": len(HEADER),
             }, "cell": {"userEnteredFormat": {"backgroundColor": {"red": 1, "green": 1, "blue": 1}}},
@@ -190,7 +202,44 @@ class GwsSheetsGateway:
                 "startColumnIndex": 13, "endColumnIndex": 14,
             }, "rule": {"condition": {"type": "ONE_OF_LIST", "values": [
                 {"userEnteredValue": value} for value in ("pending", "ambiguous", "approved", "posted", "rejected", "superseded", "unposted")
-            ]}, "showCustomUi": True, "strict": True}}}]}),
+            ]}, "showCustomUi": True, "strict": True}}}]
+        criteria = {
+            "9": {"condition": {"type": "TEXT_EQ", "values": [{"userEnteredValue": "pending"}]}},
+            "13": {"condition": {"type": "TEXT_EQ", "values": [{"userEnteredValue": "unposted"}]}},
+        }
+        expected_specs = [{"columnIndex": int(column), "filterCriteria": value}
+                          for column, value in criteria.items()]
+        for sheet in metadata.get("sheets", []):
+            if sheet.get("properties", {}).get("sheetId") != sheet_id:
+                continue
+            for view in sheet.get("filterViews", []):
+                view_range = view.get("range", {})
+                view_id = view.get("filterViewId")
+                previous_end = view_range.get("endRowIndex")
+                specs = view.get("filterSpecs")
+                if (
+                    view.get("title") != "Pending / unposted — review"
+                    or type(view_id) is not int or view_id < 0
+                    or view_range.get("sheetId") != sheet_id
+                    or view_range.get("startRowIndex", 0) != 0
+                    or view_range.get("startColumnIndex", 0) != 0
+                    or view_range.get("endColumnIndex") != len(HEADER)
+                    or view.get("criteria") != criteria
+                    or ("filterSpecs" in view and (
+                        not isinstance(specs, list) or len(specs) != len(expected_specs)
+                        or any(specs.count(spec) != 1 for spec in expected_specs)
+                    ))
+                    or type(previous_end) is not int or previous_end < 1
+                    or previous_end >= end_row
+                ):
+                    continue
+                requests.append({"updateFilterView": {
+                    "filter": {"filterViewId": view_id, "range": {"sheetId": sheet_id, "endRowIndex": end_row}},
+                    "fields": "range.endRowIndex",
+                }})
+        self._call([
+            "spreadsheets", "batchUpdate", "--params", json.dumps({"spreadsheetId": spreadsheet_id}), "--json",
+            json.dumps({"requests": requests}),
         ])
 
     def clear_values(self, spreadsheet_id: str, range_name: str) -> None:
@@ -205,31 +254,95 @@ class GwsSheetsGateway:
     ) -> None:
         if not ranges:
             return
-        self._call([
-            "spreadsheets", "values", "batchUpdate", "--params",
-            json.dumps({"spreadsheetId": spreadsheet_id}), "--json",
-            json.dumps({
+
+        def payload(values: Sequence[Mapping[str, Any]]) -> str:
+            return json.dumps({
                 "valueInputOption": "RAW",
                 "includeValuesInResponse": False,
-                "data": list(ranges),
-            }, ensure_ascii=False),
-        ])
+                "data": list(values),
+            }, ensure_ascii=False)
+
+        encoded = payload(ranges)
+        bodies = [encoded]
+        if len(encoded.encode("utf-8")) > 64 * 1024:
+            # Large calls support complete, explicitly sheet-qualified single
+            # rows only. Never guess how to split arbitrary multirow ranges.
+            row_keys = []
+            for value in ranges:
+                match = re.fullmatch(
+                    r"('(?:[^']|'')+'|[^'!\r\n]+)!\$?[A-Za-z]+\$?([1-9][0-9]*)"
+                    r"(?::\$?[A-Za-z]+\$?([1-9][0-9]*))?", str(value.get("range", "")))
+                values = value.get("values")
+                if (match is None or (match[3] is not None and match[2] != match[3])
+                        or value.get("majorDimension", "ROWS") != "ROWS"
+                        or not isinstance(values, list) or len(values) > 1):
+                    raise PublicationError("oversized update has an unsupported non-row ValueRange")
+                title = match[1]
+                if title.startswith("'"):
+                    title = title[1:-1].replace("''", "'")
+                row_keys.append((title.casefold(), int(match[2])))
+            last = {key: index for index, key in enumerate(row_keys)}
+            groups, group, boundary = [], [], 0
+            for index, (key, value) in enumerate(zip(row_keys, ranges)):
+                group.append(value)
+                boundary = max(boundary, last[key])
+                if index == boundary:
+                    groups.append(group)
+                    group = []
+            # Related A:I/K:M (or individual-cell) ranges stay in one request,
+            # including interleaved ranges. Preflight all groups before writes.
+            bodies, chunk, encoded = [], [], ""
+            for group in groups:
+                candidate = payload([*chunk, *group])
+                if len(candidate.encode("utf-8")) > 64 * 1024:
+                    if chunk:
+                        bodies.append(encoded)
+                    chunk = []
+                    candidate = payload(group)
+                    if len(candidate.encode("utf-8")) > 64 * 1024:
+                        raise PublicationError("single update row exceeds safe gws JSON payload size")
+                chunk.extend(group)
+                encoded = candidate
+            bodies.append(encoded)
+        for body in bodies:
+            self._call([
+                "spreadsheets", "values", "batchUpdate", "--params",
+                json.dumps({"spreadsheetId": spreadsheet_id}), "--json", body,
+            ])
 
     def append_values(
         self, spreadsheet_id: str, range_name: str, rows: Sequence[Sequence[Any]]
     ) -> None:
         if not rows:
             return
-        self._call([
-            "spreadsheets", "values", "append", "--params",
-            json.dumps({
-                "spreadsheetId": spreadsheet_id,
-                "range": range_name,
-                "valueInputOption": "RAW",
-                "insertDataOption": "INSERT_ROWS",
-            }),
-            "--json", json.dumps({"majorDimension": "ROWS", "values": list(rows)}, ensure_ascii=False),
-        ])
+        # Preflight complete rows before the first append. A failed request is
+        # never retried here: callers must reread/replan after a partial append.
+        bodies = []
+        chunk: list[Sequence[Any]] = []
+        encoded = ""
+        for row in rows:
+            candidate = json.dumps({"majorDimension": "ROWS", "values": [*chunk, row]}, ensure_ascii=False)
+            if len(candidate.encode("utf-8")) > 64 * 1024:
+                if chunk:
+                    bodies.append(encoded)
+                chunk = []
+                candidate = json.dumps({"majorDimension": "ROWS", "values": [row]}, ensure_ascii=False)
+                if len(candidate.encode("utf-8")) > 64 * 1024:
+                    raise PublicationError("single review row exceeds safe gws JSON payload size")
+            chunk.append(row)
+            encoded = candidate
+        bodies.append(encoded)
+        for body in bodies:
+            self._call([
+                "spreadsheets", "values", "append", "--params",
+                json.dumps({
+                    "spreadsheetId": spreadsheet_id,
+                    "range": range_name,
+                    "valueInputOption": "RAW",
+                    "insertDataOption": "INSERT_ROWS",
+                }),
+                "--json", body,
+            ])
 
     def append_monthly_rows(
         self, spreadsheet_id: str, sheet_id: int, start_row: int,
@@ -537,6 +650,41 @@ def _validate_review_warning(
         }:
             raise PublicationError("proposal semantic meeting fallback warning is invalid")
         return dict(warning)
+    elif warning_type == "estimated_task_effort":
+        # Timing observations remain private provenance. Publish the explicit
+        # estimate basis, not a misleading human-attention/runtime assertion.
+        if set(warning) != {"type", "timing_recipe", "reason", "observed_intervals"}:
+            raise PublicationError("proposal task effort warning has invalid fields")
+        expected_reason = (
+            "Estimated commissioned task effort bounded by task-owned source observations; "
+            "not human attention or measured agent runtime."
+        )
+        intervals = warning.get("observed_intervals")
+        if (
+            warning.get("timing_recipe") != "task_owned_message_observations/v1"
+            or warning.get("reason") != expected_reason
+            or not isinstance(intervals, list) or not intervals
+        ):
+            raise PublicationError("proposal task effort timing basis is invalid")
+        for interval in intervals:
+            if not isinstance(interval, Mapping) or set(interval) != {"start", "end"}:
+                raise PublicationError("proposal task effort observations are invalid")
+            try:
+                start, end = (
+                    dt.datetime.fromisoformat(_warning_text(interval[field], field).replace("Z", "+00:00"))
+                    for field in ("start", "end")
+                )
+            except ValueError as error:
+                raise PublicationError("proposal task effort observation timestamp is invalid") from error
+            if any(point.tzinfo is None or point.utcoffset() is None for point in (start, end)):
+                raise PublicationError("proposal task effort observations require a timezone")
+            if end <= start:
+                raise PublicationError("proposal task effort observation must be positive")
+        return {
+            "type": warning_type,
+            "timing_recipe": warning["timing_recipe"],
+            "reason": expected_reason,
+        }
     elif warning_type == "estimated_session_placement":
         if set(warning) != {"type", "reason"}:
             raise PublicationError("proposal estimated placement warning has invalid fields")
@@ -713,7 +861,68 @@ def validate_recovery_proposal_groups(
             )
 
 
-def portfolio_row(activity: Mapping[str, Any], run_id: str) -> list[Any]:
+def _compact_portfolio_warnings(
+    activity: Mapping[str, Any], visible_warnings: Sequence[Mapping[str, Any]],
+    source_proposals: Sequence[Mapping[str, Any]] | None,
+) -> dict[str, Any]:
+    """Display-only summary of proven same-parent overlaps; never alter proof."""
+    if source_proposals is None:
+        raise PublicationError("oversized portfolio Reason requires exact source proposals")
+    children = activity["child_review_ids"]
+    matches: dict[str, list[Mapping[str, Any]]] = {identity: [] for identity in children}
+    candidate_counts: dict[str, int] = {}
+    for source in source_proposals:
+        identity = stable_review_id(source)
+        key = source.get("candidate_key")
+        if isinstance(key, str):
+            candidate_counts[key] = candidate_counts.get(key, 0) + 1
+        if identity in matches:
+            matches[identity].append(source)
+    candidates = {}
+    for identity, sources in matches.items():
+        if len(sources) != 1 or type(sources[0].get("allocation_segment")) is not int:
+            raise PublicationError("oversized portfolio Reason source membership differs")
+        key = sources[0].get("candidate_key")
+        if (not isinstance(key, str) or not re.fullmatch(r"wks-[a-f0-9]{24}", key)
+                or candidate_counts[key] != 1):
+            raise PublicationError("oversized portfolio Reason candidate identity differs")
+        candidates[key] = identity
+    for child in activity["child_review_warnings"]:
+        if child["warnings"] != matches[child["review_id"]][0].get("review_warnings", []):
+            raise PublicationError("oversized portfolio Reason differs from source warnings")
+
+    external, internal, affected = [], [], set()
+    for child in visible_warnings:
+        retained = []
+        for warning in child["warnings"]:
+            counterpart = candidates.get(warning.get("counterpart_id"))
+            if warning["type"] in {"review_proposal_overlap", "meeting_proposal_overlap"} and counterpart:
+                internal.append(warning)
+                affected.update((child["review_id"], counterpart))
+            else:
+                retained.append(warning)
+        if retained:
+            external.append({"review_id": child["review_id"], "warnings": retained})
+    if not internal:
+        raise PublicationError("oversized portfolio Reason has no provable internal overlaps to summarize")
+    complete = json.dumps(activity["child_review_warnings"], ensure_ascii=False,
+                          sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {"child_review_warnings": external, "internal_parallel_effort": {
+        "warning_count": len(internal), "affected_child_review_ids": sorted(affected),
+        "span_start": min(internal, key=lambda warning: _warning_timestamp(
+            warning["overlap_start"], "overlap_start"))["overlap_start"],
+        "span_end": max(internal, key=lambda warning: _warning_timestamp(
+            warning["overlap_end"], "overlap_end"))["overlap_end"],
+        "notice": "Internal same-parent proposal overlaps: parallel effort, not financial credit or certified human hours; bounding span is not elapsed effort.",
+        "full_detail_reference": {
+            "immutable_package_field": f"package.activities[review_id='{activity['review_id']}'].child_review_warnings",
+            "sha256": "sha256:" + hashlib.sha256(complete).hexdigest(),
+        },
+    }}
+
+
+def portfolio_row(activity: Mapping[str, Any], run_id: str, *,
+                  source_proposals: Sequence[Mapping[str, Any]] | None = None) -> list[Any]:
     review_id = str(activity.get("review_id") or "").strip()
     if not re.fullmatch(r"pvi-[a-f0-9]{24}", review_id):
         raise PublicationError("portfolio activity lacks a stable review ID")
@@ -734,6 +943,36 @@ def portfolio_row(activity: Mapping[str, Any], run_id: str) -> list[Any]:
     duration = _duration_minutes(activity)
     if duration <= 0:
         raise PublicationError("portfolio activity duration is invalid")
+    reason = str(activity.get("validation_status") or "")
+    child_warnings = activity.get("child_review_warnings", [])
+    if not isinstance(child_warnings, list):
+        raise PublicationError("portfolio child warnings are invalid")
+    visible_warnings = []
+    for child in child_warnings:
+        if (not isinstance(child, Mapping) or set(child) != {"review_id", "warnings"}
+                or child["review_id"] not in activity.get("child_review_ids", [])
+                or not isinstance(child["warnings"], list)):
+            raise PublicationError("portfolio child warning identity is invalid")
+        warnings = [_validate_review_warning(warning, {}) for warning in child["warnings"]]
+        if warnings:
+            visible_warnings.append({"review_id": child["review_id"], "warnings": warnings})
+    if visible_warnings:
+        reason += ("\n" if reason else "") + json.dumps(visible_warnings, ensure_ascii=False, sort_keys=True)
+    if "review_notice" in activity:
+        from scripts.clockify_review_batches import OVERLAP_REVIEW_NOTICE
+        # Only the reconstructed presentation warning is displayable here;
+        # this is never an asserted validation, approval, or financial credit.
+        if activity["review_notice"] != OVERLAP_REVIEW_NOTICE:
+            raise PublicationError("portfolio review notice is invalid")
+        reason += ("\n" if reason else "") + activity["review_notice"]
+    if len(reason.encode("utf-16-le")) // 2 > 50000:
+        compact = _compact_portfolio_warnings(activity, visible_warnings, source_proposals)
+        reason = str(activity.get("validation_status") or "")
+        reason += ("\n" if reason else "") + json.dumps(compact, ensure_ascii=False, sort_keys=True)
+        if "review_notice" in activity:
+            reason += "\n" + activity["review_notice"]
+        if len(reason.encode("utf-16-le")) // 2 > 50000:
+            raise PublicationError("portfolio Reason external detail exceeds the Google Sheets cell limit")
     return [
         review_id,
         _timestamp(activity.get("start")),
@@ -747,7 +986,7 @@ def portfolio_row(activity: Mapping[str, Any], run_id: str) -> list[Any]:
         "pending",
         1,
         run_id,
-        str(activity.get("validation_status") or ""),
+        reason,
         "unposted",
         "",
     ]
@@ -1251,13 +1490,13 @@ def _apply_publish_plan(
 
 
 def _publication_receipt(
-    *, spreadsheet_id: str, sheet_title: str, rows: Sequence[Sequence[Any]],
+    *, spreadsheet_id: str, sheet_title: str, rows: Sequence[Sequence[Any]], rows_digest: str | None = None,
 ) -> dict[str, Any]:
     payload = {
         "spreadsheet_id": spreadsheet_id,
         "sheet_title": sheet_title,
         "row_ids": [str(row[0]) for row in rows],
-        "rows_sha256": "sha256:" + hashlib.sha256(
+        "rows_sha256": rows_digest or "sha256:" + hashlib.sha256(
             json.dumps(list(rows), separators=(",", ":"), sort_keys=True).encode("utf-8")
         ).hexdigest(),
     }
@@ -1376,6 +1615,7 @@ def _plan_monthly_unresolved(
     aliases: Mapping[str, Any] | None = None,
     source_dir: Path | None = None,
     historical_sources: Path | None = None,
+    retain_provenance_debt: bool = False,
 ) -> dict[str, Any]:
     if any(len(row) != 12 or not str(row[0]).startswith("uev-") for row in rows):
         raise PublicationError("monthly unresolved row contract is invalid")
@@ -1383,9 +1623,11 @@ def _plan_monthly_unresolved(
     if len(ids) != len(set(ids)):
         raise PublicationError("duplicate monthly stable evidence ID")
     source_handles, sources_handle = {}, None
+    source_context = monthly_unresolved.MonthlySourceContext()
     if historical_sources is not None:
         try:
-            source_handles, sources_handle = monthly_unresolved.load_historical_sources(historical_sources)
+            source_handles, sources_handle = monthly_unresolved.load_historical_sources(
+                historical_sources, source_context=source_context)
         except (OSError, ValueError, TypeError, KeyError) as exc:
             raise PublicationError("monthly historical source bindings are invalid") from exc
     metadata = gateway.spreadsheet(spreadsheet_id)
@@ -1419,6 +1661,7 @@ def _plan_monthly_unresolved(
     appends = []
     aliases = aliases or {}
     canonical_aliases = []
+    retained_debt = []
     for row in rows:
         prior = by_id.get(row[0])
         alias = aliases.get(row[0])
@@ -1435,22 +1678,68 @@ def _plan_monthly_unresolved(
                 raise PublicationError(f"monthly machine-field conflict: {row[0]}")
             try:
                 canonical_aliases.append(monthly_unresolved.canonical_source_alias(
-                    source_dir, list(row), prior, layout=layout, historical_sources=source_handles))
+                    source_dir, list(row), prior, layout=layout, historical_sources=source_handles,
+                    source_context=source_context))
             except (OSError, KeyError, TypeError, ValueError) as exc:
-                raise PublicationError(f"monthly canonical machine-field conflict: {row[0]}") from exc
+                if not retain_provenance_debt or str(exc) != "canonical alias historical source is unsafe":
+                    raise PublicationError(f"monthly canonical machine-field conflict: {row[0]}") from exc
+                try:
+                    retained_debt.append(monthly_unresolved.prepare_retained_debt(source_dir, list(row), prior,
+                        spreadsheet_id=spreadsheet_id, sheet_title=sheet_title, layout=layout,
+                        historical_sources=source_handles))
+                except (OSError, KeyError, TypeError, ValueError) as debt_error:
+                    raise PublicationError(f"monthly canonical machine-field conflict: {row[0]}") from debt_error
     if appends and len(existing) < 2:
         raise PublicationError("monthly unresolved tab lacks a native data-row exemplar")
+    if retained_debt:
+        try:
+            monthly_unresolved.validate_retained_debt(source_dir, [list(row) for row in rows], retained_debt,
+                spreadsheet_id=spreadsheet_id, sheet_title=sheet_title, layout=layout)
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            raise PublicationError("retained provenance source projection differs") from exc
     return {"sheet_title": sheet_title, "sheet_id": prop["sheetId"], "grid_rows": grid["rowCount"],
             "existing": existing, "appends": appends, "rows": [list(row) for row in rows], "aliases": aliases,
-            "canonical_aliases": canonical_aliases, "layout": layout, "historical_sources": sources_handle}
+            "canonical_aliases": canonical_aliases, "layout": layout, "historical_sources": sources_handle,
+            **({"canonical_source_context": source_context} if canonical_aliases else {}),
+            **({"retained_provenance_debt": retained_debt, "retained_source_dir": source_dir} if retained_debt else {})}
+
+
+def _retained_monthly_preflight(
+    gateway: SheetsGateway, *, spreadsheet_id: str, plan: Mapping[str, Any],
+) -> tuple[Sequence[Sequence[Any]], list[str] | None]:
+    title = str(plan["sheet_title"])
+    existing = plan["existing"]
+    padded = lambda row: list(row) + [""] * (12 - len(row))
+    retained_digests = None
+    if plan.get("canonical_source_context") is not None:
+        try:
+            plan["canonical_source_context"].assert_unchanged()
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            raise PublicationError("canonical monthly source changed before append") from exc
+    if plan.get("retained_provenance_debt"):
+        try:
+            retained_digests = monthly_unresolved.validate_retained_debt(plan["retained_source_dir"], plan["rows"],
+                plan["retained_provenance_debt"], spreadsheet_id=spreadsheet_id, sheet_title=title, layout=plan["layout"])
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            raise PublicationError("retained provenance source changed before append") from exc
+        # A human may edit K after planning. No machine-cell/preimage drift may
+        # cause even an independent append before it is detected.
+        fresh = gateway.values(spreadsheet_id, f"{_a1_title(title)}!A1:L{plan['grid_rows']}")
+        if (len(fresh) != len(existing) or any(
+                any(not _same_cell(padded(a)[index], padded(b)[index]) for index in (*range(10), 11))
+                for a, b in zip(fresh, existing, strict=True))):
+            raise PublicationError("retained provenance preimage changed before append")
+        existing = fresh
+    return existing, retained_digests
 
 
 def _apply_monthly_unresolved(
     gateway: SheetsGateway, *, spreadsheet_id: str, plan: Mapping[str, Any],
 ) -> dict[str, Any]:
     title = str(plan["sheet_title"])
-    existing = plan["existing"]
+    existing, retained_digests = _retained_monthly_preflight(gateway, spreadsheet_id=spreadsheet_id, plan=plan)
     appends = plan["appends"]
+    padded = lambda row: list(row) + [""] * (12 - len(row))
     if appends:
         gateway.append_monthly_rows(  # type: ignore[attr-defined]
             spreadsheet_id, plan["sheet_id"], len(existing) + 1, plan["grid_rows"], appends,
@@ -1459,18 +1748,29 @@ def _apply_monthly_unresolved(
     observed = gateway.values(spreadsheet_id, f"{_a1_title(title)}!A1:L{count}")
     expected = [*existing, *appends]
     # A retry's existing K is human-owned; the exact old prefix must survive.
-    padded = lambda row: list(row) + [""] * (12 - len(row))
     if len(observed) != len(expected) or any(padded(a) != padded(b) for a, b in zip(observed, expected, strict=True)):
         raise PublicationError("monthly unresolved exact readback differs")
     result = {"appended": len(appends), "unchanged": len(plan["rows"]) - len(appends),
               **_publication_receipt(spreadsheet_id=spreadsheet_id, sheet_title=title, rows=plan["rows"])}
+    if plan.get("retained_provenance_debt"):
+        debt = plan["retained_provenance_debt"]
+        result.update(_publication_receipt(spreadsheet_id=spreadsheet_id, sheet_title=title, rows=plan["rows"],
+            rows_digest=monthly_unresolved.retained_rows_digest([row[0] for row in plan["rows"]], retained_digests)))
+        by_id = {row[0]: padded(row) for row in observed[1:] if row}
+        evidence = {"schema_version": monthly_unresolved.RETAINED_READBACK_SCHEMA,
+            "spreadsheet_id": spreadsheet_id, "sheet_title": title, "sheet_id": plan["sheet_id"],
+            "layout": plan["layout"], "row_ids": [entry["stable_evidence_id"] for entry in debt],
+            "machine_row_digests": [monthly_unresolved.retained_row_digest(by_id[entry["stable_evidence_id"]]) for entry in debt]}
+        evidence["sha256"] = monthly_unresolved._value_digest(evidence)
+        monthly_unresolved.validate_retained_readback(evidence, debt, spreadsheet_id=spreadsheet_id, sheet_title=title)
+        result.update(retained_provenance_debt=debt, retained_target_readback=evidence)
     if plan["aliases"]:
         result["source_aliases"] = monthly_unresolved.alias_metadata(plan["rows"], plan["aliases"])
     if plan["canonical_aliases"]:
         result["canonical_source_aliases"] = plan["canonical_aliases"]
     if plan["historical_sources"] is not None:
         result["historical_sources"] = plan["historical_sources"]
-    if plan["layout"] is not None:
+    if plan["layout"] is not None and not plan.get("retained_provenance_debt"):
         by_id = {row[0]: padded(row) for row in observed[1:] if row}
         evidence = {
             "schema_version": "monthly-unresolved-target-readback/v1",
@@ -1489,9 +1789,11 @@ def publish_monthly_unresolved(
     aliases: Mapping[str, Any] | None = None,
     source_dir: Path | None = None,
     historical_sources: Path | None = None,
+    retain_provenance_debt: bool = False,
 ) -> dict[str, Any]:
     plan = _plan_monthly_unresolved(gateway, spreadsheet_id=spreadsheet_id, sheet_title=sheet_title, rows=rows, aliases=aliases,
-                                   source_dir=source_dir, historical_sources=historical_sources)
+                                   source_dir=source_dir, historical_sources=historical_sources,
+                                   retain_provenance_debt=retain_provenance_debt)
     return _apply_monthly_unresolved(gateway, spreadsheet_id=spreadsheet_id, plan=plan)
 
 
@@ -1533,7 +1835,21 @@ def publish_proposal_partitions(
     pending_selection: Path | None = None,
     presentation: Path | None = None,
     existing_publication: Path | None = None,
+    review_batch_publication: Path | None = None,
+    retain_provenance_debt: bool = False,
 ) -> dict[str, Any]:
+    batch_projection = None
+    batch_child_plan = []
+    if review_batch_publication is not None:
+        if source_dir is None or any((meeting_bindings, pending_selection, presentation)) or tombstones:
+            raise PublicationError("prepared review batches require native sources and no competing primary projection")
+        try:
+            from scripts import clockify_review_batch_publication as prepared_batches
+            batch_projection = prepared_batches.project(path=review_batch_publication,
+                source_dir=source_dir, proposals=proposals, run_id=run_id,
+                spreadsheet_id=spreadsheet_id, sheet_title=sheet_title, project_allowlist=project_allowlist)
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            raise PublicationError("prepared review publication binding is invalid") from exc
     if existing_publication is not None:
         try:
             from scripts import clockify_publication_presentation as display
@@ -1576,6 +1892,10 @@ def publish_proposal_partitions(
         for destination, members in proposal_partitions
         if members and (monthly_rows is None or destination != "unresolved-evidence")
     ]
+    if batch_projection is not None:
+        partitions = [(sheet_title, batch_projection["rows"])] if batch_projection["rows"] else []
+        batch_child_plan = prepared_batches.plan_children(gateway, spreadsheet_id=spreadsheet_id,
+            sheet_title=sheet_title, projection=batch_projection)
     meeting_aliases: dict[str, list[dict[str, Any]]] = {}
     if selection is not None:
         partitions = [(sheet_title, selection["rows"]), *[(title, rows) for title, rows in partitions if title != sheet_title]]
@@ -1648,10 +1968,11 @@ def publish_proposal_partitions(
             sheet_title=monthly_unresolved.title_for_review(sheet_title), rows=monthly_rows, aliases=monthly_aliases,
             source_dir=monthly_source_dir,
             historical_sources=monthly_historical_sources,
+            retain_provenance_debt=retain_provenance_debt,
         )
     publications: list[dict[str, Any]] = []
     if existing_publication is not None:
-        if (tombstones or any(plan["created"] or plan["updates"] or plan["appends"] for plan in plans)
+        if (tombstones or batch_child_plan or any(plan["created"] or plan["updates"] or plan["appends"] for plan in plans)
                 or selection_plan is not None and selection_plan["updates"]
                 or monthly_plan is not None and monthly_plan["appends"]):
             raise PublicationError("existing publication does not satisfy native readback contract")
@@ -1661,6 +1982,8 @@ def publish_proposal_partitions(
                 item["presentation"] = presentation_proofs[title]
             if selection is not None and title == sheet_title:
                 item["pending_selection"] = selection["receipt"]
+            if batch_projection is not None and title == sheet_title:
+                item["review_batches"] = batch_projection["receipt"]
             item["existing_publication"] = {"verification_basis": "immutable_operator_readback",
                 "operator_receipt": gateway.handle, "rows": [list(row) for row in rows]}
             display.verify_existing(item["existing_publication"], item)
@@ -1676,6 +1999,10 @@ def publish_proposal_partitions(
             publications.append(item)
         return {"schema_version": "sheet-publication-result/v1", "status": "verified-existing",
                 "external_writes": False, "clockify_writes": 0, "terminal_updates": 0, "publications": publications}
+    if monthly_plan is not None:
+        # Check protected monthly/source preimages before even primary effects;
+        # the monthly apply repeats this check for drift during primary writes.
+        _retained_monthly_preflight(gateway, spreadsheet_id=spreadsheet_id, plan=monthly_plan)
     for (destination, rows), plan in zip(partitions, plans, strict=True):
         result = _apply_publish_plan(
             gateway, spreadsheet_id=spreadsheet_id, plan=plan,
@@ -1690,6 +2017,7 @@ def publish_proposal_partitions(
             **({"meeting_aliases": meeting_aliases[destination]} if destination in meeting_aliases else {}),
             **({"presentation": presentation_proofs[destination]} if destination in presentation_proofs else {}),
             **({"pending_selection": selection["receipt"]} if selection is not None and destination == sheet_title else {}),
+            **({"review_batches": batch_projection["receipt"]} if batch_projection is not None and destination == sheet_title else {}),
         })
     if monthly_plan is not None:
         publications.append({
@@ -1698,6 +2026,9 @@ def publish_proposal_partitions(
             **({"presentation": presentation_proofs[monthly_plan["sheet_title"]]} if monthly_plan["sheet_title"] in presentation_proofs else {}),
         })
     terminal_updates = 0
+    if batch_projection is not None:
+        terminal_updates += prepared_batches.retire_children(gateway, spreadsheet_id=spreadsheet_id,
+            sheet_title=sheet_title, plans=batch_child_plan, parent_rows=batch_projection["rows"])
     if selection_plan is not None:
         terminal_updates += pending.apply(gateway, spreadsheet_id=spreadsheet_id, plan=selection_plan)
     for destination, members in (
@@ -1765,13 +2096,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--result-output", type=Path)
     parser.add_argument("--enable-write", action="store_true")
     parser.add_argument("--monthly-unresolved", action="store_true")
+    parser.add_argument("--retain-provenance-debt", action="store_true")
     parser.add_argument("--monthly-unresolved-alias-proof", type=Path)
     parser.add_argument("--monthly-unresolved-historical-sources", type=Path)
     parser.add_argument("--meeting-publication-bindings", type=Path)
     parser.add_argument("--pending-review-selection", type=Path)
     parser.add_argument("--publication-presentation", type=Path)
     parser.add_argument("--verify-existing-publication", type=Path)
+    parser.add_argument("--review-batch-publication", type=Path)
     args = parser.parse_args(argv)
+    if args.retain_provenance_debt and not (args.monthly_unresolved and args.proposals is not None):
+        parser.error("retained provenance debt requires --monthly-unresolved and --proposals")
+    if args.review_batch_publication is not None and (args.proposals is None or any((
+            args.meeting_publication_bindings, args.pending_review_selection, args.publication_presentation,
+            args.review_tombstones))):
+        parser.error("prepared review batches require --proposals without competing primary projections")
     if args.monthly_unresolved_historical_sources is not None and not (args.monthly_unresolved and args.proposals is not None):
         parser.error("monthly historical sources require --monthly-unresolved and --proposals")
 
@@ -1819,6 +2158,15 @@ def main(argv: list[str] | None = None) -> int:
             proposal_row(proposal, args.run_id, project_allowlist=projects)
             for proposal in proposals
         ]
+        if args.review_batch_publication is not None:
+            try:
+                from scripts import clockify_review_batch_publication as prepared_batches
+                preview = prepared_batches.project(path=args.review_batch_publication,
+                    source_dir=args.proposals.parent, proposals=proposals, run_id=args.run_id,
+                    spreadsheet_id=args.spreadsheet_id, sheet_title=args.sheet_title, project_allowlist=projects)
+                rows = preview["rows"]
+            except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+                raise PublicationError("prepared review publication binding is invalid") from exc
         monthly_rows = None
         monthly_aliases = None
         if args.monthly_unresolved:
@@ -1900,6 +2248,8 @@ def main(argv: list[str] | None = None) -> int:
             pending_selection=args.pending_review_selection,
             presentation=args.publication_presentation,
             existing_publication=args.verify_existing_publication,
+            review_batch_publication=args.review_batch_publication,
+            retain_provenance_debt=args.retain_provenance_debt,
         )
     else:
         result = publish(
@@ -1938,8 +2288,10 @@ def main(argv: list[str] | None = None) -> int:
                      **({"meeting_aliases": item["meeting_aliases"]} if "meeting_aliases" in item else {}),
                      **({"canonical_source_aliases": item["canonical_source_aliases"]} if "canonical_source_aliases" in item else {}),
                      **({"historical_sources": item["historical_sources"]} if "historical_sources" in item else {}),
-                     **({field: item[field] for field in ("presentation", "pending_selection", "existing_publication") if field in item}),
+                     **({field: item[field] for field in ("presentation", "pending_selection", "existing_publication", "review_batches") if field in item}),
                      **({field: item[field] for field in ("monthly_layout", "monthly_target_readback")} if "monthly_layout" in item else {})}
+                    | ({field: item[field] for field in ("retained_provenance_debt", "retained_target_readback")}
+                       if "retained_provenance_debt" in item else {})
                     for item in document["publications"]
                 ],
             }

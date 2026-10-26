@@ -79,7 +79,7 @@ class SupplementDeliveryTests(unittest.TestCase):
         state=store.append_page(state,payload=native_entries,continuation={'page':2},signature=collector._clockify_page_signature(native_entries))
         state=store.mark_complete(state)
         native=collector.fetch_clockify({'CLOCKIFY_WORKSPACE_ID':'workspace-1'},{'clockify_user_id':'member-1'},since,until,
-            snapshot_at=dt.datetime(2026,10,8,2,2,24,tzinfo=dt.timezone.utc),checkpoint_store=store)
+            snapshot_at=dt.datetime(2026,10,8,2,2,24,tzinfo=dt.timezone.utc),checkpoint_store=store,checkpoint_identity=state.identity)
         native_path=self.root/'native-evidence.json'; write_json(native_path,native)
         normalized=[event.document() for event in evidence_ledger.normalize_collector_snapshot({'clockify':native})]
         by_index={int(e['source_ref']['source_id'].removeprefix('row-'))-1:e for e in normalized if e['source_type']=='clockify'}

@@ -63,9 +63,13 @@ class CavemanRendererTests(unittest.TestCase):
             with self.subTest(description=description):
                 self.assertEqual(description, renderer.validate_description(description))
 
-    def test_fewer_than_five_words_is_rejected(self):
-        with self.assertRaisesRegex(renderer.CavemanValidationError, "at least 5 words"):
-            renderer.validate_description("SC — Fixed clock sync")
+    def test_short_complete_description_does_not_require_filler(self):
+        self.assertEqual("SC — Fixed clock sync",
+                         renderer.validate_description("SC — Fixed clock sync"))
+
+    def test_action_without_object_is_rejected(self):
+        with self.assertRaisesRegex(renderer.CavemanValidationError, "action and its object"):
+            renderer.validate_description("SC — Fixed")
 
     def test_adversarial_forbidden_content_fails_closed(self):
         base = {"prefix": "SC", "action": "Reviewed", "object": "service page", "outcome": "for client conversion planning"}

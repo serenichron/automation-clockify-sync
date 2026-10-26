@@ -84,6 +84,56 @@ class MonthlyCrossRootAliasTests(unittest.TestCase):
         self.assertEqual(monthly.LEGACY_LAYOUT, result["monthly_layout"])
         self.assertEqual(3, result["appended"])
 
+    def test_old_correction_alias_keeps_legacy_cells_under_marked_renderer_in_both_layouts(self):
+        for root in (self.historical, self.current):
+            accounting = json.loads((root / "work-accounting-result.json").read_bytes())
+            accounting["ambiguous"][0].update(exception_kind="correction_regression",
+                reason="description differs from reviewed value")
+            write(root / "work-accounting-result.json", accounting)
+            write(root / "ambiguous.json", accounting["ambiguous"])
+        report = json.loads((self.current / "run-report.json").read_bytes())
+        report["monthly_unresolved_rendering_revision"] = 1
+        write(self.current / "run-report.json", report)
+        self.historical_rows = monthly.project_rows(self.historical)
+        self.current_rows = monthly.project_rows(self.current)
+        self.retained = next(row for row in self.historical_rows if row[3] == "correction_regression")
+        current = next(row for row in self.current_rows if row[3] == "correction_regression")
+        self.assertIn("No confirmed additional work interval", self.retained[6])
+        self.assertIn("wording-only", current[8])
+        for layout in (None, monthly.LEGACY_LAYOUT):
+            with self.subTest(layout=layout):
+                gateway = self.gateway(layout)
+                before = copy.deepcopy(gateway.rows)
+                result = self.publish(gateway)
+                self.assertEqual(before, gateway.rows[:2])
+                self.assertEqual(1, len(result["canonical_source_aliases"]))
+                aliases = monthly.validate_canonical_aliases(self.current,
+                    monthly.rows_for_layout(self.current_rows, layout), result["canonical_source_aliases"],
+                    layout=layout, historical_sources={self.historical.name: self.packet["sources"][0]["source_ledger"]})
+                self.assertEqual(monthly.machine_digest(before[1]), aliases[0]["preserved_machine_digest"])
+                self.assertEqual("Human confirmation remains private", gateway.rows[1][10])
+                # Report bytes already belong to provenance: a marker cannot
+                # be retroactively added to an old canonical source.
+                path = self.historical / "run-report.json"
+                original = path.read_bytes()
+                try:
+                    old_report = json.loads(original)
+                    old_report["monthly_unresolved_rendering_revision"] = 1
+                    write(path, old_report)
+                    writes = len(gateway.writes)
+                    with self.assertRaises(publisher.PublicationError):
+                        self.publish(gateway)
+                    self.assertEqual(writes, len(gateway.writes))
+                finally:
+                    path.write_bytes(original)
+
+        context = monthly.MonthlySourceContext()
+        monthly.project_rows(self.current, _context=context)
+        report.pop("monthly_unresolved_rendering_revision")
+        write(self.current / "run-report.json", report)
+        with self.assertRaisesRegex(ValueError, "artifact bytes drifted"):
+            context.assert_unchanged()
+
     def test_no_handle_keeps_cross_root_conflict_fail_closed(self):
         gateway = self.gateway()
         with self.assertRaises(publisher.PublicationError):

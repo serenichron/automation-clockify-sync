@@ -52,6 +52,34 @@ _EVIDENCE_DUMP_RE = re.compile(
     r"trace\s+ids?|log\s+dump|artifact\s+(?:ids?|paths?)|source\s+ids?)\b",
     re.I,
 )
+_EXECUTION_DETAIL_RE = re.compile(
+    r"\b(?:identical|matching)\s+(?:md5|sha[- ]?256)\b|"
+    r"\b\d+\s+(?:files\s+uploaded|(?:[A-Z0-9]+-DOC\s+)?rows\s+with|"
+    r"(?:unit\s+)?tests?\b|browser\s+checks?\b)",
+    re.I,
+)
+# New publication wording has a stricter editorial boundary than the historical
+# semantic-evidence contract above. Do not change that contract on cache replay.
+_CLIENT_EXECUTION_DETAIL_RE = re.compile(
+    r"\b\d[\d,]*\s+(?:(?:subagent|relevant|unit|integration|regression|focused|automated)\s+)+tests?\b|"
+    r"\b\d[\d,]*\s+assertions?\b|"
+    r"\b(?:md5|sha[- ]?256)\s+(?:parity|match(?:ing)?|identical)\b|"
+    r"\b(?:parity|matching|identical)\s+(?:md5|sha[- ]?256)\b|"
+    r"\b\d[\d,]*\s+(?:(?:source|configuration|changed|modified)\s+)?files?\b|"
+    r"\b\d[\d,]*\s+registry\s+(?:entries|records|items)\b",
+    re.I,
+)
+_CLIENT_SOURCE_FILENAME_RE = re.compile(
+    r"(?<![\w.-])\.?[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\."
+    r"(?:py|json|jsonl|sh|toml|yaml|yml|md|js|ts|tsx|jsx|mjs|cjs|ini|cfg|php|css)"
+    r"(?![\w-]|\.[\w-])",
+    re.I,
+)
+# Exact complete product tokens only: app.Node.js is still a source filename.
+_CLIENT_TECHNOLOGY_NAMES = frozenset({
+    "node.js", "next.js", "vue.js", "nuxt.js", "chart.js",
+    "react.js", "angular.js", "d3.js", "three.js",
+})
 _COMPACT_TECHNICAL_SLASH_RE = re.compile(
     r"\b(?:[A-Za-z0-9][A-Za-z0-9_-]*)(?:/[A-Za-z0-9][A-Za-z0-9_-]*)+\b"
 )
@@ -71,6 +99,7 @@ _FORBIDDEN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("prompt or rule", _PROMPT_OR_RULE_RE),
     ("agent status", _STATUS_DUMP_RE),
     ("evidence dump", _EVIDENCE_DUMP_RE),
+    ("execution detail", _EXECUTION_DETAIL_RE),
 )
 
 
@@ -127,12 +156,8 @@ def validate_description(
     body_words = re.findall(r"\b[\w'-]+\b", body)
     if any(left.casefold() == right.casefold() for left, right in zip(body_words, body_words[1:])):
         raise CavemanValidationError("description contains adjacent repeated words")
-    word_count = len(re.findall(r"\b[\w'-]+\b", description))
-    if word_count < 5:
-        raise CavemanValidationError(
-            f"description has {word_count} words; expected at least 5 words "
-            f"with an 8–{max_words} word target"
-        )
+    if len(body_words) < 2:
+        raise CavemanValidationError("body must include an action and its object")
     return description
 
 
@@ -152,6 +177,21 @@ def render_caveman_description(
         allow_compact_technical_slashes=allow_compact_technical_slashes,
         allow_compact_technical_underscores=allow_compact_technical_underscores,
     )
+
+
+def validate_client_description(description: str) -> str:
+    """Validate new client-facing publication prose without rewriting sources.
+
+    Counts are rejected only with execution nouns, never as bare numbers: exam
+    product titles, prices, dates and material business quantities remain intact.
+    Historical semantic decisions keep using ``validate_description``.
+    """
+    validate_description(description)
+    if (_CLIENT_EXECUTION_DETAIL_RE.search(description)
+            or any(match.group().casefold() not in _CLIENT_TECHNOLOGY_NAMES
+                   for match in _CLIENT_SOURCE_FILENAME_RE.finditer(description))):
+        raise CavemanValidationError("description contains forbidden execution detail")
+    return description
 
 
 def try_render_caveman_description(value: CavemanParts | Mapping[str, Any]) -> RenderResult:

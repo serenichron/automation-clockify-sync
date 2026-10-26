@@ -44,6 +44,8 @@ EVIDENCE_BUNDLE_SCHEMA_VERSION = "clockify-semantic-evidence-bundle/v1"
 ACTOR_CONTRACT = "clockify-semantic-actors/v1"
 ACTOR_PROMPT_VERSION = "clockify-semantic-v18"
 ACTOR_REVIEW_PROMPT_VERSION = "clockify-semantic-review-v7"
+TASK_REVIEW_PROMPT_VERSION = "clockify-semantic-review-v8"
+COMMISSIONED_REVIEW_PROMPT_VERSION = "clockify-semantic-review-v9"
 ACTOR_BUNDLE_SCHEMA_VERSION = "clockify-semantic-evidence-bundle/v2"
 ACTOR_INSTRUCTIONS = """
 
@@ -1094,6 +1096,70 @@ def _restore_extraction_partitions(
     return restored
 
 
+def validate_review_diagnostic_record(value: Any) -> None:
+    """Validate the numeric-only, duplicate-citation subset safe for sealing."""
+    def invalid() -> None:
+        raise AnalyzerError("sealed review citation diagnostic is invalid")
+
+    if (not isinstance(value, dict) or set(value) != {
+        "cache_key", "body_digest", "failure_code", "review_scope", "coverage_contract",
+        "activities", "exceptions", "omissions",
+    } or not re.fullmatch(r"arc-[a-f0-9]{64}", str(value.get("cache_key") or ""))
+            or not re.fullmatch(r"[a-f0-9]{64}", str(value.get("body_digest") or ""))
+            or value.get("failure_code") != "contract_rejected_duplicate_evidence"
+            or not isinstance(value.get("review_scope"), str)
+            or value.get("review_scope") not in {
+                "extraction", "synthesis", "portfolio", "failed_review_scoped_recovery",
+                "portfolio_single_activity_recovery", "portfolio_wording_recovery", "portfolio_wording_recovery_retry",
+            }):
+        invalid()
+    coverage: dict[str, int] = {}
+    if not isinstance(value["coverage_contract"], list) or not value["coverage_contract"]:
+        invalid()
+    for item in value["coverage_contract"]:
+        if not isinstance(item, dict) or set(item) != {"bundle_ref", "allowed_member_range"}:
+            invalid()
+        ref, bounds = item["bundle_ref"], item["allowed_member_range"]
+        if (not isinstance(ref, str) or not BUNDLE_REF_RE.fullmatch(ref) or ref in coverage
+                or not isinstance(bounds, list) or len(bounds) != 2
+                or any(type(number) is not int for number in bounds)
+                or bounds[0] != 1 or not 1 <= bounds[1] <= 1_000_000):
+            invalid()
+        coverage[ref] = bounds[1]
+    assigned: set[tuple[str, int]] = set()
+    duplicate = False
+    for section in ("activities", "exceptions", "omissions"):
+        if not isinstance(value[section], list):
+            invalid()
+        for row in value[section]:
+            if (not isinstance(row, dict) or set(row) != {"evidence_partitions"}
+                    or not isinstance(row["evidence_partitions"], list) or not row["evidence_partitions"]):
+                invalid()
+            refs: set[str] = set()
+            owned: set[tuple[str, int]] = set()
+            for partition in row["evidence_partitions"]:
+                if not isinstance(partition, dict) or set(partition) != {"bundle_ref", "member_ranges"}:
+                    invalid()
+                ref, ranges = partition["bundle_ref"], partition["member_ranges"]
+                if (not isinstance(ref, str) or ref not in coverage or ref in refs
+                        or not isinstance(ranges, list) or not ranges):
+                    invalid()
+                refs.add(ref)
+                for bounds in ranges:
+                    if (not isinstance(bounds, list) or len(bounds) != 2
+                            or any(type(number) is not int for number in bounds)
+                            or not 1 <= bounds[0] <= bounds[1] <= coverage[ref]):
+                        invalid()
+                    members = {(ref, number) for number in range(bounds[0], bounds[1] + 1)}
+                    if owned & members:
+                        invalid()
+                    owned.update(members)
+            duplicate = duplicate or bool(assigned & owned)
+            assigned.update(owned)
+    if not duplicate:
+        invalid()
+
+
 def _review_citation_conflicts(
     diagnostic: Mapping[str, Any], *, events: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
@@ -1606,6 +1672,23 @@ exception requires a nonempty kind and reason.
 Every omission requires lifecycle planned or noise and a nonempty reason. Prefer a
 corrected evidence-supported activity over omission when the candidate merely chose
 an invalid project or task type. This review uses {review_prompt_version}."""
+    if review_prompt_version in {TASK_REVIEW_PROMPT_VERSION, COMMISSIONED_REVIEW_PROMPT_VERSION}:
+        system += """
+
+TASK-BASED ROUTING: Select the task type from the evidence-supported work and
+outcome, independently of the client's source location. A broad client folder or
+repository route can identify the client without proving its hinted task type.
+Technical GA4 measurement, signup or checkout behavior, and CRM integration work
+must be judged by the actual diagnosis, implementation, verification or outcome;
+they are not Content writing merely because the source is a content client's
+workspace. Conversely, drafting, editing or reviewing article prose or editorial
+copy can genuinely be Content writing. Topic words alone do not decide the task:
+an article about GA4 can be editorial, while debugging its event integration is
+technical. Choose only an exact supplied taxonomy row supported by the evidence;
+retain a consistent hint, override its task type when a better exact row is proved,
+and split distinct outcomes or raise an exception when the evidence is insufficient.
+The evidence remains authority and the candidate remains an untrusted hint.
+"""
     if review_scope == "portfolio":
         system += """
 
@@ -1889,6 +1972,39 @@ Do not infer duration from a session envelope or reuse a prior disputed citation
         ):
             raise AnalyzerError("scoped failed-review binding is invalid")
         payload["scoped_failed_review"] = dict(scoped_failed_review)
+    if review_prompt_version == COMMISSIONED_REVIEW_PROMPT_VERSION:
+        system += """
+
+COMMISSIONED TASK EFFORT / NON-OWNING CONTEXT: This v9 contract supersedes
+earlier human-attention-only effort, same-row paired-instruction, and actor wording
+that would exclude supported commissioned agent-assisted outcomes. Review the full
+supplied chunk, not only each row's owned citations. A genuine instruction or
+standing commission may support multiple independently proved outcomes in the same
+causally supported source task/session without being owned by every outcome row.
+Treat that instruction and shared corroboration as non-owning context for those
+other rows, not additional evidence_partitions or a new output field. Exclusive
+outcome membership still covers every supplied member exactly once; never duplicate
+implementation evidence, artifacts, results or effort across separate outcomes.
+Same session alone is not a causal link, and unrelated, stale, foreign-task or
+absent instructions cannot supply authority. Injected automation/cron wrappers and
+generic user-role metadata are not proof of a human commission or subject identity.
+If the supplied context does not resolve material authority, use an exception.
+
+Completed commissioned agent-assisted task work is eligible even when the agent
+performed implementation. Preserve the actual performer and do not describe agent
+implementation as the subject's own manual implementation. Keep actor identity
+uncertainty explicit; do not invent subject attribution. Independently evidenced
+parallel commissioned tasks are valid, with overlap visible for human review.
+Effort means an evidence-supported estimate of task effort, not human-attention
+time, not measured agent runtime, provider-billed time or the whole session envelope.
+Judge positive ordered effort estimates conservatively from the actual task work;
+never derive minutes from token totals, cost, a session duration or arbitrary
+multipliers. Cited task-owned timestamped message observations bound placement
+capacity, not proof that every elapsed minute was active. Non-owning instruction
+context supplies no timing capacity. Singleton points, idle gaps, waiting, polling
+and unsupported duration remain exceptions rather than invented minutes. Preserve
+taxonomy, outcome proof, exact-once coverage and all existing safety boundaries.
+"""
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": canonical_json(payload)},
@@ -2988,14 +3104,17 @@ class AnalyzerResponseCache:
     immutable replay independent of provider wording drift.
     """
 
-    def __init__(self, path: Path, *, record_review_diagnostics: bool = False):
+    def __init__(self, path: Path, *, record_review_diagnostics: bool = False,
+                 use_review_diagnostic_feedback: bool = True):
         self.path = path
         self.record_review_diagnostics = record_review_diagnostics
+        self.use_review_diagnostic_feedback = use_review_diagnostic_feedback
         self._lock = threading.RLock()
         self._records: dict[str, dict[str, Any]] = {}
         self.hits = 0
         self.misses = 0
         self.used: dict[str, str] = {}
+        self._used_review_diagnostics: dict[str, dict[str, Any]] = {}
         self._load()
 
     @staticmethod
@@ -3516,8 +3635,6 @@ class AnalyzerResponseCache:
         The cache rejection remains authoritative and unchanged. Untrusted or
         unavailable diagnostics retain historical category-only repair bodies.
         """
-        if not self.record_review_diagnostics:
-            return None
         try:
             identity = self._request_identity(endpoint, source_body)
             record = self._records.get(identity["cache_key"])
@@ -3527,6 +3644,10 @@ class AnalyzerResponseCache:
                 return None
             source = json.loads(source_body["messages"][1]["content"])
             current = json.loads(current_body["messages"][1]["content"])
+            fresh_v9 = all(payload.get("review_prompt_version") == COMMISSIONED_REVIEW_PROMPT_VERSION
+                           for payload in (source, current))
+            if not fresh_v9 and (not self.record_review_diagnostics or not self.use_review_diagnostic_feedback):
+                return None
             if (source.get("mode") != "review" or current.get("mode") != "review"
                     or any(source.get(key) != current.get(key) for key in (
                         "bundles", "coverage_contract", "candidate", "clockify_taxonomy", "review_scope",
@@ -3561,9 +3682,53 @@ class AnalyzerResponseCache:
                     or diagnostic["review_scope"] != source.get("review_scope", "extraction")
                     or canonical_json(diagnostic["coverage_contract"]) != canonical_json(coverage)):
                 return None
-            return _review_citation_conflicts(diagnostic, events=events)
+            feedback = _review_citation_conflicts(diagnostic, events=events)
+            if feedback is not None and fresh_v9:
+                validate_review_diagnostic_record(diagnostic)
+                self._used_review_diagnostics[identity["cache_key"]] = copy.deepcopy(diagnostic)
+            return feedback
         except (AnalyzerError, KeyError, IndexError, TypeError, ValueError, OSError):
             return None
+
+    def review_diagnostics_for_snapshot(
+        self, references: list[dict[str, str]], *, used_cache_records: Iterable[Mapping[str, Any]],
+    ) -> bytes:
+        """Export only consulted numeric diagnostics, bound to used cache decisions."""
+        try:
+            used = {record["cache_key"]: record for record in used_cache_records}
+            sidecar = self.path.with_name(self.path.name + ".review-diagnostics.jsonl")
+            descriptor = os.open(sidecar, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+                metadata = os.fstat(handle.fileno())
+                if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+                        or metadata.st_mode & 0o777 != 0o600):
+                    raise AnalyzerError("review diagnostics snapshot source is unsafe")
+                fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+                try:
+                    diagnostics = [json.loads(line) for line in handle.read().splitlines()]
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            selected: dict[str, dict[str, Any]] = {}
+            for reference in references:
+                if not isinstance(reference, dict) or set(reference) != {"cache_key", "diagnostic_digest"}:
+                    raise AnalyzerError("review diagnostics snapshot reference is invalid")
+                key = reference["cache_key"]
+                record = used[key]
+                matches = [row for row in diagnostics if isinstance(row, dict) and row.get("cache_key") == key]
+                if (key in selected or not matches
+                        or any(canonical_json(row) != canonical_json(matches[0]) for row in matches)):
+                    raise AnalyzerError("review diagnostics snapshot source is ambiguous")
+                diagnostic = matches[0]
+                validate_review_diagnostic_record(diagnostic)
+                if (record.get("status") != "rejected"
+                        or record.get("failure_code") != diagnostic["failure_code"]
+                        or record.get("body_digest") != diagnostic["body_digest"]
+                        or hashlib.sha256(canonical_json(diagnostic).encode()).hexdigest() != reference["diagnostic_digest"]):
+                    raise AnalyzerError("review diagnostics snapshot identity differs")
+                selected[key] = diagnostic
+            return b"".join((canonical_json(selected[key]) + "\n").encode() for key in sorted(selected))
+        except (KeyError, TypeError, ValueError, OSError) as exc:
+            raise AnalyzerError("review diagnostics snapshot cannot be verified") from exc
 
     def sealed_endpoints(self) -> tuple[AnalyzerEndpoint, ...]:
         """Return credential-free routes sealed into cache records."""
@@ -3651,6 +3816,10 @@ class AnalyzerResponseCache:
                     {"cache_key": key, "decision_digest": digest}
                     for key, digest in sorted(self.used.items())
                 ],
+                **({"review_diagnostic_records": [
+                    {"cache_key": key, "diagnostic_digest": hashlib.sha256(canonical_json(value).encode()).hexdigest()}
+                    for key, value in sorted(self._used_review_diagnostics.items())
+                ]} if self._used_review_diagnostics else {}),
             }
 
 
@@ -3966,6 +4135,11 @@ def _call_semantic_review_once(
             )
             if replacement is None:
                 raise
+            if cache is not None:
+                cache.record_rejected_review(
+                    endpoint, body, failure_code=_contract_failure_code(exc),
+                    review_scope=review_scope, response=response,
+                )
             response = replacement
             repaired = _restore_extraction_partitions(response, events=events)
             repaired = bind_activity_evidence_spans(
@@ -4169,6 +4343,7 @@ def _call_validated(
     timeout_recovery_attempt: int | None = None,
     connection_recovery_attempt: int | None = None,
     review_taxonomy: list[dict[str, Any]] | None = None,
+    review_prompt_version: str = REVIEW_PROMPT_VERSION,
     failed_review_retry_targets: Mapping[tuple[str, ...], str] | None = None,
 ) -> dict[str, Any]:
     body = _body_for(
@@ -4257,6 +4432,7 @@ def _call_validated(
                 cancelled=cancelled,
                 extractor_model=provider_model,
                 failed_review_retry_targets=failed_review_retry_targets,
+                review_prompt_version=review_prompt_version,
             )
             return _ValidatedAnalysis(
                 reviewed,
@@ -4482,6 +4658,20 @@ def _synthesis_candidate_key(activity: Mapping[str, Any]) -> str:
     )
 
 
+def _extraction_review_version(events: list[dict[str, Any]], version: Any) -> str:
+    """Resolve a run-wide recipe without consulting mutable cache contents."""
+    if not isinstance(version, str) or version not in {
+        REVIEW_PROMPT_VERSION, ACTOR_REVIEW_PROMPT_VERSION, TASK_REVIEW_PROMPT_VERSION,
+        COMMISSIONED_REVIEW_PROMPT_VERSION,
+    }:
+        raise AnalyzerError("semantic extraction review version is unsupported")
+    if _actor_aware(events) and version == REVIEW_PROMPT_VERSION:
+        return ACTOR_REVIEW_PROMPT_VERSION
+    if events and not _actor_aware(events) and version != REVIEW_PROMPT_VERSION:
+        raise AnalyzerError("semantic actor review version requires actor evidence")
+    return version
+
+
 def analyze_tiered(
     events: Iterable[dict[str, Any]],
     *,
@@ -4496,6 +4686,7 @@ def analyze_tiered(
     private_text_approved: bool | None = None,
     cache: AnalyzerResponseCache | None = None,
     review_taxonomy: list[dict[str, Any]] | None = None,
+    review_prompt_version: str = REVIEW_PROMPT_VERSION,
     failed_review_retry_targets: Mapping[tuple[str, ...], str] | None = None,
 ) -> dict[str, Any]:
     if max_workers <= 0:
@@ -4525,6 +4716,7 @@ def analyze_tiered(
             return original_transport(endpoint, body)
         transport = retry_transport
     original_events = sorted((dict(event) for event in events), key=_event_sort_key)
+    review_prompt_version = _extraction_review_version(original_events, review_prompt_version)
     if not original_events:
         return {
             "schema_version": SCHEMA_VERSION,
@@ -4740,6 +4932,7 @@ def analyze_tiered(
                 cancelled=cancellation.is_set,
                 review_taxonomy=review_taxonomy,
                 failed_review_retry_targets=failed_review_retry_targets,
+                review_prompt_version=review_prompt_version,
             )
         except AnalyzerContractError as initial_error:
             # A sealed contract rejection receives a small, deterministic
@@ -4766,6 +4959,7 @@ def analyze_tiered(
                         repair_attempt=repair_attempt,
                         review_taxonomy=review_taxonomy,
                         failed_review_retry_targets=failed_review_retry_targets,
+                        review_prompt_version=review_prompt_version,
                     )
                 except AnalyzerContractError as error:
                     repair_error = error
@@ -4835,6 +5029,7 @@ def analyze_tiered(
                                 timeout_recovery_attempt=timeout_attempt,
                                 review_taxonomy=review_taxonomy,
                                 failed_review_retry_targets=failed_review_retry_targets,
+                                review_prompt_version=review_prompt_version,
                             )
                         except AnalyzerTimeoutError:
                             continue
@@ -4908,6 +5103,7 @@ def analyze_tiered(
                                 connection_recovery_attempt=connection_attempt,
                                 review_taxonomy=review_taxonomy,
                                 failed_review_retry_targets=failed_review_retry_targets,
+                                review_prompt_version=review_prompt_version,
                             )
                         except AnalyzerTransportError:
                             continue
@@ -5021,6 +5217,7 @@ def analyze_tiered(
                             repair_attempt=(fallback_attempt or None),
                             review_taxonomy=review_taxonomy,
                             failed_review_retry_targets=failed_review_retry_targets,
+                            review_prompt_version=review_prompt_version,
                         )
                     except AnalyzerContractError as error:
                         fallback_error = error
@@ -5095,6 +5292,7 @@ def analyze_tiered(
                         cancelled=cancellation.is_set,
                         review_taxonomy=review_taxonomy,
                         failed_review_retry_targets=failed_review_retry_targets,
+                        review_prompt_version=review_prompt_version,
                     )
                 except AnalyzerContractError:
                     # A validated low-confidence primary decision is still useful
@@ -5507,6 +5705,7 @@ def analyze_tiered(
                 candidate=synthesized,
                 taxonomy=review_taxonomy,
                 tier=f"{tier}_post_synthesis_flash_review",
+                review_prompt_version=review_prompt_version,
                 transport=transport,
                 known_evidence_ids=synthesis_ids,
                 evidence_time_spans=synthesis_spans,
@@ -5534,7 +5733,7 @@ def analyze_tiered(
         "prompt_version": _prompt_version(original_events),
         **({"actor_contract": ACTOR_CONTRACT} if _actor_aware(original_events) else {}),
         "review_prompt_version": (
-            (ACTOR_REVIEW_PROMPT_VERSION if _actor_aware(original_events) else REVIEW_PROMPT_VERSION)
+            review_prompt_version
             if review_taxonomy is not None else None
         ),
         "evidence_bundle_schema_version": _bundle_schema_version(original_events),
