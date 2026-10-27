@@ -788,6 +788,44 @@ known authorization, integrity, configuration, or route block cannot create a
 restart loop. Install or load this agent only under separate approval; keeping
 the reviewed files in the repository does not activate it.
 
+## Efficiency controls
+
+These reduce model calls, request bytes, Clockify paging and repeated child
+runs without changing sealed decisions. Each one leaves historical replays
+byte-identical.
+
+- **Review partition normalization** (on for the ledger pipeline cache):
+  a fresh semantic-review response whose only defect is partition
+  bookkeeping is repaired locally (`review_partition_normalization_v1`)
+  instead of spending model repair calls. Contested rows and unassigned
+  members go to one `analyzer_review_partial_quarantine` exception without
+  effort, and only when that routes at most 25% of members; otherwise the
+  usual repair path runs. Sealed decisions replay unchanged.
+- **Trimmed projection** (routing `"semantic_projection_contract":
+  "clockify-semantic-projection/v2"`): diff hunks and fenced code blocks
+  become line-count markers, and user bodies over 4,000 characters keep a
+  head and tail excerpt. Every member is still sent. Requests declare the
+  contract, so unmarked runs keep their historical request bytes.
+- **Bounded Clockify overlap read** (routing `"clockify_bounded_overlap":
+  true`): fresh collection starts seven days before the window
+  (`clockify-overlap-pagination/v3`) instead of paging all history. It
+  would miss an entry that began more than seven days before the window
+  and still overlaps it, so the complete v2 scan stays the default.
+- **Cycle circuit breaker** (config `circuit_breaker_failures`, default 2;
+  `circuit_breaker_cooldown_hours`, default 72): a failed slice whose rerun
+  inputs are unchanged is skipped after repeated identical failures, then
+  probed once per cooldown. A new release, config, routing, corrections,
+  acceptance, source or replay closes it immediately. A cycle with nothing
+  else to do reports `circuit_open` and exits 75.
+- **Per-call diagnostics**: live analyzer calls append numeric-only
+  records (route, mode, body digest and bytes, latency, outcome, token
+  usage) to `<analyzer-cache>.call-diagnostics.jsonl`, mode `0600`. The file
+  is not part of the sealed cache or any snapshot.
+
+`scripts/efficiency_measurement.py` reproduces the offline before/after
+numbers from sealed artifacts only (`partitions`, `cache-rejections`,
+`projection RUN...`, `clockify-overlap`, `circuit-breaker JOURNAL`).
+
 ## Safety contract
 
 Fresh, configured Clockify collections retain full native checkpoint pages in

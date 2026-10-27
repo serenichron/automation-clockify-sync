@@ -1109,8 +1109,9 @@ def load_pending_collector_source(run_dir: Path, *, checkpoint_root: Path,
             # admission needs one unambiguous cache whose projection matches
             # the exact original raw evidence, never merely a preferred version.
             candidates = []
-            for ci in (legacy_ci, collector._clockify_checkpoint_identity(
-                    period.identity.workspace_id, period.identity.member_id, since, until, overlap_history=True)):
+            for ci in (legacy_ci, *(collector._clockify_checkpoint_identity(
+                    period.identity.workspace_id, period.identity.member_id, since, until,
+                    overlap_history=True, bounded_lookback=bounded) for bounded in (False, True))):
                 try:
                     candidates.append(read_candidate(ci))
                 except (OSError, ValueError, TypeError, KeyError, StopIteration):

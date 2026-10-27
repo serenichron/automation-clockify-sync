@@ -1513,6 +1513,59 @@ class ReviewCycleDeliveryTests(unittest.TestCase):
             (self.state_dir / "delivery-receipts" / "2026-09-07.json").exists()
         )
 
+    def test_identical_publisher_failures_open_circuit_breaker(self):
+        """Catches the cycle rerunning the same failing child every timer tick."""
+        commands: list[list[str]] = []
+        child = self.child_for_runs(commands, publish_codes=[9, 9, 0])
+        with mock.patch.object(cycle, "run_child_bounded", side_effect=child):
+            results = [cycle.run_cycle(self.config, enable_sheet_write=True, today=dt.date(2026, 9, 10))
+                       for _ in range(4)]
+        publishes = [item for item in commands if "clockify_sheet_publish.py" in item[1]]
+        self.assertEqual(["failed", "failed"], [result["status"] for result in results[:2]])
+        self.assertEqual(2, len(publishes))
+        self.assertEqual(1, sum("--replay-from" in item for item in commands))
+        for result in results[2:]:
+            self.assertEqual("circuit_open", result["status"])
+            self.assertEqual(["2026-09-07"], [item["since"] for item in result["circuit_open"]])
+        record = json.loads((self.state_dir / "review-cycle-state.json").read_text())["slices"]["2026-09-07"]
+        self.assertEqual("failed", record["status"])
+        self.assertEqual(("publish", 2), (record["circuit_breaker"]["stage"], record["circuit_breaker"]["failures"]))
+        self.assertEqual(2, cycle._CIRCUIT_DEFAULT_FAILURES)
+
+    def test_changed_inputs_or_expired_cooldown_close_circuit_breaker(self):
+        """Catches a breaker that blocks a fixed release or never re-probes."""
+        for change in ("routing", "cooldown"):
+            with self.subTest(change=change):
+                self.tearDown()
+                self.setUp()
+                commands: list[list[str]] = []
+                child = self.child_for_runs(commands, publish_codes=[9, 9, 0])
+                with mock.patch.object(cycle, "run_child_bounded", side_effect=child):
+                    for _ in range(2):
+                        cycle.run_cycle(self.config, enable_sheet_write=True, today=dt.date(2026, 9, 10))
+                    config = dict(self.config)
+                    later = dt.datetime.now(dt.timezone.utc)
+                    if change == "routing":
+                        routing = Path(str(config["routing"]))
+                        routing.write_text(routing.read_text() + "\n")
+                    else:
+                        later += dt.timedelta(hours=cycle._CIRCUIT_DEFAULT_COOLDOWN_HOURS + 1)
+                    with mock.patch.object(cycle, "_circuit_now", return_value=later):
+                        result = cycle.run_cycle(config, enable_sheet_write=True, today=dt.date(2026, 9, 10))
+                self.assertEqual("delivered", result["status"])
+                self.assertEqual(3, sum("clockify_sheet_publish.py" in item[1] for item in commands))
+                record = json.loads((self.state_dir / "review-cycle-state.json").read_text())["slices"]["2026-09-07"]
+                self.assertNotIn("circuit_breaker", record)
+
+    def test_circuit_open_exits_tempfail(self):
+        with mock.patch.object(cycle, "load_config", return_value=self.config), \
+             mock.patch.object(cycle, "_validate_runtime_root"), \
+             mock.patch.object(cycle, "run_cycle", return_value={"status": "circuit_open", "slices": [],
+                                                                  "circuit_open": [{"since": "2026-09-07"}]}), \
+             mock.patch.object(cycle.clockify_review_run.clockify_sync_collect, "collector_runtime_identity",
+                               return_value={}):
+            self.assertEqual(75, cycle.main(["--config", str(self.root / "config.json"), "--enable-sheet-write"]))
+
     def test_replay_failure_blocks_before_publisher(self):
         """Catches publication continuing without a passing distinct replay."""
         commands: list[list[str]] = []

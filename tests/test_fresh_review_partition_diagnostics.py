@@ -48,7 +48,9 @@ class FreshReviewPartitionDiagnosticsTests(unittest.TestCase):
                         members = provider_members(payload)
                         selections = {
                             "duplicate": ([0, 1], [1], [2, 3]),
-                            "missing": ([0, 1], [2]),
+                            # Two of four unassigned stays above the local
+                            # partition-normalization cap, so generic repair runs.
+                            "missing": ([0, 1],),
                             "duplicate_and_missing": ([0, 1], [1], [2]),
                         }[defect]
                         rows = [provider_response(payload, [members[i] for i in selection])["activities"][0]
@@ -73,7 +75,7 @@ class FreshReviewPartitionDiagnosticsTests(unittest.TestCase):
                                      else "contract_rejected_omitted_evidence", record["failure_code"])
                     self.assertEqual([{"bundle_ref": "b-0001", "allowed_member_range": [1, 4]}], record["coverage_contract"])
                     expected = {"duplicate": ([[1, 2]], [[2, 2]], [[3, 4]]),
-                                "missing": ([[1, 2]], [[3, 3]]),
+                                "missing": ([[1, 2]],),
                                 "duplicate_and_missing": ([[1, 2]], [[2, 2]], [[3, 3]])}[defect]
                     self.assertEqual([{"evidence_partitions": [{"bundle_ref": "b-0001", "member_ranges": ranges}]}
                                       for ranges in expected], record["activities"])

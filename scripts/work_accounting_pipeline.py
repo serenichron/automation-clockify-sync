@@ -879,6 +879,13 @@ def _load_verified_posted_credits(path: Path | None) -> list[dict[str, Any]]:
         raise WorkAccountingError(f"review correction log is invalid: {exc}") from exc
 
 
+def _call_diagnostics_path(analyzer_cache_path: Path | None) -> Path | None:
+    """Unsealed per-call latency/token log beside the analyzer cache."""
+    if analyzer_cache_path is None:
+        return None
+    return analyzer_cache_path.with_name(analyzer_cache_path.name + ".call-diagnostics.jsonl")
+
+
 def analyze_ledger(
     events: list[dict[str, Any]],
     *,
@@ -1013,6 +1020,7 @@ def analyze_ledger(
         semantic_analyzer.AnalyzerResponseCache(
             analyzer_cache_path, record_review_diagnostics=True,
             use_review_diagnostic_feedback=retry_targets is not None,
+            partition_normalization=True,
         )
         if analyzer_cache_path is not None
         else None
@@ -1045,6 +1053,11 @@ def analyze_ledger(
     hinted_events = _with_semantic_route_hints(
         events, routing, normalize_meeting_domains_type=actor_contract is not None,
     )
+    projection_contract = routing.get("semantic_projection_contract")
+    if projection_contract not in {None, semantic_analyzer.PROJECTION_CONTRACT}:
+        raise WorkAccountingError("semantic projection contract is invalid")
+    if projection_contract is not None:
+        hinted_events = semantic_analyzer.with_projection_contract(hinted_events)
     scoped_retry = retry_targets is not None and (failed_review_retry_selected_evidence_ids is not None or any(
         isinstance(row, Mapping)
         and tuple(sorted(str(value) for value in row.get("evidence_ids", []))) in retry_targets
@@ -1066,18 +1079,19 @@ def analyze_ledger(
     if scoped_retry:
         def cache_only_transport(*_args):
             raise WorkAccountingError("scoped retry cache miss; inference is prohibited")
-        result = run_scoped_failed_review_retry(
-            retry_source_document, hinted_events, primary=primary, cache=cache,
-            review_taxonomy=review_taxonomy or [], targets=retry_targets,
-            source_semantic_sha256=hashlib.sha256(
-                failed_review_retry_source.read_bytes()
-            ).hexdigest(),
-            selected_evidence_ids=failed_review_retry_selected_evidence_ids,
-            scoped_review_mode=failed_review_retry_scoped_mode,
-            actor_contract=actor_contract,
-            actor_subject_binding=actor_binding,
-            **({"transport": cache_only_transport, "private_text_approved": True} if failed_review_retry_cache_only else {}),
-        )
+        with semantic_analyzer.call_diagnostics(_call_diagnostics_path(analyzer_cache_path)):
+            result = run_scoped_failed_review_retry(
+                retry_source_document, hinted_events, primary=primary, cache=cache,
+                review_taxonomy=review_taxonomy or [], targets=retry_targets,
+                source_semantic_sha256=hashlib.sha256(
+                    failed_review_retry_source.read_bytes()
+                ).hexdigest(),
+                selected_evidence_ids=failed_review_retry_selected_evidence_ids,
+                scoped_review_mode=failed_review_retry_scoped_mode,
+                actor_contract=actor_contract,
+                actor_subject_binding=actor_binding,
+                **({"transport": cache_only_transport, "private_text_approved": True} if failed_review_retry_cache_only else {}),
+            )
     else:
         if actor_contract is not None:
             hinted_events = semantic_analyzer.with_actor_context(hinted_events, subject_binding=actor_binding)
@@ -1090,17 +1104,18 @@ def analyze_ledger(
                 semantic_analyzer.COMMISSIONED_REVIEW_PROMPT_VERSION if actor_contract is not None
                 else semantic_analyzer.REVIEW_PROMPT_VERSION
             )
-        result = semantic_analyzer.analyze_tiered(
-            hinted_events,
-            primary=primary,
-            fallback=fallback,
-            corrections=corrections,
-            cache=cache,
-            review_taxonomy=review_taxonomy,
-            review_prompt_version=review_prompt_version,
-            **({"failed_review_retry_targets": retry_targets} if retry_targets is not None else {}),
-            **tuning,
-        )
+        with semantic_analyzer.call_diagnostics(_call_diagnostics_path(analyzer_cache_path)):
+            result = semantic_analyzer.analyze_tiered(
+                hinted_events,
+                primary=primary,
+                fallback=fallback,
+                corrections=corrections,
+                cache=cache,
+                review_taxonomy=review_taxonomy,
+                review_prompt_version=review_prompt_version,
+                **({"failed_review_retry_targets": retry_targets} if retry_targets is not None else {}),
+                **tuning,
+            )
     if retry_targets is not None and not scoped_retry:
         target_ids = set().union(*retry_targets)
         for section in ("activities", "exceptions", "omissions"):

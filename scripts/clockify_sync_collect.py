@@ -118,6 +118,16 @@ FATHOM_COLLECTION_RETRY_DEADLINE_SECONDS = 1800
 CLOCKIFY_PAGE_SIZE = 200
 CLOCKIFY_CHECKPOINT_COMPATIBILITY_VERSION = "clockify-pagination/v1"
 CLOCKIFY_OVERLAP_CHECKPOINT_COMPATIBILITY_VERSION = "clockify-overlap-pagination/v2"
+# Opt-in (routing "clockify_bounded_overlap": true): overlap reads start this
+# far before the window instead of paging the whole history. The longest saved
+# entry is 3h29m, but an entry that began more than this before the window and
+# still overlaps it would be missed, so the full v2 scan stays the default.
+CLOCKIFY_BOUNDED_OVERLAP_CHECKPOINT_COMPATIBILITY_VERSION = "clockify-overlap-pagination/v3"
+CLOCKIFY_OVERLAP_LOOKBACK = dt.timedelta(days=7)
+CLOCKIFY_OVERLAP_COMPATIBILITY_VERSIONS = frozenset({
+    CLOCKIFY_OVERLAP_CHECKPOINT_COMPATIBILITY_VERSION,
+    CLOCKIFY_BOUNDED_OVERLAP_CHECKPOINT_COMPATIBILITY_VERSION,
+})
 FATHOM_CHECKPOINT_COMPATIBILITY_VERSION = "fathom-cursor-pagination/v2"
 MULTICA_PAGE_SIZE = 100
 MULTICA_CHECKPOINT_COMPATIBILITY_VERSION = "multica-offset-pagination/v1"
@@ -2624,7 +2634,9 @@ def _clockify_checkpoint_identity(
     until: dt.datetime,
     *,
     overlap_history: bool = False,
+    bounded_lookback: bool = False,
 ) -> CheckpointIdentity:
+    """Return the v1 start-filtered, v2 full-history or v3 bounded identity."""
     request_contract = {
         "endpoint": "/workspaces/{workspace_id}/user/{user_id}/time-entries",
         "workspace_id": workspace_id,
@@ -2636,6 +2648,10 @@ def _clockify_checkpoint_identity(
         # Clockify's start parameter filters entry starts, not overlap. Read
         # earlier starts too, then retain only rows touching the target window.
         request_contract["query"] = {"end": iso_utc(until)}
+        if bounded_lookback:
+            request_contract["query"] = {
+                "start": iso_utc(since - CLOCKIFY_OVERLAP_LOOKBACK), "end": iso_utc(until),
+            }
     request_fingerprint = "sha256:" + hashlib.sha256(
         json.dumps(request_contract, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -2644,9 +2660,19 @@ def _clockify_checkpoint_identity(
         since_utc=iso_utc(since),
         until_utc=iso_utc(until),
         request_fingerprint=request_fingerprint,
-        compatibility_version=(CLOCKIFY_OVERLAP_CHECKPOINT_COMPATIBILITY_VERSION
-                               if overlap_history else CLOCKIFY_CHECKPOINT_COMPATIBILITY_VERSION),
+        compatibility_version=(
+            CLOCKIFY_CHECKPOINT_COMPATIBILITY_VERSION if not overlap_history
+            else CLOCKIFY_BOUNDED_OVERLAP_CHECKPOINT_COMPATIBILITY_VERSION if bounded_lookback
+            else CLOCKIFY_OVERLAP_CHECKPOINT_COMPATIBILITY_VERSION
+        ),
     )
+
+
+def _clockify_bounded_overlap(routing: Mapping[str, Any]) -> bool:
+    value = routing.get("clockify_bounded_overlap", False)
+    if not isinstance(value, bool):
+        raise ValueError("routing clockify_bounded_overlap must be a boolean")
+    return value
 
 
 def _clockify_overlap_rows(
@@ -2708,7 +2734,7 @@ def _clockify_checkpoint_entries(
     entries: list[Mapping[str, Any]] = []
     seen_pages: set[str] = set()
     final_page_size: int | None = None
-    overlap_history = state.identity.compatibility_version == CLOCKIFY_OVERLAP_CHECKPOINT_COMPATIBILITY_VERSION
+    overlap_history = state.identity.compatibility_version in CLOCKIFY_OVERLAP_COMPATIBILITY_VERSIONS
     for page_number, saved_page in enumerate(checkpoint_store.iter_pages(state), start=1):
         payload = saved_page["payload"]
         wire_count, signature = _clockify_checkpoint_wire_page(saved_page, overlap_history=overlap_history)
@@ -2767,13 +2793,17 @@ def fetch_clockify(
     if observed_at.tzinfo is None:
         observed_at = observed_at.replace(tzinfo=dt.timezone.utc)
     try:
+        bounded_overlap = _clockify_bounded_overlap(routing)
         if checkpoint_store is None:
             entries: list[Mapping[str, Any]] = []
             seen_pages: set[tuple[str, ...]] = set()
             page = 1
+            start_query = (f"start={iso_utc(since - CLOCKIFY_OVERLAP_LOOKBACK)}&"
+                           if bounded_overlap else "")
             while True:
                 page_entries = clockify_get(
                     f"/workspaces/{ws}/user/{user}/time-entries?"
+                    f"{start_query}"
                     f"end={iso_utc(until)}&page={page}&page-size={CLOCKIFY_PAGE_SIZE}",
                     cenv,
                 )
@@ -2796,9 +2826,12 @@ def fetch_clockify(
         else:
             # Fresh collection never treats start-filtered v1 history as full
             # overlap coverage. Historical replay must explicitly pin its v1 identity.
-            identity = checkpoint_identity or _clockify_checkpoint_identity(ws, user, since, until, overlap_history=True)
-            overlap_history = identity.compatibility_version == CLOCKIFY_OVERLAP_CHECKPOINT_COMPATIBILITY_VERSION
-            expected_identity = _clockify_checkpoint_identity(ws, user, since, until, overlap_history=overlap_history)
+            identity = checkpoint_identity or _clockify_checkpoint_identity(
+                ws, user, since, until, overlap_history=True, bounded_lookback=bounded_overlap)
+            overlap_history = identity.compatibility_version in CLOCKIFY_OVERLAP_COMPATIBILITY_VERSIONS
+            bounded = identity.compatibility_version == CLOCKIFY_BOUNDED_OVERLAP_CHECKPOINT_COMPATIBILITY_VERSION
+            expected_identity = _clockify_checkpoint_identity(
+                ws, user, since, until, overlap_history=overlap_history, bounded_lookback=bounded)
             if identity != expected_identity:
                 raise CheckpointError("checkpoint Clockify identity does not match requested collection")
             checkpoint_state = checkpoint_store.open(
@@ -2814,7 +2847,10 @@ def fetch_clockify(
             while not checkpoint_state.complete:
                 if page > 100:
                     raise ValueError("Clockify pagination exceeded safety limit")
-                start_query = "" if overlap_history else f"start={iso_utc(since)}&"
+                start_query = (
+                    f"start={iso_utc(since - CLOCKIFY_OVERLAP_LOOKBACK)}&" if bounded
+                    else "" if overlap_history else f"start={iso_utc(since)}&"
+                )
                 page_entries = clockify_get(
                     f"/workspaces/{ws}/user/{user}/time-entries?"
                     f"{start_query}end={iso_utc(until)}&page={page}&page-size={CLOCKIFY_PAGE_SIZE}",
@@ -4661,7 +4697,8 @@ def _collect_slice(
         except ModuleNotFoundError:
             from clockify_checkpoint_snapshot import capture_checkpoint_snapshot
         identity = _clockify_checkpoint_identity(
-            cenv["CLOCKIFY_WORKSPACE_ID"], routing["clockify_user_id"], since, until, overlap_history=True
+            cenv["CLOCKIFY_WORKSPACE_ID"], routing["clockify_user_id"], since, until, overlap_history=True,
+            bounded_lookback=_clockify_bounded_overlap(routing),
         )
         with tempfile.TemporaryDirectory(prefix="native-checkpoint-", dir=run_dir.parent) as staging:
             staged = Path(staging) / "snapshot"

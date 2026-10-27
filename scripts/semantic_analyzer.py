@@ -11,6 +11,7 @@ available merely because its name appears in repository documentation.
 from __future__ import annotations
 
 import argparse
+import contextlib
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 import copy
 import dataclasses
@@ -44,6 +45,17 @@ PORTFOLIO_VALIDATION_PROMPT_VERSION = "clockify-portfolio-validation-v1"
 ANALYZER_CACHE_SCHEMA_VERSION = "clockify-analyzer-cache/v2"
 EVIDENCE_BUNDLE_SCHEMA_VERSION = "clockify-semantic-evidence-bundle/v1"
 ACTOR_CONTRACT = "clockify-semantic-actors/v1"
+# Opt-in projection that elides diffs/code blocks and excerpts long user
+# bodies. Unmarked events keep the historical projection and request bytes.
+PROJECTION_CONTRACT = "clockify-semantic-projection/v2"
+PROJECTION_EXCERPT_HEAD_CHARS = 3000
+PROJECTION_EXCERPT_TAIL_CHARS = 1000
+PROJECTION_INSTRUCTIONS = (
+    "\n\nPROJECTION: Long user bodies are shown as a head and tail excerpt "
+    "around an [elided N characters] marker, and diffs or code blocks as "
+    "[diff elided: N lines] or [code block elided: N lines]. Classify from "
+    "the visible prose; do not infer work from what was elided."
+)
 ACTOR_PROMPT_VERSION = "clockify-semantic-v18"
 ACTOR_REVIEW_PROMPT_VERSION = "clockify-semantic-review-v7"
 TASK_REVIEW_PROMPT_VERSION = "clockify-semantic-review-v8"
@@ -86,6 +98,10 @@ DEFAULT_CHUNK_BODY_BYTES = 250_000
 DEFAULT_MAX_EVENTS_PER_CHUNK = 250
 DEFAULT_ANALYZER_WORKERS = 4
 MAX_CONTRACT_REPAIR_ATTEMPTS = 2
+PARTITION_NORMALIZATION_VERSION = "review_partition_normalization_v1"
+# Above this share of quarantined members a model repair is still cheaper than
+# the manual review the quarantine would create.
+PARTITION_NORMALIZATION_MAX_ROUTED_SHARE = 0.25
 MAX_TIMEOUT_RECOVERY_ATTEMPTS = 3
 MAX_CONNECTION_RECOVERY_ATTEMPTS = 3
 # A provider usage/rate limit (HTTP 429, or any retryable status carrying
@@ -832,6 +848,74 @@ def with_actor_context(
     return output
 
 
+def with_projection_contract(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Opt NEW requests into the trimmed projection; sources stay unchanged."""
+    return [{**event, "semantic_projection_contract": PROJECTION_CONTRACT} for event in events]
+
+
+def _projection_trimmed(events: Iterable[dict[str, Any]]) -> bool:
+    contracts = {event.get("semantic_projection_contract") for event in events}
+    if contracts - {None, PROJECTION_CONTRACT} or len(contracts) > 1:
+        raise AnalyzerError("semantic projection contracts differ")
+    return contracts == {PROJECTION_CONTRACT}
+
+
+DIFF_HUNK_START_RE = re.compile(
+    r"^(?:diff --git |@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@|--- (?:a/|/dev/null)|\+\+\+ (?:b/|/dev/null))"
+)
+DIFF_HUNK_LINE_RE = re.compile(
+    r"^(?:[ +\-\\]|@@ |diff --git |index [0-9a-f]|new file mode|deleted file mode|"
+    r"similarity index|rename (?:from|to) )"
+)
+
+
+def _elide_text_blocks(value: Any) -> Any:
+    """Replace unified-diff hunks and fenced code blocks with line counts."""
+    if not isinstance(value, str):
+        return value
+    output: list[str] = []
+    block: tuple[str, int] | None = None
+    for line in value.splitlines():
+        fence = line.lstrip().startswith(("```", "~~~"))
+        if block is not None and block[0] == "code block":
+            block = (block[0], block[1] + 1)
+            if fence:
+                output.append(f"[code block elided: {block[1]} lines]")
+                block = None
+            continue
+        if block is not None and DIFF_HUNK_LINE_RE.match(line):
+            block = (block[0], block[1] + 1)
+            continue
+        if block is not None:
+            output.append(f"[diff elided: {block[1]} lines]")
+            block = None
+        if fence:
+            block = ("code block", 1)
+        elif DIFF_HUNK_START_RE.match(line):
+            block = ("diff", 1)
+        else:
+            output.append(line)
+    if block is not None:
+        output.append(f"[{block[0]} elided: {block[1]} lines]")
+    return "\n".join(output)
+
+
+def _excerpt(content: str) -> str:
+    """Keep a head and tail excerpt on whitespace so no token is split."""
+    limit = PROJECTION_EXCERPT_HEAD_CHARS + PROJECTION_EXCERPT_TAIL_CHARS
+    if len(content) <= limit:
+        return content
+    head = content[:PROJECTION_EXCERPT_HEAD_CHARS]
+    head = head.rsplit(" ", 1)[0] if " " in head else ""
+    tail = content[-PROJECTION_EXCERPT_TAIL_CHARS:]
+    tail = tail.split(" ", 1)[-1] if " " in tail else ""
+    elided = len(content) - len(head) - len(tail)
+    excerpt = _one_line(f"{head} [elided {elided} characters] {tail}")
+    if any(pattern.search(excerpt) for pattern in (URL_RE, EMAIL_RE, PATH_RE, BEARER_RE, SECRET_RE, HASH_RE, COMMAND_RE, TRANSPORT_RE)):
+        raise AnalyzerError("semantic projection excerpt contains unsafe text")
+    return excerpt
+
+
 def _actor_aware(events: Iterable[dict[str, Any]]) -> bool:
     contracts = {event.get("semantic_actor_contract") for event in events}
     if contracts - {None, ACTOR_CONTRACT} or len(contracts) > 1:
@@ -873,7 +957,12 @@ def project_event(event: dict[str, Any]) -> dict[str, Any]:
         attributes.get("label"), attributes.get("reason"), attributes.get("first_user_message"),
         attributes.get("last_assistant_message"), attributes.get("subject"),
     ]
+    trimmed = _projection_trimmed([event])
+    if trimmed:
+        content_values = [_elide_text_blocks(value) for value in content_values]
     content = _one_line(" ".join(filter(None, (_safe_text(value) for value in content_values))))
+    if trimmed and role == "user":
+        content = _excerpt(content)
     artifact_names = _safe_artifact_names(attributes.get("artifacts"))
     if artifact_names:
         content = _one_line(f"{content} Artifacts: {', '.join(artifact_names)}")
@@ -1429,6 +1518,173 @@ def _quarantine_review_citation_conflicts(
     return replacement
 
 
+def _compressed_partitions(members: Iterable[tuple[str, int]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[int]] = {}
+    for bundle_ref, position in sorted(set(members)):
+        grouped.setdefault(bundle_ref, []).append(position)
+    partitions = []
+    for bundle_ref, positions in grouped.items():
+        ranges: list[list[int]] = []
+        for position in positions:
+            if ranges and position == ranges[-1][1] + 1:
+                ranges[-1][1] = position
+            else:
+                ranges.append([position, position])
+        partitions.append({"bundle_ref": bundle_ref, "member_ranges": ranges})
+    return partitions
+
+
+def normalize_review_partitions(
+    response: Mapping[str, Any], *, member_counts: Mapping[str, int],
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """Repair partition bookkeeping deterministically, never dropping evidence.
+
+    Lossless fixes come first: partitions naming no supplied bundle and ranges
+    with no supplied member are dropped (they cite nothing), ranges are clipped
+    to the bundle, and repeated refs or overlapping ranges inside one row are
+    merged. A row left citing nothing is dropped, since it has no evidence.
+    Rows still sharing a member with another row are quarantined whole, as in
+    the retry-time citation quarantine, and those rows' members plus every
+    unassigned member go to one explicit, versioned quarantine exception
+    without effort. Returns None when the partitions are already an exact
+    cover, else the replacement provider response and a numeric-only report.
+    """
+    sections = ("activities", "exceptions", "omissions")
+    counts = dict.fromkeys((
+        "partitions_dropped", "partitions_reshaped", "ranges_dropped",
+        "ranges_clipped", "members_merged", "rows_dropped_ungrounded",
+        "rows_quarantined",
+    ), 0)
+    cleaned: dict[str, list[tuple[Mapping[str, Any], set[tuple[str, int]]]]] = {}
+    for section in sections:
+        rows = response.get(section)
+        if not isinstance(rows, list):
+            return None
+        cleaned[section] = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                return None
+            owned: set[tuple[str, int]] = set()
+            partitions = row.get("evidence_partitions")
+            for partition in partitions if isinstance(partitions, list) else []:
+                bundle_ref = partition.get("bundle_ref") if isinstance(partition, Mapping) else None
+                ranges = partition.get("member_ranges") if isinstance(partition, Mapping) else None
+                if (not isinstance(bundle_ref, str) or bundle_ref not in member_counts
+                        or not isinstance(ranges, list) or not ranges):
+                    counts["partitions_dropped"] += 1
+                    continue
+                if set(partition) != {"bundle_ref", "member_ranges"}:
+                    counts["partitions_reshaped"] += 1
+                for bounds in ranges:
+                    if (not isinstance(bounds, list) or len(bounds) != 2
+                            or any(type(value) is not int for value in bounds)
+                            or bounds[0] > bounds[1]):
+                        counts["ranges_dropped"] += 1
+                        continue
+                    start = max(1, bounds[0])
+                    end = min(int(member_counts[bundle_ref]), bounds[1])
+                    if start > end:
+                        counts["ranges_dropped"] += 1
+                        continue
+                    if [start, end] != bounds:
+                        counts["ranges_clipped"] += 1
+                    positions = {(bundle_ref, number) for number in range(start, end + 1)}
+                    counts["members_merged"] += len(owned & positions)
+                    owned.update(positions)
+            if not owned:
+                counts["rows_dropped_ungrounded"] += 1
+                continue
+            cleaned[section].append((row, owned))
+
+    owners: dict[tuple[str, int], int] = {}
+    for section in sections:
+        for _row, owned in cleaned[section]:
+            for member in owned:
+                owners[member] = owners.get(member, 0) + 1
+    contested = {member for member, total in owners.items() if total > 1}
+    expected = {
+        (bundle_ref, number)
+        for bundle_ref, total in member_counts.items()
+        for number in range(1, int(total) + 1)
+    }
+    replacement: dict[str, Any] = {}
+    routed: set[tuple[str, int]] = set()
+    assigned: set[tuple[str, int]] = set()
+    for section in sections:
+        replacement[section] = []
+        for row, owned in cleaned[section]:
+            if owned & contested:
+                counts["rows_quarantined"] += 1
+                routed.update(owned)
+                continue
+            assigned.update(owned)
+            replacement[section].append({
+                **copy.deepcopy(dict(row)),
+                "evidence_partitions": _compressed_partitions(owned),
+            })
+    routed.update(expected - assigned)
+    if not routed and not any(counts.values()):
+        return None
+    if routed:
+        replacement["exceptions"].append({
+            "kind": "analyzer_review_partial_quarantine",
+            "evidence_partitions": _compressed_partitions(routed),
+            "reason": (
+                f"Locally derived {PARTITION_NORMALIZATION_VERSION} quarantine for "
+                "contested or unassigned evidence; manual review required and no "
+                "effort assigned"
+            ),
+        })
+    report = {
+        "version": PARTITION_NORMALIZATION_VERSION,
+        **counts,
+        "members_total": len(expected),
+        "members_routed": len(routed),
+    }
+    return replacement, report
+
+
+def _review_partition_replacement(
+    response: Mapping[str, Any], *, events: list[dict[str, Any]],
+    taxonomy: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Return a normalized review response when the repair is small enough."""
+    _bundles, manifest = _semantic_evidence_bundles(events)
+    normalized = normalize_review_partitions(
+        response,
+        member_counts={bundle["bundle_ref"]: bundle["member_count"] for bundle in manifest},
+    )
+    if normalized is None:
+        return None
+    replacement, report = normalized
+    if report["members_routed"] > PARTITION_NORMALIZATION_MAX_ROUTED_SHARE * report["members_total"]:
+        return None
+    try:
+        # Quarantine must not hide a project-selection failure on a dropped row.
+        _validate_review_taxonomy(response, taxonomy)
+    except AnalyzerError:
+        return None
+    return replacement
+
+
+def _review_partition_failure_code(
+    response: Mapping[str, Any], *, events: list[dict[str, Any]],
+    known_evidence_ids: set[str], evidence_time_spans: dict[str, dict[str, str]] | None,
+) -> str:
+    """Name the rejection the unnormalized provider response would have had."""
+    try:
+        restored = _restore_extraction_partitions(response, events=events)
+        restored = bind_activity_evidence_spans(restored, evidence_time_spans=evidence_time_spans)
+        validate_result(
+            restored, known_evidence_ids=known_evidence_ids, provider_model="",
+            analyzer_tier="", evidence_time_spans=evidence_time_spans,
+            semantic_validation=False,
+        )
+    except AnalyzerError as exc:
+        return _contract_failure_code(exc)
+    return "contract_rejected_other"
+
+
 def _normalize_provider_response(
     response: Mapping[str, Any], *, mode: str
 ) -> dict[str, Any]:
@@ -1628,6 +1884,9 @@ Output object:
     if _actor_aware(events):
         system += ACTOR_INSTRUCTIONS
         payload["actor_contract"] = ACTOR_CONTRACT
+    if _projection_trimmed(events):
+        system += PROJECTION_INSTRUCTIONS
+        payload["projection_contract"] = PROJECTION_CONTRACT
     if repair_failure_code is not None:
         payload["repair_feedback"] = {
             "failure_code": repair_failure_code,
@@ -2028,6 +2287,9 @@ Do not infer duration from a session envelope or reuse a prior disputed citation
     if _actor_aware(events):
         system += ACTOR_INSTRUCTIONS
         payload["actor_contract"] = ACTOR_CONTRACT
+    if _projection_trimmed(events):
+        system += PROJECTION_INSTRUCTIONS
+        payload["projection_contract"] = PROJECTION_CONTRACT
     if review_scope != "extraction":
         payload["review_scope"] = review_scope
     if repair_failure_code is not None:
@@ -3262,10 +3524,14 @@ class AnalyzerResponseCache:
     """
 
     def __init__(self, path: Path, *, record_review_diagnostics: bool = False,
-                 use_review_diagnostic_feedback: bool = True):
+                 use_review_diagnostic_feedback: bool = True,
+                 partition_normalization: bool = False):
         self.path = path
         self.record_review_diagnostics = record_review_diagnostics
         self.use_review_diagnostic_feedback = use_review_diagnostic_feedback
+        # Opt-in: fresh review responses get deterministic partition repair
+        # before rejection. Sealed decisions replay unchanged either way.
+        self.partition_normalization = partition_normalization
         self._lock = threading.RLock()
         self._records: dict[str, dict[str, Any]] = {}
         self.hits = 0
@@ -3980,8 +4246,96 @@ class AnalyzerResponseCache:
             }
 
 
+CALL_DIAGNOSTICS_SCHEMA_VERSION = "clockify-analyzer-call-diagnostics/v1"
+_CALL_DIAGNOSTICS_PATH: Path | None = None
+_CALL_DIAGNOSTICS_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def call_diagnostics(path: Path | None):
+    """Record per-call latency and token usage to a file beside the cache.
+
+    The file is never part of the sealed cache or any replay input; it holds
+    only numeric fields, route identity and the request body digest.
+    """
+    global _CALL_DIAGNOSTICS_PATH
+    previous = _CALL_DIAGNOSTICS_PATH
+    _CALL_DIAGNOSTICS_PATH = path
+    try:
+        yield
+    finally:
+        _CALL_DIAGNOSTICS_PATH = previous
+
+
+def _usage_counts(response: Any) -> dict[str, int]:
+    usage = response.get("usage") if isinstance(response, Mapping) else None
+    if not isinstance(usage, Mapping):
+        return {}
+    counts = {
+        key: usage[key] for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+        if type(usage.get(key)) is int
+    }
+    for group, key, name in (("prompt_tokens_details", "cached_tokens", "cached_tokens"),
+                             ("completion_tokens_details", "reasoning_tokens", "reasoning_tokens")):
+        details = usage.get(group)
+        if isinstance(details, Mapping) and type(details.get(key)) is int:
+            counts[name] = details[key]
+    return counts
+
+
+def _record_call_diagnostic(
+    endpoint: AnalyzerEndpoint, body: Mapping[str, Any], *, started: float,
+    outcome: str, response: Any = None, status_code: int | None = None,
+) -> None:
+    path = _CALL_DIAGNOSTICS_PATH
+    if path is None:
+        return
+    try:
+        encoded = canonical_json(body).encode("utf-8")
+        try:
+            payload = json.loads(body["messages"][1]["content"])
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+            payload = {}
+        payload = payload if isinstance(payload, Mapping) else {}
+        repair = payload.get("repair_feedback")
+        record = {
+            "schema_version": CALL_DIAGNOSTICS_SCHEMA_VERSION,
+            "recorded_at": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+            "route": endpoint.name,
+            "model": endpoint.model,
+            "revision": endpoint.revision,
+            "mode": "probe" if "probe" in payload else str(payload.get("mode") or "unknown"),
+            "review_scope": payload.get("review_scope") if isinstance(payload.get("review_scope"), str) else None,
+            "repair_failure_code": (repair.get("failure_code") if isinstance(repair, Mapping)
+                                    and isinstance(repair.get("failure_code"), str) else None),
+            "body_digest": hashlib.sha256(encoded).hexdigest(),
+            "body_bytes": len(encoded),
+            "latency_ms": int((time.monotonic() - started) * 1000),
+            "outcome": outcome,
+            "status_code": status_code,
+            "usage": _usage_counts(response),
+        }
+        with _CALL_DIAGNOSTICS_LOCK:
+            descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
+                metadata = os.fstat(handle.fileno())
+                if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid()
+                        or metadata.st_mode & 0o777 != 0o600):
+                    return
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    handle.write(canonical_json(record) + "\n")
+                    handle.flush()
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except (OSError, ValueError, TypeError):
+        # Diagnostics must never change an accounting decision.
+        return
+
+
 def http_transport(endpoint: AnalyzerEndpoint, body: dict[str, Any]) -> dict[str, Any]:
     require_current_live_flash_route(endpoint)
+    started = time.monotonic()
     transport_body = dict(body)
     if endpoint.reasoning_effort:
         transport_body["reasoning_effort"] = endpoint.reasoning_effort
@@ -4009,8 +4363,11 @@ def http_transport(endpoint: AnalyzerEndpoint, body: dict[str, Any]) -> dict[str
     )
     try:
         with urllib.request.urlopen(request, timeout=endpoint.timeout_seconds) as response:
-            return json.loads(response.read().decode("utf-8"))
+            decoded = json.loads(response.read().decode("utf-8"))
+        _record_call_diagnostic(endpoint, body, started=started, outcome="ok", response=decoded)
+        return decoded
     except TimeoutError as exc:
+        _record_call_diagnostic(endpoint, body, started=started, outcome="timeout")
         # A timeout has no usable provider response. Keep it distinguishable so
         # extraction can seal the exact failed request and bisect only at safe
         # conversation-turn boundaries; no identical request is retried.
@@ -4019,6 +4376,8 @@ def http_transport(endpoint: AnalyzerEndpoint, body: dict[str, Any]) -> dict[str
         ) from exc
     except urllib.error.HTTPError as exc:
         status_code = int(exc.code)
+        _record_call_diagnostic(endpoint, body, started=started, outcome="http_error",
+                                status_code=status_code)
         if status_code in {408, 425, 429} or 500 <= status_code <= 599:
             raise AnalyzerRetryableHTTPError(
                 f"analyzer endpoint {endpoint.name} failed: retryable HTTPError",
@@ -4031,6 +4390,10 @@ def http_transport(endpoint: AnalyzerEndpoint, body: dict[str, Any]) -> dict[str
             f"analyzer endpoint {endpoint.name} failed: HTTPError"
         ) from exc
     except urllib.error.URLError as exc:
+        _record_call_diagnostic(
+            endpoint, body, started=started,
+            outcome="timeout" if isinstance(exc.reason, TimeoutError) else "transport_error",
+        )
         if isinstance(exc.reason, TimeoutError):
             raise AnalyzerTimeoutError(
                 f"analyzer endpoint {endpoint.name} failed: TimeoutError"
@@ -4040,6 +4403,7 @@ def http_transport(endpoint: AnalyzerEndpoint, body: dict[str, Any]) -> dict[str
             f"analyzer endpoint {endpoint.name} failed: URLError"
         ) from exc
     except json.JSONDecodeError as exc:
+        _record_call_diagnostic(endpoint, body, started=started, outcome="invalid_json")
         # Never include request headers/body: they can contain credentials or evidence.
         raise AnalyzerError(f"analyzer endpoint {endpoint.name} failed: {type(exc).__name__}") from exc
 
@@ -4244,12 +4608,20 @@ def _call_semantic_review_once(
     reviewer_model, reviewer_revision = _response_provider_identity(
         response, endpoint
     )
+    provider_response: Mapping[str, Any] | None = None
     try:
         response = _normalize_provider_response(response, mode="extract")
         _provider_response_cache_safe(
             response,
             original_evidence_ids=known_evidence_ids,
         )
+        if (cache is not None and cache.partition_normalization and cache_miss
+                and not local_coverage_repair):
+            normalized = _review_partition_replacement(
+                response, events=events, taxonomy=taxonomy,
+            )
+            if normalized is not None:
+                provider_response, response = response, normalized
         restored = _restore_extraction_partitions(response, events=events)
         restored = bind_activity_evidence_spans(
             restored,
@@ -4329,13 +4701,25 @@ def _call_semantic_review_once(
             )
             cache.record_rejected_review(
                 endpoint, body, failure_code=_contract_failure_code(exc),
-                review_scope=review_scope, response=response,
+                review_scope=review_scope,
+                response=provider_response if provider_response is not None else response,
             )
         error = AnalyzerContractError(str(exc))
         error.review_rejection_body = body
         raise error from exc
     _raise_if_cancelled(cancelled)
     if cache is not None and cache_miss:
+        if provider_response is not None:
+            # Keep the numeric skeleton of what the provider actually sent.
+            cache.record_rejected_review(
+                endpoint, body,
+                failure_code=_review_partition_failure_code(
+                    provider_response, events=events,
+                    known_evidence_ids=known_evidence_ids,
+                    evidence_time_spans=evidence_time_spans,
+                ),
+                review_scope=review_scope, response=provider_response,
+            )
         cache.store_accepted(endpoint, body, response)
     for activity in result["activities"]:
         activity["extractor_model"] = extractor_model or reviewer_model
