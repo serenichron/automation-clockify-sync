@@ -15,6 +15,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 import copy
 import dataclasses
 import datetime as dt
+import email.utils
 import fcntl
 import hashlib
 import json
@@ -24,6 +25,7 @@ import re
 import stat
 import sys
 import threading
+import time
 from typing import Any, Callable, Iterable, Mapping
 import urllib.error
 import urllib.request
@@ -86,6 +88,18 @@ DEFAULT_ANALYZER_WORKERS = 4
 MAX_CONTRACT_REPAIR_ATTEMPTS = 2
 MAX_TIMEOUT_RECOVERY_ATTEMPTS = 3
 MAX_CONNECTION_RECOVERY_ATTEMPTS = 3
+# A provider usage/rate limit (HTTP 429, or any retryable status carrying
+# Retry-After) says nothing about the request: the identical request succeeds
+# once the provider window resets. It is never sealed. The same request is
+# retried after a bounded wait inside this child's budget; when the wait would
+# outlast that budget the run defers (exit 75) and the next wake resumes it.
+RATE_LIMIT_STATUS_CODES = frozenset({429})
+RATE_LIMIT_BACKOFF_SECONDS = (15.0, 30.0, 60.0, 120.0)
+MAX_RATE_LIMIT_DELAY_SECONDS = 300.0
+MAX_RATE_LIMIT_WAIT_SECONDS = 900.0
+RATE_LIMIT_DEADLINE_MARGIN_SECONDS = 300.0
+CHILD_DEADLINE_ENV = "CLOCKIFY_CHILD_DEADLINE_UNIX"
+QUOTA_DEFERRED_EXIT_CODE = 75
 # A dual contract rejection can be caused by a request that is semantically too
 # dense for both available routes, not by the underlying evidence being bad.
 # Recover only by deterministic bisection.  The default extraction limit is
@@ -227,9 +241,152 @@ class AnalyzerTransportError(AnalyzerError):
 class AnalyzerRetryableHTTPError(AnalyzerTransportError):
     """A transient HTTP status is eligible for bounded transport recovery."""
 
-    def __init__(self, message: str, *, status_code: int):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int,
+        retry_after_seconds: float | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
+        self.retry_after_seconds = retry_after_seconds
+
+
+class AnalyzerQuotaDeferred(RuntimeError):
+    """A provider usage/rate limit outlasted this run's bounded wait.
+
+    Deliberately not an AnalyzerError: extraction, repair and recovery handlers
+    convert AnalyzerError into sealed or exception results, while a quota hit
+    must leave no decision behind so the identical request runs after reset.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int,
+        retry_after_seconds: float | None = None,
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after_seconds = retry_after_seconds
+
+
+def _is_rate_limited(error: BaseException) -> bool:
+    return isinstance(error, AnalyzerRetryableHTTPError) and (
+        error.status_code in RATE_LIMIT_STATUS_CODES
+        or error.retry_after_seconds is not None
+    )
+
+
+def _defer_if_rate_limited(error: BaseException) -> None:
+    """Never seal a rate limit, including on paths without a _RateLimitGate."""
+    if _is_rate_limited(error):
+        assert isinstance(error, AnalyzerRetryableHTTPError)
+        raise AnalyzerQuotaDeferred(
+            "analyzer provider usage limit deferred this request",
+            status_code=error.status_code,
+            retry_after_seconds=error.retry_after_seconds,
+        ) from error
+
+
+def _retry_after_seconds(headers: Any) -> float | None:
+    value = headers.get("Retry-After") if headers is not None else None
+    if not value:
+        return None
+    value = str(value).strip()
+    try:
+        return max(0.0, float(int(value)))
+    except ValueError:
+        pass
+    try:
+        retry_at = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=dt.timezone.utc)
+    return max(0.0, retry_at.timestamp() - time.time())
+
+
+def _child_deadline() -> float | None:
+    raw = os.environ.get(CHILD_DEADLINE_ENV)
+    if raw is None:
+        return None
+    try:
+        deadline = float(raw)
+    except ValueError as exc:
+        raise AnalyzerError(f"{CHILD_DEADLINE_ENV} is invalid") from exc
+    if deadline != deadline or deadline in {float("inf"), float("-inf")}:
+        raise AnalyzerError(f"{CHILD_DEADLINE_ENV} is invalid")
+    return deadline
+
+
+def _wait_for_rate_limit(stop: threading.Event, seconds: float) -> None:
+    stop.wait(seconds)
+
+
+class _RateLimitGate:
+    """Retry identical rate-limited requests inside one bounded run budget."""
+
+    def __init__(self, *, deadline: float | None):
+        self.deadline = deadline
+        self.stop = threading.Event()
+        self._lock = threading.Lock()
+        self._first_limited: float | None = None
+        self._deferral: AnalyzerQuotaDeferred | None = None
+
+    def _defer(self, error: AnalyzerRetryableHTTPError) -> AnalyzerQuotaDeferred:
+        if self._deferral is None:
+            self._deferral = AnalyzerQuotaDeferred(
+                "analyzer provider usage limit outlasted this run's bounded wait",
+                status_code=error.status_code,
+                retry_after_seconds=error.retry_after_seconds,
+            )
+        self.stop.set()
+        return self._deferral
+
+    def _delay(self, error: AnalyzerRetryableHTTPError, attempt: int) -> float:
+        with self._lock:
+            if self.stop.is_set() or attempt >= len(RATE_LIMIT_BACKOFF_SECONDS):
+                raise self._defer(error) from error
+            delay = (
+                max(1.0, float(error.retry_after_seconds))
+                if error.retry_after_seconds is not None
+                else RATE_LIMIT_BACKOFF_SECONDS[attempt]
+            )
+            now = time.monotonic()
+            if self._first_limited is None:
+                self._first_limited = now
+            if (
+                delay > MAX_RATE_LIMIT_DELAY_SECONDS
+                or now + delay - self._first_limited > MAX_RATE_LIMIT_WAIT_SECONDS
+                or (
+                    self.deadline is not None
+                    and time.time() + delay
+                    > self.deadline - RATE_LIMIT_DEADLINE_MARGIN_SECONDS
+                )
+            ):
+                raise self._defer(error) from error
+            return delay
+
+    def wrap(self, transport: Transport) -> Transport:
+        def gated(endpoint: AnalyzerEndpoint, body: dict[str, Any]) -> dict[str, Any]:
+            attempt = 0
+            while True:
+                try:
+                    return transport(endpoint, body)
+                except AnalyzerRetryableHTTPError as error:
+                    if not _is_rate_limited(error):
+                        raise
+                    delay = self._delay(error, attempt)
+                    attempt += 1
+                    _wait_for_rate_limit(self.stop, delay)
+                    if self.stop.is_set():
+                        raise self._defer(error) from error
+
+        gated.__wrapped__ = transport  # type: ignore[attr-defined]
+        return gated
 
 
 class _ValidatedAnalysis(dict[str, Any]):
@@ -3866,6 +4023,7 @@ def http_transport(endpoint: AnalyzerEndpoint, body: dict[str, Any]) -> dict[str
             raise AnalyzerRetryableHTTPError(
                 f"analyzer endpoint {endpoint.name} failed: retryable HTTPError",
                 status_code=status_code,
+                retry_after_seconds=_retry_after_seconds(exc.headers),
             ) from exc
         # Authentication and other client failures are route/configuration
         # errors, not transient request loss.
@@ -3887,7 +4045,10 @@ def http_transport(endpoint: AnalyzerEndpoint, body: dict[str, Any]) -> dict[str
 
 
 def probe_endpoint(endpoint: AnalyzerEndpoint, transport: Transport = http_transport) -> dict[str, Any]:
-    if transport is http_transport or endpoint.model.startswith("deepseek-v4"):
+    if (
+        getattr(transport, "__wrapped__", transport) is http_transport
+        or endpoint.model.startswith("deepseek-v4")
+    ):
         require_current_live_flash_route(endpoint)
     if endpoint.model.endswith((":cloud", "-cloud")) and not re.fullmatch(
         r"[a-f0-9]{64}", endpoint.revision
@@ -4054,8 +4215,9 @@ def _call_semantic_review_once(
                     failure_code="transport_timeout",
                 )
             raise
-        except AnalyzerTransportError:
+        except AnalyzerTransportError as transport_exc:
             _raise_if_cancelled(cancelled)
+            _defer_if_rate_limited(transport_exc)
             if cache is not None and cache_miss:
                 cache.store_rejected(
                     endpoint,
@@ -4379,8 +4541,9 @@ def _call_validated(
                     failure_code="transport_timeout",
                 )
             raise
-        except AnalyzerTransportError:
+        except AnalyzerTransportError as transport_exc:
             _raise_if_cancelled(cancelled)
+            _defer_if_rate_limited(transport_exc)
             if cache is not None and cache_miss:
                 cache.store_rejected(
                     endpoint,
@@ -4518,7 +4681,8 @@ def _call_synthesis_validated(
                     failure_code="transport_timeout",
                 )
             raise
-        except AnalyzerTransportError:
+        except AnalyzerTransportError as transport_exc:
+            _defer_if_rate_limited(transport_exc)
             if cache is not None and cache_miss:
                 cache.store_rejected(
                     endpoint,
@@ -4691,6 +4855,10 @@ def analyze_tiered(
 ) -> dict[str, Any]:
     if max_workers <= 0:
         raise AnalyzerError("max_workers must be positive")
+    # Innermost wrapper: rate-limit retries resend the identical request and
+    # never count against the failed-review retry transport budget below.
+    rate_limit_gate = _RateLimitGate(deadline=_child_deadline())
+    transport = rate_limit_gate.wrap(transport)
     if failed_review_retry_targets is not None:
         if cache is None or review_taxonomy is None or not failed_review_retry_targets:
             raise AnalyzerError("failed-review retry requires cache and review taxonomy")
@@ -5406,6 +5574,8 @@ def analyze_tiered(
         finally:
             if fatal_error is not None:
                 cancellation.set()
+                # Wake peers sleeping on a rate limit; their results are void.
+                rate_limit_gate.stop.set()
                 for future in pending:
                     future.cancel()
                 executor.shutdown(wait=True, cancel_futures=True)
