@@ -505,7 +505,8 @@ def _auto_fields(proposals: Sequence[Mapping[str, Any]], authority: Mapping[str,
                  lifecycle_route_authority: Mapping[str, Any] | None = None,
                  current_presentation: Mapping[str, Any] | None = None,
                  allow_recorded_attendance: bool = False,
-                 recorded_attendance_authority: Mapping[str, Any] | None = None) -> dict[str, Any]:
+                 recorded_attendance_authority: Mapping[str, Any] | None = None,
+                 summary_fallback_ids: Sequence[str] = ()) -> dict[str, Any]:
     fields = _derive_authority(proposals, authority, source_dir, timezone,
         allow_wording_consolidation=consolidation_policy in {WORDING_CONSOLIDATION_POLICY, OVERLAP_CONSOLIDATION_POLICY,
                                                             CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
@@ -518,6 +519,16 @@ def _auto_fields(proposals: Sequence[Mapping[str, Any]], authority: Mapping[str,
         allow_recorded_attendance=allow_recorded_attendance,
         recorded_attendance_authority=recorded_attendance_authority)
     protected_existing = fields.pop("protected_existing_ids")
+    if summary_fallback_ids:
+        # A group whose reviewed summary is unavailable is not consolidated:
+        # each child keeps its own already reviewed wording, identity and
+        # duration as a standalone row. No new wording is produced here.
+        missing = set(summary_fallback_ids) - (set(fields["editorial_descriptions"]) & set(fields["work_contexts"]))
+        if missing:
+            raise ValueError("summary fallback requires reviewed child wording")
+        fields["protected_ids"] = sorted(set(fields["protected_ids"]) | set(summary_fallback_ids))
+        fields["standalone_review_ids"] = sorted(set(fields["standalone_review_ids"]) | set(summary_fallback_ids))
+        fields["summary_fallback_ids"] = sorted(set(summary_fallback_ids))
     if current_presentation is not None:
         _, _, current = _current_presentation_rows(current_presentation, proposals, timezone)
         if set(current) - (set(fields["editorial_descriptions"]) - set(fields["protected_ids"])):
@@ -613,7 +624,9 @@ def prepare(*, source_dir: Path, output: Path, run_id: str, spreadsheet_id: str,
                           lifecycle_route_authority=lifecycle_authority,
                           current_presentation=current_presentation,
                           allow_recorded_attendance=existing is None or "recorded_attendance_authority" in existing,
-                          recorded_attendance_authority=existing.get("recorded_attendance_authority") if existing else None)
+                          recorded_attendance_authority=existing.get("recorded_attendance_authority") if existing else None,
+                          summary_fallback_ids=existing.get("summary_fallback_ids", ()) if existing else ())
+    summary_fallback = None
     if existing is None and group_summaries is None and summary_provider is not None:
         from scripts import clockify_review_group_summary
         activities = fields["package"]["activities"]
@@ -624,15 +637,35 @@ def prepare(*, source_dir: Path, output: Path, run_id: str, spreadsheet_id: str,
             # the authority used to derive stable identities and durations.
             # It also screens unsafe singleton wording, while healthy
             # singletons require no model call or cache write.
-            group_summaries = summary_provider(copy.deepcopy(activities))
-            reviewed = batches.group_summary_descriptions(activities, group_summaries)
-            if not required.issubset(reviewed):
-                raise ValueError("automatic group summaries are incomplete")
-            fields = _auto_fields(proposals, authority, source_dir, timezone, consolidation_policy=policy,
-                                  group_summaries=group_summaries, allow_materialized_corrections=allow_materialized,
-                                  lifecycle_route_authority=lifecycle_authority,
-                                  current_presentation=current_presentation,
-                                  allow_recorded_attendance=True)
+            try:
+                group_summaries = summary_provider(copy.deepcopy(activities))
+            except clockify_review_group_summary.GroupSummaryError as error:
+                # Do not loop on a summary the model cannot produce: publish the
+                # affected children individually, each with its reviewed wording.
+                fallback = sorted({child for item in activities if item["review_id"] in required
+                                   for child in item["child_review_ids"]})
+                if not fallback:
+                    raise
+                group_summaries = None
+                fields = _auto_fields(proposals, authority, source_dir, timezone, consolidation_policy=policy,
+                                      allow_materialized_corrections=allow_materialized,
+                                      lifecycle_route_authority=lifecycle_authority,
+                                      current_presentation=current_presentation,
+                                      allow_recorded_attendance=True, summary_fallback_ids=fallback)
+                remaining = fields["package"]["activities"]
+                if (any(len({child["description"] for child in item["prepared_descriptions"]}) > 1 for item in remaining)
+                        or clockify_review_group_summary.needs_summary(remaining)):
+                    raise
+                summary_fallback = {"review_ids": fallback, "reason": str(error)[:300]}
+            else:
+                reviewed = batches.group_summary_descriptions(activities, group_summaries)
+                if not required.issubset(reviewed):
+                    raise ValueError("automatic group summaries are incomplete")
+                fields = _auto_fields(proposals, authority, source_dir, timezone, consolidation_policy=policy,
+                                      group_summaries=group_summaries, allow_materialized_corrections=allow_materialized,
+                                      lifecycle_route_authority=lifecycle_authority,
+                                      current_presentation=current_presentation,
+                                      allow_recorded_attendance=True)
     if allow_materialized:
         _require_group_summaries(fields)
     document = {"schema_version": AUTO_SCHEMA, "run_id": run_id, "spreadsheet_id": spreadsheet_id,
@@ -655,7 +688,8 @@ def prepare(*, source_dir: Path, output: Path, run_id: str, spreadsheet_id: str,
             (json.dumps(document, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode(),
             label="automatic review preparation")
     return {**fields["preparation_outcome"], "binding": artifact_handle(output),
-            "diagnostics": fields["preparation_diagnostics"]}
+            "diagnostics": fields["preparation_diagnostics"],
+            **({"summary_fallback": summary_fallback} if summary_fallback is not None else {})}
 
 
 def _require_group_summaries(document: Mapping[str, Any]) -> None:
@@ -671,7 +705,7 @@ def load(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
     document = json.loads(adoptions._capture(handle, {}))
     if (not isinstance(document, dict) or document.get("schema_version") not in {SCHEMA, AUTO_SCHEMA}
             or set(document) - {"group_summaries", "native_credit_source", "materialized_correction_ids", "current_presentation",
-                                "recorded_attendance_authority", "lifecycle_route_authority"} != (FIELDS if document["schema_version"] == SCHEMA else
+                                "recorded_attendance_authority", "lifecycle_route_authority", "summary_fallback_ids"} != (FIELDS if document["schema_version"] == SCHEMA else
                 WORDING_AUTO_FIELDS if document.get("consolidation_policy") in {
                     WORDING_CONSOLIDATION_POLICY, OVERLAP_CONSOLIDATION_POLICY,
                     CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY, STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY,
@@ -683,6 +717,13 @@ def load(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
         _require_group_summaries(document)
     if "current_presentation" in document and document["schema_version"] != AUTO_SCHEMA:
         raise ValueError("current presentation requires automatic preparation")
+    if "summary_fallback_ids" in document:
+        fallback = document["summary_fallback_ids"]
+        if (document["schema_version"] != AUTO_SCHEMA or not isinstance(fallback, list) or not fallback
+                or fallback != sorted(set(fallback)) or "group_summaries" in document
+                or any(not isinstance(item, str) or not re.fullmatch(r"wka-[a-f0-9]{24}-s[0-9]{2,}", item)
+                       for item in fallback)):
+            raise ValueError("group summary fallback authority differs")
     if "lifecycle_route_authority" in document and (document["schema_version"] != AUTO_SCHEMA
             or "materialized_correction_ids" not in document
             or not isinstance(document["lifecycle_route_authority"], Mapping)):
@@ -733,7 +774,8 @@ def load(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
                               current_presentation=document.get("current_presentation"),
                               allow_recorded_attendance="recorded_attendance_authority" in document,
                               recorded_attendance_authority=document.get("recorded_attendance_authority"),
-                              group_summaries=document.get("group_summaries"))
+                              group_summaries=document.get("group_summaries"),
+                              summary_fallback_ids=document.get("summary_fallback_ids", ()))
         if any(document[key] != value for key, value in derived.items()):
             raise ValueError("automatic preparation editorial authority or derived maps differ")
     return document, handle

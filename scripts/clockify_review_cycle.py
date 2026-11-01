@@ -5846,7 +5846,14 @@ def _prepare_new_publication(
         # the already verified replay and require an explicit repair/retry.
         if output.exists():
             raise CycleError("immutable automatic review preparation drifted") from exc
-        return config, {"status": "incomplete", "reason": "editorial_authority_unavailable"}
+        # Record the exception type so a repeating failure is diagnosable. Only
+        # group-summary errors carry fixed code messages; other messages may
+        # contain source text and stay out of state.
+        from scripts import clockify_review_group_summary
+        detail = {"error_type": type(exc).__name__}
+        if isinstance(exc, clockify_review_group_summary.GroupSummaryError):
+            detail["error"] = str(exc)[:300]
+        return config, {"status": "incomplete", "reason": "editorial_authority_unavailable", **detail}
     return {**config, "review_batch_publication": outcome["binding"]["path"]}, outcome
 
 
