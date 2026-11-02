@@ -2908,6 +2908,23 @@ def _circuit_inputs(config: Mapping[str, Any], record: Mapping[str, Any]) -> str
     return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _sealed_stage_runtime(
+    config: Mapping[str, Any], stage: Mapping[str, Any], transition_validation: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Revalidate a stage against the release that sealed it, as stored stages are.
+
+    A publisher retry after a release upgrade reuses stages sealed by the
+    earlier release; they must not be judged against the current runtime.
+    """
+    if transition_validation:
+        return transition_validation
+    sealed = stage.get("runtime_identity_digest")
+    runtime = config.get("_runtime_identity")
+    if isinstance(sealed, str) and isinstance(runtime, Mapping) and sealed != _value_digest(dict(runtime)):
+        return {"expected_runtime_digest": sealed, "historical_state_validation": True}
+    return {}
+
+
 def _record_stage_failure(
     config: Mapping[str, Any], record: dict[str, Any], stage: str, child: Any,
 ) -> None:
@@ -6356,13 +6373,13 @@ def _run_slice(
         verified_source = _validate_stage(
             config, Path(str(source["result_path"])), since, until, replay=False,
             expected_snapshot_digests=expected_snapshots,
-            **transition_validation,
+            **_sealed_stage_runtime(config, source, transition_validation),
         )
         verified_replay = _validate_stage(
             config, Path(str(replay["result_path"])), since, until, replay=True,
             expected_snapshot_digests=source["snapshot_digests"],
             source_run_id=str(source["run_id"]), source_run_dir=str(source["run_dir"]),
-            **transition_validation,
+            **_sealed_stage_runtime(config, replay, transition_validation),
         )
         if verified_source != source or verified_replay != replay:
             raise CycleError("delivery inputs drifted while the publisher was running")
