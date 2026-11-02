@@ -92,7 +92,9 @@ class CycleAutomaticGroupSummaryTests(unittest.TestCase):
     def test_cycle_summary_failure_preserves_source_and_refuses_raw_fallback(self):
         with mock.patch.object(cycle, "_summarize_review_groups", side_effect=ValueError("private detail"), create=True):
             config, outcome = self.cycle()
-        self.assertEqual({"status": "incomplete", "reason": "editorial_authority_unavailable"}, outcome)
+        self.assertEqual({"status": "incomplete", "reason": "editorial_authority_unavailable",
+                          "error_type": "ValueError"}, outcome)
+        self.assertNotIn("private detail", json.dumps(outcome))
         self.assertNotIn("review_batch_publication", config)
         self.assertFalse((self.fixture.root / "state" / "prepared-review-publications" / "source-run.json").exists())
 
