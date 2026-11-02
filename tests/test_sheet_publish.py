@@ -1075,6 +1075,8 @@ class SheetPublicationTests(unittest.TestCase):
             with self.subTest(status=status):
                 approved_row = list(new_row)
                 approved_row[8] = "SC — Older description"
+                # Wording alone is retained as reviewed; accounting drift aborts.
+                approved_row[3] = 15
                 approved_row[13] = status
                 gateway = StatefulGateway([publisher.HEADER, approved_row])
 
@@ -1668,6 +1670,7 @@ class SheetPublicationTests(unittest.TestCase):
         })
         prior = publisher.proposal_row(unresolved, "old-run", project_allowlist={})
         prior[8] = "Immutable approved description"
+        prior[3] = 15
         prior[9] = "approved"
         gateway = MultiSheetGateway()
         gateway.sheets["unresolved-evidence"] = {

@@ -38,6 +38,9 @@ HEADER = [
     "Last Seen Run", "Reason", "Review Status", "Review Notes",
 ]
 HUMAN_COLUMNS = {9, 13, 14}  # Disposition, Review Status, Review Notes.
+# Confidence, Description, Revision, Last Seen Run, Reason: wording a reviewer
+# already approved or posted stays as reviewed when a later run regenerates it.
+REVIEWED_PRESENTATION_COLUMNS = frozenset({7, 8, 10, 11, 12})
 CAPACITY_WARNING_FIELDS = frozenset({
     "type", "requested_minutes", "observed_capacity_minutes", "proposed_minutes",
 })
@@ -1367,6 +1370,7 @@ def _plan_publish(
 
     updates: list[Mapping[str, Any]] = []
     appends: list[Sequence[Any]] = []
+    retained: dict[str, list[Any]] = {}
     unchanged = 0
     for row in rows:
         review_id = str(row[0])
@@ -1392,9 +1396,14 @@ def _plan_publish(
             unchanged += 1
             continue
         if _is_approved_or_posted(prior):
-            raise PublicationError(
-                f"approved or posted review ID cannot change machine fields: {review_id}"
-            )
+            drifted = {index for index in machine_columns if not _same_cell(prior[index], row[index])}
+            if not drifted <= REVIEWED_PRESENTATION_COLUMNS:
+                raise PublicationError(
+                    f"approved or posted review ID cannot change machine fields: {review_id}"
+                )
+            retained[review_id] = prior
+            unchanged += 1
+            continue
         if (type(prior[10]) is int and type(row[10]) is int and prior[10] > row[10]):
             raise PublicationError(f"older projection cannot replace a newer review revision: {review_id}")
         if str(prior[9]).strip().casefold() == str(prior[13]).strip().casefold() == "superseded":
@@ -1415,6 +1424,7 @@ def _plan_publish(
         "appends": [list(row) for row in appends],
         "unchanged": unchanged,
         "new_ids": new_ids,
+        "retained_reviewed": retained,
         "existing_max_row": max(positions.values(), default=1),
         **({"partial_revision": revision_binding} if revision_binding is not None else {}),
     }
@@ -1466,6 +1476,7 @@ def _apply_publish_plan(
             raise PublicationError("partial revision full preimage changed before application")
     updates = plan["updates"]
     appends = plan["appends"]
+    retained = plan.get("retained_reviewed", {})
     gateway.update_values(spreadsheet_id, updates)
     gateway.append_values(spreadsheet_id, f"{quoted}!A:O", appends)
     _prepare_appended_rows(
@@ -1477,7 +1488,7 @@ def _apply_publish_plan(
         spreadsheet_id,
         quoted,
         max(row_count, int(plan["existing_max_row"]) + len(appends)),
-        rows,
+        [retained.get(str(row[0]), row) for row in rows],
         new_ids=new_ids | (frozenset({revision_binding["review_id"]}) if revision_binding is not None else frozenset()),
     )
     return {
@@ -1485,6 +1496,7 @@ def _apply_publish_plan(
         "appended": len(appends),
         "updated": int(bool(updates)) if revision_binding is not None else len(updates) // 2,
         "unchanged": int(plan["unchanged"]),
+        **({"retained_reviewed": sorted(retained)} if retained else {}),
         **({"partial_revision": revision_binding} if revision_binding is not None else {}),
     }
 
