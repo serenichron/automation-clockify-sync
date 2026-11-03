@@ -854,6 +854,22 @@ class AutomaticPreparationTests(unittest.TestCase):
         self.assertEqual("published_with_preparation_gaps", repeated["status"])
         self.assertEqual(2, len(gateway.rows))
 
+    def test_read_only_retry_of_partial_slice_releases_routine_frontier(self):
+        # A sealed partial receipt is only re-verified, never re-prepared, so holding the
+        # frontier there would select the same slice forever when max_slices is 1.
+        self.analysis["activities"][0]["rendered_description"] = "SC — Bad"
+        self.write(self.run / "semantic-analysis.json", self.analysis)
+        gateway = StatefulGateway(rows=[publisher.HEADER])
+        outcome, _state, _state_dir = self.run_slice(child=self.publication_child(gateway))
+        self.assertFalse(outcome["advance_frontier"])
+        with mock.patch.object(prepared, "prepare", side_effect=AssertionError("partial historical reprojection")):
+            repeated, state, _directory = self.run_slice(child=lambda *_args, **_kwargs: self.fail("partial duplicate child"))
+        self.assertEqual("published_with_preparation_gaps", repeated["status"])
+        self.assertTrue(repeated["advance_frontier"])
+        self.assertEqual(2, len(gateway.rows))
+        cycle._recompute_completed_through({"recovery_since": "2026-08-01"}, state)
+        self.assertIsNone(state["completed_through"])
+
     def test_malformed_native_identity_stays_private_without_suppressing_ready_peer(self):
         self.sources[0]["review_activity_key"] = "wka-unresolved"
         self.analysis["activities"][0]["rendered_description"] = None

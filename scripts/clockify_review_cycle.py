@@ -6311,7 +6311,8 @@ def _run_slice(
     )
     preparation_partial = False
     retained_only = False
-    if receipt_path.exists():
+    reverified_receipt = receipt_path.exists()
+    if reverified_receipt:
         _verify_delivery_receipt(
             receipt_path, config, since, until, source, replay,
             sheet_title=sheet_title,
@@ -6414,7 +6415,12 @@ def _run_slice(
         "slice": {"since": since, "until": until, "exception_ids": source["exception_ids"]},
         # Provenance debt holds completed_through, not independent routine
         # scheduling: exact source/replay are already sealed and need no retry.
-        "advance_frontier": False if preparation_partial and not retained_only else _record_advances_frontier(record, advance_frontier),
+        # A re-verified partial receipt is never re-prepared, so it releases
+        # the frontier too instead of selecting the same slice forever.
+        "advance_frontier": (
+            False if preparation_partial and not (retained_only or reverified_receipt)
+            else _record_advances_frontier(record, advance_frontier)
+        ),
     }
 
 
