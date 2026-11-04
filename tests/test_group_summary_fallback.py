@@ -46,6 +46,66 @@ class GroupSummaryFallbackTests(unittest.TestCase):
         self.assertEqual(self.descriptions, [row[8] for row in rows])
         self.assertEqual([71 / 60, 83 / 60], [row[3] for row in rows])
 
+    def add_reviewed_source(self, index, start, end, seconds, wording):
+        from test_review_batch_publication import source
+        proposal = source(index, start, end, seconds)
+        model, revision = auto_preparation.semantic_analyzer.CURRENT_LIVE_FLASH_ROUTE
+        proposal["provenance"].update(semantic_reviewer_model=model, semantic_reviewer_revision=revision)
+        self.sources.append(proposal)
+        self.analysis["activities"].append({"activity_id": proposal["activity_id"],
+            "evidence_ids": proposal["provenance"]["evidence_ids"], "rendered_description": wording,
+            "semantic_reviewer_model": model, "semantic_reviewer_revision": revision})
+        self.write(self.run / "proposals.json", self.sources)
+        self.write(self.run / "semantic-analysis.json", self.analysis)
+        self.write(self.run / "work-accounting-result.json", {"schema_version": 1,
+            "allocation_mode": "non_overlapping_v1", "proposals": self.sources, "ambiguous": [], "skipped": []})
+        return prepared.publisher.stable_review_id(proposal)
+
+    def test_unavailable_summary_also_falls_back_for_singleton_needing_review(self):
+        # A singleton is sent to the provider only because its wording needs
+        # screening. When the provider fails, it must not block the delivery.
+        noisy = "SC — Restored SER-1801 receipt comparison"
+        singleton = self.add_reviewed_source(3, "2026-08-02T15:00:00+03:00", "2026-08-02T15:01:40+03:00", 100, noisy)
+        calls = []
+        outcome = self.prepare_with(self.failing(calls))
+        self.assertEqual([2], calls)
+        self.assertEqual("complete", outcome["status"])
+        self.assertEqual(254, outcome["prepared_seconds"])
+        self.assertIn(singleton, outcome["summary_fallback"]["review_ids"])
+        self.assertEqual(3, len(outcome["summary_fallback"]["review_ids"]))
+        projection = prepared.project(path=self.root / "prepared.json", source_dir=self.run,
+            proposals=self.sources, run_id="source-run", spreadsheet_id="sheet",
+            sheet_title="August 2026 review", project_allowlist={"abc123": "Example"})
+        self.assertEqual(sorted(self.descriptions + [noisy]), sorted(row[8] for row in projection["rows"]))
+        before = (self.root / "prepared.json").read_bytes()
+        replay_calls = []
+        self.assertEqual("complete", self.prepare_with(self.failing(replay_calls))["status"])
+        self.assertEqual([], replay_calls)
+        self.assertEqual(before, (self.root / "prepared.json").read_bytes())
+
+    def test_unavailable_summary_falls_back_when_only_a_singleton_needs_review(self):
+        noisy = "SC — Restored SER-1801 receipt comparison"
+        self.sources = self.sources[:1]
+        self.analysis["activities"] = self.analysis["activities"][:1]
+        self.analysis["activities"][0]["rendered_description"] = noisy
+        self.write(self.run / "proposals.json", self.sources)
+        self.write(self.run / "semantic-analysis.json", self.analysis)
+        self.write(self.run / "work-accounting-result.json", {"schema_version": 1,
+            "allocation_mode": "non_overlapping_v1", "proposals": self.sources, "ambiguous": [], "skipped": []})
+        calls = []
+        outcome = self.prepare_with(self.failing(calls))
+        self.assertEqual([1], calls)
+        self.assertEqual("complete", outcome["status"])
+        self.assertEqual([prepared.publisher.stable_review_id(self.sources[0])],
+                         outcome["summary_fallback"]["review_ids"])
+        projection = prepared.project(path=self.root / "prepared.json", source_dir=self.run,
+            proposals=self.sources, run_id="source-run", spreadsheet_id="sheet",
+            sheet_title="August 2026 review", project_allowlist={"abc123": "Example"})
+        self.assertEqual([noisy], [row[8] for row in projection["rows"]])
+        replay_calls = []
+        self.assertEqual("complete", self.prepare_with(self.failing(replay_calls))["status"])
+        self.assertEqual([], replay_calls)
+
     def test_fallback_binding_replays_without_calling_the_provider_again(self):
         self.prepare_with(self.failing([]))
         before = (self.root / "prepared.json").read_bytes()

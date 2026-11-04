@@ -641,8 +641,9 @@ def prepare(*, source_dir: Path, output: Path, run_id: str, spreadsheet_id: str,
                 group_summaries = summary_provider(copy.deepcopy(activities))
             except clockify_review_group_summary.GroupSummaryError as error:
                 # Do not loop on a summary the model cannot produce: publish the
-                # affected children individually, each with its reviewed wording.
-                fallback = sorted({child for item in activities if item["review_id"] in required
+                # affected children and singletons individually with reviewed wording.
+                fallback_review_ids = required | clockify_review_group_summary.summary_review_ids(activities)
+                fallback = sorted({child for item in activities if item["review_id"] in fallback_review_ids
                                    for child in item["child_review_ids"]})
                 if not fallback:
                     raise

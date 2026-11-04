@@ -116,6 +116,12 @@ def _project(activities: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, An
     return projected, by_ref
 
 
+def summary_review_ids(activities: Sequence[Mapping[str, Any]]) -> set[str]:
+    """Return native review IDs selected for summary or wording screening."""
+    _, originals = _project(activities)
+    return {activity["review_id"] for activity in originals.values()}
+
+
 def needs_summary(activities: Sequence[Mapping[str, Any]]) -> bool:
     """Select dirty singleton wording as well as multi-outcome groups locally."""
     return bool(_project(activities)[0])
