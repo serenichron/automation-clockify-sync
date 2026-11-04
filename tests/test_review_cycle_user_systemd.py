@@ -108,14 +108,17 @@ class UserSystemdArtifactTests(unittest.TestCase):
             set(repeated_directives(SERVICE, "ReadWritePaths")),
         )
         command = shlex.split(service["ExecStart"])
+        # A busy runner lock (73) is neither release proof nor release failure.
         self.assertEqual(
             [
                 "/usr/bin/flock",
                 "--nonblock",
+                "--conflict-exit-code",
+                "73",
                 "%h/Work/automation-clockify-sync/state/autopilot-runner.lock",
                 "/usr/bin/python3",
             ],
-            command[:4],
+            command[:6],
         )
         self.assertIn(
             "${CLOCKIFY_AUTOPILOT_ROOT}/scripts/clockify_review_cycle.py",

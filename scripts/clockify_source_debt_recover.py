@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import datetime as dt
+from functools import lru_cache
 import hashlib
 import importlib.util
 import json
@@ -673,31 +674,42 @@ def _transition(parent: _Parent, attempt_id: str) -> tuple[dict[str, object], st
     return {**unsigned, "transition_digest": _digest(unsigned)}, locator
 
 
+@lru_cache(maxsize=4)
+def _release_helper(helper_path: Path):
+    spec = importlib.util.spec_from_file_location(
+        "clockify_historical_recovery_release", helper_path
+    )
+    if spec is None or spec.loader is None:
+        raise ValueError("release identity validator is unavailable")
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    return helper
+
+
 def _historical_release_vouches(transition: Mapping[str, Any]) -> bool:
-    """Require one authenticated archived release to bind the transition."""
+    """Cheaply shortlist archives, then freshly authenticate the unique match."""
     try:
         if not ROOT.is_dir():
             return False
         helper_path = ROOT / "ops/systemd/user/clockify_review_cycle_release.py"
-        spec = importlib.util.spec_from_file_location(
-            "clockify_historical_recovery_release", helper_path
-        )
-        if spec is None or spec.loader is None:
-            return False
-        helper = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(helper)
+        helper = _release_helper(helper_path)
         releases = list(ROOT.parent.iterdir())
     except Exception:
         return False
-    matches = 0
+    bindings = {
+        "scripts/clockify_source_debt_recover.py": "recovery_adapter_sha256",
+        "scripts/clockify_sync_collect.py": "current_collector_sha256",
+        "routing.json": "current_routing_sha256",
+        "fleet.json": "current_fleet_sha256",
+    }
+    matches = []
     for release in releases:
         try:
             if release == ROOT or release.is_symlink() or not release.is_dir():
                 continue
-            identity = helper._identity(release, release.name)
-            files = {
-                entry["path"]: "sha256:" + entry["sha256"]
-                for entry in identity["tree_manifest"] if entry.get("type") == "file"
+            fingerprints = {
+                path: _file_digest(release / path, label="archived " + path)
+                for path in bindings
             }
             runtime = {
                 "collector_path": str(release / "scripts" / "clockify_sync_collect.py"),
@@ -706,18 +718,33 @@ def _historical_release_vouches(transition: Mapping[str, Any]) -> bool:
                 "git_dirty": None,
             }
             if (
-                files["scripts/clockify_source_debt_recover.py"]
-                == transition.get("recovery_adapter_sha256")
-                and files["scripts/clockify_sync_collect.py"]
-                == transition.get("current_collector_sha256")
-                and files["routing.json"] == transition.get("current_routing_sha256")
-                and files["fleet.json"] == transition.get("current_fleet_sha256")
+                all(fingerprints[path] == transition.get(key) for path, key in bindings.items())
                 and _digest(runtime) == transition.get("current_runtime_identity_digest")
             ):
-                matches += 1
+                matches.append(release)
         except Exception:
             continue
-    return matches == 1
+    if len(matches) != 1:
+        return False
+    try:
+        release = matches[0]
+        identity = helper._identity(release, release.name)
+        files = {
+            entry["path"]: "sha256:" + entry["sha256"]
+            for entry in identity["tree_manifest"] if entry.get("type") == "file"
+        }
+        runtime = {
+            "collector_path": str(release / "scripts" / "clockify_sync_collect.py"),
+            "canonical_root": str(release),
+            "git_sha": None,
+            "git_dirty": None,
+        }
+        return (
+            all(files[path] == transition.get(key) for path, key in bindings.items())
+            and _digest(runtime) == transition.get("current_runtime_identity_digest")
+        )
+    except Exception:
+        return False
 
 
 def _historical_transition(

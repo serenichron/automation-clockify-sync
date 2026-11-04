@@ -2,6 +2,8 @@
 Description=Clockify bounded review-cycle coordinator (user manager)
 Wants=network-online.target
 After=network-online.target
+Wants=clockify-review-cycle-update.service
+After=clockify-review-cycle-update.service
 
 [Service]
 Type=oneshot
@@ -13,7 +15,8 @@ EnvironmentFile=%h/.config/serenichron/precision-inference-client.env
 EnvironmentFile=%h/.config/serenichron/clockify-review-cycle-override.env
 UnsetEnvironment=CLOCKIFY_ANALYZER_FALLBACK_URL CLOCKIFY_ANALYZER_FALLBACK_MODEL CLOCKIFY_ANALYZER_FALLBACK_API_KEY CLOCKIFY_ANALYZER_FALLBACK_TIMEOUT_SECONDS CLOCKIFY_ANALYZER_FALLBACK_REVISION
 ExecStartPre=/usr/bin/python3 ${CLOCKIFY_AUTOPILOT_ROOT}/ops/systemd/user/clockify_review_cycle_release.py preflight --release ${CLOCKIFY_AUTOPILOT_ROOT} --config ${CLOCKIFY_REVIEW_CYCLE_CONFIG} --environment %h/.config/serenichron/clockify-review-cycle.env --credential-environment %h/.config/serenichron/precision-inference-client.env --override %h/.config/serenichron/clockify-review-cycle-override.env --gws %h/.config/gws
-ExecStart=/usr/bin/flock --nonblock %h/Work/automation-clockify-sync/state/autopilot-runner.lock /usr/bin/python3 ${CLOCKIFY_AUTOPILOT_ROOT}/scripts/clockify_review_cycle.py --config ${CLOCKIFY_REVIEW_CYCLE_CONFIG} --enable-sheet-write
+ExecStart=/usr/bin/flock --nonblock --conflict-exit-code 73 %h/Work/automation-clockify-sync/state/autopilot-runner.lock /usr/bin/python3 ${CLOCKIFY_AUTOPILOT_ROOT}/scripts/clockify_review_cycle.py --config ${CLOCKIFY_REVIEW_CYCLE_CONFIG} --enable-sheet-write
+ExecStopPost=-/usr/bin/python3 ${CLOCKIFY_AUTOPILOT_ROOT}/ops/systemd/user/clockify_review_cycle_release.py record-result --record %h/Work/automation-clockify-sync/state/release-updates.json --release ${CLOCKIFY_AUTOPILOT_ROOT} --override %h/.config/serenichron/clockify-review-cycle-override.env --service-result "${SERVICE_RESULT}" --exit-code "${EXIT_CODE}" --exit-status "${EXIT_STATUS}"
 Restart=no
 KillMode=control-group
 TimeoutStartSec=7500
