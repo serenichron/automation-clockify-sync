@@ -74,6 +74,13 @@ class SheetsGateway(Protocol):
     def duplicate_sheet(
         self, spreadsheet_id: str, source_sheet_id: int, title: str
     ) -> int: ...
+    def open_monthly_tab(
+        self, spreadsheet_id: str, template_sheet_id: int, title: str, grid_rows: int
+    ) -> int: ...
+    def append_monthly_rows(
+        self, spreadsheet_id: str, sheet_id: int, start_row: int,
+        grid_rows: int, rows: Sequence[Sequence[Any]], *, exemplar_row: int | None = None,
+    ) -> None: ...
     def prepare_sheet(self, spreadsheet_id: str, sheet_id: int) -> None: ...
     def prepare_new_rows(self, spreadsheet_id: str, sheet_id: int, start_row: int, end_row: int) -> None: ...
     def clear_values(self, spreadsheet_id: str, range_name: str) -> None: ...
@@ -145,6 +152,38 @@ class GwsSheetsGateway:
             return int(response["replies"][0]["duplicateSheet"]["properties"]["sheetId"])
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             raise PublicationError("Google Sheets did not confirm the duplicated tab") from exc
+
+    def open_monthly_tab(
+        self, spreadsheet_id: str, template_sheet_id: int, title: str, grid_rows: int
+    ) -> int:
+        """Duplicate and clear in one batch, leaving no copied evidence on failure."""
+        if type(grid_rows) is not int or grid_rows < 2:
+            raise PublicationError("monthly unresolved template grid is invalid")
+        metadata = self.spreadsheet(spreadsheet_id)
+        used_ids = {sheet.get("properties", {}).get("sheetId") for sheet in metadata.get("sheets", [])}
+        sheet_id = int(hashlib.sha256(title.encode("utf-8")).hexdigest()[:8], 16) % (2 ** 31)
+        while sheet_id in used_ids:
+            sheet_id = (sheet_id + 1) % (2 ** 31)
+        target = {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": grid_rows,
+                  "startColumnIndex": 0, "endColumnIndex": 12}
+        response = self._call([
+            "spreadsheets", "batchUpdate", "--params",
+            json.dumps({"spreadsheetId": spreadsheet_id}), "--json",
+            json.dumps({"requests": [{"duplicateSheet": {
+                "sourceSheetId": template_sheet_id, "newSheetName": title, "newSheetId": sheet_id,
+            }}, {"updateCells": {
+                "range": target, "fields": "userEnteredValue",
+            }}, {"repeatCell": {
+                "range": target, "cell": {}, "fields": "userEnteredFormat.textFormat.link",
+            }}]}),
+        ])
+        try:
+            confirmed = response["replies"][0]["duplicateSheet"]["properties"]["sheetId"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise PublicationError("Google Sheets did not confirm the monthly tab") from exc
+        if type(confirmed) is not int or confirmed != sheet_id:
+            raise PublicationError("Google Sheets did not confirm the monthly tab identity")
+        return sheet_id
 
     def prepare_sheet(self, spreadsheet_id: str, sheet_id: int) -> None:
         metadata = self.spreadsheet(spreadsheet_id)
@@ -349,12 +388,14 @@ class GwsSheetsGateway:
 
     def append_monthly_rows(
         self, spreadsheet_id: str, sheet_id: int, start_row: int,
-        grid_rows: int, rows: Sequence[Sequence[Any]],
+        grid_rows: int, rows: Sequence[Sequence[Any]], *, exemplar_row: int | None = None,
     ) -> None:
         """Native row-atomic append, bounded below Linux's per-argument limit."""
         if not rows:
             return
-        if start_row < 3 or any(len(row) != 12 for row in rows):
+        if exemplar_row is None:
+            exemplar_row = start_row - 1
+        if start_row < 2 or exemplar_row < 2 or any(len(row) != 12 for row in rows):
             raise PublicationError("monthly append lacks a data-row format exemplar")
         # gws accepts inline JSON, so bound the actual UTF-8 argument including
         # formatting/grid requests. Never split or truncate a proof-bearing row.
@@ -369,7 +410,7 @@ class GwsSheetsGateway:
                 }})
             destination = {"sheetId": sheet_id, "startRowIndex": start_index,
                            "endRowIndex": end_index, "startColumnIndex": 0, "endColumnIndex": 12}
-            exemplar = {**destination, "startRowIndex": start_row - 2, "endRowIndex": start_row - 1}
+            exemplar = {**destination, "startRowIndex": exemplar_row - 1, "endRowIndex": exemplar_row}
             for paste_type in ("PASTE_FORMAT", "PASTE_DATA_VALIDATION"):
                 requests.append({"copyPaste": {
                     "source": exemplar, "destination": destination, "pasteType": paste_type,
@@ -1645,14 +1686,44 @@ def _plan_monthly_unresolved(
     metadata = gateway.spreadsheet(spreadsheet_id)
     properties = [sheet.get("properties", {}) for sheet in metadata.get("sheets", [])
                   if sheet.get("properties", {}).get("title") == sheet_title]
+    created = not properties
+    if created and not rows:
+        return {"sheet_title": sheet_title, "rows": [], "appends": [], "no_op": True}
+    if created:
+        months = ("January", "February", "March", "April", "May", "June",
+                  "July", "August", "September", "October", "November", "December")
+        match = re.fullmatch(r"([A-Za-z]+) ([0-9]{4}) unresolved evidence", sheet_title)
+        if match is None or match[1] not in months or int(match[2]) < 1:
+            raise PublicationError("monthly unresolved template tab is missing or invalid")
+        month = months.index(match[1])
+        year = int(match[2]) - (1 if month == 0 else 0)
+        template_title = f"{months[month - 1]} {year:04d} unresolved evidence"
+        properties = [sheet.get("properties", {}) for sheet in metadata.get("sheets", [])
+                      if sheet.get("properties", {}).get("title") == template_title]
+        if len(properties) != 1 or properties[0].get("hidden") is True:
+            raise PublicationError("monthly unresolved template tab is missing or invalid")
+        template = properties[0]
+        grid = template.get("gridProperties", {})
+        if (not isinstance(grid, Mapping)
+                or type(template.get("sheetId")) is not int or template["sheetId"] < 0
+                or type(grid.get("rowCount")) is not int or grid["rowCount"] < 2
+                or type(grid.get("columnCount")) is not int or grid["columnCount"] < 12):
+            raise PublicationError("monthly unresolved template tab is missing or invalid")
+        template_rows = gateway.values(spreadsheet_id, f"{_a1_title(template_title)}!A1:L{grid['rowCount']}")
+        if (not template_rows or template_rows[0] != monthly_unresolved.HEADER
+                or not any(any(value != "" for value in row) for row in template_rows[1:])):
+            raise PublicationError("monthly unresolved template tab is missing or invalid")
     if len(properties) != 1 or properties[0].get("hidden") is True:
         raise PublicationError("visible monthly unresolved tab is missing or hidden")
     prop = properties[0]
     grid = prop.get("gridProperties", {})
     if grid.get("columnCount", 0) < 12:
         raise PublicationError("monthly unresolved tab grid is invalid")
-    range_name = f"{_a1_title(sheet_title)}!A1:L{grid['rowCount']}"
-    existing = gateway.values(spreadsheet_id, range_name)
+    if created:
+        existing = [list(monthly_unresolved.HEADER)]
+    else:
+        range_name = f"{_a1_title(sheet_title)}!A1:L{grid['rowCount']}"
+        existing = gateway.values(spreadsheet_id, range_name)
     if not existing or existing[0] not in (monthly_unresolved.HEADER, monthly_unresolved.LEGACY_HEADER):
         raise PublicationError("monthly unresolved header differs")
     layout = monthly_unresolved.LEGACY_LAYOUT if existing[0] == monthly_unresolved.LEGACY_HEADER else None
@@ -1701,7 +1772,7 @@ def _plan_monthly_unresolved(
                         historical_sources=source_handles))
                 except (OSError, KeyError, TypeError, ValueError) as debt_error:
                     raise PublicationError(f"monthly canonical machine-field conflict: {row[0]}") from debt_error
-    if appends and len(existing) < 2:
+    if appends and len(existing) < 2 and grid["rowCount"] < 2:
         raise PublicationError("monthly unresolved tab lacks a native data-row exemplar")
     if retained_debt:
         try:
@@ -1709,7 +1780,9 @@ def _plan_monthly_unresolved(
                 spreadsheet_id=spreadsheet_id, sheet_title=sheet_title, layout=layout)
         except (OSError, KeyError, TypeError, ValueError) as exc:
             raise PublicationError("retained provenance source projection differs") from exc
-    return {"sheet_title": sheet_title, "sheet_id": prop["sheetId"], "grid_rows": grid["rowCount"],
+    return {"sheet_title": sheet_title, "sheet_id": None if created else prop["sheetId"],
+            "created": created, **({"template_sheet_id": prop["sheetId"]} if created else {}),
+            "grid_rows": grid["rowCount"],
             "existing": existing, "appends": appends, "rows": [list(row) for row in rows], "aliases": aliases,
             "canonical_aliases": canonical_aliases, "layout": layout, "historical_sources": sources_handle,
             **({"canonical_source_context": source_context} if canonical_aliases else {}),
@@ -1749,12 +1822,19 @@ def _apply_monthly_unresolved(
     gateway: SheetsGateway, *, spreadsheet_id: str, plan: Mapping[str, Any],
 ) -> dict[str, Any]:
     title = str(plan["sheet_title"])
+    if plan.get("no_op"):
+        return {"appended": 0, "unchanged": 0,
+                **_publication_receipt(spreadsheet_id=spreadsheet_id, sheet_title=title, rows=[])}
     existing, retained_digests = _retained_monthly_preflight(gateway, spreadsheet_id=spreadsheet_id, plan=plan)
     appends = plan["appends"]
     padded = lambda row: list(row) + [""] * (12 - len(row))
+    sheet_id = plan["sheet_id"]
+    if plan.get("created"):
+        sheet_id = gateway.open_monthly_tab(spreadsheet_id, plan["template_sheet_id"], title, plan["grid_rows"])
     if appends:
-        gateway.append_monthly_rows(  # type: ignore[attr-defined]
-            spreadsheet_id, plan["sheet_id"], len(existing) + 1, plan["grid_rows"], appends,
+        gateway.append_monthly_rows(
+            spreadsheet_id, sheet_id, len(existing) + 1, plan["grid_rows"], appends,
+            **({"exemplar_row": 2} if len(existing) == 1 else {}),
         )
     count = max(plan["grid_rows"], len(existing) + len(appends))
     observed = gateway.values(spreadsheet_id, f"{_a1_title(title)}!A1:L{count}")
@@ -1762,7 +1842,7 @@ def _apply_monthly_unresolved(
     # A retry's existing K is human-owned; the exact old prefix must survive.
     if len(observed) != len(expected) or any(padded(a) != padded(b) for a, b in zip(observed, expected, strict=True)):
         raise PublicationError("monthly unresolved exact readback differs")
-    result = {"appended": len(appends), "unchanged": len(plan["rows"]) - len(appends),
+    result = {"appended": len(appends), "unchanged": len(plan["rows"]) - len(appends), "sheet_id": sheet_id,
               **_publication_receipt(spreadsheet_id=spreadsheet_id, sheet_title=title, rows=plan["rows"])}
     if plan.get("retained_provenance_debt"):
         debt = plan["retained_provenance_debt"]
@@ -1770,7 +1850,7 @@ def _apply_monthly_unresolved(
             rows_digest=monthly_unresolved.retained_rows_digest([row[0] for row in plan["rows"]], retained_digests)))
         by_id = {row[0]: padded(row) for row in observed[1:] if row}
         evidence = {"schema_version": monthly_unresolved.RETAINED_READBACK_SCHEMA,
-            "spreadsheet_id": spreadsheet_id, "sheet_title": title, "sheet_id": plan["sheet_id"],
+            "spreadsheet_id": spreadsheet_id, "sheet_title": title, "sheet_id": sheet_id,
             "layout": plan["layout"], "row_ids": [entry["stable_evidence_id"] for entry in debt],
             "machine_row_digests": [monthly_unresolved.retained_row_digest(by_id[entry["stable_evidence_id"]]) for entry in debt]}
         evidence["sha256"] = monthly_unresolved._value_digest(evidence)
@@ -1786,7 +1866,7 @@ def _apply_monthly_unresolved(
         by_id = {row[0]: padded(row) for row in observed[1:] if row}
         evidence = {
             "schema_version": "monthly-unresolved-target-readback/v1",
-            "spreadsheet_id": spreadsheet_id, "sheet_title": title, "sheet_id": plan["sheet_id"],
+            "spreadsheet_id": spreadsheet_id, "sheet_title": title, "sheet_id": sheet_id,
             "header": observed[0],
             "machine_rows": [[*by_id[row[0]][:10], "", by_id[row[0]][11]] for row in plan["rows"]],
         }
