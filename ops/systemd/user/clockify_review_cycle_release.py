@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import datetime as dt
+import fcntl
 from io import BytesIO
 import hashlib
 import json
@@ -12,9 +15,10 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
-from typing import Sequence
+from typing import Iterator, Sequence
 
 
 IDENTITY_NAME = ".clockify-release.json"
@@ -540,17 +544,407 @@ def materialize(source_repository: Path, releases_root: Path, sha: str) -> Path:
     return destination
 
 
-def activate(release: Path, sha: str, config: Path, override: Path) -> None:
-    """Atomically point both runtime root and config at one verified release."""
+@contextmanager
+def _file_lock(path: Path) -> Iterator[None]:
+    path = path.expanduser().absolute()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _secure_directory(path.parent, "lock parent")
+    path = _canonical(path, must_exist=False)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        details = os.fstat(descriptor)
+        if (not stat.S_ISREG(details.st_mode) or details.st_uid != os.getuid()
+                or stat.S_IMODE(details.st_mode) != 0o600):
+            raise ValueError("release lock must be a user-owned regular mode-0600 file")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def _lock_path(path: Path) -> Path:
+    return path.with_name(path.name + ".lock")
+
+
+def _override_bytes(override: Path) -> bytes | None:
+    if not override.exists() and not override.is_symlink():
+        return None
+    return _private_file(override, "activation override").read_bytes()
+
+
+def _override_payload(release: Path, config: Path) -> bytes:
+    return (
+        f"CLOCKIFY_AUTOPILOT_ROOT={release}\n"
+        f"CLOCKIFY_REVIEW_CYCLE_CONFIG={config}\n"
+    ).encode("utf-8")
+
+
+class _OverrideChanged(ValueError):
+    pass
+
+
+def _activate_locked(
+    release: Path, sha: str, config: Path, override: Path, expected: bytes | None,
+) -> None:
     sha = _sha(sha)
     release = _canonical(release)
     _identity(release, sha)
     config, _ = _validated_config(release, config)
-    payload = (
-        f"CLOCKIFY_AUTOPILOT_ROOT={release}\n"
-        f"CLOCKIFY_REVIEW_CYCLE_CONFIG={config}\n"
-    ).encode("utf-8")
-    _atomic_write(override.expanduser().absolute(), payload, mode=0o600)
+    if _override_bytes(override) != expected:
+        raise _OverrideChanged("activation override changed")
+    _atomic_write(override, _override_payload(release, config), mode=0o600)
+
+
+def activate(release: Path, sha: str, config: Path, override: Path) -> None:
+    """Serialize all selectors and atomically replace a verified activation."""
+    with _file_lock(_lock_path(override)):
+        expected = _override_bytes(override)
+        _activate_locked(release, sha, config, override, expected)
+
+
+def _selection(override: Path) -> tuple[bytes, Path, Path]:
+    payload = _override_bytes(override)
+    if payload is None:
+        raise ValueError("activation override is missing")
+    lines = payload.decode("utf-8").splitlines()
+    if (len(lines) != 2 or not lines[0].startswith("CLOCKIFY_AUTOPILOT_ROOT=")
+            or not lines[1].startswith("CLOCKIFY_REVIEW_CYCLE_CONFIG=")):
+        raise ValueError("activation override must contain exactly the activation pointers")
+    release = _canonical(Path(lines[0].split("=", 1)[1]))
+    config = _private_file(Path(lines[1].split("=", 1)[1]), "review-cycle config")
+    if payload != _override_payload(release, config):
+        raise ValueError("activation override does not match release and config")
+    _identity(release, _release_sha(release))
+    return payload, release, config
+
+
+def _read_record(path: Path) -> dict[str, object]:
+    if not path.exists() and not path.is_symlink():
+        return {"rejected": [], "results": [], "proven": []}
+    document = json.loads(_private_file(path, "release update record").read_bytes())
+    if not isinstance(document, dict):
+        raise ValueError("release update record must be a JSON object")
+    for key in ("rejected", "results", "proven"):
+        document.setdefault(key, [])
+        if not isinstance(document[key], list):
+            raise ValueError("release update record lists are invalid")
+    for item in document["rejected"]:
+        if (not isinstance(item, dict) or set(item) != {"sha", "reason"}
+                or not isinstance(item["sha"], str) or not isinstance(item["reason"], str)):
+            raise ValueError("release update rejection is invalid")
+        _sha(item["sha"])
+    for item in document["results"]:
+        if (not isinstance(item, dict) or not isinstance(item.get("sha"), str)
+                or "exit_status" not in item):
+            raise ValueError("release update result is invalid")
+        _sha(item["sha"])
+    for sha in document["proven"]:
+        if not isinstance(sha, str):
+            raise ValueError("release update proven SHA is invalid")
+        _sha(sha)
+    for key in ("current", "previous"):
+        if document.get(key) is not None:
+            if not isinstance(document[key], str):
+                raise ValueError("release update SHA is invalid")
+            _sha(document[key])
+    if document.get("health") not in (None, "proven", "unproven"):
+        raise ValueError("release update health is invalid")
+    pending = document.get("pending")
+    if pending is not None:
+        if not isinstance(pending, dict) or set(pending) != {"from", "to"}:
+            raise ValueError("release update pending transaction is invalid")
+        for key in ("from", "to"):
+            if not isinstance(pending[key], str):
+                raise ValueError("release update pending SHA is invalid")
+            _sha(pending[key])
+    return document
+
+
+def _write_record(path: Path, record: dict[str, object]) -> None:
+    _atomic_write(
+        path, (json.dumps(record, sort_keys=True, indent=2) + "\n").encode("utf-8"), mode=0o600
+    )
+
+
+def _now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _healthy(result: dict[str, object]) -> bool:
+    return result.get("exit_code") == "exited" and str(result.get("exit_status")) in {"0", "75"}
+
+
+def _failed(result: dict[str, object]) -> bool:
+    if str(result.get("exit_status")) == "73" or _healthy(result):
+        return False
+    return result.get("service_result") in {
+        "exit-code", "core-dump", "timeout", "start-limit-hit", "resources",
+    }
+
+
+def _release_health(record: dict[str, object], sha: str) -> str:
+    if (sha in record["proven"]
+            or (record.get("current") == sha and record.get("health") == "proven")
+            or any(item["sha"] == sha and _healthy(item) for item in record["results"])):
+        return "proven"
+    return "unproven"
+
+
+def _rejected(record: dict[str, object], sha: str) -> bool:
+    return any(item["sha"] == sha for item in record["rejected"])
+
+
+def _reject(record: dict[str, object], sha: str, reason: str) -> None:
+    if not _rejected(record, sha):
+        record["rejected"].append({"sha": sha, "reason": reason})
+
+
+def _finish_switch(record: dict[str, object], previous: str, current: str) -> None:
+    rollback = _rejected(record, previous)
+    record.update({
+        "previous": None if rollback else previous,
+        "current": current,
+        "activated_at": _now(),
+        "health": _release_health(record, current),
+        "pending": None,
+    })
+
+
+class _UpdateSkipped(ValueError):
+    pass
+
+
+def _switch(
+    record_path: Path, record: dict[str, object], override: Path, expected: bytes,
+    old: Path, release: Path, config: Path,
+) -> None:
+    if _rejected(record, release.name):
+        raise _UpdateSkipped("rejected")
+    record["pending"] = {"from": old.name, "to": release.name}
+    _write_record(record_path, record)
+    if _override_bytes(override) != expected:
+        raise _UpdateSkipped("override_changed")
+    _activate_locked(release, release.name, config, override, expected)
+    _finish_switch(record, old.name, release.name)
+    _write_record(record_path, record)
+
+
+def _candidate_file(path: Path, payload: bytes, *, previously_active: bool) -> None:
+    if path.exists() or path.is_symlink():
+        if _private_file(path, "candidate config").read_bytes() == payload:
+            return
+        if previously_active:
+            raise _UpdateSkipped("config_conflict")
+    _atomic_write(path, payload, mode=0o600)
+
+
+def _derive_config(old: Path, release: Path, config: Path, *, previously_active: bool = True) -> Path:
+    original = config.read_bytes()
+    derived = original.replace(old.name.encode("ascii"), release.name.encode("ascii"))
+    before, after = json.loads(original), json.loads(derived)
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        raise ValueError("review-cycle config must be a JSON object")
+    retained_before = {key: item for key, item in before.items() if key not in {"root", "routing"}}
+    retained_after = {key: item for key, item in after.items() if key not in {"root", "routing"}}
+    if (json.dumps(retained_before, sort_keys=True, separators=(",", ":"))
+            != json.dumps(retained_after, sort_keys=True, separators=(",", ":"))):
+        raise _UpdateSkipped("config_drift")
+    target = config.parent / f"clockify-review-cycle.{release.name}.json"
+    routing = config.parent / f"clockify-review-cycle.{old.name}.routing.json"
+    if routing.exists() or routing.is_symlink():
+        payload = _private_file(routing, "private routing").read_bytes().replace(
+            old.name.encode("ascii"), release.name.encode("ascii")
+        )
+        _candidate_file(config.parent / f"clockify-review-cycle.{release.name}.routing.json", payload,
+                        previously_active=previously_active)
+    _candidate_file(target, derived, previously_active=previously_active)
+    _validated_config(release, target)
+    return target
+
+
+def _update_locked(arguments: argparse.Namespace) -> str:
+    override, record_path = arguments.override, arguments.record
+    expected, active, config = _selection(override)
+    record = _read_record(record_path)
+    bound_override = str(_canonical(override))
+    if record.get("override", bound_override) != bound_override:
+        raise ValueError("release update record override differs")
+    record["override"] = bound_override
+    pending = record.get("pending")
+    if pending is not None:
+        if active.name == pending["to"]:
+            if _rejected(record, active.name):
+                raise _UpdateSkipped("rejected")
+            _finish_switch(record, pending["from"], pending["to"])
+        elif active.name == pending["from"]:
+            record["pending"] = None
+        else:
+            raise _UpdateSkipped("override_changed")
+    if record.get("current") != active.name:
+        # The initial selection (or an explicit manual activation) predates this update.
+        record.update({"current": active.name, "previous": None, "health": "proven"})
+    if record.get("health") == "proven" and active.name not in record["proven"]:
+        record["proven"].append(active.name)
+    if arguments.clear_rejected is not None:
+        sha = _sha(arguments.clear_rejected)
+        record["rejected"] = [item for item in record["rejected"] if item["sha"] != sha]
+    _write_record(record_path, record)
+
+    decisive = [item for item in record["results"]
+                if item["sha"] == active.name and (_healthy(item) or _failed(item))][-2:]
+    previous = record.get("previous")
+    if (_release_health(record, active.name) == "unproven" and len(decisive) == 2
+            and all(_failed(item) for item in decisive)
+            and previous is not None and not _rejected(record, previous)):
+        restored = active.parent / previous
+        restored_config = config.parent / f"clockify-review-cycle.{previous}.json"
+        rollback_record = {**record, "rejected": list(record["rejected"])}
+        try:
+            _identity(restored, previous)
+            _validated_config(restored, restored_config)
+            _reject(rollback_record, active.name, "blocked_after_activation")
+            _switch(record_path, rollback_record, override, expected, active, restored, restored_config)
+        except _OverrideChanged:
+            raise
+        except Exception as exc:
+            if isinstance(exc, _UpdateSkipped) and str(exc) == "override_changed":
+                raise
+            # A failed final record write may follow a successful pointer replacement.
+            selected = _override_bytes(override)
+            if selected != expected:
+                if selected != _override_payload(restored, restored_config):
+                    raise _OverrideChanged("activation override changed") from exc
+                _finish_switch(rollback_record, active.name, previous)
+                record = rollback_record
+                expected, active, config = _selection(override)
+            record["previous"] = None
+            record["pending"] = None
+            _write_record(record_path, record)
+            print("clockify release rollback unavailable", file=sys.stderr)
+        else:
+            return f"clockify release rolled back: {active.name} -> {previous}"
+
+    try:
+        source = _canonical(arguments.source_repository)
+        environment = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_SSH_COMMAND": (
+            "ssh -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=yes"
+        )}
+        subprocess.run(
+            ["git", "-C", str(source), "fetch", "--quiet", "--", arguments.remote, arguments.branch],
+            check=True, capture_output=True, env=environment, timeout=120,
+        )
+        sha = subprocess.run(
+            ["git", "-C", str(source), "rev-parse", "--verify",
+             f"refs/remotes/{arguments.remote}/{arguments.branch}^{{commit}}"],
+            check=True, capture_output=True, text=True, env=environment, timeout=120,
+        ).stdout.strip()
+        _sha(sha)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        raise _UpdateSkipped("fetch_failed") from exc
+    if sha == active.name:
+        return f"clockify release current: {sha}"
+    if _rejected(record, sha):
+        raise _UpdateSkipped("rejected")
+    try:
+        release = materialize(source, arguments.releases_root, sha)
+    except (OSError, ValueError, subprocess.SubprocessError, tarfile.TarError) as exc:
+        raise _UpdateSkipped("materialize_failed") from exc
+    try:
+        previously_active = (sha in record["proven"]
+                             or sha in {record.get("current"), record.get("previous")}
+                             or any(item["sha"] == sha for item in record["results"]))
+        candidate_config = _derive_config(active, release, config, previously_active=previously_active)
+    except _UpdateSkipped as exc:
+        if str(exc) in {"config_drift", "config_conflict"}:
+            _reject(record, sha, str(exc))
+            _write_record(record_path, record)
+        raise
+    except (OSError, ValueError) as exc:
+        raise _UpdateSkipped("config_invalid") from exc
+    try:
+        descriptor, name = tempfile.mkstemp(prefix=".clockify-candidate-", dir=override.parent)
+        os.close(descriptor)
+        candidate_override = Path(name)
+        try:
+            _atomic_write(candidate_override, _override_payload(release, candidate_config), mode=0o600)
+            verify_runtime(release, candidate_config, arguments.environment,
+                           arguments.credential_environment, candidate_override, arguments.gws)
+        finally:
+            candidate_override.unlink()
+    except (OSError, ValueError) as exc:
+        raise _UpdateSkipped("preflight_failed") from exc
+    _switch(record_path, record, override, expected, active, release, candidate_config)
+    return f"clockify release activated: {sha}"
+
+
+def update(arguments: argparse.Namespace) -> None:
+    try:
+        with _file_lock(_lock_path(arguments.override)), _file_lock(_lock_path(arguments.record)):
+            message = _update_locked(arguments)
+    except _UpdateSkipped as exc:
+        print(f"clockify release update skipped: {exc}", file=sys.stderr)
+    except _OverrideChanged:
+        print("clockify release update skipped: override_changed", file=sys.stderr)
+    except Exception:
+        # The active service must still start after an operational updater failure.
+        print("clockify release update skipped: update_failed", file=sys.stderr)
+    else:
+        print(message)
+
+
+def rollback(release: Path, sha: str, config: Path, override: Path, record_path: Path | None) -> None:
+    with _file_lock(_lock_path(override)):
+        expected = _override_bytes(override)
+        if record_path is None:
+            _activate_locked(release, sha, config, override, expected)
+            return
+        with _file_lock(_lock_path(record_path)):
+            expected, active, _ = _selection(override)
+            record = _read_record(record_path)
+            binding = str(_canonical(override))
+            if record.get("override", binding) != binding:
+                raise ValueError("release update record override differs")
+            if _rejected(record, _sha(sha)):
+                raise ValueError("rollback release is rejected")
+            # Validate the target before recording a deterministic rejection.
+            release = _canonical(release)
+            _identity(release, sha)
+            config, _ = _validated_config(release, config)
+            if active.name == sha:
+                return
+            record["override"] = binding
+            _reject(record, active.name, "manual_rollback")
+            _switch(record_path, record, override, expected, active, release, config)
+
+
+def record_result(arguments: argparse.Namespace) -> None:
+    # Units pass --override explicitly; older callers can use the persisted binding.
+    initial = _read_record(arguments.record)
+    override = arguments.override or Path(initial.get(
+        "override", str(Path.home() / ".config/serenichron/clockify-review-cycle-override.env")
+    ))
+    # Every record writer holds the record lock; the cycle sandbox cannot write the override lock.
+    with _file_lock(_lock_path(arguments.record)):
+        record = _read_record(arguments.record)
+        binding = str(_canonical(override, must_exist=False))
+        if record.get("override", binding) != binding:
+            raise ValueError("release update record override differs")
+        sha = _release_sha(_canonical(arguments.release))
+        status = arguments.exit_status
+        result = {
+            "sha": sha, "service_result": arguments.service_result,
+            "exit_code": arguments.exit_code,
+            "exit_status": int(status) if status.isdecimal() else status, "at": _now(),
+        }
+        record["override"] = binding
+        record["results"] = (record["results"] + [result])[-50:]
+        if _healthy(result):
+            if sha not in record["proven"]:
+                record["proven"].append(sha)
+            if sha == record.get("current"):
+                record["health"] = "proven"
+        _write_record(arguments.record, record)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -566,6 +960,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         select.add_argument("--sha", required=True)
         select.add_argument("--config", type=Path, required=True)
         select.add_argument("--override", type=Path, required=True)
+        if name == "rollback":
+            select.add_argument("--record", type=Path)
+    refresh = commands.add_parser("update")
+    refresh.add_argument("--source-repository", type=Path, required=True)
+    refresh.add_argument("--remote", default="origin")
+    refresh.add_argument("--branch", default="master")
+    refresh.add_argument("--releases-root", type=Path, required=True)
+    refresh.add_argument("--override", type=Path, required=True)
+    refresh.add_argument("--environment", type=Path, required=True)
+    refresh.add_argument("--credential-environment", type=Path, required=True)
+    refresh.add_argument("--gws", type=Path, required=True)
+    refresh.add_argument("--record", type=Path, required=True)
+    refresh.add_argument("--clear-rejected", type=_sha)
+    result = commands.add_parser("record-result")
+    result.add_argument("--record", type=Path, required=True)
+    result.add_argument("--release", type=Path, required=True)
+    result.add_argument("--override", type=Path)
+    result.add_argument("--service-result", default="")
+    result.add_argument("--exit-code", default="")
+    result.add_argument("--exit-status", default="")
     bootstrap = commands.add_parser("bootstrap-ledgers")
     bootstrap.add_argument("--release", type=Path, required=True)
     bootstrap.add_argument("--config", type=Path, required=True)
@@ -580,8 +994,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if arguments.command == "materialize":
             print(materialize(arguments.source_repository, arguments.releases_root, arguments.sha))
-        elif arguments.command in {"activate", "rollback"}:
+        elif arguments.command == "activate":
             activate(arguments.release, arguments.sha, arguments.config, arguments.override)
+        elif arguments.command == "rollback":
+            rollback(arguments.release, arguments.sha, arguments.config,
+                     arguments.override, arguments.record)
+        elif arguments.command == "update":
+            update(arguments)
+        elif arguments.command == "record-result":
+            record_result(arguments)
         elif arguments.command == "bootstrap-ledgers":
             bootstrap_ledgers(arguments.release, arguments.config)
         else:

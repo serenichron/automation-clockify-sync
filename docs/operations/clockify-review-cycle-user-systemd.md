@@ -30,7 +30,10 @@ does not copy credentials or durable evidence into a release.
   Never copy its files into a release, environment file, log, or report.
 - The user units contain no `User=` or `Group=` directives and never require
   `/etc` or `/var/lib`. `ProtectSystem=strict`, `ProtectHome=read-only`, and
-  the three narrow `ReadWritePaths` exceptions remain enabled.
+  narrow `ReadWritePaths` exceptions remain enabled. The cycle's result recorder
+  writes only its record and record lock; the cycle cannot replace the override.
+  The updater can write releases, private configs, the source repository's
+  resolved `.git` directory, and durable state; SSH files remain read-only.
 - Only `deepseek-v4.1-flash:cloud` is configured. Every inherited
   `CLOCKIFY_ANALYZER_FALLBACK_*` variable is cleared by the unit. The optional
   credential-bearing Precision client environment loads before the final
@@ -56,8 +59,11 @@ Start from the verified principal-branch checkout after its authoritative
 remote SHA has been read back. Use the full 40-character SHA; never use a
 branch, tag, moving symlink, or abbreviated revision.
 
+Create the dedicated source clone once during bootstrap:
+
 ```bash
-source_repo=/home/blackthorne/Work/automation-clockify-sync
+git clone git@github.com:serenichron/automation-clockify-sync.git ~/Work/automation-clockify-sync-source
+source_repo=/home/blackthorne/Work/automation-clockify-sync-source
 release_sha=REPLACE_WITH_40_HEX_GIT_SHA
 releases_root=/home/blackthorne/Work/automation-clockify-sync-releases
 python3 "$source_repo/ops/systemd/user/clockify_review_cycle_release.py" \
@@ -162,13 +168,18 @@ Preflight validates only and never chmods or rewrites credential material.
 
 ## Install units and select the release
 
-Copy only the two reviewed files into `~/.config/systemd/user` with mode
-`0644`. Do not install a timer: Multica owns the recurring schedule and the
-user service owns execution.
+Install `clockify-review-cycle.service`, `clockify-review-cycle-update.service`,
+and the manual `clockify-review-cycle-canary.service` into
+`~/.config/systemd/user` with mode `0644`. Do not install a timer: Multica owns
+the recurring schedule and the user service owns execution.
 
 Use the helper to atomically create the final, non-secret override. The helper
 validates the release identity plus config root/routing before replacing the
 pointer; a failed validation leaves the current pointer unchanged.
+Activation also creates the mode-`0600` `clockify-review-cycle-override.env.lock`
+beside the override. Keep this lock file in place: every override writer locks
+that same inode. The cycle's result recorder takes only the record lock in
+durable state, without write access to the private config directory.
 
 ```bash
 override=/home/blackthorne/.config/serenichron/clockify-review-cycle-override.env
@@ -178,9 +189,76 @@ python3 "$source_repo/ops/systemd/user/clockify_review_cycle_release.py" \
 systemctl --user daemon-reload
 ```
 
+The first updater-capable release must be materialized, configured, activated,
+and have all three units installed once by hand before `daemon-reload`. Later
+starts update automatically. These installation and activation commands require
+the usual release authorization; preparing the files does not execute them.
+
 Read back `FragmentPath`, `EnvironmentFiles`, `ExecStart`, `ReadWritePaths`,
 `ProtectSystem`, `ProtectHome`, and `UMask` with `systemctl --user show` before
 running either unit.
+
+## Automatic release updates and health
+
+Starting `clockify-review-cycle.service` pulls in
+`clockify-review-cycle-update.service` with `Wants=` and waits for it with
+`After=`. The updater fetches `origin/master` unattended from
+the dedicated `/home/blackthorne/Work/automation-clockify-sync-source` clone
+with strict SSH host checking, BatchMode, and a 120-second fetch timeout. It authenticates the
+current release, materializes the exact fetched SHA, derives private configs,
+and runs preflight against a temporary override before switching the pointer.
+Config bytes replace the old SHA with the new one, but parsed config changes
+outside `root` and `routing` are refused. A private
+`clockify-review-cycle.<sha>.routing.json` sibling follows the same derivation.
+The cycle reads the final override at exec time. An updater failure leaves the
+cycle free to start on the active release; it is deliberately not `Requires=`.
+Create the dedicated clone once with the bootstrap command above. Its optional
+`ReadWritePaths=-%h/Work/automation-clockify-sync-source/.git` exception lets a
+missing clone reach the updater, which skips with `fetch_failed`. The updater
+loads `clockify-review-cycle.env` before the override so preflight inherits
+`CLOCKIFY_COLLECTOR_CHECKPOINT_ROOT` just as the cycle does.
+
+Update state is the mode-`0600` file
+`/home/blackthorne/Work/automation-clockify-sync/state/release-updates.json`.
+It retains `previous`, `current`, `health`, pending transaction information,
+`rejected` entries shaped as `{sha, reason}`, and the last 50 systemd results.
+Override writers take the shared override lock; record writers take the record
+lock. The updater takes both, while the cycle's result recorder takes only the
+record lock. An interrupted switch is resolved against the actual override on
+the next update. Do not edit this record by hand.
+
+`ExecStopPost` records `SERVICE_RESULT`, `EXIT_CODE`, and `EXIT_STATUS`, including
+preflight failures. Only `EXIT_CODE=exited` with `EXIT_STATUS=0` or `75` (the
+cycle's TEMPFAIL) proves the release healthy. Runner-lock contention exits `73`
+and is neutral. The release active before the first update is already proven.
+Two consecutive failures (`exit-code`, `core-dump`, `timeout`, `start-limit-hit`,
+or `resources`) for the current unproven SHA restore an authenticated,
+non-rejected previous release, reject the failed SHA, and stop that update
+without fetching. A single failure keeps the release. Neutral results, including
+`73` and deliberate `signal` stops, are ignored when finding the last two
+decisive results. Any healthy result prevents automatic rollback of that SHA.
+Restoring a release preserves its health and clears `previous`, preventing a
+second automatic rollback. If rollback authentication, config validation, or
+switching is unavailable, the updater clears `previous`, logs
+`clockify release rollback unavailable` to standard error, and continues the
+normal fetch/forward path in the same run. An override change still stops the
+update.
+
+Only `config_drift`, `config_conflict`, `blocked_after_activation`, and
+`manual_rollback` reject a SHA. Fetch, materialization, config validation, and
+host preflight failures are skipped and retried on the next start. Each update
+prints one `clockify release current`, `activated`, `rolled back`, or
+`update skipped` line; skipped outcomes go to standard error with exit `0`.
+Differing candidate config or routing bytes can be refreshed after a skipped
+update only when the SHA has never been active: it is absent from `proven`,
+`current`, `previous`, and recorded results. A differing config for a previously
+active SHA is rejected as `config_conflict`.
+
+The update unit has no schedule or install target and a 900-second start
+budget. It does not collect evidence or publish rows. After the archive-vouching
+change, measure the plan-only canary separately; raise only the host's
+`clockify-review-cycle-canary.service.d/30-recovery-verification-budget.conf`
+if it still exceeds 900 seconds.
 
 ## Plan-only canary, then cut over
 
@@ -213,7 +291,7 @@ systemctl --user start clockify-review-cycle.service
 
 They do not execute Python directly and do not start
 `clockify-work-accounting.service`. Concurrent starts of the same oneshot are
-coalesced by systemd. Both new units hold the legacy runner's
+coalesced by systemd. The cycle and canary hold the legacy runner's
 `state/autopilot-runner.lock` for their complete execution, so a mistakenly
 overlapping legacy process fails closed instead of duplicating collection; the
 coordinator's durable `review-cycle.lock` is the second exclusion boundary.
@@ -223,7 +301,8 @@ second calendar schedule. The review cycle resumes the same immutable
 receipts/debt and therefore does not recollect completed slices.
 
 Only the recurring service has `[Install] WantedBy=default.target`. The canary
-is manual-only. No `.timer` artifact exists.
+is manual-only and the updater is pulled in by the recurring service. No
+`.timer` artifact exists.
 
 ## Roll back atomically
 
@@ -238,10 +317,31 @@ old_config=/home/blackthorne/.config/serenichron/clockify-review-cycle.$old_sha.
 systemctl --user stop clockify-review-cycle.service
 python3 "$source_repo/ops/systemd/user/clockify_review_cycle_release.py" \
   rollback --release "$old_release" --sha "$old_sha" \
-  --config "$old_config" --override "$override"
+  --config "$old_config" --override "$override" \
+  --record /home/blackthorne/Work/automation-clockify-sync/state/release-updates.json
 systemctl --user daemon-reload
 systemctl --user start clockify-review-cycle-canary.service
 ```
+
+Passing `--record` rejects the release being left with reason `manual_rollback`,
+so automatic starts do not reselect it. A newer master SHA remains eligible.
+To deliberately retry a rejected SHA, clear it through the updater instead of
+editing the record (this command also performs the normal update):
+
+```bash
+python3 "$source_repo/ops/systemd/user/clockify_review_cycle_release.py" update \
+  --source-repository "$source_repo" --remote origin --branch master \
+  --releases-root "$releases_root" --override "$override" \
+  --environment /home/blackthorne/.config/serenichron/clockify-review-cycle.env \
+  --credential-environment /home/blackthorne/.config/serenichron/precision-inference-client.env \
+  --gws /home/blackthorne/.config/gws \
+  --record /home/blackthorne/Work/automation-clockify-sync/state/release-updates.json \
+  --clear-rejected REPLACE_WITH_REJECTED_40_HEX_GIT_SHA
+```
+
+A rollback to a pre-updater release makes the update unit fail with an unknown
+subcommand. The recurring cycle still starts because the updater is wanted,
+not required. Use an updater-capable source helper for the commands above.
 
 After the old plan-only canary passes, start the recurring service. Do not
 move, delete, restore, or copy `runs/`, `state/`, caches, receipts, GWS files,

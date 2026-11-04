@@ -1,0 +1,26 @@
+[Unit]
+Description=Clockify immutable release update before review cycle
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=%h/.config/serenichron/clockify-review-cycle.env
+EnvironmentFile=%h/.config/serenichron/clockify-review-cycle-override.env
+ExecStart=/usr/bin/python3 ${CLOCKIFY_AUTOPILOT_ROOT}/ops/systemd/user/clockify_review_cycle_release.py update --source-repository %h/Work/automation-clockify-sync-source --remote origin --branch master --releases-root %h/Work/automation-clockify-sync-releases --override %h/.config/serenichron/clockify-review-cycle-override.env --environment %h/.config/serenichron/clockify-review-cycle.env --credential-environment %h/.config/serenichron/precision-inference-client.env --gws %h/.config/gws --record %h/Work/automation-clockify-sync/state/release-updates.json
+TimeoutStartSec=900
+Restart=no
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths=%h/Work/automation-clockify-sync-releases
+ReadWritePaths=%h/.config/serenichron
+ReadWritePaths=-%h/Work/automation-clockify-sync-source/.git
+ReadWritePaths=%h/Work/automation-clockify-sync/state
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=clockify-review-cycle-update

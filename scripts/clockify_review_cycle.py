@@ -2075,7 +2075,12 @@ def _recovery_command(
     config: Mapping[str, Any], parent_run_dir: Path, source: str, attempt_id: str,
     parent_routing_digest: str,
 ) -> list[str]:
-    root = _path(config, "root")
+    raw_root = config.get("root")
+    if not isinstance(raw_root, str) or not raw_root or not Path(raw_root).is_absolute():
+        raise CycleError("root must be an absolute path")
+    # Keep the script path's spelling in the digest. Resolving an alias here
+    # would make a symlink command indistinguishable from its sealed target.
+    root = Path(raw_root)
     if not _valid_digest(parent_routing_digest):
         raise CycleError("recovery parent routing digest is invalid")
     return [
@@ -5282,6 +5287,54 @@ def _legacy_recovery_command_for_parent(
     return command[:index] + command[index + 2:]
 
 
+def _rebound_started_attempt(
+    config: Mapping[str, Any], attempt: Mapping[str, Any], *,
+    parent: Mapping[str, Any], source: str, command: list[str],
+    legacy_command: list[str] | None,
+) -> dict[str, Any] | None:
+    """Rebind only an authenticated script-path change in an unverified attempt."""
+    if attempt.get("phase") != "started" or attempt.get("command_digest") in {
+        _value_digest(item) for item in (command, legacy_command) if item is not None
+    }:
+        return None
+    root = _path(config, "root")
+    try:
+        helper = clockify_source_debt_recover._release_helper(
+            Path(__file__).resolve().parents[1]
+            / "ops/systemd/user/clockify_review_cycle_release.py"
+        )
+        releases = list(root.parent.iterdir())
+    except Exception:
+        return None
+    matches = []
+    for release in releases:
+        try:
+            if (release == root or release.is_symlink() or not release.is_dir()
+                    or re.fullmatch(r"[0-9a-f]{40}", release.name) is None):
+                continue
+            helper._identity(release, release.name)
+            historical_config = {**config, "root": str(release)}
+            historical_command = _recovery_command(
+                historical_config, Path(str(parent["run_dir"])), source,
+                str(attempt["attempt_id"]), _recovery_parent_routing_digest(parent),
+            )
+            historical_legacy = _legacy_recovery_command_for_parent(
+                historical_config, parent, historical_command,
+            )
+            for old, current in ((historical_command, command),
+                                 (historical_legacy, legacy_command)):
+                if old is None or current is None or len(old) != len(current):
+                    continue
+                if ([index for index, (a, b) in enumerate(zip(old, current)) if a != b]
+                        == [1] and _value_digest(old) == attempt["command_digest"]):
+                    matches.append(_value_digest(current))
+        except Exception:
+            continue
+    if len(matches) != 1:
+        return None
+    return {**attempt, "command_digest": matches[0]}
+
+
 def _recovery_attempt(
     record: dict[str, Any], debt: source_coverage.DebtItem,
     parent: Mapping[str, Any], config: Mapping[str, Any],
@@ -5313,11 +5366,20 @@ def _recovery_attempt(
         legacy_command = _legacy_recovery_command_for_parent(
             config, validation_parent, command,
         )
+        _validate_recovery_attempt(existing, debt_id=debt.debt_id, parent=validation_parent)
+        rebound = _rebound_started_attempt(
+            config, existing, parent=validation_parent, source=debt.interval.source,
+            command=command, legacy_command=legacy_command,
+        )
         checked = _validate_recovery_attempt(
-            existing, debt_id=debt.debt_id, parent=validation_parent,
+            rebound if rebound is not None else existing,
+            debt_id=debt.debt_id, parent=validation_parent,
             command=command,
             legacy_command=legacy_command,
         )
+        if rebound is not None:
+            attempts[debt.debt_id] = checked
+            record["recovery_attempts"] = attempts
         if not str(checked["phase"]).startswith("finished_"):
             return checked, (
                 legacy_command
@@ -5714,13 +5776,21 @@ def _reconcile_verified_attempts(
                 str(attempt.get("attempt_id")) if isinstance(attempt, Mapping) else "",
                 _recovery_parent_routing_digest(parent),
             )
-            checked = _validate_recovery_attempt(
-                attempt, debt_id=debt.debt_id, parent=parent,
-                command=command,
-                legacy_command=_legacy_recovery_command_for_parent(
-                    config, parent, command,
-                ),
+            legacy_command = _legacy_recovery_command_for_parent(config, parent, command)
+            attempt = _validate_recovery_attempt(attempt, debt_id=debt.debt_id, parent=parent)
+            rebound = _rebound_started_attempt(
+                config, attempt, parent=parent, source=debt.interval.source,
+                command=command, legacy_command=legacy_command,
             )
+            checked = _validate_recovery_attempt(
+                rebound if rebound is not None else attempt,
+                debt_id=debt.debt_id, parent=parent,
+                command=command, legacy_command=legacy_command,
+            )
+            if rebound is not None:
+                attempts = {**attempts, debt.debt_id: checked}
+                record["recovery_attempts"] = attempts
+                _persist_state(state_path, state, str(since), record)
             if checked["phase"] not in {"verified_complete", "verified_incomplete"}:
                 continue
             _apply_verified_recovery(
