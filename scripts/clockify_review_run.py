@@ -4365,4 +4365,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # Keep lazy importers on this module and its --runs-root binding.
+    sys.modules["clockify_review_run"] = sys.modules[__name__]
+    sys.modules["scripts.clockify_review_run"] = sys.modules[__name__]
     raise SystemExit(main())
