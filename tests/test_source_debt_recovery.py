@@ -1142,6 +1142,86 @@ class SourceDebtRecoveryTests(unittest.TestCase):
         self.assertEqual(first, second.parent_run_dir)
         self.assertEqual(1, transport.call_count)
 
+    def release_switch(self):
+        # A newer release is now running: the collector runtime identity differs
+        # from the one stamped into recoveries made before the switch.
+        return mock.patch.object(collector, "collector_runtime_identity", return_value={
+            "collector_path": "/repo/next/collector.py", "git_sha": "next", "dirty": False,
+        })
+
+    def rewrite_transition(self, run_dir: Path, **changes) -> None:
+        report_path = run_dir / "run-report.json"
+        report = json.loads(report_path.read_text())
+        transition = {**report["source_debt_recovery"], **changes}
+        transition.pop("transition_digest")
+        transition["transition_digest"] = recovery._digest(transition)
+        report["source_debt_recovery"] = transition
+        report_path.write_text(json.dumps(report) + "\n")
+
+    def test_historical_recovery_parent_verifies_when_its_archived_release_vouches(self) -> None:
+        root = self.make_parent()
+        first, _bundle = self.make_terminal_recovery(
+            root, SOURCE, ATTEMPT_1, peer=self.session_only_peer()
+        )
+        stored = json.loads((first / "run-report.json").read_text())["source_debt_recovery"]
+
+        with self.release_switch():
+            with self.assertRaisesRegex(recovery.SourceDebtRecoveryError, "binding differs"):
+                recovery.verify_recovery_run(first)
+            with mock.patch.object(
+                recovery, "_historical_release_vouches", return_value=True, create=True,
+            ) as vouches, mock.patch.object(
+                collector, "collect_remote_sessions", return_value=self.healthy_peer()
+            ) as transport:
+                verified = recovery.verify_recovery_run(first)
+                second = recovery.recover(first, SOURCE, ATTEMPT_2)
+
+        self.assertEqual(stored, verified.transition)
+        vouches.assert_called_with(stored)
+        self.assertEqual(first, second.parent_run_dir)
+        self.assertEqual(1, transport.call_count)
+
+    def test_archived_release_cannot_vouch_for_non_release_fields(self) -> None:
+        root = self.make_parent()
+        first, _bundle = self.make_terminal_recovery(
+            root, SOURCE, ATTEMPT_1, peer=self.session_only_peer()
+        )
+        self.rewrite_transition(first, parent_bundle_digest="sha256:" + "f" * 64)
+
+        with self.release_switch(), mock.patch.object(
+            recovery, "_historical_release_vouches", return_value=True, create=True,
+        ):
+            with self.assertRaisesRegex(recovery.SourceDebtRecoveryError, "binding differs"):
+                recovery.verify_recovery_run(first)
+
+    def test_historical_transition_digest_must_cover_its_fields(self) -> None:
+        root = self.make_parent()
+        first, _bundle = self.make_terminal_recovery(
+            root, SOURCE, ATTEMPT_1, peer=self.session_only_peer()
+        )
+        report_path = first / "run-report.json"
+        report = json.loads(report_path.read_text())
+        report["source_debt_recovery"]["current_fleet_sha256"] = "sha256:" + "e" * 64
+        report_path.write_text(json.dumps(report) + "\n")
+
+        with self.release_switch(), mock.patch.object(
+            recovery, "_historical_release_vouches", return_value=True, create=True,
+        ):
+            with self.assertRaisesRegex(recovery.SourceDebtRecoveryError, "binding differs"):
+                recovery.verify_recovery_run(first)
+
+    def test_unvouched_historical_recovery_stays_rejected(self) -> None:
+        root = self.make_parent()
+        first, _bundle = self.make_terminal_recovery(
+            root, SOURCE, ATTEMPT_1, peer=self.session_only_peer()
+        )
+
+        with self.release_switch(), mock.patch.object(
+            recovery, "_historical_release_vouches", return_value=False, create=True,
+        ):
+            with self.assertRaisesRegex(recovery.SourceDebtRecoveryError, "binding differs"):
+                recovery.verify_recovery_run(first)
+
     def test_multi_hop_recovery_preserves_bound_non_peer_raw_evidence(self) -> None:
         """Derived parents must round-trip retained providers without recollection."""
         providers = {

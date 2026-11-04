@@ -7,6 +7,7 @@ import argparse
 from dataclasses import dataclass
 import datetime as dt
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -45,6 +46,14 @@ RECONCILIATION_SNAPSHOTS = (
     "routing.json",
     "review-corrections.jsonl",
     "review-acceptance.jsonl",
+)
+RELEASE_BOUND_TRANSITION_FIELDS = (
+    "recovery_adapter_sha256",
+    "current_collector_sha256",
+    "current_runtime_identity_digest",
+    "current_routing_sha256",
+    "current_fleet_sha256",
+    "transition_digest",
 )
 _EVIDENCE_FILES = {
     "clockify": "evidence/clockify-existing.json",
@@ -664,6 +673,72 @@ def _transition(parent: _Parent, attempt_id: str) -> tuple[dict[str, object], st
     return {**unsigned, "transition_digest": _digest(unsigned)}, locator
 
 
+def _historical_release_vouches(transition: Mapping[str, Any]) -> bool:
+    """Require one authenticated archived release to bind the transition."""
+    try:
+        if not ROOT.is_dir():
+            return False
+        helper_path = ROOT / "ops/systemd/user/clockify_review_cycle_release.py"
+        spec = importlib.util.spec_from_file_location(
+            "clockify_historical_recovery_release", helper_path
+        )
+        if spec is None or spec.loader is None:
+            return False
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        releases = list(ROOT.parent.iterdir())
+    except Exception:
+        return False
+    matches = 0
+    for release in releases:
+        try:
+            if release == ROOT or release.is_symlink() or not release.is_dir():
+                continue
+            identity = helper._identity(release, release.name)
+            files = {
+                entry["path"]: "sha256:" + entry["sha256"]
+                for entry in identity["tree_manifest"] if entry.get("type") == "file"
+            }
+            runtime = {
+                "collector_path": str(release / "scripts" / "clockify_sync_collect.py"),
+                "canonical_root": str(release),
+                "git_sha": None,
+                "git_dirty": None,
+            }
+            if (
+                files["scripts/clockify_source_debt_recover.py"]
+                == transition.get("recovery_adapter_sha256")
+                and files["scripts/clockify_sync_collect.py"]
+                == transition.get("current_collector_sha256")
+                and files["routing.json"] == transition.get("current_routing_sha256")
+                and files["fleet.json"] == transition.get("current_fleet_sha256")
+                and _digest(runtime) == transition.get("current_runtime_identity_digest")
+            ):
+                matches += 1
+        except Exception:
+            continue
+    return matches == 1
+
+
+def _historical_transition(
+    transition: Mapping[str, Any], expected: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Accept only release-bound differences vouched for by an archive."""
+    if (
+        set(transition) != set(expected)
+        or any(
+            transition[key] != expected[key]
+            for key in expected if key not in RELEASE_BOUND_TRANSITION_FIELDS
+        )
+        or transition.get("transition_digest") != _digest({
+            key: value for key, value in transition.items() if key != "transition_digest"
+        })
+        or not _historical_release_vouches(transition)
+    ):
+        raise SourceDebtRecoveryError("recovery transition binding differs")
+    return dict(transition)
+
+
 def _fsync_directory(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
@@ -930,7 +1005,7 @@ def verify_recovery_run(
         ) from exc
     expected, locator = _transition(parent, attempt_id)
     if transition != expected:
-        raise SourceDebtRecoveryError("recovery transition binding differs")
+        transition = _historical_transition(transition, expected)
     locator_digest = locator.rsplit("/", 1)[1]
     expected_run = RUNS.resolve() / f"source-debt-recovery-{locator_digest}"
     attempt_root = collector.collector_checkpoint_root() / "source-debt-recovery" / locator_digest
@@ -941,19 +1016,19 @@ def verify_recovery_run(
         "schema_version": "source-debt-recovery-attempt-marker/v1",
         "run_dir": str(run_dir),
         "checkpoint_dir": str(attempt_root / "source-checkpoints"),
-        "transition": expected,
+        "transition": transition,
     }
     if marker != expected_marker:
         raise SourceDebtRecoveryError("recovery attempt marker differs")
     ledger = _verified_parent_ledger(run_dir)
     lineage = _read_object(run_dir / "ledger-recovery.json", label="ledger recovery")
-    if lineage != _ledger_recovery_document(parent, expected, ledger):
+    if lineage != _ledger_recovery_document(parent, transition, ledger):
         raise SourceDebtRecoveryError("ledger recovery lineage differs")
     finalization = _read_object(run_dir / "slice-finalization.json", label="recovery slice finalization")
     if finalization != collector._safe_slice_finalization_document(parent.identity, parent.slice_):
         raise SourceDebtRecoveryError("recovery slice finalization differs")
     return RecoveryResult(
-        run_dir, parent.run_dir, attempt_root / "source-checkpoints", expected, True
+        run_dir, parent.run_dir, attempt_root / "source-checkpoints", transition, True
     )
 
 
@@ -1062,11 +1137,18 @@ def _recovery_receipt_document(
     current_runtime = collector.collector_runtime_identity()
     if (
         not isinstance(runtime, Mapping)
-        or dict(runtime) != current_runtime
         or _digest(dict(runtime)) != verified.transition.get(
             "current_runtime_identity_digest"
         )
         or bundle.runtime_identity_digest != _digest(dict(runtime))
+    ):
+        raise SourceDebtRecoveryError(
+            "external recovery receipt runtime identity differs"
+        )
+    # A historical runtime is bound through the transition digest checked
+    # above; the vouching archived release recomputes that same digest.
+    if dict(runtime) != current_runtime and not _historical_release_vouches(
+        verified.transition
     ):
         raise SourceDebtRecoveryError(
             "external recovery receipt runtime identity differs"
