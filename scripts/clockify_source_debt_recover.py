@@ -1145,23 +1145,14 @@ def _recovery_receipt_document(
         raise SourceDebtRecoveryError(
             "external recovery receipt runtime identity differs"
         )
-    if dict(runtime) != current_runtime:
-        release_root = runtime.get("canonical_root")
-        release = Path(release_root) if isinstance(release_root, str) else None
-        if (
-            release is None or not release.is_absolute()
-            or release.parent != ROOT.parent or release == ROOT
-            or dict(runtime) != {
-                "collector_path": str(release / "scripts" / "clockify_sync_collect.py"),
-                "canonical_root": str(release),
-                "git_sha": None,
-                "git_dirty": None,
-            }
-            or not _historical_release_vouches(verified.transition)
-        ):
-            raise SourceDebtRecoveryError(
-                "external recovery receipt runtime identity differs"
-            )
+    # A historical runtime is bound through the transition digest checked
+    # above; the vouching archived release recomputes that same digest.
+    if dict(runtime) != current_runtime and not _historical_release_vouches(
+        verified.transition
+    ):
+        raise SourceDebtRecoveryError(
+            "external recovery receipt runtime identity differs"
+        )
     expected_result = {
         "source": source,
         "attempt_id": verified.transition["attempt_id"],
