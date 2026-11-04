@@ -827,8 +827,12 @@ def _update_locked(arguments: argparse.Namespace) -> str:
 
     try:
         source = _canonical(arguments.source_repository)
+        # Sandboxed user units see root-owned /etc/ssh files as unowned and ssh rejects
+        # them, so read only the user ssh configuration.
+        ssh_config = Path.home() / ".ssh" / "config"
         environment = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_SSH_COMMAND": (
-            "ssh -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=yes"
+            f"ssh -F {ssh_config if ssh_config.is_file() else os.devnull} -o BatchMode=yes"
+            " -o ConnectTimeout=20 -o StrictHostKeyChecking=yes"
         )}
         subprocess.run(
             ["git", "-C", str(source), "fetch", "--quiet", "--", arguments.remote, arguments.branch],
