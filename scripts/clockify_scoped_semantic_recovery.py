@@ -123,8 +123,10 @@ def validate_cached_recovery(source_dir, recovery_dir, failed_review_digests):
     primary = endpoints[0]
     ledger, all_events = pipeline.load_ledger(source_dir / "evidence/evidence-ledger.json")
     members = pipeline.meeting_reconciliation.manifest_member_identities(ledger.manifest.document())
-    events, _noise = pipeline._analysis_events(all_events, members)
     routing = pipeline._read_json(source_dir / "routing.json")
+    events, _noise = pipeline._analysis_events(
+        all_events, members, personal_rules=pipeline.personal_session_rules(routing),
+    )
     actor_contract = provenance.get("actor_contract")
     if actor_contract not in {None, semantic.ACTOR_CONTRACT}:
         raise pipeline.WorkAccountingError("cached semantic actor contract is invalid")
@@ -178,8 +180,10 @@ def run(args):
     source_sha256 = hashlib.sha256(source_bytes).hexdigest()
     ledger, all_events = pipeline.load_ledger(source_dir / "evidence/evidence-ledger.json")
     members = pipeline.meeting_reconciliation.manifest_member_identities(ledger.manifest.document())
-    events, _noise = pipeline._analysis_events(all_events, members)
     routing = pipeline._read_json(source_dir / "routing.json")
+    events, _noise = pipeline._analysis_events(
+        all_events, members, personal_rules=pipeline.personal_session_rules(routing),
+    )
     actor_contract = routing.get("semantic_actor_contract")
     if actor_contract not in {None, semantic.ACTOR_CONTRACT}:
         raise pipeline.WorkAccountingError("semantic actor contract is invalid")

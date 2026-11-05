@@ -136,8 +136,10 @@ def _run_analysis_events(run_dir: Path) -> tuple[list[dict[str, Any]], dict[str,
 
     ledger, events = pipeline.load_ledger(run_dir / "evidence" / "evidence-ledger.json")
     identities = meeting_reconciliation.manifest_member_identities(ledger.manifest.document())
-    analysis_events, noise = pipeline._analysis_events(events, identities)
     routing = json.loads((run_dir / "routing.json").read_text(encoding="utf-8"))
+    analysis_events, noise = pipeline._analysis_events(
+        events, identities, personal_rules=pipeline.personal_session_rules(routing),
+    )
     actor_contract = routing.get("semantic_actor_contract")
     hinted = pipeline._with_semantic_route_hints(
         analysis_events, routing, normalize_meeting_domains_type=actor_contract is not None,

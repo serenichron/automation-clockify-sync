@@ -747,11 +747,150 @@ def load_ledger(path: Path) -> tuple[evidence_ledger.EvidenceLedger, list[dict[s
     return ledger, [event.document() for event in ledger.events]
 
 
+def personal_session_rules(routing: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:
+    """Validate the opt-in, deterministic personal-session exclusion policy."""
+    if not isinstance(routing, Mapping):
+        raise WorkAccountingError("routing must be an object")
+    if "personal_session_rules" not in routing:
+        return ()
+    values = routing["personal_session_rules"]
+    if not isinstance(values, list):
+        raise WorkAccountingError("personal_session_rules must be a list")
+    matchers = {"session_ids", "cwd_prefix", "route_pattern"}
+    allowed = {"id", "reason", "machine", *matchers}
+    rules: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, Mapping) or set(value) - allowed:
+            raise WorkAccountingError("personal_session_rules contains invalid or unknown fields")
+        selected = set(value) & matchers
+        if len(selected) != 1:
+            raise WorkAccountingError("personal_session_rules requires exactly one matcher per rule")
+        matcher = next(iter(selected))
+        rule: dict[str, Any] = {}
+        fields = ["id", "reason", matcher]
+        if "machine" in value:
+            fields.append("machine")
+        for key in fields:
+            item = value.get(key)
+            if key == "session_ids":
+                if (not isinstance(item, list) or not item
+                        or any(not isinstance(entry, str) or entry.strip() in {"", "unknown"} for entry in item)):
+                    raise WorkAccountingError("personal_session_rules session_ids must be non-empty, non-placeholder strings")
+                rule[key] = [entry.strip() for entry in item]
+            else:
+                if not isinstance(item, str) or not item.strip():
+                    raise WorkAccountingError(f"personal_session_rules {key} must be a non-empty string")
+                rule[key] = item.strip()
+        if rule["id"] in seen:
+            raise WorkAccountingError("personal_session_rules contains duplicate ids")
+        seen.add(rule["id"])
+        if matcher == "cwd_prefix":
+            rule[matcher] = rule[matcher].rstrip("/") or "/"
+        rules.append(rule)
+    return tuple(rules)
+
+
+def _personal_session_decisions(
+    events: Sequence[dict[str, Any]], personal_rules: Sequence[Mapping[str, Any]],
+) -> tuple[dict[int, str], list[dict[str, Any]]]:
+    """Match whole sessions, anonymous events, and individual repository events."""
+    excluded: dict[int, str] = {}
+    audit: list[dict[str, Any]] = []
+    if not personal_rules:
+        return excluded, audit
+    sessions: dict[tuple[str, str, str, int | None], list[int]] = {}
+    repository_audit: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for index, event in enumerate(events):
+        source = event.get("source_ref") if isinstance(event.get("source_ref"), Mapping) else {}
+        family = str(source.get("source_type") or event.get("source_type") or "").removesuffix("_event")
+        if family not in {"codex_sessions", "claude_bursts", "hermes_sessions", "hermes_db_sessions", "repository_events"}:
+            continue
+        machine = str(source.get("machine") or "").strip()
+        session_id = str(source.get("session_id") or "").strip()
+        # Anonymous evidence must never inherit a different event's match.
+        anonymous = machine in {"", "unknown"} or session_id in {"", "unknown"}
+        if family == "repository_events":
+            record = _event_record(event)
+            session_id = str(record.get("cwd") or record.get("path") or "")
+            anonymous = True  # Commits match independently; session-id rules never apply.
+        key = (family, machine, session_id, index if anonymous else None)
+        sessions.setdefault(key, []).append(index)
+    for (family, machine, session_id, anonymous), indices in sessions.items():
+        matches: list[tuple[Mapping[str, Any], list[int]]] = []
+        for rule in personal_rules:
+            if "machine" in rule and rule["machine"] != machine:
+                continue
+            matched: list[int] = []
+            for index in indices:
+                record = _event_record(events[index])
+                if "session_ids" in rule:
+                    applies = anonymous is None and session_id in rule["session_ids"]
+                elif "cwd_prefix" in rule:
+                    cwd = str(record.get("cwd") or record.get("path") or "")
+                    prefix = rule["cwd_prefix"]
+                    applies = cwd == prefix or cwd.startswith(prefix.rstrip("/") + "/")
+                else:
+                    # Reuse the exact normalized cwd/label session-route semantics,
+                    # independently of any earlier route in the routing table.
+                    candidate = _route_session_record(record, {"session_routes": [{
+                        "pattern": rule["route_pattern"], "action": "skip",
+                    }]})
+                    applies = candidate.get("action") == "skip"
+                if applies:
+                    matched.append(index)
+            if matched:
+                matches.append((rule, matched))
+        if not matches:
+            continue
+        complete = next(((rule, matched) for rule, matched in matches if len(matched) == len(indices)), None)
+        if complete is not None:
+            matches = [complete]
+            excluded.update({index: str(complete[0]["id"]) for index in indices})
+        observed = [
+            bound
+            for index in indices
+            for bound in _observed_span(events[index])
+            if bound is not None
+        ]
+        for rule, _matched in matches:
+            row = {
+                "machine": machine,
+                "session_id": session_id,
+                "source_type": family,
+                "rule_id": rule["id"],
+                "reason": rule["reason"] if complete is not None else f"personal_session_partial:{rule['id']}",
+                "evidence_count": len(indices),
+                "first_observed_at": _iso(min(observed)) if observed else None,
+                "last_observed_at": _iso(max(observed)) if observed else None,
+                "status": "excluded" if complete is not None else "partial_not_excluded",
+            }
+            if family == "repository_events":
+                repository_key = (machine, session_id, str(rule["id"]))
+                previous = repository_audit.get(repository_key)
+                if previous is None:
+                    repository_audit[repository_key] = row
+                    audit.append(row)
+                else:
+                    previous["evidence_count"] += row["evidence_count"]
+                    for field, bound in (("first_observed_at", min), ("last_observed_at", max)):
+                        values = [value for value in (previous[field], row[field]) if value is not None]
+                        previous[field] = bound(values, key=_parse_dt) if values else None
+            else:
+                audit.append(row)
+    return excluded, sorted(audit, key=lambda row: (
+        row["source_type"], row["machine"], row["session_id"], row["rule_id"],
+        row["first_observed_at"] or "", row["last_observed_at"] or "",
+    ))
+
+
 def _analysis_events(
     events: Iterable[dict[str, Any]],
     member_identities: frozenset[str] = frozenset({"vlad@serenichron.com"}),
+    personal_rules: Sequence[Mapping[str, Any]] = (),
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     event_list = list(events)
+    personal_excluded, _session_audit = _personal_session_decisions(event_list, personal_rules)
     retained: list[dict[str, Any]] = []
     noise: list[dict[str, str]] = []
     has_message_events = any(
@@ -801,7 +940,7 @@ def _analysis_events(
             )
         )
     }
-    for event in event_list:
+    for index, event in enumerate(event_list):
         source_type = str(event.get("source_type") or "")
         if source_type == "clockify":
             continue
@@ -824,6 +963,12 @@ def _analysis_events(
             str(source.get("machine") or ""),
             str(source.get("session_id") or ""),
         )
+        if index in personal_excluded:
+            noise.append({
+                "evidence_id": str(event.get("evidence_id")),
+                "reason": f"personal_session:{personal_excluded[index]}",
+            })
+            continue
         if session_key in autonomous_session_keys:
             noise.append({
                 "evidence_id": str(event.get("evidence_id")),
@@ -3388,8 +3533,11 @@ def run_accounting(
         )
     except meeting_reconciliation.MeetingReconciliationError as exc:
         raise WorkAccountingError(f"ledger member identities are invalid: {exc}") from exc
-    analysis_events, noise = _analysis_events(all_events, member_identities)
-    routing = _read_json(routing_path or (root / "routing.json"))
+    snapshot_routing = run_dir / "routing.json"
+    effective_routing = routing_path or (snapshot_routing if snapshot_routing.exists() else root / "routing.json")
+    routing = _read_json(effective_routing)
+    personal_rules = personal_session_rules(routing)
+    analysis_events, noise = _analysis_events(all_events, member_identities, personal_rules=personal_rules)
     daily_pairs = _audited_daily_recording_pairs(all_events, ledger.manifest.document(), routing,
         _accounting_collection_snapshot(run_dir, all_events) if AUDITED_DAILY_KEY in routing else None)
     session_pool_sources = _session_timing_pool_sources(routing)
@@ -4369,6 +4517,8 @@ def run_accounting(
             if source not in hard_missing
         ],
     }
+    if personal_rules:
+        _excluded, result["session_exclusions"] = _personal_session_decisions(all_events, personal_rules)
     # The initial analyzer artifact is written before deterministic routing and
     # rendering so failures remain inspectable. Rewrite it with the final
     # rendered_description values for activities that became proposals.
