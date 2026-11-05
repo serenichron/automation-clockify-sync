@@ -775,8 +775,8 @@ def personal_session_rules(routing: Mapping[str, Any]) -> tuple[dict[str, Any], 
             item = value.get(key)
             if key == "session_ids":
                 if (not isinstance(item, list) or not item
-                        or any(not isinstance(entry, str) or not entry.strip() for entry in item)):
-                    raise WorkAccountingError("personal_session_rules session_ids must be non-empty strings")
+                        or any(not isinstance(entry, str) or entry.strip() in {"", "unknown"} for entry in item)):
+                    raise WorkAccountingError("personal_session_rules session_ids must be non-empty, non-placeholder strings")
                 rule[key] = [entry.strip() for entry in item]
             else:
                 if not isinstance(item, str) or not item.strip():
@@ -794,21 +794,27 @@ def personal_session_rules(routing: Mapping[str, Any]) -> tuple[dict[str, Any], 
 def _personal_session_decisions(
     events: Sequence[dict[str, Any]], personal_rules: Sequence[Mapping[str, Any]],
 ) -> tuple[dict[int, str], list[dict[str, Any]]]:
-    """Require one rule to cover every event in a source/machine/session family."""
+    """Match whole sessions, anonymous events, and individual repository events."""
     excluded: dict[int, str] = {}
     audit: list[dict[str, Any]] = []
     if not personal_rules:
         return excluded, audit
     sessions: dict[tuple[str, str, str, int | None], list[int]] = {}
+    repository_audit: dict[tuple[str, str, str], dict[str, Any]] = {}
     for index, event in enumerate(events):
         source = event.get("source_ref") if isinstance(event.get("source_ref"), Mapping) else {}
         family = str(source.get("source_type") or event.get("source_type") or "").removesuffix("_event")
-        if family not in {"codex_sessions", "claude_bursts", "hermes_sessions", "hermes_db_sessions"}:
+        if family not in {"codex_sessions", "claude_bursts", "hermes_sessions", "hermes_db_sessions", "repository_events"}:
             continue
-        machine = str(source.get("machine") or "")
-        session_id = str(source.get("session_id") or "")
+        machine = str(source.get("machine") or "").strip()
+        session_id = str(source.get("session_id") or "").strip()
         # Anonymous evidence must never inherit a different event's match.
-        key = (family, machine, session_id, None if machine and session_id else index)
+        anonymous = machine in {"", "unknown"} or session_id in {"", "unknown"}
+        if family == "repository_events":
+            record = _event_record(event)
+            session_id = str(record.get("cwd") or record.get("path") or "")
+            anonymous = True  # Commits match independently; session-id rules never apply.
+        key = (family, machine, session_id, index if anonymous else None)
         sessions.setdefault(key, []).append(index)
     for (family, machine, session_id, anonymous), indices in sessions.items():
         matches: list[tuple[Mapping[str, Any], list[int]]] = []
@@ -848,7 +854,7 @@ def _personal_session_decisions(
             if bound is not None
         ]
         for rule, _matched in matches:
-            audit.append({
+            row = {
                 "machine": machine,
                 "session_id": session_id,
                 "source_type": family,
@@ -858,7 +864,20 @@ def _personal_session_decisions(
                 "first_observed_at": _iso(min(observed)) if observed else None,
                 "last_observed_at": _iso(max(observed)) if observed else None,
                 "status": "excluded" if complete is not None else "partial_not_excluded",
-            })
+            }
+            if family == "repository_events":
+                repository_key = (machine, session_id, str(rule["id"]))
+                previous = repository_audit.get(repository_key)
+                if previous is None:
+                    repository_audit[repository_key] = row
+                    audit.append(row)
+                else:
+                    previous["evidence_count"] += row["evidence_count"]
+                    for field, bound in (("first_observed_at", min), ("last_observed_at", max)):
+                        values = [value for value in (previous[field], row[field]) if value is not None]
+                        previous[field] = bound(values, key=_parse_dt) if values else None
+            else:
+                audit.append(row)
     return excluded, sorted(audit, key=lambda row: (
         row["source_type"], row["machine"], row["session_id"], row["rule_id"],
         row["first_observed_at"] or "", row["last_observed_at"] or "",

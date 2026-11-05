@@ -75,6 +75,45 @@ class PersonalSessionRulesTests(unittest.TestCase):
         self.assertEqual(["ev-2"], retained)
         self.assertEqual("personal_session:known-session", reasons["ev-1"])
 
+    def test_events_without_session_identity_are_never_grouped(self):
+        personal = event("ev-1", "unknown", SCRATCH + "/tramvai-41-imperio")
+        work = event("ev-2", "unknown", "/Users/blackthorne/Work/Clients/tstprep.com")
+        retained, reasons = self.split([personal, work])
+        self.assertEqual(["ev-2"], retained)
+        self.assertEqual("personal_session:tramvai-41", reasons["ev-1"])
+
+    def test_placeholder_session_id_cannot_be_declared(self):
+        with self.assertRaises(pipeline.WorkAccountingError):
+            pipeline.personal_session_rules({"personal_session_rules": [
+                {"id": "x", "reason": "r", "session_ids": ["unknown"]}]})
+
+    def test_commits_in_a_personal_repository_are_excluded(self):
+        commit = {
+            "evidence_id": "ev-commit",
+            "source_type": "repository_events",
+            "source_ref": {"source_type": "repository_events", "machine": "macbook",
+                           "source_id": "/Users/blackthorne/Work/atelieruldevis:abc123"},
+            "raw_source_span": {"start": "2026-10-28T15:34:19+02:00", "end": "2026-10-28T15:34:19+02:00",
+                                "cwd": "/Users/blackthorne/Work/atelieruldevis"},
+            "attributes": {"subject": "Update gallery"},
+        }
+        work_commit = {**commit, "evidence_id": "ev-work-commit",
+                       "source_ref": {**commit["source_ref"], "source_id": "/Users/blackthorne/Work/serenichron:def456"},
+                       "raw_source_span": {**commit["raw_source_span"], "cwd": "/Users/blackthorne/Work/serenichron"}}
+        retained, reasons = self.split([commit, work_commit])
+        self.assertEqual(["ev-work-commit"], retained)
+        self.assertEqual("personal_session:atelieruldevis", reasons["ev-commit"])
+
+    def test_repair_cannot_change_personal_rules_under_a_reused_analysis(self):
+        from scripts import clockify_review_run as review_run
+        before = {"personal_session_rules": RULES["personal_session_rules"][:1]}
+        for after in ({}, RULES, {"personal_session_rules": [
+                {**RULES["personal_session_rules"][0], "cwd_prefix": SCRATCH + "/other"}]}):
+            with self.subTest(after=after), self.assertRaises(review_run.ReviewRunError):
+                review_run.ensure_personal_rules_unchanged(before, after)
+        review_run.ensure_personal_rules_unchanged(before, dict(before, session_routes=[]))
+        review_run.ensure_personal_rules_unchanged({}, {"session_routes": []})
+
     def test_absent_rules_change_nothing(self):
         events = [event("ev-1", "tram", SCRATCH), event("ev-2", "work", "/Users/blackthorne/Work/x")]
         self.assertEqual((), pipeline.personal_session_rules({"session_routes": []}))

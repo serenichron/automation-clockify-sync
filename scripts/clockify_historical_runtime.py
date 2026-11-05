@@ -189,7 +189,7 @@ try:
             captured[path.name]=json.loads(json.dumps(value,ensure_ascii=False))
         accounting._write_json=capture
         accounting.run_accounting(target,root=Path.cwd(),
-            routing_path=Path(data['routing']['path']),
+            routing_path=source/'routing.json',
             corrections_path=Path(data['corrections']['path']),
             analysis_fixture=Path(data['analysis']['path']),
             analyzer_cache_path=Path(data['cache']['path']))
@@ -398,6 +398,8 @@ def snapshot_projection(source: Path, target: Path) -> dict[str, Any]:
     """
     source, target = Path(source), Path(target)
     context = legacy_inference_lineage(source)
+    from scripts import clockify_review_run as review
+    inference_routing = _handle(context / 'routing.json')
     analysis = _handle(source / 'semantic-analysis.json')
     cache = _handle(source / 'analyzer-cache-used.jsonl')
     routing = _handle(target / 'routing.json')
@@ -405,12 +407,16 @@ def snapshot_projection(source: Path, target: Path) -> dict[str, Any]:
     for relative in ('evidence/evidence-ledger.json', 'routing.json', 'review-corrections.jsonl'):
         if (source / relative).read_bytes() != (target / relative).read_bytes():
             raise ValueError('historical projection target input differs from source')
+    review.ensure_personal_rules_unchanged(
+        json.loads(adoptions._capture(inference_routing, {})),
+        json.loads(adoptions._capture(routing, {})),
+    )
     result = _invoke('projection', {'source': str(source), 'target': str(target),
         'inference_context': str(context),
         'analysis': analysis, 'cache': cache, 'routing': routing, 'corrections': corrections,
         'outputs': sorted(_PROJECTION_FILES)},
         pins=[*_source_pins(source), _handle(target / 'evidence/evidence-ledger.json'),
-              routing, corrections, _handle(context / 'routing.json'),
+              routing, corrections, inference_routing,
               _handle(context / 'review-corrections.jsonl')], runs_root=source.parent)
     if not isinstance(result, dict) or set(result) != _PROJECTION_FILES:
         raise ValueError('historical projection returned an invalid artifact inventory')

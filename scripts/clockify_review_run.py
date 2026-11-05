@@ -1861,10 +1861,16 @@ def _verified_native_checkpoint_copy(source: Path, target: Path, provenance: Map
         raise ReviewRunError("native checkpoint copied collection basis differs") from exc
 
 
+def ensure_personal_rules_unchanged(source_routing: Mapping, routing: Mapping) -> None:
+    """Keep the evidence filter fixed when reusing semantic decisions."""
+    if work_accounting_pipeline.personal_session_rules(source_routing) != work_accounting_pipeline.personal_session_rules(routing):
+        raise ReviewRunError("personal_session_rules cannot change under a reused semantic analysis")
+
+
 def _verified_replay_inference_context(source: Path) -> Path:
     """Follow unchanged sealed decisions to their original inference snapshots.
 
-    Accounting repairs may change routing without changing model decisions.
+    Accounting repairs may change routing, but never personal-session rules.
     Those decisions must still be proven against their original request bytes.
     Every traversed hop is verified; fresh retry decisions use the existing
     scoped-retry validator rather than inheriting older inference inputs.
@@ -1886,6 +1892,10 @@ def _verified_replay_inference_context(source: Path) -> Path:
         if parent in seen:
             raise ReviewRunError("replay inference source lineage loops")
         seen.add(parent)
+        ensure_personal_rules_unchanged(
+            _read_snapshot_json(parent / "routing.json", label="inference original routing")[0],
+            _read_snapshot_json(current / "routing.json", label="inference child routing")[0],
+        )
         if has_repair:
             if (
                 _file_sha256(parent / "completion-bundle.json", label="inference source completion") != lineage.get("source_completion_sha256")
@@ -2691,6 +2701,10 @@ def _prepare_repair_run(
                 raise ReviewRunError("repair routing snapshot is invalid") from exc
             if not isinstance(routing_document, Mapping):
                 raise ReviewRunError("repair routing snapshot must be an object")
+            ensure_personal_rules_unchanged(
+                _read_snapshot_json(snapshots["routing.json"], label="repair original routing")[0],
+                routing_document,
+            )
         (target / filename).parent.mkdir(parents=True, exist_ok=True)
         _write_snapshot(target / filename, content, label=f"repair {filename}")
     semantic_document, semantic_content, semantic_digest = _read_snapshot_json(
@@ -4270,7 +4284,7 @@ def main(argv: list[str] | None = None) -> int:
                 replay_source, run_dirs[0]
             )
             args._replay_analyzer_cache = _replay_analyzer_cache(run_dirs[0])
-        except (OSError, ValueError, json.JSONDecodeError, semantic_analyzer.AnalyzerError) as exc:
+        except (OSError, ValueError, json.JSONDecodeError, semantic_analyzer.AnalyzerError, work_accounting_pipeline.WorkAccountingError) as exc:
             print(f"clockify review run: cannot prepare immutable replay: {exc}", file=sys.stderr)
             return 2
     else:
