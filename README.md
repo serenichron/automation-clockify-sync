@@ -418,6 +418,45 @@ eligibility and the identities removed before participant-window fallback
 matching; a later routing change cannot alter a previously collected period.
 Recollect a period to apply an identity change.
 
+The optional `routing.json.personal_session_rules` list excludes confidently
+identified personal sessions before semantic analysis. Each rule needs a unique,
+non-empty `id`, a `reason`, and exactly one matcher: `session_ids` (a non-empty
+list of exact session IDs), `cwd_prefix` (equal to the path or anchored at its
+next `/` segment), or `route_pattern` (the same normalized cwd/label matching
+as session routes, evaluated independently of their order). An optional `machine`
+restricts any matcher. Unknown fields and invalid or empty values block accounting.
+For example:
+
+```json
+{"personal_session_rules": [
+  {"id": "personal-folder", "reason": "Personal hobby project",
+   "machine": "macbook", "cwd_prefix": "/Users/blackthorne/Personal"},
+  {"id": "personal-site", "reason": "Personal/non-billable",
+   "route_pattern": "personal-site"}
+]}
+```
+
+A whole source-family/machine/session is excluded only if every ledger event in
+that session matches the same rule. Partial matches retain the entire session;
+anonymous evidence is checked separately per event and never matches a
+`session_ids` rule. No model label determines personal status. Excluded events
+remain in the complete evidence ledger and appear in semantic noise accounting
+as `personal_session:<id>`. With non-empty rules, `work-accounting-result.json`
+includes `session_exclusions` with session identity, rule ID, reason, event
+count, observed bounds and status (`excluded` or `partial_not_excluded`); partial
+audit reasons are `personal_session_partial:<id>`. The run summary counts both.
+The audit contains no prompts, titles or message text. `-private-tmp` is not a
+personal-session rule.
+
+Accounting, replay, recovery, receipt verification and measurement use each
+run's routing snapshot. Snapshots without this key retain historical behavior;
+an empty list also leaves analysis unchanged. Slices collected after this change
+have new compatibility/run identities and must not reuse old compatibility
+receipts. Operational merge rule: merge the release containing these routing
+rules only when the cycle state has **no unfinished source or recovery attempt**.
+Claude must check that state before requesting merge approval. No automatic
+routing transition is introduced, and existing checks remain in force.
+
 When present, `duration_seconds` and second-precision `start`/`end` bounds are
 authoritative for a recording, proposal, review row, and its allocation
 segments. `duration_minutes` remains a display and legacy-compatibility field;

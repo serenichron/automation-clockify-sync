@@ -7,6 +7,29 @@
     "vlad@serenichron.com"
   ],
   "default_since_policy": "one_day_before_latest_clockify_entry",
+  "personal_session_rules": [
+    {
+      "id": "tramvai-41",
+      "reason": "Personal hobby project",
+      "machine": "macbook",
+      "cwd_prefix": "/Users/blackthorne/Library/Application Support/Claude/scratch-workspaces/1394710b-85ec-4d22-a6f9-906355b8976b/8db63d3c-54d5-4fbd-94d1-46f17118a1f5/scratch-2026-10-19-e146a7"
+    },
+    {
+      "id": "atelieruldevis",
+      "reason": "Personal/non-billable",
+      "route_pattern": "atelieruldevis"
+    },
+    {
+      "id": "family-bank",
+      "reason": "Personal/non-billable",
+      "route_pattern": "family-bank"
+    },
+    {
+      "id": "hartacoruptiei",
+      "reason": "Separate project, not Clockify-billable",
+      "route_pattern": "hartacoruptiei"
+    }
+  ],
   "prefix_overrides": [
     {
       "project_name_prefix": "Serenichron",

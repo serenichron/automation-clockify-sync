@@ -1262,12 +1262,18 @@ def verify_frozen_source(run_dir: Path) -> FrozenSourceSnapshot:
                 from scripts import work_accounting_pipeline
             except ModuleNotFoundError:  # direct script execution
                 import work_accounting_pipeline  # type: ignore[no-redef]
+            try:
+                personal_rules = work_accounting_pipeline.personal_session_rules(json.loads(read("routing.json")))
+            except work_accounting_pipeline.WorkAccountingError as exc:
+                raise ValueError("frozen personal-session routing is invalid") from exc
             old_retained, _old_noise = work_accounting_pipeline._analysis_events(
                 events_document, frozenset(manifest.member_identities),
+                personal_rules=personal_rules,
             )
             new_retained, _new_noise = work_accounting_pipeline._analysis_events(
                 [event.document() for event in reconstructed.events],
                 frozenset(manifest.member_identities),
+                personal_rules=personal_rules,
             )
             if (
                 old_retained != new_retained

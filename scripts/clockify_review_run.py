@@ -230,6 +230,10 @@ def build_result(
                 ]
             ),
             "fathom_records": len(accounting.get("fathom_reconciliation", [])),
+            **({
+                "session_exclusions": sum(row["status"] == "excluded" for row in accounting["session_exclusions"]),
+                "personal_session_partials": sum(row["status"] == "partial_not_excluded" for row in accounting["session_exclusions"]),
+            } if "session_exclusions" in accounting else {}),
         },
         "review_summary": {
             "new": int(summary.get("new", len(new_items))),
@@ -295,6 +299,12 @@ def write_summary(path: Path, result: dict[str, Any]) -> None:
         f"- Run report: `{result['paths']['run_report']}`",
         "",
     ]
+    if "session_exclusions" in result["accounting_summary"]:
+        lines.insert(-1, (
+            "- Personal sessions: "
+            f"{result['accounting_summary']['session_exclusions']} excluded, "
+            f"{result['accounting_summary']['personal_session_partials']} partial matches retained"
+        ))
     if result["review_mode"] == "exceptions_only":
         delta = [(str(item.get("category") or "exception"), item) for item in result["exceptions"]]
     else:
@@ -902,7 +912,11 @@ def _frozen_source_inputs(
     member_identities = work_accounting_pipeline.meeting_reconciliation.manifest_member_identities(
         ledger.manifest.document()
     )
-    analysis_events, _noise = work_accounting_pipeline._analysis_events(all_events, member_identities)
+    routing = json.loads(extra["routing.json"])
+    analysis_events, _noise = work_accounting_pipeline._analysis_events(
+        all_events, member_identities,
+        personal_rules=work_accounting_pipeline.personal_session_rules(routing),
+    )
     evidence_ids = sorted(str(event["evidence_id"]) for event in analysis_events)
     if (
         analysis.get("ledger_event_count") != len(evidence_ids)
@@ -1580,11 +1594,12 @@ def _preflight_replay_analyzer_cache(
     member_identities = work_accounting_pipeline.meeting_reconciliation.manifest_member_identities(
         ledger.manifest.document()
     )
-    events, _noise = work_accounting_pipeline._analysis_events(
-        all_events, member_identities
-    )
     context = inference_context or source
     routing = _read_json(context / "routing.json")
+    events, _noise = work_accounting_pipeline._analysis_events(
+        all_events, member_identities,
+        personal_rules=work_accounting_pipeline.personal_session_rules(routing),
+    )
     corrections = work_accounting_pipeline._load_corrections(
         context / "review-corrections.jsonl"
     )
@@ -2032,7 +2047,8 @@ def _prepare_replay_run(source: Path) -> Path:
             )
         )
         analysis_events, _noise = work_accounting_pipeline._analysis_events(
-            all_events, member_identities
+            all_events, member_identities,
+            personal_rules=work_accounting_pipeline.personal_session_rules(_read_json(source / "routing.json")),
         )
         evidence_ids = sorted(
             str(event.get("evidence_id"))
@@ -4216,7 +4232,8 @@ def main(argv: list[str] | None = None) -> int:
                     ledger.manifest.document()
                 )
                 events, _noise = work_accounting_pipeline._analysis_events(
-                    all_events, identities
+                    all_events, identities,
+                    personal_rules=work_accounting_pipeline.personal_session_rules(_read_json(source / "routing.json")),
                 )
                 work_accounting_pipeline._failed_review_retry_targets(
                     _read_json(fixture), events, retry_cache, args.retry_review_digest,
