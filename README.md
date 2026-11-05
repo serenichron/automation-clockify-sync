@@ -104,6 +104,36 @@ is frozen in the existing publication binding; retries and historical bindings
 replay offline without changing child wording, time, approvals or IDs. Direct
 historical callers of the pure adapter retain their previous default behavior.
 
+Fresh recurring deliveries explicitly select
+`approved-daily-project-presentation/v8`. Compatible children under fifteen
+minutes group by local day, project, tags, billable state and `workstream_id`.
+Only analyzer lifecycles `completed` and `advanced` can merge; blocked, planned,
+unknown-status and missing-workstream children stay standalone, as do groups
+with only one child. There is no session fallback. Original source segments,
+review identities, warnings and exact seconds remain intact.
+
+V8 requests summaries separately per group with the v4 summary prompt. A wording
+or independent-review failure produces a deterministic parent: use the cleaned
+wording of the longest child (tie: earliest start), adding “and related steps”
+when another child's wording differs. The immutable `deterministic_merges`
+records bind the parent, ordered children, representative and reason; these
+merges do not claim independent summary approval. Loading, projection, staging
+and native posting reconstruct this authority and reject mismatches. Staging
+keeps eligible children as native rows when their complete group is unavailable.
+Timeout, transport and quota failures defer preparation without writing a
+binding; the cycle remains incomplete and exits 75 even if a later slice succeeds.
+
+For structured analyzer wording under v8, a numeric or comma/semicolon findings
+tail is omitted unless it contains a limitation/status marker such as blocked,
+failed, pending, partial, unable, cannot, could not, not yet, still, except or
+until. Qualitative outcomes and human-corrected wording are preserved; reviewed
+group summaries retain their supplied wording. Existing bindings replay their
+recorded policy without new inference or rewriting. Direct `prepare()` callers
+still default to v6 (v7 with `all_durations`), and v6/v7 keep their historical
+standalone summary fallback. Extractor/reviewer prompts and analyzer versions
+are unchanged. Native posting of v8 parents still requires approval of the exact
+Clockify entries; presentation preparation grants no posting authority.
+
 Google Sheet publication is a separate post-review stage. Collection, analysis,
 quality checks and replay do not publish. The recurring review cycle can invoke
 publication after source quality and immutable replay pass, using the explicit

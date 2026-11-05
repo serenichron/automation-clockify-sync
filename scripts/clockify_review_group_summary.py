@@ -22,6 +22,8 @@ V2_PROMPT_VERSION = "clockify-review-group-summary-v2"
 V2_REVIEW_PROMPT_VERSION = "clockify-review-group-summary-review-v2"
 FRESH_PROMPT_VERSION = "clockify-review-group-summary-v3"
 FRESH_REVIEW_PROMPT_VERSION = "clockify-review-group-summary-review-v3"
+ACCOMPLISHMENT_PROMPT_VERSION = "clockify-review-group-summary-v4"
+ACCOMPLISHMENT_REVIEW_PROMPT_VERSION = "clockify-review-group-summary-review-v4"
 MAX_GROUPS_PER_BATCH = 20
 MAX_BODY_BYTES = semantic.DEFAULT_CHUNK_BODY_BYTES
 MAX_WORDING_CHARACTERS = 1000
@@ -29,6 +31,14 @@ MAX_WORDING_CHARACTERS = 1000
 
 class GroupSummaryError(ValueError):
     """Sanitized, fail-closed summary preparation failure."""
+
+
+class GroupSummaryRejected(GroupSummaryError):
+    """Wording or independent review rejected the candidate, not the provider."""
+
+
+class GroupSummaryUnavailable(Exception):
+    """Provider/configuration failure; do not freeze any preparation decision."""
 
 
 def _text(value: Any) -> bool:
@@ -48,8 +58,12 @@ def _structural_wording_problem(description: Any, group: Mapping[str, Any]) -> s
     return None
 
 
-def _wording_problem(description: str, group: Mapping[str, Any]) -> str | None:
+def _wording_problem(description: str, group: Mapping[str, Any], *, contract_version: int = 3) -> str | None:
     """Check display hygiene only; child outcome coverage remains semantic."""
+    if contract_version == 4:
+        from scripts.clockify_review_batch_publication import _INTERNAL_JOURNAL_RE
+        if _INTERNAL_JOURNAL_RE.search(description):
+            return "Describe the client-facing accomplishment without internal journal or execution-status wording."
     try:
         caveman_renderer.validate_client_description(description if group["prefix"] else "Work — " + description)
     except caveman_renderer.CavemanValidationError:
@@ -129,12 +143,13 @@ def needs_summary(activities: Sequence[Mapping[str, Any]]) -> bool:
 
 def _body(groups: list[dict[str, Any]], endpoint: semantic.AnalyzerEndpoint, stage: str,
           *, contract_version: int = 3) -> dict[str, Any]:
-    if contract_version not in {1, 2, 3}:
+    if contract_version not in {1, 2, 3, 4}:
         raise GroupSummaryError("review summary contract version is unsupported")
     review = stage == "review"
     version = ((REVIEW_PROMPT_VERSION if review else PROMPT_VERSION) if contract_version == 1
                else (V2_REVIEW_PROMPT_VERSION if review else V2_PROMPT_VERSION) if contract_version == 2
-               else (FRESH_REVIEW_PROMPT_VERSION if review else FRESH_PROMPT_VERSION))
+               else (FRESH_REVIEW_PROMPT_VERSION if review else FRESH_PROMPT_VERSION) if contract_version == 3
+               else (ACCOMPLISHMENT_REVIEW_PROMPT_VERSION if review else ACCOMPLISHMENT_PROMPT_VERSION))
     payload = {"prompt_version": version,
                "stage": stage, "groups": groups}
     shared = (
@@ -182,18 +197,30 @@ def _body(groups: list[dict[str, Any]], endpoint: semantic.AnalyzerEndpoint, sta
             "Describe the source-backed client outcome instead, preserving local-only, blocked or deployed status. "
             "Keep real product titles such as Tests 16–18 and meaningful business dates, prices and quantities."
         )
+    if contract_version == 4:
+        instruction = instruction.replace(
+            "Preserve material business quantities, scope and measurable results.",
+            "State the accomplishment and its business purpose; omit incidental counts and metrics.")
+        instruction += (
+            " CLIENT-FACING V4: Each group covers one accomplishment stream. State that accomplishment "
+            "and its business purpose; omit incidental counts, versions and metrics. Omit execution telemetry, "
+            "source filenames and hash-parity mechanics. Preserve limitations and lifecycle/status truth "
+            "and cover all material child outcomes."
+        )
     return {"model": endpoint.model, "temperature": 0, "response_format": {"type": "json_object"},
             "messages": [{"role": "system", "content": shared + instruction},
                          {"role": "user", "content": semantic.canonical_json(payload)}]}
 
 
 def _validate(response: Any, groups: list[dict[str, Any]], stage: str, *,
-              allow_fresh_wording_repair: bool = False) -> dict[str, dict[str, Any]]:
+              allow_fresh_wording_repair: bool = False, cached: bool = False,
+              contract_version: int = 3) -> dict[str, dict[str, Any]]:
     if (not isinstance(response, dict) or set(response) != {"groups"}
             or not isinstance(response["groups"], list) or len(response["groups"]) != len(groups)):
         raise GroupSummaryError("review summary response scope differs")
     expected = {group["group_ref"]: group for group in groups}
     result = {}
+    cached_wording_rejected = False
     for row in response["groups"]:
         fields = ({"approved", "covers_all_children", "no_invented_claims", "preserves_status", "feedback"}
                   if stage == "review" else {"description"})
@@ -212,46 +239,71 @@ def _validate(response: Any, groups: list[dict[str, Any]], stage: str, *,
                     or (not row["approved"] and not _text(row["feedback"]))):
                 raise GroupSummaryError("review summary semantic decision is invalid")
         else:
-            if (_structural_wording_problem(row["description"], group) is not None
-                    and not (stage == "generate" and allow_fresh_wording_repair)):
-                raise GroupSummaryError("review summary candidate wording is invalid")
+            structural_problem = _structural_wording_problem(row["description"], group)
+            if (structural_problem is not None and not (stage == "generate" and allow_fresh_wording_repair)):
+                if cached and isinstance(row["description"], str):
+                    cached_wording_rejected = True
+                else:
+                    raise GroupSummaryError("review summary candidate wording is invalid")
+            if cached and structural_problem is None and _wording_problem(
+                    row["description"], group, contract_version=contract_version) is not None:
+                cached_wording_rejected = True
         result[row["group_ref"]] = copy.deepcopy(row)
+    if cached_wording_rejected:
+        raise GroupSummaryRejected("review summary cached candidate wording is invalid")
     return result
 
 
 def _request(groups: list[dict[str, Any]], *, stage: str, endpoint: semantic.AnalyzerEndpoint,
-             cache: semantic.AnalyzerResponseCache, transport: semantic.Transport) -> dict[str, dict[str, Any]]:
-    body = _body(groups, endpoint, stage)
+             cache: semantic.AnalyzerResponseCache | None, transport: semantic.Transport,
+             contract_version: int = 3) -> dict[str, dict[str, Any]]:
+    body = _body(groups, endpoint, stage, contract_version=contract_version)
     if len(semantic.canonical_json(body).encode("utf-8")) > MAX_BODY_BYTES:
         raise GroupSummaryError("review summary request exceeds bounded body size")
-    response = cache.lookup(endpoint, body)
+    response = cache.lookup(endpoint, body) if cache is not None else None
     miss = response is None
     if miss:
-        raw = transport(endpoint, body)
+        try:
+            raw = transport(endpoint, body)
+        except (TypeError, ValueError):
+            if contract_version == 4:
+                raise GroupSummaryUnavailable("review summary endpoint or response is malformed") from None
+            raise
         try:
             content = raw["choices"][0]["message"]["content"]
             response = json.loads(content) if isinstance(content, str) else content
         except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+            if contract_version == 4:
+                raise GroupSummaryUnavailable("review summary response is not structured JSON") from None
             raise GroupSummaryError("review summary response is not structured JSON") from None
     # Only a newly generated candidate may consume the single wording repair.
     # Cache corruption, repair failures and the complete membership envelope
     # remain strict; no invalid wording is accepted into the response cache.
-    result = _validate(response, groups, stage, allow_fresh_wording_repair=miss and stage == "generate")
+    try:
+        result = _validate(response, groups, stage, allow_fresh_wording_repair=miss and stage == "generate",
+                           cached=not miss and contract_version == 4, contract_version=contract_version)
+    except GroupSummaryRejected:
+        raise
+    except GroupSummaryError:
+        if contract_version == 4:
+            raise GroupSummaryUnavailable("review summary response contract is malformed") from None
+        raise
     structurally_clean = stage == "review" or all(
         _structural_wording_problem(result[group["group_ref"]]["description"], group) is None
-        and _wording_problem(result[group["group_ref"]]["description"], group) is None for group in groups)
-    if miss and structurally_clean:
+        and _wording_problem(result[group["group_ref"]]["description"], group,
+                             contract_version=contract_version) is None for group in groups)
+    if miss and structurally_clean and cache is not None:
         cache.store_accepted(endpoint, body, response=response)
     return result
 
 
-def _chunks(groups: list[dict[str, Any]], endpoint: semantic.AnalyzerEndpoint):
+def _chunks(groups: list[dict[str, Any]], endpoint: semantic.AnalyzerEndpoint, *, contract_version: int = 3):
     chunk = []
     for group in groups:
         trial = chunk + [group]
         # Reserve enough room for both an independent review and a targeted
         # repair's bounded summary/feedback. Never truncate a late child.
-        estimated = len(semantic.canonical_json(_body(trial, endpoint, "generate")).encode("utf-8")) + 8000 * len(trial)
+        estimated = len(semantic.canonical_json(_body(trial, endpoint, "generate", contract_version=contract_version)).encode("utf-8")) + 8000 * len(trial)
         if chunk and (len(trial) > MAX_GROUPS_PER_BATCH or estimated > MAX_BODY_BYTES):
             yield chunk
             chunk = []
@@ -260,16 +312,26 @@ def _chunks(groups: list[dict[str, Any]], endpoint: semantic.AnalyzerEndpoint):
         yield chunk
 
 
-def summarize_groups(activities: Sequence[Mapping[str, Any]], *, cache: semantic.AnalyzerResponseCache,
+def summarize_groups(activities: Sequence[Mapping[str, Any]], *, cache: semantic.AnalyzerResponseCache | None = None,
                      endpoint: semantic.AnalyzerEndpoint | None = None,
-                     transport: semantic.Transport | None = None) -> dict[str, dict[str, Any]]:
+                     transport: semantic.Transport | None = None,
+                     contract_version: int = 3) -> dict[str, dict[str, Any]]:
     """Return exact native parent/child-bound overlays after independent approval.
 
-    Same-wording groups need no endpoint. A rejection has one targeted repair;
+    Legacy same-wording groups need no endpoint. A rejection has one targeted repair;
     unresolved, malformed or transport failures abort without a fallback overlay.
     The caller freezes this overlay in its existing immutable preparation binding.
     """
     try:
+        if contract_version == 4 and activities:
+            try:
+                endpoint = endpoint or semantic.AnalyzerEndpoint.from_env(
+                    "CLOCKIFY_ANALYZER_PRIMARY", default_model=semantic.DEFAULT_PRIMARY_MODEL)
+                if endpoint is None:
+                    raise GroupSummaryUnavailable("review summaries require the configured current Flash endpoint")
+                semantic.require_current_live_flash_route(endpoint)
+            except (semantic.AnalyzerError, TypeError, ValueError):
+                raise GroupSummaryUnavailable("review summary endpoint configuration is unavailable") from None
         groups, originals = _project(copy.deepcopy(activities))
         if not groups:
             return {}
@@ -280,8 +342,9 @@ def summarize_groups(activities: Sequence[Mapping[str, Any]], *, cache: semantic
         semantic.require_current_live_flash_route(endpoint)
         transport = transport or semantic.http_transport
         overlay = {}
-        for chunk in _chunks(groups, endpoint):
-            candidates = _request(chunk, stage="generate", endpoint=endpoint, cache=cache, transport=transport)
+        for chunk in _chunks(groups, endpoint, contract_version=contract_version):
+            candidates = _request(chunk, stage="generate", endpoint=endpoint, cache=cache, transport=transport,
+                                  contract_version=contract_version)
             review_groups = []
             rejected = []
             for group in chunk:
@@ -293,32 +356,53 @@ def summarize_groups(activities: Sequence[Mapping[str, Any]], *, cache: semantic
                     # remain available, with bounded targeted feedback.
                     rejected.append({**group, "feedback": structural_problem})
                     continue
-                problem = _wording_problem(candidate["summary"], group)
+                problem = _wording_problem(candidate["summary"], group, contract_version=contract_version)
                 if problem is not None:
                     rejected.append({**candidate, "feedback": problem})
                 else:
                     review_groups.append(candidate)
             if review_groups:
-                decisions = _request(review_groups, stage="review", endpoint=endpoint, cache=cache, transport=transport)
+                decisions = _request(review_groups, stage="review", endpoint=endpoint, cache=cache, transport=transport,
+                                     contract_version=contract_version)
                 rejected.extend({**group, "feedback": decisions[group["group_ref"]]["feedback"]}
                                 for group in review_groups if not decisions[group["group_ref"]]["approved"])
             if rejected:
-                repaired = _request(rejected, stage="repair", endpoint=endpoint, cache=cache, transport=transport)
+                repaired = _request(rejected, stage="repair", endpoint=endpoint, cache=cache, transport=transport,
+                                    contract_version=contract_version)
                 # Review afresh, without generation feedback or the old candidate.
                 repaired_groups = [{**group, "summary": repaired[group["group_ref"]]["description"]}
                                    for group in chunk if group["group_ref"] in repaired]
-                if any(_wording_problem(group["summary"], group) is not None for group in repaired_groups):
-                    raise GroupSummaryError("review summary failed client-facing wording after one targeted repair")
-                second = _request(repaired_groups, stage="review", endpoint=endpoint, cache=cache, transport=transport)
+                if any(_wording_problem(group["summary"], group, contract_version=contract_version) is not None
+                       for group in repaired_groups):
+                    raise GroupSummaryRejected("review summary failed client-facing wording after one targeted repair")
+                second = _request(repaired_groups, stage="review", endpoint=endpoint, cache=cache, transport=transport,
+                                  contract_version=contract_version)
                 if any(not row["approved"] for row in second.values()):
-                    raise GroupSummaryError("review summary failed independent review after one targeted repair")
+                    raise GroupSummaryRejected("review summary failed independent review after one targeted repair")
                 candidates.update(repaired)
             for group in chunk:
                 native = originals[group["group_ref"]]
                 overlay[native["review_id"]] = {"child_review_ids": list(native["child_review_ids"]),
                     "description": candidates[group["group_ref"]]["description"]}
         return overlay
+    except (semantic.AnalyzerTimeoutError, semantic.AnalyzerTransportError,
+            semantic.AnalyzerQuotaDeferred, OSError) as error:
+        if contract_version == 4:
+            raise GroupSummaryUnavailable("review summary provider is temporarily unavailable") from None
+        if isinstance(error, semantic.AnalyzerError):
+            raise GroupSummaryError("review summary preparation failed; no unreviewed fallback is permitted") from None
+        raise
     except GroupSummaryError:
         raise
-    except (semantic.AnalyzerError, TypeError, ValueError):
+    except (semantic.AnalyzerCancelledError, semantic.AnalyzerContractError):
+        raise GroupSummaryError("review summary preparation failed; no unreviewed fallback is permitted") from None
+    except semantic.AnalyzerError:
+        if contract_version == 4:
+            raise GroupSummaryUnavailable("review summary provider or route is unavailable") from None
+        raise GroupSummaryError("review summary preparation failed; no unreviewed fallback is permitted") from None
+    except json.JSONDecodeError:
+        if contract_version == 4:
+            raise GroupSummaryUnavailable("review summary provider response is not structured JSON") from None
+        raise GroupSummaryError("review summary preparation failed; no unreviewed fallback is permitted") from None
+    except (TypeError, ValueError):
         raise GroupSummaryError("review summary preparation failed; no unreviewed fallback is permitted") from None

@@ -22,7 +22,7 @@ def source(number, start, end, seconds):
             "client_project": "Example", "tag_names": ["Development"],
             "tag_suffixes": ["def456"], "clockify_project_suffix": "abc123",
             "billable": True, "confidence": "high", "review_warnings": [],
-            "description": "raw source wording",
+            "description": "raw source wording", "workstream_id": "ws-fixture",
             "provenance": {"source_type": "semantic_activity", "evidence_ids": [f"ev-{number}"]}}
 
 

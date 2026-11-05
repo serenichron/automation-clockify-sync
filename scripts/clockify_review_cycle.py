@@ -5872,11 +5872,12 @@ def _run_exact_recovery(
     )
 
 
-def _summarize_review_groups(activities: Sequence[Mapping[str, Any]], cache_path: Path) -> Mapping[str, Any]:
+def _summarize_review_groups(activities: Sequence[Mapping[str, Any]], cache_path: Path, *,
+                             contract_version: int = 3) -> Mapping[str, Any]:
     """Use the existing semantic response cache only for fresh group wording."""
     from scripts import clockify_review_group_summary, semantic_analyzer
     return clockify_review_group_summary.summarize_groups(activities,
-        cache=semantic_analyzer.AnalyzerResponseCache(cache_path))
+        cache=semantic_analyzer.AnalyzerResponseCache(cache_path), contract_version=contract_version)
 
 
 def _prepare_new_publication(
@@ -5884,6 +5885,7 @@ def _prepare_new_publication(
 ) -> tuple[Mapping[str, Any], dict[str, Any]]:
     """New-delivery-only preparation; never called to reconstruct old receipts."""
     from scripts import clockify_review_batch_publication as prepared
+    from scripts import clockify_review_group_summary
     source_dir = Path(str(source["run_dir"]))
     # These adapters have their own immutable representation/retirement proofs.
     # Combining them with automatic batches needs an explicit integration, not
@@ -5923,11 +5925,18 @@ def _prepare_new_publication(
         outcome = prepared.prepare(source_dir=source_dir, output=output, run_id=str(source["run_id"]),
             spreadsheet_id=str(config["spreadsheet_id"]), sheet_title=sheet_title, timezone=str(config["timezone"]),
             consolidate_materialized_corrections=True,
+            consolidation_policy=prepared.ACCOMPLISHMENT_CONSOLIDATION_POLICY,
             native_credit_directory=(state_dir / "native-credit-inputs"
                 if source.get("artifact_digests", {}).get("evidence_ledger")
                 and "clockify_native_checkpoint" in _json_file(source_dir / "run-report.json", "source report") else None),
             summary_provider=lambda activities: _summarize_review_groups(activities,
-                _path(config, "cache") if config.get("cache") else state_dir / "analyzer-cache-v2.jsonl"))
+                _path(config, "cache") if config.get("cache") else state_dir / "analyzer-cache-v2.jsonl",
+                contract_version=4))
+    except clockify_review_group_summary.GroupSummaryUnavailable:
+        if output.exists():
+            raise CycleError("immutable automatic review preparation drifted") from None
+        return config, {"status": "incomplete", "reason": "group_summary_unavailable",
+                        "error_type": "GroupSummaryUnavailable"}
     except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
         # No raw source content is placed in state or error reporting. Preserve
         # the already verified replay and require an explicit repair/retry.
@@ -7245,6 +7254,7 @@ def run_cycle(config: Mapping[str, Any], *, enable_sheet_write: bool, today: dt.
         final_reason: str | None = None
         any_exceptions = False
         any_preparation_gaps = False
+        any_incomplete = False
         budget = [float(config.get("total_child_budget_seconds", 7200))]
         for since, until, kind, generic in selected:
             if kind == "exact":
@@ -7262,6 +7272,7 @@ def run_cycle(config: Mapping[str, Any], *, enable_sheet_write: bool, today: dt.
                 )
             attempted.append(outcome["slice"])
             final_status = str(outcome["status"])
+            any_incomplete = any_incomplete or outcome.get("reason") == "group_summary_unavailable"
             if outcome.get("reason") == "total_child_budget_exhausted":
                 final_reason = "total_child_budget_exhausted"
             any_exceptions = any_exceptions or final_status == "delivered_with_exceptions"
@@ -7279,7 +7290,7 @@ def run_cycle(config: Mapping[str, Any], *, enable_sheet_write: bool, today: dt.
             final_status = "delivered_with_exceptions"
         if any_preparation_gaps and final_status not in {"incomplete", "failed", "recovery_blocked"}:
             final_status = "published_with_preparation_gaps"
-        if final_reason == "total_child_budget_exhausted":
+        if (final_reason == "total_child_budget_exhausted" or any_incomplete) and final_status not in {"failed", "recovery_blocked"}:
             final_status = "incomplete"
         result: dict[str, Any] = {"status": final_status, "slices": attempted}
         if final_reason is not None:

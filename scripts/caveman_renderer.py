@@ -4,6 +4,32 @@ import re
 from typing import Any, Mapping
 
 
+_ACCOMPLISHMENT_STATUS_RE = re.compile(
+    r"\b(?:blocked|failed|failing|pending|partial|unable|cannot|could\s+not|"
+    r"not\s+yet|still|except|until|not\s+deployed|undeployed|local|locally|local-only|"
+    r"staging|draft|awaiting|waiting|needs|requires|review|planned)\b", re.I,
+)
+
+
+def has_accomplishment_status(description: str) -> bool:
+    """Keep status and limitations visible in accomplishment presentations."""
+    return bool(_ACCOMPLISHMENT_STATUS_RE.search(description))
+
+
+def accomplishment_description(prefix: str, action: str, object: str, outcome: str) -> str:
+    """Omit findings/metric tails while preserving limitations and status."""
+    prefix, action, object, outcome = (" ".join(part.split()) for part in (prefix, action, object, outcome))
+    # Thousands separators belong to a count, not separate findings.
+    findings_text = re.sub(r"(?<=\d),(?=\d{3}(?:\D|$))", "", outcome)
+    segments = [part.strip() for part in re.split(r"[,;]", findings_text) if part.strip()]
+    findings = (len(segments) >= 2 and sum(bool(re.search(r"\d", part)) for part in segments) * 2 >= len(segments)
+                or len(segments) == 1 and bool(re.match(r"^\d+(?:[,.]\d+)*\s+[^\W\d_]+\b", segments[0])))
+    parts = [action, object]
+    if not findings or has_accomplishment_status(outcome):
+        parts.append(outcome)
+    return f"{prefix} — {' '.join(part for part in parts if part)}"
+
+
 class CavemanRenderError(ValueError):
     """Base class for unsafe or incomplete Caveman description input."""
 

@@ -35,7 +35,7 @@ class AutomaticPreparationTests(unittest.TestCase):
             proposal["provenance"].update(semantic_reviewer_model=model, semantic_reviewer_revision=revision)
             self.analysis["activities"].append({"activity_id": proposal["activity_id"],
                 "evidence_ids": proposal["provenance"]["evidence_ids"], "rendered_description": wording,
-                "semantic_reviewer_model": model, "semantic_reviewer_revision": revision})
+                "semantic_reviewer_model": model, "semantic_reviewer_revision": revision, "lifecycle": "completed"})
         self.write(self.run / "proposals.json", self.sources)
         self.write(self.run / "semantic-analysis.json", self.analysis)
         self.write(self.run / "routing.json", {"session_routes": [{"project_name": "Example",
@@ -47,7 +47,7 @@ class AutomaticPreparationTests(unittest.TestCase):
             "ambiguous": [], "skipped": []})
         # Existing orchestration tests stay local: substitute only the external
         # semantic boundary, leaving preparation, projection and receipts real.
-        summary = mock.patch.object(cycle, "_summarize_review_groups", side_effect=lambda groups, _state: {
+        summary = mock.patch.object(cycle, "_summarize_review_groups", side_effect=lambda groups, _state, **_kwargs: {
             item["review_id"]: {"child_review_ids": item["child_review_ids"],
                 "description": "SC — Prepared source publication and verified its review receipt"}
             for item in groups if len({child["description"] for child in item["prepared_descriptions"]}) > 1})

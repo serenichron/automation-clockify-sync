@@ -47,6 +47,48 @@ def _strings(value: Any) -> bool:
     return isinstance(value, list) and all(_text(item) for item in value) and len(set(value)) == len(value)
 
 
+def _cited_evidence_ids(proposal: Mapping[str, Any]) -> Any:
+    provenance = proposal.get("provenance")
+    if isinstance(provenance, Mapping) and "evidence_ids" in provenance:
+        return provenance["evidence_ids"]
+    source = proposal.get("source")
+    if not isinstance(source, list):
+        return []
+    return [item.removeprefix("evidence:") for item in source
+            if isinstance(item, str) and item.startswith("evidence:")]
+
+
+def accomplishment_session_key(proposal: Mapping[str, Any],
+        evidence_events: Mapping[str, Mapping[str, Any]] | None = None) -> tuple[str, ...] | None:
+    """Derive a unanimous ledger identity; never infer it from analyzer labels."""
+    def identity(value):
+        return _text(value) and value.strip().casefold() != "unknown"
+
+    citations = _cited_evidence_ids(proposal)
+    keys = set()
+    if evidence_events is not None and _strings(citations) and citations:
+        for evidence_id in citations:
+            event = evidence_events.get(evidence_id, {})
+            ref = event.get("source_ref") or {}
+            machine, session = ref.get("machine"), ref.get("session_id")
+            if not identity(machine):
+                break
+            if event.get("source_type") == "repository_events":
+                root = (event.get("attributes") or {}).get("repository_root") or ref.get("repository_root")
+                if not identity(root):
+                    break
+                keys.add(("repository", machine, root))
+            elif identity(session):
+                keys.add(("session", machine, session))
+            else:
+                break
+        else:
+            if len(keys) == 1:
+                return next(iter(keys))
+    workstream = proposal.get("workstream_id")
+    return ("workstream", workstream) if _text(workstream) else None
+
+
 def _activity(members: list[dict[str, Any]], *, allow_review_overlaps: bool = False) -> dict[str, Any]:
     members = sorted(members, key=lambda item: (item["start"], item["end"], item["review_id"]))
     sources = [item["proposal"] for item in members]
@@ -54,12 +96,15 @@ def _activity(members: list[dict[str, Any]], *, allow_review_overlaps: bool = Fa
     segments = [{"start": source["start"], "end": source["end"],
                  "duration_seconds": source["duration_seconds"],
                  "duration_minutes": source["duration_seconds"] // 60} for source in sources]
-    # Bind editorial wording and exact source content, not just the grouping key.
+    # Bind editorial wording and exact source content. V8 also binds the ledger
+    # identity so omitting its authority cannot replay a session as a workstream.
     notice = OVERLAP_REVIEW_NOTICE if allow_review_overlaps and any(
         item.get("has_review_overlap") for item in members) else None
     digest = hashlib.sha256(_canonical({
         "children": [{"review_id": item["review_id"], "proposal": item["proposal"],
-                      "description": item["description"], "context": item["context"]} for item in members],
+                      "description": item["description"], "context": item["context"],
+                      **({"session_key": item["session_key"]} if "session_key" in item else {})}
+                     for item in members],
         **({"review_notice": notice} if notice else {}),
     }).encode()).hexdigest()[:24]
     first = sources[0]
@@ -75,7 +120,8 @@ def _activity(members: list[dict[str, Any]], *, allow_review_overlaps: bool = Fa
                                   for item in members],
         "prepared_descriptions": descriptions,
         "evidence_ids": sorted({str(value) for source in sources
-                                for value in (source.get("provenance") or {}).get("evidence_ids", [])}),
+                                for value in (_cited_evidence_ids(source) if "session_key" in members[0]
+                                    else (source.get("provenance") or {}).get("evidence_ids", []))}),
         "allocation_segments": segments,
         "start": sources[0]["start"], "end": max(members, key=lambda item: item["end"])["proposal"]["end"],
         "duration_seconds": seconds, "duration_minutes": seconds // 60,
@@ -114,6 +160,56 @@ def group_summary_descriptions(activities: Sequence[Mapping[str, Any]],
     return descriptions
 
 
+def deterministic_merge(activity: Mapping[str, Any],
+                        proposals: Sequence[Mapping[str, Any]], *, reason: str) -> dict[str, Any]:
+    """Record the representative mechanically; this is not independent review."""
+    originals = {stable_review_id(source): source for source in proposals}
+    children = activity["child_review_ids"]
+    representative = min(children, key=lambda identity: (
+        -originals[identity]["duration_seconds"], _time(originals[identity]["start"]), identity))
+    return {"review_id": activity["review_id"], "child_review_ids": list(children),
+            "representative_review_id": representative, "reason": reason}
+
+
+def deterministic_merge_eligible(activity: Mapping[str, Any], proposals: Sequence[Mapping[str, Any]],
+                                 work_contexts: Mapping[str, str]) -> bool:
+    """Only completed, unqualified peers may hide behind a representative."""
+    from scripts.caveman_renderer import has_accomplishment_status
+    representative = deterministic_merge(activity, proposals, reason="summary_rejected")["representative_review_id"]
+    originals = {stable_review_id(source): source for source in proposals}
+    wording = {item["review_id"]: item["description"] for item in activity["prepared_descriptions"]}
+    return all(work_contexts.get(identity) == f"workstream:{originals[identity].get('workstream_id')}"
+               and not has_accomplishment_status(wording[identity])
+               for identity in activity["child_review_ids"] if identity != representative)
+
+
+def deterministic_merge_descriptions(activities: Sequence[Mapping[str, Any]],
+        proposals: Sequence[Mapping[str, Any]], merges: Sequence[Mapping[str, Any]], *,
+        work_contexts: Mapping[str, str]) -> dict[str, str]:
+    """Rederive merge membership, representative and wording from frozen inputs."""
+    if not isinstance(merges, list):
+        raise ValueError("deterministic merges must be a list")
+    groups = {activity["review_id"]: activity for activity in activities}
+    descriptions = {}
+    for merge in merges:
+        if (not isinstance(merge, Mapping) or set(merge) != {
+                "review_id", "child_review_ids", "representative_review_id", "reason"}
+                or not _text(merge["review_id"]) or merge["review_id"] not in groups
+                or merge["review_id"] in descriptions or merge["reason"] != "summary_rejected"):
+            raise ValueError("deterministic merge authority differs")
+        activity = groups[merge["review_id"]]
+        if (len(activity["child_review_ids"]) < 2
+                or merge != deterministic_merge(activity, proposals, reason="summary_rejected")
+                or not deterministic_merge_eligible(activity, proposals, work_contexts)):
+            raise ValueError("deterministic merge membership or representative differs")
+        wording = {item["review_id"]: item["description"] for item in activity["prepared_descriptions"]}
+        description = wording[merge["representative_review_id"]]
+        if any(value != description for value in wording.values()):
+            description += " and related steps"
+        descriptions[merge["review_id"]] = description
+    return descriptions
+
+
 def package_review_batches(
     proposals: Sequence[Mapping[str, Any]], *,
     editorial_descriptions: Mapping[str, str], work_contexts: Mapping[str, str],
@@ -125,6 +221,9 @@ def package_review_batches(
     natural_batches: bool = False,
     all_durations: bool = False,
     group_summaries: Mapping[str, Any] | None = None,
+    accomplishment_batches: bool = False,
+    deterministic_merges: Sequence[Mapping[str, Any]] | None = None,
+    evidence_events: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Consolidate compatible sub-fifteen-minute sources to reviewable batches.
 
@@ -196,10 +295,12 @@ def package_review_batches(
         if source.get("human_corrected") and review_id not in correction_exemptions:
             reasons.append("human_corrected")
         provenance = source.get("provenance") or {}
+        citations = (_cited_evidence_ids(source) if accomplishment_batches else
+                     provenance.get("evidence_ids") if isinstance(provenance, Mapping) else None)
         if not isinstance(provenance, Mapping):
             provenance = {}
             reasons.append("invalid_provenance")
-        elif not _strings(provenance.get("evidence_ids")) or not provenance["evidence_ids"]:
+        elif not _strings(citations) or not citations:
             reasons.append("invalid_provenance")
         if (provenance.get("source_type") in {"recorded_meeting", "fathom", "calendly"}
                 or provenance.get("canonical_meeting_id") or source.get("lifecycle") == "meeting"):
@@ -232,6 +333,14 @@ def package_review_batches(
             reasons.append("missing_editorial_description")
         if not _text(context):
             reasons.append("missing_work_context")
+        session_key = accomplishment_session_key(source, evidence_events) if accomplishment_batches else None
+        if accomplishment_batches and session_key is None:
+            reasons.append("missing_accomplishment_workstream")
+        if accomplishment_batches and context not in {
+                f"workstream:{source.get('workstream_id')}", f"advanced-workstream:{source.get('workstream_id')}"}:
+            # Only the producer's source-bound lifecycle authority grants this
+            # context. Native reconstruction must not promote retained work.
+            reasons.append("ineligible_accomplishment_context")
         start, end = _time(source.get("start")), _time(source.get("end"))
         if start is None or end is None or end <= start:
             reasons.append("invalid_interval")
@@ -259,6 +368,7 @@ def package_review_batches(
             reasons.append("untagged_native_entry")
         items.append({"proposal": source, "review_id": review_id, "reasons": reasons,
                       "start": start, "end": end, "description": description, "context": context,
+                      **({"session_key": session_key} if accomplishment_batches else {}),
                       "has_review_overlap": isinstance(warnings, list) and any(
                           isinstance(w, Mapping) and w.get("type") in (
                               "review_proposal_overlap", "existing_clockify_overlap") for w in warnings)})
@@ -293,10 +403,16 @@ def package_review_batches(
         source = item["proposal"]
         key = (item["start"].astimezone(zone).date().isoformat(), source["client_project"],
                str(source.get("clockify_project_suffix") or ""), tuple(sorted(source["tag_names"])),
-               tuple(sorted(source.get("tag_suffixes", []))), source["billable"], item["context"])
+               tuple(sorted(source.get("tag_suffixes", []))), source["billable"],
+               item["session_key"] if accomplishment_batches else item["context"])
         grouped.setdefault(key, []).append(item)
     activities = []
     for key in sorted(grouped):
+        if accomplishment_batches and len(grouped[key]) < 2:
+            item = grouped[key][0]
+            retained.append({"review_id": item["review_id"], "proposal": item["proposal"],
+                             "preparation_reasons": ["single_accomplishment_source"]})
+            continue
         if natural_batches:
             activities.append(_activity(grouped[key],
                 allow_review_overlaps=allow_review_overlaps or allow_clockify_overlaps))
@@ -324,6 +440,17 @@ def package_review_batches(
         for activity in activities:
             if activity["review_id"] in descriptions:
                 activity["description"] = descriptions[activity["review_id"]]
+    if deterministic_merges is not None:
+        if not accomplishment_batches:
+            raise ValueError("deterministic merges require accomplishment policy")
+        descriptions = deterministic_merge_descriptions(activities, proposals, deterministic_merges,
+                                                        work_contexts=work_contexts)
+        if set(descriptions) & set(group_summaries or {}):
+            raise ValueError("deterministic merges cannot claim independent summaries")
+        for activity in activities:
+            if activity["review_id"] in descriptions:
+                activity["description"] = descriptions[activity["review_id"]]
+                activity["summary_fallback"] = "deterministic_merge"
     retained.sort(key=lambda row: (row["review_id"] or "", _canonical(row["proposal"])))
     return {"activities": activities, "retained": retained}
 
@@ -339,6 +466,9 @@ def verify_package(
     natural_batches: bool = False,
     all_durations: bool = False,
     group_summaries: Mapping[str, Any] | None = None,
+    accomplishment_batches: bool = False,
+    deterministic_merges: Sequence[Mapping[str, Any]] | None = None,
+    evidence_events: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Bind a prepared projection to original sources, not claimed totals.
 
@@ -376,7 +506,15 @@ def verify_package(
         natural_batches=natural_batches,
         all_durations=all_durations,
         group_summaries=group_summaries,
+        accomplishment_batches=accomplishment_batches,
+        deterministic_merges=deterministic_merges,
+        evidence_events=evidence_events,
     )
+    if accomplishment_batches and any(
+            activity["review_id"] not in (group_summaries or {})
+            and not deterministic_merge_eligible(activity, proposals, work_contexts)
+            for activity in expected["activities"]):
+        raise ValueError("deterministic accomplishment hides unfinished or qualified work")
     if package["activities"] != expected["activities"]:
         raise ValueError("review batch differs from original sources or preparation")
     # Unused editorial metadata can change preparation reasons, but it cannot
