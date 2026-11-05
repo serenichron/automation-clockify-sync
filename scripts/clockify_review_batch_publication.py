@@ -283,6 +283,14 @@ def _session_grouping_ledger(source_dir: Path) -> dict[str, Any] | None:
         return artifact_handle(path)
     except FileNotFoundError:
         return None
+    except adoptions.AdoptionError as error:
+        reasons = {
+            "source adoption artifact must be an absolute original file": "non_original_file",
+            "source adoption artifact changed while being read": "changed_while_reading",
+            "source adoption artifact bytes drifted": "bytes_drifted",
+        }
+        return {"path": str(path), "state": "unusable",
+                "reason": reasons.get(str(error), "invalid_artifact")}
     except OSError as error:
         # Unreadable bytes cannot be hashed. Pin the failure and file metadata
         # so replay cannot silently adopt newly readable or changed evidence.
@@ -305,7 +313,7 @@ def _session_grouping_events(handle: Mapping[str, Any] | None, source_dir: Path
         return {}
     if not isinstance(handle, Mapping) or handle.get("path") != str(expected):
         raise ValueError("v8 session ledger source differs")
-    if handle.get("state") == "unreadable":
+    if handle.get("state") in {"unreadable", "unusable"}:
         if handle != _session_grouping_ledger(source_dir):
             raise ValueError("v8 session ledger availability or identity differs")
         return {}
@@ -323,7 +331,17 @@ def _session_grouping_events(handle: Mapping[str, Any] | None, source_dir: Path
         identity, ref = event.get("evidence_id"), event.get("source_ref")
         if not isinstance(identity, str) or not identity.strip() or identity in events or not isinstance(ref, Mapping):
             return {}
-        events[identity] = {"evidence_id": identity, "source_ref": dict(ref)}
+        projected = {"evidence_id": identity, "source_ref": dict(ref),
+                     "source_type": event.get("source_type")}
+        if event.get("source_type") == "repository_events":
+            attributes = event.get("attributes")
+            attributes = attributes if isinstance(attributes, Mapping) else {}
+            root = attributes.get("repository_root")
+            if "repository_root" not in attributes:
+                source_id = ref.get("source_id")
+                root = source_id.split(":", 1)[0] if isinstance(source_id, str) else None
+            projected["attributes"] = {"repository_root": root}
+        events[identity] = projected
     return events
 
 
@@ -786,6 +804,12 @@ def prepare(*, source_dir: Path, output: Path, run_id: str, spreadsheet_id: str,
                 reviewed = batches.group_summary_descriptions([activity], summaries)
                 if activity["review_id"] not in reviewed:
                     raise clockify_review_group_summary.GroupSummaryError("automatic group summary is incomplete")
+                try:
+                    _structured_editorial_description(
+                        {"rendered_description": reviewed[activity["review_id"]]}, {}, accomplishment=True)
+                except ValueError:
+                    raise clockify_review_group_summary.GroupSummaryRejected(
+                        "review summary wording cannot be published") from None
             except clockify_review_group_summary.GroupSummaryUnavailable:
                 raise
             except clockify_review_group_summary.GroupSummaryRejected:

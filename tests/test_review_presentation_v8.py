@@ -214,6 +214,46 @@ class PresentationV8Tests(unittest.TestCase):
         merges = [sorted(m["child_review_ids"]) for m in document.get("deterministic_merges", [])]
         self.assertEqual([sorted(self.ids()[:2])], merges)
 
+    def test_summary_with_internal_status_words_is_treated_as_rejected(self):
+        def summary(groups):
+            return {g["review_id"]: {"child_review_ids": g["child_review_ids"],
+                    "description": "SC — Built the checkout page, undeployed"} for g in groups}
+        outcome = self.prepare_with(summary)
+        self.assertEqual("complete", outcome["status"])
+        rows = self.project()
+        self.assertEqual(1, len(rows))
+        self.assertEqual("SC — Verified immutable review receipt binding and related steps", rows[0][8])
+
+    def test_commits_in_one_repository_group_together(self):
+        self.set_workstreams(["ws-a", "ws-b"])
+        events = []
+        for proposal, activity in zip(self.sources, self.analysis["activities"]):
+            event = evidence_ledger.evidence_event("repository_events",
+                {"source_type": "repository_events", "machine": "m",
+                 "source_id": "/work/repo:" + proposal["activity_id"]},
+                observed_at=proposal["start"], raw_source_span={"start": proposal["start"], "end": proposal["end"]},
+                attributes={"repository_root": "/work/repo", "subject": "change"})
+            events.append(event)
+            proposal["provenance"]["evidence_ids"] = [event.evidence_id]
+            activity["evidence_ids"] = [event.evidence_id]
+        ledger = evidence_ledger.EvidenceLedger(tuple(events), {"repositories/m": {"status": "complete"}})
+        (self.run / "evidence").mkdir(exist_ok=True)
+        self.write(self.run / "evidence" / "evidence-ledger.json", {"schema_version": ledger.manifest.schema_version,
+            "manifest": ledger.manifest.document(), "events": [e.document() for e in ledger.events]})
+        self.persist()
+        self.prepare_with(self.summarising([], fail_for=self.ids()))
+        self.assertEqual(1, len(self.project()))
+
+    def test_symlinked_ledger_falls_back_instead_of_blocking(self):
+        self.set_workstreams(["ws-a", "ws-a"])
+        real = self.root / "real-evidence"
+        real.mkdir()
+        (real / "evidence-ledger.json").write_text("{}")
+        (self.run / "evidence").symlink_to(real, target_is_directory=True)
+        outcome = self.prepare_with(self.summarising([], fail_for=self.ids()))
+        self.assertEqual("complete", outcome["status"])
+        self.assertEqual(1, len(self.project()))
+
     def test_children_without_workstream_stay_standalone(self):
         self.set_workstreams([None, None])
         for proposal in self.sources:

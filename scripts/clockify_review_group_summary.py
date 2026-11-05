@@ -58,8 +58,12 @@ def _structural_wording_problem(description: Any, group: Mapping[str, Any]) -> s
     return None
 
 
-def _wording_problem(description: str, group: Mapping[str, Any]) -> str | None:
+def _wording_problem(description: str, group: Mapping[str, Any], *, contract_version: int = 3) -> str | None:
     """Check display hygiene only; child outcome coverage remains semantic."""
+    if contract_version == 4:
+        from scripts.clockify_review_batch_publication import _INTERNAL_JOURNAL_RE
+        if _INTERNAL_JOURNAL_RE.search(description):
+            return "Describe the client-facing accomplishment without internal journal or execution-status wording."
     try:
         caveman_renderer.validate_client_description(description if group["prefix"] else "Work — " + description)
     except caveman_renderer.CavemanValidationError:
@@ -209,7 +213,8 @@ def _body(groups: list[dict[str, Any]], endpoint: semantic.AnalyzerEndpoint, sta
 
 
 def _validate(response: Any, groups: list[dict[str, Any]], stage: str, *,
-              allow_fresh_wording_repair: bool = False, cached: bool = False) -> dict[str, dict[str, Any]]:
+              allow_fresh_wording_repair: bool = False, cached: bool = False,
+              contract_version: int = 3) -> dict[str, dict[str, Any]]:
     if (not isinstance(response, dict) or set(response) != {"groups"}
             or not isinstance(response["groups"], list) or len(response["groups"]) != len(groups)):
         raise GroupSummaryError("review summary response scope differs")
@@ -240,7 +245,8 @@ def _validate(response: Any, groups: list[dict[str, Any]], stage: str, *,
                     cached_wording_rejected = True
                 else:
                     raise GroupSummaryError("review summary candidate wording is invalid")
-            if cached and structural_problem is None and _wording_problem(row["description"], group) is not None:
+            if cached and structural_problem is None and _wording_problem(
+                    row["description"], group, contract_version=contract_version) is not None:
                 cached_wording_rejected = True
         result[row["group_ref"]] = copy.deepcopy(row)
     if cached_wording_rejected:
@@ -275,7 +281,7 @@ def _request(groups: list[dict[str, Any]], *, stage: str, endpoint: semantic.Ana
     # remain strict; no invalid wording is accepted into the response cache.
     try:
         result = _validate(response, groups, stage, allow_fresh_wording_repair=miss and stage == "generate",
-                           cached=not miss and contract_version == 4)
+                           cached=not miss and contract_version == 4, contract_version=contract_version)
     except GroupSummaryRejected:
         raise
     except GroupSummaryError:
@@ -284,7 +290,8 @@ def _request(groups: list[dict[str, Any]], *, stage: str, endpoint: semantic.Ana
         raise
     structurally_clean = stage == "review" or all(
         _structural_wording_problem(result[group["group_ref"]]["description"], group) is None
-        and _wording_problem(result[group["group_ref"]]["description"], group) is None for group in groups)
+        and _wording_problem(result[group["group_ref"]]["description"], group,
+                             contract_version=contract_version) is None for group in groups)
     if miss and structurally_clean and cache is not None:
         cache.store_accepted(endpoint, body, response=response)
     return result
@@ -349,7 +356,7 @@ def summarize_groups(activities: Sequence[Mapping[str, Any]], *, cache: semantic
                     # remain available, with bounded targeted feedback.
                     rejected.append({**group, "feedback": structural_problem})
                     continue
-                problem = _wording_problem(candidate["summary"], group)
+                problem = _wording_problem(candidate["summary"], group, contract_version=contract_version)
                 if problem is not None:
                     rejected.append({**candidate, "feedback": problem})
                 else:
@@ -365,7 +372,8 @@ def summarize_groups(activities: Sequence[Mapping[str, Any]], *, cache: semantic
                 # Review afresh, without generation feedback or the old candidate.
                 repaired_groups = [{**group, "summary": repaired[group["group_ref"]]["description"]}
                                    for group in chunk if group["group_ref"] in repaired]
-                if any(_wording_problem(group["summary"], group) is not None for group in repaired_groups):
+                if any(_wording_problem(group["summary"], group, contract_version=contract_version) is not None
+                       for group in repaired_groups):
                     raise GroupSummaryRejected("review summary failed client-facing wording after one targeted repair")
                 second = _request(repaired_groups, stage="review", endpoint=endpoint, cache=cache, transport=transport,
                                   contract_version=contract_version)
