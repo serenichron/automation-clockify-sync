@@ -1710,7 +1710,9 @@ def _plan_monthly_unresolved(
                 or type(grid.get("columnCount")) is not int or grid["columnCount"] < 12):
             raise PublicationError("monthly unresolved template tab is missing or invalid")
         template_rows = gateway.values(spreadsheet_id, f"{_a1_title(template_title)}!A1:L{grid['rowCount']}")
-        if (not template_rows or template_rows[0] != monthly_unresolved.HEADER
+        # The new month continues the previous month's layout (current or legacy header).
+        if (not template_rows
+                or template_rows[0] not in (monthly_unresolved.HEADER, monthly_unresolved.LEGACY_HEADER)
                 or not any(any(value != "" for value in row) for row in template_rows[1:])):
             raise PublicationError("monthly unresolved template tab is missing or invalid")
     if len(properties) != 1 or properties[0].get("hidden") is True:
@@ -1720,7 +1722,7 @@ def _plan_monthly_unresolved(
     if grid.get("columnCount", 0) < 12:
         raise PublicationError("monthly unresolved tab grid is invalid")
     if created:
-        existing = [list(monthly_unresolved.HEADER)]
+        existing = [list(template_rows[0])]
     else:
         range_name = f"{_a1_title(sheet_title)}!A1:L{grid['rowCount']}"
         existing = gateway.values(spreadsheet_id, range_name)

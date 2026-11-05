@@ -78,6 +78,19 @@ class MonthlyRolloverTests(unittest.TestCase):
         self.assertEqual([list(monthly.HEADER), *rows], gateway.tabs[NOVEMBER]["rows"])
         self.assertEqual(october_before, gateway.tabs[OCTOBER])
 
+    def test_new_month_keeps_the_previous_month_legacy_layout(self):
+        gateway = TabsGateway({OCTOBER: {"id": 11, "rows": [list(monthly.LEGACY_HEADER), row("uev-oct-1")]}})
+        linked = row("uev-nov-1")
+        linked[7] = "https://fathom.video/share/example"
+
+        result = self.publish(gateway, [linked])
+
+        self.assertEqual(1, result["appended"])
+        written = gateway.tabs[NOVEMBER]["rows"]
+        self.assertEqual(list(monthly.LEGACY_HEADER), written[0])
+        self.assertEqual("", written[1][7])
+        self.assertTrue(written[1][9].endswith("; Meeting linkage: https://fathom.video/share/example"))
+
     def test_header_only_tab_from_an_interrupted_bootstrap_is_filled_from_row_two(self):
         gateway = TabsGateway({OCTOBER: self.october(),
                                NOVEMBER: {"id": 12, "rows": [list(monthly.HEADER)]}})
