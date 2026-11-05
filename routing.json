@@ -20,11 +20,6 @@
       "route_pattern": "atelieruldevis"
     },
     {
-      "id": "family-bank",
-      "reason": "Personal/non-billable",
-      "route_pattern": "family-bank"
-    },
-    {
       "id": "hartacoruptiei",
       "reason": "Separate project, not Clockify-billable",
       "route_pattern": "hartacoruptiei"
@@ -488,7 +483,7 @@
     {
       "pattern": "family-bank",
       "action": "skip",
-      "reason": "Personal/non-billable",
+      "reason": "Ended client project (Aspire LLC); no current work",
       "prefix": "SC"
     },
     {

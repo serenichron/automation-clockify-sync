@@ -99,9 +99,11 @@ class PersonalSessionRulesTests(unittest.TestCase):
         rules = {rule["id"]: rule for rule in pipeline.personal_session_rules(routing)}
         self.assertEqual(SCRATCH, rules["tramvai-41"]["cwd_prefix"])
         self.assertEqual("macbook", rules["tramvai-41"]["machine"])
-        for pattern in ("atelieruldevis", "family-bank", "hartacoruptiei"):
+        for pattern in ("atelieruldevis", "hartacoruptiei"):
             self.assertIn(pattern, {rule.get("route_pattern") for rule in rules.values()})
         self.assertNotIn("-private-tmp", {rule.get("route_pattern") for rule in rules.values()})
+        # family-bank is an ended client project (Aspire LLC), not personal work.
+        self.assertNotIn("family-bank", {rule.get("route_pattern") for rule in rules.values()})
 
 
 if __name__ == "__main__":
