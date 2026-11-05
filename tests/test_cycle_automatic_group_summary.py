@@ -69,7 +69,7 @@ class CycleAutomaticGroupSummaryTests(unittest.TestCase):
             self.assertFalse(self.path.exists())
 
     def test_cycle_fresh_delivery_uses_summary_for_publication_and_receipt(self):
-        with mock.patch.object(cycle, "_summarize_review_groups", side_effect=lambda groups, _: self.summaries(groups),
+        with mock.patch.object(cycle, "_summarize_review_groups", side_effect=lambda groups, _, **_kwargs: self.summaries(groups),
                                create=True):
             config, outcome = self.cycle()
         self.assertEqual("complete", outcome["status"])

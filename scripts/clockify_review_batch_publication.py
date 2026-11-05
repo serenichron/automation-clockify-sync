@@ -27,6 +27,7 @@ CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY = "approved-daily-project-presentation/v4"
 STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY = "approved-daily-project-presentation/v5"
 NATURAL_BATCH_CONSOLIDATION_POLICY = "approved-daily-project-presentation/v6"
 ALL_DURATION_CONSOLIDATION_POLICY = "approved-daily-project-presentation/v7"
+ACCOMPLISHMENT_CONSOLIDATION_POLICY = "approved-daily-project-presentation/v8"
 LIFECYCLE_ROUTE_POLICY = "frozen-lifecycle-editorial-route/v1"
 FIELDS = {"schema_version", "run_id", "spreadsheet_id", "sheet_title", "source_proposals",
           "editorial_descriptions", "work_contexts", "protected_ids", "timezone", "package"}
@@ -218,7 +219,8 @@ _MEANINGFUL_OUTCOME_RE = re.compile(
 )
 
 
-def _structured_editorial_description(activity: Mapping[str, Any], proposal: Mapping[str, Any]) -> Any:
+def _structured_editorial_description(activity: Mapping[str, Any], proposal: Mapping[str, Any], *,
+                                      accomplishment: bool = False) -> Any:
     """Omit whole clearly technical fields from an exact reviewed field render.
 
     This is a narrow presentation transform, not a semantic certification.
@@ -227,6 +229,23 @@ def _structured_editorial_description(activity: Mapping[str, Any], proposal: Map
     """
     from scripts import clockify_portfolio_repair as repair
     description = activity.get("rendered_description")
+    if accomplishment:
+        from scripts.caveman_renderer import accomplishment_description
+        parts = [activity.get(field) for field in ("action", "object", "outcome")]
+        if isinstance(description, str) and _INTERNAL_JOURNAL_RE.search(description):
+            if not all(isinstance(part, str) and part.strip() for part in parts):
+                # This exact terminal journal marker has no client outcome.
+                # Other internal prose still needs the structured-field proof.
+                clean = re.sub(r"\s+lint\s+clean$", "", description, flags=re.I)
+                if clean != description and not _INTERNAL_JOURNAL_RE.search(clean) and not repair.repair_reasons(clean):
+                    return clean
+            return _structured_editorial_description(activity, proposal)
+        if all(isinstance(part, str) and part.strip() for part in parts):
+            prefix, separator, _ = description.partition(" — ") if isinstance(description, str) else ("", "", "")
+            if not separator or f"{prefix} — {' '.join(parts)}" != description:
+                raise ValueError("structured_editorial_source_mismatch")
+            return accomplishment_description(prefix, *parts)
+        return description
     if not isinstance(description, str) or not _INTERNAL_JOURNAL_RE.search(description):
         return description
     parts = [activity.get(field) for field in ("action", "object", "outcome")]
@@ -255,6 +274,64 @@ def frozen_lifecycle_route_authority(source_dir: Path) -> dict[str, Any]:
     """Pin optional fresh lifecycle-route evidence without changing old bindings."""
     return {"policy": LIFECYCLE_ROUTE_POLICY,
             "ledger": artifact_handle(Path(source_dir) / "evidence/evidence-ledger.json")}
+
+
+def _session_grouping_ledger(source_dir: Path) -> dict[str, Any] | None:
+    """Bind optional presentation bytes, or their explicit unavailability."""
+    path = source_dir / "evidence/evidence-ledger.json"
+    try:
+        return artifact_handle(path)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        # Unreadable bytes cannot be hashed. Pin the failure and file metadata
+        # so replay cannot silently adopt newly readable or changed evidence.
+        try:
+            info = path.stat()
+            state = {name: getattr(info, name) for name in (
+                "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")}
+        except OSError as stat_error:
+            state = {"stat_errno": stat_error.errno}
+        return {"path": str(path), "state": "unreadable", "errno": error.errno, "stat": state}
+
+
+def _session_grouping_events(handle: Mapping[str, Any] | None, source_dir: Path
+                             ) -> dict[str, dict[str, Any]]:
+    """Read optional v8 grouping hints; only the bound bytes carry integrity."""
+    expected = source_dir / "evidence/evidence-ledger.json"
+    if handle is None:
+        if _session_grouping_ledger(source_dir) is not None:
+            raise ValueError("v8 session ledger was absent from the binding")
+        return {}
+    if not isinstance(handle, Mapping) or handle.get("path") != str(expected):
+        raise ValueError("v8 session ledger source differs")
+    if handle.get("state") == "unreadable":
+        if handle != _session_grouping_ledger(source_dir):
+            raise ValueError("v8 session ledger availability or identity differs")
+        return {}
+    content = adoptions._capture(handle, {})
+    try:
+        document = json.loads(content)
+    except (ValueError, RecursionError):
+        return {}
+    if not isinstance(document, Mapping) or not isinstance(document.get("events"), list):
+        return {}
+    events = {}
+    for event in document["events"]:
+        if not isinstance(event, Mapping):
+            return {}
+        identity, ref = event.get("evidence_id"), event.get("source_ref")
+        if not isinstance(identity, str) or not identity.strip() or identity in events or not isinstance(ref, Mapping):
+            return {}
+        events[identity] = {"evidence_id": identity, "source_ref": dict(ref)}
+    return events
+
+
+def _document_session_events(document: Mapping[str, Any]) -> dict[str, dict[str, Any]] | None:
+    if document.get("consolidation_policy") != ACCOMPLISHMENT_CONSOLIDATION_POLICY:
+        return None
+    return _session_grouping_events(document["authority"]["session_ledger"],
+                                    Path(document["source_proposals"]["path"]).parent)
 
 
 def _lifecycle_route_events(authority: Mapping[str, Any], source_dir: Path) -> dict[str, dict[str, Any]]:
@@ -304,6 +381,7 @@ def _materialized_lifecycle_route(proposal: Mapping[str, Any], prefix: str,
 def _derive_authority(proposals: Sequence[Mapping[str, Any]], authority: Mapping[str, Any],
                       source_dir: Path, timezone: str, *, allow_wording_consolidation: bool = False,
                       clean_structured_outcomes: bool = False,
+                      accomplishment: bool = False,
                       allow_materialized_corrections: bool = False,
                       lifecycle_route_authority: Mapping[str, Any] | None = None,
                       allow_recorded_attendance: bool = False,
@@ -314,12 +392,14 @@ def _derive_authority(proposals: Sequence[Mapping[str, Any]], authority: Mapping
     not claim that distinct accomplishments are semantically identical.
     """
     from scripts import clockify_portfolio_repair as repair, review_corrections, work_accounting_pipeline as pipeline
-    if not isinstance(authority, Mapping) or set(authority) != set(AUTHORITY_FILES):
+    if not isinstance(authority, Mapping) or set(authority) != (set(AUTHORITY_FILES) | (
+            {"session_ledger"} if accomplishment else set())):
         raise ValueError("automatic preparation authority inventory differs")
     for name, filename in AUTHORITY_FILES.items():
         if not isinstance(authority[name], Mapping) or authority[name].get("path") != str(source_dir / filename):
             raise ValueError("automatic preparation authority source differs")
-    captures = {name: adoptions._capture(handle, {}) for name, handle in authority.items()}
+    captures = {name: adoptions._capture(authority[name], {}) for name in AUTHORITY_FILES}
+    session_events = _session_grouping_events(authority["session_ledger"], source_dir) if accomplishment else None
     analysis = json.loads(captures["semantic_analysis"])
     routing = json.loads(captures["routing"])
     if not isinstance(analysis, Mapping) or not isinstance(analysis.get("activities"), list):
@@ -422,11 +502,19 @@ def _derive_authority(proposals: Sequence[Mapping[str, Any]], authority: Mapping
                         provenance.get("semantic_reviewer_model"), provenance.get("semantic_reviewer_revision")) != (model, revision):
                     reasons.append("unapproved_or_mismatched_editorial_reviewer")
                 description = activity.get("rendered_description")
-                if clean_structured_outcomes and not reasons:
+                if clean_structured_outcomes and not accomplishment and not reasons:
                     try:
-                        description = _structured_editorial_description(activity, proposal)
+                        description = _structured_editorial_description(activity, proposal, accomplishment=accomplishment)
                     except ValueError as error:
                         reasons.append(str(error))
+        if accomplishment and not reasons:
+            reviewed = activities.get(target, [])
+            editorial = (reviewed[0] if len(reviewed) == 1 and reviewed[0].get("rendered_description") == description
+                         else {"rendered_description": description})
+            try:
+                description = _structured_editorial_description(editorial, proposal, accomplishment=True)
+            except ValueError as error:
+                reasons.append(str(error))
         unsafe = repair.repair_reasons(description)
         if unsafe:
             reasons.append("unsafe_or_missing_reviewed_wording")
@@ -465,6 +553,19 @@ def _derive_authority(proposals: Sequence[Mapping[str, Any]], authority: Mapping
             continue
         descriptions[identity] = description
         contexts[identity] = CONSOLIDATION_POLICY
+        if accomplishment:
+            reviewed = activities.get(target, [])
+            workstream = proposal.get("workstream_id")
+            if (len(reviewed) != 1 or reviewed[0].get("lifecycle") not in {"completed", "investigated", "advanced"}
+                    or batches.accomplishment_session_key(proposal, session_events) is None):
+                protected.add(identity)
+                standalone.add(identity)
+            else:
+                # Freeze completion separately from progress so native replay
+                # can apply the same deterministic-merge boundary.
+                # A finished diagnosis is an accomplishment like a completed change.
+                contexts[identity] = (f"workstream:{workstream}" if reviewed[0].get("lifecycle") in {"completed", "investigated"}
+                                      else f"advanced-workstream:{workstream}")
         if group_corrected:
             wording_only.add(identity)
         if group_materialized:
@@ -487,6 +588,9 @@ def _publication_members(document: Mapping[str, Any]) -> set[str]:
     identities = {child for activity in document["package"]["activities"] for child in activity["child_review_ids"]}
     for retained in document["package"]["retained"]:
         allowed = STANDALONE_REASONS
+        if document.get("consolidation_policy") == ACCOMPLISHMENT_CONSOLIDATION_POLICY:
+            allowed = allowed | {"single_accomplishment_source", "missing_accomplishment_workstream",
+                                 "ineligible_accomplishment_context"}
         if document["schema_version"] == AUTO_SCHEMA and retained["review_id"] in document["standalone_review_ids"]:
             allowed = allowed | {"protected_review_id", "human_corrected"}
         if retained["review_id"] in document.get("recorded_attendance_authority", {}).get("review_ids", []):
@@ -506,18 +610,31 @@ def _auto_fields(proposals: Sequence[Mapping[str, Any]], authority: Mapping[str,
                  current_presentation: Mapping[str, Any] | None = None,
                  allow_recorded_attendance: bool = False,
                  recorded_attendance_authority: Mapping[str, Any] | None = None,
-                 summary_fallback_ids: Sequence[str] = ()) -> dict[str, Any]:
+                 summary_fallback_ids: Sequence[str] = (),
+                 deterministic_merges: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
+    accomplishment = consolidation_policy == ACCOMPLISHMENT_CONSOLIDATION_POLICY
+    if accomplishment and summary_fallback_ids:
+        raise ValueError("v8 cannot use standalone summary fallback")
+    if not accomplishment and deterministic_merges is not None:
+        raise ValueError("deterministic merges require v8")
+    if accomplishment and group_summaries is not None:
+        group_summaries = copy.deepcopy(dict(group_summaries))
+        for summary in group_summaries.values():
+            summary["description"] = _structured_editorial_description(
+                {"rendered_description": summary["description"]}, {}, accomplishment=True)
     fields = _derive_authority(proposals, authority, source_dir, timezone,
         allow_wording_consolidation=consolidation_policy in {WORDING_CONSOLIDATION_POLICY, OVERLAP_CONSOLIDATION_POLICY,
                                                             CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
                                                             STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY,
-                                                            NATURAL_BATCH_CONSOLIDATION_POLICY, ALL_DURATION_CONSOLIDATION_POLICY},
+                                                            NATURAL_BATCH_CONSOLIDATION_POLICY, ALL_DURATION_CONSOLIDATION_POLICY, ACCOMPLISHMENT_CONSOLIDATION_POLICY},
+        accomplishment=accomplishment,
         clean_structured_outcomes=consolidation_policy in {STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY,
-                                                         NATURAL_BATCH_CONSOLIDATION_POLICY, ALL_DURATION_CONSOLIDATION_POLICY},
+                                                         NATURAL_BATCH_CONSOLIDATION_POLICY, ALL_DURATION_CONSOLIDATION_POLICY, ACCOMPLISHMENT_CONSOLIDATION_POLICY},
         allow_materialized_corrections=allow_materialized_corrections,
         lifecycle_route_authority=lifecycle_route_authority,
         allow_recorded_attendance=allow_recorded_attendance,
         recorded_attendance_authority=recorded_attendance_authority)
+    session_events = _session_grouping_events(authority["session_ledger"], source_dir) if accomplishment else None
     protected_existing = fields.pop("protected_existing_ids")
     if summary_fallback_ids:
         # A group whose reviewed summary is unavailable is not consolidated:
@@ -533,25 +650,44 @@ def _auto_fields(proposals: Sequence[Mapping[str, Any]], authority: Mapping[str,
         _, _, current = _current_presentation_rows(current_presentation, proposals, timezone)
         if set(current) - (set(fields["editorial_descriptions"]) - set(fields["protected_ids"])):
             raise ValueError("current presentation cannot grant editorial eligibility")
+        if accomplishment and any(_INTERNAL_JOURNAL_RE.search(row[8]) for _, row in current.values()):
+            raise ValueError("current presentation contains internal journal wording")
         fields["editorial_descriptions"].update({identity: row[8] for identity, (_, row) in current.items()})
         fields["current_presentation"] = copy.deepcopy(current_presentation)
-    package = batches.package_review_batches(proposals, editorial_descriptions=fields["editorial_descriptions"],
-        work_contexts=fields["work_contexts"], protected_ids=fields["protected_ids"], timezone=timezone,
-        wording_only_ids=fields.get("wording_only_ids", ()),
-        materialized_correction_ids=fields.get("materialized_correction_ids", ()),
-        allow_review_overlaps=consolidation_policy in {OVERLAP_CONSOLIDATION_POLICY, CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
-                                                      STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY, NATURAL_BATCH_CONSOLIDATION_POLICY,
-                                                      ALL_DURATION_CONSOLIDATION_POLICY},
-        allow_clockify_overlaps=consolidation_policy in {CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
-                                                       STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY, NATURAL_BATCH_CONSOLIDATION_POLICY,
-                                                       ALL_DURATION_CONSOLIDATION_POLICY},
-        natural_batches=consolidation_policy in {NATURAL_BATCH_CONSOLIDATION_POLICY, ALL_DURATION_CONSOLIDATION_POLICY},
-        all_durations=consolidation_policy == ALL_DURATION_CONSOLIDATION_POLICY,
-        group_summaries=group_summaries)
+
+    def package_fields():
+        return batches.package_review_batches(proposals, editorial_descriptions=fields["editorial_descriptions"],
+            work_contexts=fields["work_contexts"], protected_ids=fields["protected_ids"], timezone=timezone,
+            wording_only_ids=fields.get("wording_only_ids", ()),
+            materialized_correction_ids=fields.get("materialized_correction_ids", ()),
+            allow_review_overlaps=consolidation_policy in {OVERLAP_CONSOLIDATION_POLICY, CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
+                                                          STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY, NATURAL_BATCH_CONSOLIDATION_POLICY,
+                                                          ALL_DURATION_CONSOLIDATION_POLICY, ACCOMPLISHMENT_CONSOLIDATION_POLICY},
+            allow_clockify_overlaps=consolidation_policy in {CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
+                                                           STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY, NATURAL_BATCH_CONSOLIDATION_POLICY,
+                                                           ALL_DURATION_CONSOLIDATION_POLICY, ACCOMPLISHMENT_CONSOLIDATION_POLICY},
+            natural_batches=consolidation_policy in {NATURAL_BATCH_CONSOLIDATION_POLICY, ALL_DURATION_CONSOLIDATION_POLICY, ACCOMPLISHMENT_CONSOLIDATION_POLICY},
+            all_durations=consolidation_policy == ALL_DURATION_CONSOLIDATION_POLICY,
+            group_summaries=group_summaries, accomplishment_batches=accomplishment,
+            deterministic_merges=deterministic_merges, evidence_events=session_events)
+
+    package = package_fields()
+    if accomplishment and (group_summaries is not None or deterministic_merges is not None):
+        merged = {merge["review_id"] for merge in deterministic_merges or []}
+        standalone = {child for activity in package["activities"]
+                      if activity["review_id"] not in (group_summaries or {}) and activity["review_id"] not in merged
+                      and not batches.deterministic_merge_eligible(activity, proposals, fields["work_contexts"])
+                      for child in activity["child_review_ids"]}
+        if standalone:
+            fields["protected_ids"] = sorted(set(fields["protected_ids"]) | standalone)
+            fields["standalone_review_ids"] = sorted(set(fields["standalone_review_ids"]) | standalone)
+            package = package_fields()
     if group_summaries is not None:
         fields["group_summaries"] = copy.deepcopy(dict(group_summaries))
+    if accomplishment:
+        fields["deterministic_merges"] = copy.deepcopy(list(deterministic_merges or []))
     fields["package"] = package
-    members = _publication_members({**fields, "schema_version": AUTO_SCHEMA})
+    members = _publication_members({**fields, "schema_version": AUTO_SCHEMA, "consolidation_policy": consolidation_policy})
     withheld = [item for item in proposals if publisher.stable_review_id(item) not in members | protected_existing]
     source_seconds = sum(item["duration_seconds"] for item in proposals)
     withheld_seconds = sum(item["duration_seconds"] for item in withheld)
@@ -587,8 +723,9 @@ def prepare(*, source_dir: Path, output: Path, run_id: str, spreadsheet_id: str,
             summary_provider: Callable[[Sequence[Mapping[str, Any]]], Mapping[str, Any]] | None = None,
             native_credit_directory: Path | None = None,
             current_presentation: Mapping[str, Any] | None = None,
+            consolidation_policy: str | None = None,
             ) -> dict[str, Any]:
-    """Create an immutable v2 binding; opt in to v7 for all source durations.
+    """Create an immutable v2 binding with an explicitly selected policy.
 
     Existing output always replays its recorded policy and summaries and is
     never edited. Fresh automatic deliveries supply a summary provider; every
@@ -596,6 +733,7 @@ def prepare(*, source_dir: Path, output: Path, run_id: str, spreadsheet_id: str,
     written. Explicit maps and historical callers retain their existing API.
     The additive materialized-correction field records the separate source-bound
     opt-in; its absence preserves every historical policy's replay semantics.
+    None retains v6 (v7 with all_durations); fresh cycle deliveries select v8.
     """
     from scripts import clockify_review_run
     source_dir = source_dir.resolve()
@@ -608,8 +746,15 @@ def prepare(*, source_dir: Path, output: Path, run_id: str, spreadsheet_id: str,
     lifecycle_authority = existing.get("lifecycle_route_authority") if existing is not None else None
     if existing is None and allow_materialized and json.loads(adoptions._capture(authority["routing"], {})).get("client_lifecycle_routes"):
         lifecycle_authority = frozen_lifecycle_route_authority(source_dir)
-    policy = existing["consolidation_policy"] if existing is not None else (
-        ALL_DURATION_CONSOLIDATION_POLICY if all_durations else NATURAL_BATCH_CONSOLIDATION_POLICY)
+    policy = existing["consolidation_policy"] if existing is not None else (consolidation_policy if consolidation_policy is not None else (
+        ALL_DURATION_CONSOLIDATION_POLICY if all_durations else NATURAL_BATCH_CONSOLIDATION_POLICY))
+    if policy not in {CONSOLIDATION_POLICY, WORDING_CONSOLIDATION_POLICY, OVERLAP_CONSOLIDATION_POLICY,
+            CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY, STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY,
+            NATURAL_BATCH_CONSOLIDATION_POLICY, ALL_DURATION_CONSOLIDATION_POLICY, ACCOMPLISHMENT_CONSOLIDATION_POLICY}:
+        raise ValueError("automatic preparation consolidation policy differs")
+    if policy == ACCOMPLISHMENT_CONSOLIDATION_POLICY:
+        authority["session_ledger"] = (existing["authority"]["session_ledger"] if existing is not None
+                                       else _session_grouping_ledger(source_dir))
     if existing is not None and group_summaries is None:
         group_summaries = existing.get("group_summaries")
     if existing is not None:
@@ -625,9 +770,34 @@ def prepare(*, source_dir: Path, output: Path, run_id: str, spreadsheet_id: str,
                           current_presentation=current_presentation,
                           allow_recorded_attendance=existing is None or "recorded_attendance_authority" in existing,
                           recorded_attendance_authority=existing.get("recorded_attendance_authority") if existing else None,
+                          deterministic_merges=(existing.get("deterministic_merges") if existing else
+                              [] if policy == ACCOMPLISHMENT_CONSOLIDATION_POLICY and summary_provider is None else None),
                           summary_fallback_ids=existing.get("summary_fallback_ids", ()) if existing else ())
     summary_fallback = None
-    if existing is None and group_summaries is None and summary_provider is not None:
+    if (existing is None and policy == ACCOMPLISHMENT_CONSOLIDATION_POLICY
+            and group_summaries is None and summary_provider is not None):
+        from scripts import clockify_review_group_summary
+        group_summaries, merges = {}, []
+        for activity in fields["package"]["activities"]:
+            if not clockify_review_group_summary.needs_summary([activity]):
+                continue
+            try:
+                summaries = summary_provider([copy.deepcopy(activity)])
+                reviewed = batches.group_summary_descriptions([activity], summaries)
+                if activity["review_id"] not in reviewed:
+                    raise clockify_review_group_summary.GroupSummaryError("automatic group summary is incomplete")
+            except clockify_review_group_summary.GroupSummaryUnavailable:
+                raise
+            except clockify_review_group_summary.GroupSummaryRejected:
+                if batches.deterministic_merge_eligible(activity, proposals, fields["work_contexts"]):
+                    merges.append(batches.deterministic_merge(activity, proposals, reason="summary_rejected"))
+            else:
+                group_summaries.update(summaries)
+        fields = _auto_fields(proposals, authority, source_dir, timezone, consolidation_policy=policy,
+            group_summaries=group_summaries, deterministic_merges=merges,
+            allow_materialized_corrections=allow_materialized, lifecycle_route_authority=lifecycle_authority,
+            current_presentation=current_presentation, allow_recorded_attendance=True)
+    elif existing is None and group_summaries is None and summary_provider is not None:
         from scripts import clockify_review_group_summary
         activities = fields["package"]["activities"]
         required = {item["review_id"] for item in activities
@@ -667,7 +837,7 @@ def prepare(*, source_dir: Path, output: Path, run_id: str, spreadsheet_id: str,
                                       lifecycle_route_authority=lifecycle_authority,
                                       current_presentation=current_presentation,
                                       allow_recorded_attendance=True)
-    if allow_materialized:
+    if allow_materialized or policy == ACCOMPLISHMENT_CONSOLIDATION_POLICY:
         _require_group_summaries(fields)
     document = {"schema_version": AUTO_SCHEMA, "run_id": run_id, "spreadsheet_id": spreadsheet_id,
         "sheet_title": sheet_title, "source_proposals": proposals_handle, "timezone": timezone,
@@ -697,7 +867,13 @@ def _require_group_summaries(document: Mapping[str, Any]) -> None:
     activities = document["package"]["activities"]
     required = {item["review_id"] for item in activities
                 if len({child["description"] for child in item["prepared_descriptions"]}) > 1}
-    if not required.issubset(batches.group_summary_descriptions(activities, document.get("group_summaries") or {})):
+    covered = set(batches.group_summary_descriptions(activities, document.get("group_summaries") or {}))
+    if "deterministic_merges" in document:
+        merges = document["deterministic_merges"]
+        if not isinstance(merges, list) or any(not isinstance(item, Mapping) for item in merges):
+            raise ValueError("deterministic merge authority differs")
+        covered.update(item.get("review_id") for item in merges)
+    if not required.issubset(covered):
         raise ValueError("automatic group summaries are incomplete")
 
 
@@ -706,12 +882,20 @@ def load(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
     document = json.loads(adoptions._capture(handle, {}))
     if (not isinstance(document, dict) or document.get("schema_version") not in {SCHEMA, AUTO_SCHEMA}
             or set(document) - {"group_summaries", "native_credit_source", "materialized_correction_ids", "current_presentation",
-                                "recorded_attendance_authority", "lifecycle_route_authority", "summary_fallback_ids"} != (FIELDS if document["schema_version"] == SCHEMA else
+                                "recorded_attendance_authority", "lifecycle_route_authority", "summary_fallback_ids", "deterministic_merges"} != (FIELDS if document["schema_version"] == SCHEMA else
                 WORDING_AUTO_FIELDS if document.get("consolidation_policy") in {
                     WORDING_CONSOLIDATION_POLICY, OVERLAP_CONSOLIDATION_POLICY,
                     CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY, STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY,
-                    NATURAL_BATCH_CONSOLIDATION_POLICY, ALL_DURATION_CONSOLIDATION_POLICY} else AUTO_FIELDS)):
+                    NATURAL_BATCH_CONSOLIDATION_POLICY, ALL_DURATION_CONSOLIDATION_POLICY, ACCOMPLISHMENT_CONSOLIDATION_POLICY} else AUTO_FIELDS)):
         raise ValueError("prepared review publication fields differ")
+    accomplishment = document.get("consolidation_policy") == ACCOMPLISHMENT_CONSOLIDATION_POLICY
+    if accomplishment:
+        if (document["schema_version"] != AUTO_SCHEMA or "deterministic_merges" not in document
+                or "summary_fallback_ids" in document):
+            raise ValueError("v8 deterministic merge authority is missing or incompatible")
+        _require_group_summaries(document)
+    elif "deterministic_merges" in document:
+        raise ValueError("deterministic merges require v8")
     if "materialized_correction_ids" in document:
         if document["schema_version"] != AUTO_SCHEMA:
             raise ValueError("materialized correction authority requires automatic preparation")
@@ -759,7 +943,7 @@ def load(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
         if document["consolidation_policy"] not in {CONSOLIDATION_POLICY, WORDING_CONSOLIDATION_POLICY,
                                                    OVERLAP_CONSOLIDATION_POLICY, CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
                                                    STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY, NATURAL_BATCH_CONSOLIDATION_POLICY,
-                                                   ALL_DURATION_CONSOLIDATION_POLICY}:
+                                                   ALL_DURATION_CONSOLIDATION_POLICY, ACCOMPLISHMENT_CONSOLIDATION_POLICY}:
             raise ValueError("automatic preparation consolidation policy differs")
         source_handle = document["source_proposals"]
         proposals = json.loads(adoptions._capture(source_handle, {}))
@@ -776,7 +960,8 @@ def load(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
                               allow_recorded_attendance="recorded_attendance_authority" in document,
                               recorded_attendance_authority=document.get("recorded_attendance_authority"),
                               group_summaries=document.get("group_summaries"),
-                              summary_fallback_ids=document.get("summary_fallback_ids", ()))
+                              summary_fallback_ids=document.get("summary_fallback_ids", ()),
+                              deterministic_merges=document.get("deterministic_merges"))
         if any(document[key] != value for key, value in derived.items()):
             raise ValueError("automatic preparation editorial authority or derived maps differ")
     return document, handle
@@ -801,13 +986,15 @@ def project(*, path: Path, source_dir: Path, proposals: Sequence[Mapping[str, An
         materialized_correction_ids=document.get("materialized_correction_ids", ()),
         allow_review_overlaps=document.get("consolidation_policy") in {OVERLAP_CONSOLIDATION_POLICY, CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
                                                                     STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY, NATURAL_BATCH_CONSOLIDATION_POLICY,
-                                                                    ALL_DURATION_CONSOLIDATION_POLICY},
+                                                                    ALL_DURATION_CONSOLIDATION_POLICY, ACCOMPLISHMENT_CONSOLIDATION_POLICY},
         allow_clockify_overlaps=document.get("consolidation_policy") in {CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
                                                                      STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY, NATURAL_BATCH_CONSOLIDATION_POLICY,
-                                                                     ALL_DURATION_CONSOLIDATION_POLICY},
-        natural_batches=document.get("consolidation_policy") in {NATURAL_BATCH_CONSOLIDATION_POLICY, ALL_DURATION_CONSOLIDATION_POLICY},
+                                                                     ALL_DURATION_CONSOLIDATION_POLICY, ACCOMPLISHMENT_CONSOLIDATION_POLICY},
+        natural_batches=document.get("consolidation_policy") in {NATURAL_BATCH_CONSOLIDATION_POLICY, ALL_DURATION_CONSOLIDATION_POLICY, ACCOMPLISHMENT_CONSOLIDATION_POLICY},
         all_durations=document.get("consolidation_policy") == ALL_DURATION_CONSOLIDATION_POLICY,
-        group_summaries=document.get("group_summaries"))
+        group_summaries=document.get("group_summaries"),
+        accomplishment_batches=document.get("consolidation_policy") == ACCOMPLISHMENT_CONSOLIDATION_POLICY,
+        deterministic_merges=document.get("deterministic_merges"), evidence_events=_document_session_events(document))
     if expected != document["package"]:
         raise ValueError("prepared review package differs from explicit editorial inputs")
     package = batches.verify_package(document["package"], proposals=frozen,
@@ -816,13 +1003,15 @@ def project(*, path: Path, source_dir: Path, proposals: Sequence[Mapping[str, An
         materialized_correction_ids=document.get("materialized_correction_ids", ()),
         allow_review_overlaps=document.get("consolidation_policy") in {OVERLAP_CONSOLIDATION_POLICY, CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
                                                                     STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY, NATURAL_BATCH_CONSOLIDATION_POLICY,
-                                                                    ALL_DURATION_CONSOLIDATION_POLICY},
+                                                                    ALL_DURATION_CONSOLIDATION_POLICY, ACCOMPLISHMENT_CONSOLIDATION_POLICY},
         allow_clockify_overlaps=document.get("consolidation_policy") in {CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
                                                                      STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY, NATURAL_BATCH_CONSOLIDATION_POLICY,
-                                                                     ALL_DURATION_CONSOLIDATION_POLICY},
-        natural_batches=document.get("consolidation_policy") in {NATURAL_BATCH_CONSOLIDATION_POLICY, ALL_DURATION_CONSOLIDATION_POLICY},
+                                                                     ALL_DURATION_CONSOLIDATION_POLICY, ACCOMPLISHMENT_CONSOLIDATION_POLICY},
+        natural_batches=document.get("consolidation_policy") in {NATURAL_BATCH_CONSOLIDATION_POLICY, ALL_DURATION_CONSOLIDATION_POLICY, ACCOMPLISHMENT_CONSOLIDATION_POLICY},
         all_durations=document.get("consolidation_policy") == ALL_DURATION_CONSOLIDATION_POLICY,
-        group_summaries=document.get("group_summaries"))
+        group_summaries=document.get("group_summaries"),
+        accomplishment_batches=document.get("consolidation_policy") == ACCOMPLISHMENT_CONSOLIDATION_POLICY,
+        deterministic_merges=document.get("deterministic_merges"), evidence_events=_document_session_events(document))
     # Exercise native warning validation even though raw wording is not exposed.
     children = {publisher.stable_review_id(item): publisher.proposal_row(item, run_id,
                 project_allowlist=project_allowlist) for item in frozen
@@ -854,6 +1043,8 @@ def project(*, path: Path, source_dir: Path, proposals: Sequence[Mapping[str, An
     return {"rows": rows, "children": children, "parents": parents,
             "editorial_descriptions": document["editorial_descriptions"],
             **({"group_summaries": copy.deepcopy(document["group_summaries"])} if "group_summaries" in document else {}),
+            **({"deterministic_merges": copy.deepcopy(document["deterministic_merges"])}
+               if "deterministic_merges" in document else {}),
             "receipt": {"binding": handle, "source_proposals": document["source_proposals"],
                 **({"preparation_outcome": document["preparation_outcome"]} if document["schema_version"] == AUTO_SCHEMA else {})}}
 
@@ -1126,20 +1317,41 @@ def stage_projection(path: Path) -> dict[str, Any]:
     # Restrict at child scope, so one missing/noted sibling cannot prevent safe
     # peers from receiving a usable presentation. Every original still survives
     # in the scoped package as a child or explicitly protected retained record.
+    stage_protected = set(document["protected_ids"]) | (set(origins) - eligible)
+    stage_summaries = document.get("group_summaries")
+    stage_merges = document.get("deterministic_merges")
+    standalone_ids = set(document.get("standalone_review_ids", []))
+    if document.get("consolidation_policy") == ACCOMPLISHMENT_CONSOLIDATION_POLICY:
+        # Never attach a complete-group summary or deterministic authority to
+        # a newly scoped subset. Safe peers keep their native rows instead.
+        complete_groups = set()
+        for activity in document["package"]["activities"]:
+            children = set(activity["child_review_ids"])
+            if children <= eligible:
+                complete_groups.add(activity["review_id"])
+            else:
+                stage_protected.update(children)
+                standalone_ids.update(children & eligible)
+        if stage_summaries is not None:
+            stage_summaries = {identity: summary for identity, summary in stage_summaries.items()
+                               if identity in complete_groups}
+        stage_merges = [merge for merge in stage_merges if merge["review_id"] in complete_groups]
     package = batches.package_review_batches(proposals,
         editorial_descriptions=document["editorial_descriptions"], work_contexts=document["work_contexts"],
-        protected_ids=set(document["protected_ids"]) | (set(origins) - eligible),
+        protected_ids=stage_protected,
         wording_only_ids=document.get("wording_only_ids", ()), timezone=document["timezone"],
         materialized_correction_ids=document.get("materialized_correction_ids", ()),
         allow_review_overlaps=document.get("consolidation_policy") in {OVERLAP_CONSOLIDATION_POLICY, CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
                                                                     STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY, NATURAL_BATCH_CONSOLIDATION_POLICY,
-                                                                    ALL_DURATION_CONSOLIDATION_POLICY},
+                                                                    ALL_DURATION_CONSOLIDATION_POLICY, ACCOMPLISHMENT_CONSOLIDATION_POLICY},
         allow_clockify_overlaps=document.get("consolidation_policy") in {CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
                                                                      STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY, NATURAL_BATCH_CONSOLIDATION_POLICY,
-                                                                     ALL_DURATION_CONSOLIDATION_POLICY},
-        natural_batches=document.get("consolidation_policy") in {NATURAL_BATCH_CONSOLIDATION_POLICY, ALL_DURATION_CONSOLIDATION_POLICY},
+                                                                     ALL_DURATION_CONSOLIDATION_POLICY, ACCOMPLISHMENT_CONSOLIDATION_POLICY},
+        natural_batches=document.get("consolidation_policy") in {NATURAL_BATCH_CONSOLIDATION_POLICY, ALL_DURATION_CONSOLIDATION_POLICY, ACCOMPLISHMENT_CONSOLIDATION_POLICY},
         all_durations=document.get("consolidation_policy") == ALL_DURATION_CONSOLIDATION_POLICY,
-        group_summaries=document.get("group_summaries"))
+        group_summaries=stage_summaries,
+        accomplishment_batches=document.get("consolidation_policy") == ACCOMPLISHMENT_CONSOLIDATION_POLICY,
+        deterministic_merges=stage_merges, evidence_events=_document_session_events(document))
     # A lone safe peer is already a usable native row: do not create a new
     # parent merely to move the same micro-entry under another identity.
     singles = [activity for activity in package["activities"] if len(activity["child_review_ids"]) == 1]
@@ -1150,7 +1362,8 @@ def stage_projection(path: Path) -> dict[str, Any]:
         package["retained"].append({"review_id": identity, "proposal": copy.deepcopy(by_id[identity]),
             "preparation_reasons": ["single_current_source_preserved_natively"]})
     selected = [publisher.portfolio_row(activity, document["run_id"]) for activity in package["activities"]]
-    publishable = _publication_members({**document, "package": package}) & eligible
+    publishable = _publication_members({**document, "package": package,
+        "standalone_review_ids": sorted(standalone_ids)}) & eligible
     publishable |= {activity["child_review_ids"][0] for activity in singles}
     for retained in package["retained"]:
         identity = retained["review_id"]
@@ -1176,6 +1389,8 @@ def stage_projection(path: Path) -> dict[str, Any]:
                 row[12] += ("\n" if row[12] else "") + json.dumps(fresh, ensure_ascii=False, sort_keys=True)
     selected_originals = set(children) | {row[0] for row in selected if row[0] in captured}
     return {**projection, "rows": selected, "children": children,
+        **({"group_summaries": stage_summaries, "deterministic_merges": stage_merges}
+           if document.get("consolidation_policy") == ACCOMPLISHMENT_CONSOLIDATION_POLICY else {}),
         "parents": {child: parent for child, parent in parents.items() if child in children},
         "staged_package": package,
         "staged_preimages": {identity: captured[identity]["values"] for identity in selected_originals},

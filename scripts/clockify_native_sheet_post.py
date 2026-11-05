@@ -404,7 +404,7 @@ def _review_batch_groups(binding: Mapping[str, Any], timezone: str) -> tuple[dic
     from scripts.clockify_sheet_publish import stable_review_id, portfolio_row
     try:
         fields = {"package", "source_proposals", "work_contexts", "captured_rows"}
-        if set(binding) - {"group_summaries", "current_presentation", "posting_description_basis"} not in (fields, fields | {"preparation_authority"}):
+        if set(binding) - {"group_summaries", "deterministic_merges", "current_presentation", "posting_description_basis"} not in (fields, fields | {"preparation_authority"}):
             raise NativePostError("review batch binding fields differ")
         if "posting_description_basis" in binding and binding["posting_description_basis"] != "reviewed_parent_summary/v1":
             raise NativePostError("review batch posting description basis differs")
@@ -431,15 +431,28 @@ def _review_batch_groups(binding: Mapping[str, Any], timezone: str) -> tuple[dic
                 raise NativePostError("current presentation prepared caption differs")
         wording_ids, allow_overlaps, allow_clockify_overlaps, natural_batches, all_durations = [], False, False, False, False
         materialized_ids = []
+        accomplishment = False
+        session_events = None
         if authority is not None:
             from scripts import clockify_review_batch_publication as prepared
-            if (not isinstance(authority, Mapping) or set(authority) - {"materialized_correction_ids"} != {"consolidation_policy", "wording_only_ids"}
+            if (not isinstance(authority, Mapping) or set(authority) - {"materialized_correction_ids", "session_grouping_authority"} != {"consolidation_policy", "wording_only_ids"}
                     or authority["consolidation_policy"] not in {
                         prepared.WORDING_CONSOLIDATION_POLICY, prepared.OVERLAP_CONSOLIDATION_POLICY,
                         prepared.CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
                         prepared.STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY,
-                        prepared.NATURAL_BATCH_CONSOLIDATION_POLICY, prepared.ALL_DURATION_CONSOLIDATION_POLICY}):
+                        prepared.NATURAL_BATCH_CONSOLIDATION_POLICY, prepared.ALL_DURATION_CONSOLIDATION_POLICY, prepared.ACCOMPLISHMENT_CONSOLIDATION_POLICY}):
                 raise NativePostError("review batch preparation authority differs")
+            accomplishment = authority["consolidation_policy"] == prepared.ACCOMPLISHMENT_CONSOLIDATION_POLICY
+            if "session_grouping_authority" in authority:
+                session_authority = authority["session_grouping_authority"]
+                if (not accomplishment or not isinstance(session_authority, Mapping)
+                        or set(session_authority) != {"source_proposals", "ledger"}):
+                    raise NativePostError("review batch session grouping authority differs")
+                source_handle = session_authority["source_proposals"]
+                if json.loads(clockify_source_adoptions._capture(source_handle, {})) != sources:
+                    raise NativePostError("review batch session grouping originals differ")
+                session_events = prepared._session_grouping_events(session_authority["ledger"],
+                    Path(source_handle["path"]).parent)
             wording_ids = authority["wording_only_ids"]
             materialized_ids = authority.get("materialized_correction_ids", [])
             originals = {stable_review_id(source): source for source in sources}
@@ -465,13 +478,23 @@ def _review_batch_groups(binding: Mapping[str, Any], timezone: str) -> tuple[dic
             allow_overlaps = authority["consolidation_policy"] in {
                 prepared.OVERLAP_CONSOLIDATION_POLICY, prepared.CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
                 prepared.STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY, prepared.NATURAL_BATCH_CONSOLIDATION_POLICY,
-                prepared.ALL_DURATION_CONSOLIDATION_POLICY}
+                prepared.ALL_DURATION_CONSOLIDATION_POLICY, prepared.ACCOMPLISHMENT_CONSOLIDATION_POLICY}
             allow_clockify_overlaps = authority["consolidation_policy"] in {
                 prepared.CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY, prepared.STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY,
-                prepared.NATURAL_BATCH_CONSOLIDATION_POLICY, prepared.ALL_DURATION_CONSOLIDATION_POLICY}
+                prepared.NATURAL_BATCH_CONSOLIDATION_POLICY, prepared.ALL_DURATION_CONSOLIDATION_POLICY, prepared.ACCOMPLISHMENT_CONSOLIDATION_POLICY}
             natural_batches = authority["consolidation_policy"] in {
-                prepared.NATURAL_BATCH_CONSOLIDATION_POLICY, prepared.ALL_DURATION_CONSOLIDATION_POLICY}
+                prepared.NATURAL_BATCH_CONSOLIDATION_POLICY, prepared.ALL_DURATION_CONSOLIDATION_POLICY, prepared.ACCOMPLISHMENT_CONSOLIDATION_POLICY}
             all_durations = authority["consolidation_policy"] == prepared.ALL_DURATION_CONSOLIDATION_POLICY
+        if accomplishment:
+            if "deterministic_merges" not in binding:
+                raise NativePostError("v8 deterministic merge authority is missing")
+            prepared._require_group_summaries(binding)
+            for group in package["activities"]:
+                for description in [group["description"], *(item["description"] for item in group["prepared_descriptions"])]:
+                    if prepared._INTERNAL_JOURNAL_RE.search(description):
+                        raise NativePostError("v8 wording contains internal journal details")
+        elif "deterministic_merges" in binding:
+            raise NativePostError("deterministic merges require v8 authority")
         protected = {str(row["Review ID"]).strip() for _, row in binding["captured_rows"]
                      if str(row["Disposition"]).strip().casefold() == "approved"
                      or str(row["Review Status"]).strip().casefold() == "posted"}
@@ -529,7 +552,9 @@ def _review_batch_groups(binding: Mapping[str, Any], timezone: str) -> tuple[dic
             wording_only_ids=wording_ids, allow_review_overlaps=allow_overlaps,
             materialized_correction_ids=materialized_ids,
             allow_clockify_overlaps=allow_clockify_overlaps, natural_batches=natural_batches,
-            all_durations=all_durations, group_summaries=binding.get("group_summaries"))
+            all_durations=all_durations, group_summaries=binding.get("group_summaries"),
+            accomplishment_batches=accomplishment, deterministic_merges=binding.get("deterministic_merges"),
+            evidence_events=session_events)
         groups = {group["review_id"]: group for group in package["activities"]}
         if len(groups) != len(package["activities"]):
             raise NativePostError("review batch identities are duplicated")
@@ -584,13 +609,13 @@ def _group_payloads(group: Mapping[str, Any], route: Mapping[str, Any], *,
 
 
 def _independent_review_ids(plan: Mapping[str, Any]) -> set[str]:
-    """Only explicit v3-v7 source-bound claims are independent of payload aliases."""
+    """Keep v3-v8 accounting claims distinct from payload aliases, not certify prose."""
     from scripts import clockify_review_batch_publication as prepared
     binding = plan.get("review_batches_binding") or {}
     if (binding.get("preparation_authority") or {}).get("consolidation_policy") not in {
             prepared.OVERLAP_CONSOLIDATION_POLICY, prepared.CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY,
             prepared.STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY, prepared.NATURAL_BATCH_CONSOLIDATION_POLICY,
-            prepared.ALL_DURATION_CONSOLIDATION_POLICY}:
+            prepared.ALL_DURATION_CONSOLIDATION_POLICY, prepared.ACCOMPLISHMENT_CONSOLIDATION_POLICY}:
         return set()
     return {child for group in binding["package"]["activities"] for child in group["child_review_ids"]}
 
@@ -657,6 +682,7 @@ def build_plan(document: Mapping[str, Any], *, capture_sha256: str, routing: Map
                review_batch_work_contexts: Mapping[str, str] | None = None,
                review_batch_authority: Mapping[str, Any] | None = None,
                review_batch_group_summaries: Mapping[str, Any] | None = None,
+               review_batch_deterministic_merges: Sequence[Mapping[str, Any]] | None = None,
                review_batch_current_presentation: Mapping[str, Any] | None = None,
                native_credit_source: Mapping[str, Any] | None = None) -> dict[str, Any]:
     spreadsheet_id, sheet_title, rows = _sheet_rows(document)
@@ -672,7 +698,9 @@ def build_plan(document: Mapping[str, Any], *, capture_sha256: str, routing: Map
                                  "posting_description_basis": "reviewed_parent_summary/v1",
                                  **({"preparation_authority": review_batch_authority} if review_batch_authority is not None else {}),
                                  **({"current_presentation": review_batch_current_presentation} if review_batch_current_presentation is not None else {}),
-                                 **({"group_summaries": review_batch_group_summaries} if review_batch_group_summaries is not None else {})})
+                                 **({"group_summaries": review_batch_group_summaries} if review_batch_group_summaries is not None else {}),
+                                 **({"deterministic_merges": review_batch_deterministic_merges}
+                                    if review_batch_deterministic_merges is not None else {})})
         groups, batch_sources = _review_batch_groups(binding, timezone)
         if review_batch_current_presentation is not None:
             from scripts import clockify_review_batch_publication as prepared
@@ -682,6 +710,7 @@ def build_plan(document: Mapping[str, Any], *, capture_sha256: str, routing: Map
                 raise NativePostError(str(error)) from error
     elif (review_batch_sources is not None or review_batch_work_contexts is not None
           or review_batch_authority is not None or review_batch_group_summaries is not None
+          or review_batch_deterministic_merges is not None
           or review_batch_current_presentation is not None):
         raise NativePostError("review batch source inputs require their prepared package")
     entries: list[dict[str, Any]] = []
@@ -1377,17 +1406,21 @@ def main(argv: list[str] | None = None) -> int:
                         "source_proposals": json.loads(clockify_source_adoptions._capture(original["source_proposals"], {})),
                         "work_contexts": original["work_contexts"],
                         **({"current_presentation": original["current_presentation"]} if "current_presentation" in original else {}),
-                        **({"group_summaries": original["group_summaries"]} if "group_summaries" in original else {})}
+                        **({"group_summaries": original["group_summaries"]} if "group_summaries" in original else {}),
+                        **({"deterministic_merges": original["deterministic_merges"]} if "deterministic_merges" in original else {})}
                     if original.get("consolidation_policy") in {
                             publication.WORDING_CONSOLIDATION_POLICY, publication.OVERLAP_CONSOLIDATION_POLICY,
                             publication.CLOCKIFY_OVERLAP_CONSOLIDATION_POLICY, publication.STRUCTURED_EDITORIAL_CONSOLIDATION_POLICY,
-                            publication.NATURAL_BATCH_CONSOLIDATION_POLICY, publication.ALL_DURATION_CONSOLIDATION_POLICY}:
+                            publication.NATURAL_BATCH_CONSOLIDATION_POLICY, publication.ALL_DURATION_CONSOLIDATION_POLICY, publication.ACCOMPLISHMENT_CONSOLIDATION_POLICY}:
                         prepared["preparation_authority"] = {"consolidation_policy": original["consolidation_policy"],
                             "wording_only_ids": original["wording_only_ids"],
+                            **({"session_grouping_authority": {"source_proposals": original["source_proposals"],
+                                "ledger": original["authority"]["session_ledger"]}}
+                               if original["consolidation_policy"] == publication.ACCOMPLISHMENT_CONSOLIDATION_POLICY else {}),
                             **({"materialized_correction_ids": original["materialized_correction_ids"]}
                                if "materialized_correction_ids" in original else {})}
                 if (not isinstance(prepared, Mapping)
-                        or set(prepared) - {"group_summaries", "current_presentation"} not in ({"package", "source_proposals", "work_contexts"},
+                        or set(prepared) - {"group_summaries", "deterministic_merges", "current_presentation"} not in ({"package", "source_proposals", "work_contexts"},
                             {"package", "source_proposals", "work_contexts", "preparation_authority"})):
                     raise NativePostError("prepared review batch input fields differ")
                 _, _, captured_rows = _sheet_rows(document, pending_only=False)
@@ -1411,6 +1444,7 @@ def main(argv: list[str] | None = None) -> int:
                               review_batch_work_contexts=prepared["work_contexts"] if prepared is not None else None,
                               review_batch_authority=prepared.get("preparation_authority") if prepared is not None else None,
                               review_batch_group_summaries=prepared.get("group_summaries") if prepared is not None else None,
+                              review_batch_deterministic_merges=prepared.get("deterministic_merges") if prepared is not None else None,
                               review_batch_current_presentation=prepared.get("current_presentation") if prepared is not None else None,
                               native_credit_source=native_credit_source if prepared is not None else None)
             _atomic_write(args.output, plan)
