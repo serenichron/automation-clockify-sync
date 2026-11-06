@@ -734,6 +734,26 @@ def _auto_fields(proposals: Sequence[Mapping[str, Any]], authority: Mapping[str,
     return fields
 
 
+def _existing_auto_fields(proposals: Sequence[Mapping[str, Any]], authority: Mapping[str, Any],
+                          source_dir: Path, timezone: str, *, document: Mapping[str, Any],
+                          mismatch_message: str, **options: Any) -> dict[str, Any]:
+    """Replay either historical attendance policy only when every field matches."""
+    derived = _auto_fields(proposals, authority, source_dir, timezone,
+        allow_recorded_attendance="recorded_attendance_authority" in document,
+        recorded_attendance_authority=document.get("recorded_attendance_authority"), **options)
+    if all(key in document and document[key] == value for key, value in derived.items()):
+        return derived
+    if "recorded_attendance_authority" not in document:
+        # Fresh writers can attempt attendance without adopting a row or
+        # emitting authority. Reproduce that attempt only for an exact replay.
+        derived = _auto_fields(proposals, authority, source_dir, timezone,
+            allow_recorded_attendance=True, recorded_attendance_authority=None, **options)
+        if ("recorded_attendance_authority" not in derived
+                and all(key in document and document[key] == value for key, value in derived.items())):
+            return derived
+    raise ValueError(mismatch_message)
+
+
 def prepare(*, source_dir: Path, output: Path, run_id: str, spreadsheet_id: str,
             sheet_title: str, timezone: str, all_durations: bool = False,
             consolidate_materialized_corrections: bool = False,
@@ -782,15 +802,19 @@ def prepare(*, source_dir: Path, output: Path, run_id: str, spreadsheet_id: str,
     if current_presentation is not None and _current_presentation_rows(
             current_presentation, proposals, timezone)[:2] != (spreadsheet_id, sheet_title):
         raise ValueError("current presentation destination differs")
-    fields = _auto_fields(proposals, authority, source_dir, timezone, consolidation_policy=policy,
+    field_options = dict(consolidation_policy=policy,
                           group_summaries=group_summaries, allow_materialized_corrections=allow_materialized,
                           lifecycle_route_authority=lifecycle_authority,
                           current_presentation=current_presentation,
-                          allow_recorded_attendance=existing is None or "recorded_attendance_authority" in existing,
-                          recorded_attendance_authority=existing.get("recorded_attendance_authority") if existing else None,
                           deterministic_merges=(existing.get("deterministic_merges") if existing else
                               [] if policy == ACCOMPLISHMENT_CONSOLIDATION_POLICY and summary_provider is None else None),
                           summary_fallback_ids=existing.get("summary_fallback_ids", ()) if existing else ())
+    if existing is None:
+        fields = _auto_fields(proposals, authority, source_dir, timezone,
+                              allow_recorded_attendance=True, **field_options)
+    else:
+        fields = _existing_auto_fields(proposals, authority, source_dir, timezone, document=existing,
+            mismatch_message="immutable automatic preparation binding differs", **field_options)
     summary_fallback = None
     if (existing is None and policy == ACCOMPLISHMENT_CONSOLIDATION_POLICY
             and group_summaries is None and summary_provider is not None):
@@ -976,18 +1000,16 @@ def load(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
                 document["current_presentation"], proposals, document["timezone"])[:2] != (
                     document["spreadsheet_id"], document["sheet_title"]):
             raise ValueError("current presentation destination differs")
-        derived = _auto_fields(proposals, document["authority"], source_dir, document["timezone"],
+        _existing_auto_fields(proposals, document["authority"], source_dir, document["timezone"],
+                              document=document,
+                              mismatch_message="automatic preparation editorial authority or derived maps differ",
                               consolidation_policy=document["consolidation_policy"],
                               allow_materialized_corrections="materialized_correction_ids" in document,
                               lifecycle_route_authority=document.get("lifecycle_route_authority"),
                               current_presentation=document.get("current_presentation"),
-                              allow_recorded_attendance="recorded_attendance_authority" in document,
-                              recorded_attendance_authority=document.get("recorded_attendance_authority"),
                               group_summaries=document.get("group_summaries"),
                               summary_fallback_ids=document.get("summary_fallback_ids", ()),
                               deterministic_merges=document.get("deterministic_merges"))
-        if any(document[key] != value for key, value in derived.items()):
-            raise ValueError("automatic preparation editorial authority or derived maps differ")
     return document, handle
 
 
