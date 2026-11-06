@@ -472,12 +472,16 @@
     },
     {
       "pattern": "stefaniazaharia",
-      "project_name": "Stefania Zaharia \u2014 B2B",
-      "project_suffix": "",
-      "tag_suffixes": [],
-      "tag_names": [],
+      "project_name": "Art Tattoo Level 2",
+      "project_suffix": "59c81b",
+      "tag_suffixes": [
+        "35aa9b54"
+      ],
+      "tag_names": [
+        "Technical development"
+      ],
       "billable": true,
-      "confidence": "low",
+      "confidence": "high",
       "prefix": "SZ"
     },
     {
@@ -827,6 +831,19 @@
     },
     {
       "domains_type": "internal_only",
+      "prefix": "SC",
+      "project_name": "Serenichron Level 1",
+      "project_suffix": "31b39a",
+      "tag_suffixes": [
+        "35aa9aef"
+      ],
+      "tag_names": [
+        "Project Management"
+      ],
+      "billable": true
+    },
+    {
+      "title_regex": "\\bImpromptu\\s+Google\\s+Meet\\b",
       "prefix": "SC",
       "project_name": "Serenichron Level 1",
       "project_suffix": "31b39a",
