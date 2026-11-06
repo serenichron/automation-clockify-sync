@@ -745,18 +745,60 @@ def _derive_config(old: Path, release: Path, config: Path, *, previously_active:
     before, after = json.loads(original), json.loads(derived)
     if not isinstance(before, dict) or not isinstance(after, dict):
         raise ValueError("review-cycle config must be a JSON object")
-    retained_before = {key: item for key, item in before.items() if key not in {"root", "routing"}}
-    retained_after = {key: item for key, item in after.items() if key not in {"root", "routing"}}
+    routing_target = config.parent / f"clockify-review-cycle.{release.name}.routing.json"
+    payload = None
+    derived_keys = {"root", "routing"}
+    if before.get("private_routing") is not None:
+        base_bytes = (release / "routing.json").read_bytes()
+        if base_bytes != (old / "routing.json").read_bytes():
+            _, validated_before = _validated_config(old, config)
+            if validated_before != before:
+                raise ValueError("review-cycle config changed during derivation")
+            private_bytes = _private_file(Path(before["routing"]), "private routing").read_bytes()
+            if hashlib.sha256(private_bytes).hexdigest() != before["private_routing"]["sha256"]:
+                raise ValueError("private routing changed during derivation")
+            private_document = json.loads(private_bytes)
+            rebased = json.loads(base_bytes)
+            if not isinstance(rebased, dict):
+                raise ValueError("private routing base must be a JSON object")
+            style = {"indent": 2, "sort_keys": True, "ensure_ascii": False}
+            newline = "\n"
+            indentation = re.search(rb'\n([ \t]+)"', private_bytes)
+            previous_style = {
+                "indent": indentation[1].decode("ascii") if indentation else None,
+                "sort_keys": list(private_document) == sorted(private_document),
+                "ensure_ascii": b"\\u" in private_bytes,
+            }
+            previous_newline = "\n" if private_bytes.endswith(b"\n") else ""
+            # Preserve a detected style only when it reproduces the original bytes.
+            previous_serialized = json.dumps(private_document, **previous_style) + previous_newline
+            if previous_serialized.encode("utf-8") == private_bytes:
+                style, newline = previous_style, previous_newline
+            for key in ("semantic_actor_contract", "semantic_subject_binding"):
+                rebased[key] = private_document[key]
+            payload = (json.dumps(rebased, **style) + newline).encode("utf-8")
+            after["routing"] = str(routing_target)
+            after["private_routing"] = {
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "base_sha256": hashlib.sha256(base_bytes).hexdigest(),
+            }
+            derived = (
+                json.dumps(after, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+            ).encode("utf-8")
+            derived_keys.add("private_routing")
+    retained_before = {key: item for key, item in before.items() if key not in derived_keys}
+    retained_after = {key: item for key, item in after.items() if key not in derived_keys}
     if (json.dumps(retained_before, sort_keys=True, separators=(",", ":"))
             != json.dumps(retained_after, sort_keys=True, separators=(",", ":"))):
         raise _UpdateSkipped("config_drift")
     target = config.parent / f"clockify-review-cycle.{release.name}.json"
     routing = config.parent / f"clockify-review-cycle.{old.name}.routing.json"
-    if routing.exists() or routing.is_symlink():
+    if payload is None and (routing.exists() or routing.is_symlink()):
         payload = _private_file(routing, "private routing").read_bytes().replace(
             old.name.encode("ascii"), release.name.encode("ascii")
         )
-        _candidate_file(config.parent / f"clockify-review-cycle.{release.name}.routing.json", payload,
+    if payload is not None:
+        _candidate_file(routing_target, payload,
                         previously_active=previously_active)
     _candidate_file(target, derived, previously_active=previously_active)
     _validated_config(release, target)
