@@ -304,6 +304,58 @@ Only the recurring service has `[Install] WantedBy=default.target`. The canary
 is manual-only and the updater is pulled in by the recurring service. No
 `.timer` artifact exists.
 
+## Run-directory retention
+
+After an exit-0 cycle, `OnSuccess` starts
+`clockify-runs-retention.service`. It inventories run directories, keeps direct
+and transitive references, runs younger than 14 days, and H1–H5 reader holds
+(autopilot results, incomplete slices, collector derivations, the latest three
+names, and run reports while source coverage is absent). Top-level regular
+files stay in place and supply references. The coverage default is the live
+`state/source-coverage.json`, matching the legacy runner; set `coverage_file`
+to its `CLOCKIFY_AUTOPILOT_COVERAGE_STATE` override if one is configured.
+
+The default is **dry-run**. Private history and a bounded token cache live in
+`state/runs-retention/`, excluded from reference matching. Scans hold no producer
+locks. Deletion takes the override, release-record, and runner locks in that
+order, then requires unchanged unit markers and filesystem snapshots. Missing
+inputs, links, special files, scan errors, lock contention, or changed evidence
+abort before deletion. A removal failure stops the pass and records deleted,
+remaining, and possibly partially removed candidates. A token over 16 MiB also
+aborts to bound scan memory.
+
+One-time operator steps, after the release is authorized for integration and
+activation, are as follows.
+
+1. Integrate the change to master and let the existing updater materialize and
+   activate that release. Confirm the SHA in
+   `~/.config/serenichron/clockify-review-cycle-override.env` and confirm the
+   selected release contains the retention script.
+2. Compare installed units with the release copies, preserving host overrides.
+   Install the updated `clockify-review-cycle.service` and the new
+   `clockify-runs-retention.service` into `~/.config/systemd/user/` with mode
+   `0644`, then run `systemctl --user daemon-reload`. Retention has no install
+   target or timer.
+3. Run `systemctl --user start clockify-runs-retention.service`. Inspect
+   `journalctl --user -u clockify-runs-retention.service --since today` and
+   `~/Work/automation-clockify-sync/state/runs-retention/inventory.json`.
+   Confirm systemctl connectivity inside the sandbox, a completed dry-run,
+   hold counts, candidate ages, closure, and duration. Compare with the manual
+   archive inventory at `~/Work/_ops/clockify-runs-archive/20261110/`.
+4. To enable deletion after reviewing that dry-run, create or update the
+   user-owned mode-`0600` JSON file
+   `~/.config/serenichron/clockify-runs-retention.json` with `"mode": "delete"`,
+   preserving any other settings. An absent config uses built-in defaults.
+   Unknown keys fail closed. `min_age_days` must be at least 7,
+   `latest_keep` at least 1, and `deadline_seconds` between 1 and 1500.
+   Each new release SHA requires another successful same-schema/tokenizer
+   dry-run before deletion. Setting `"mode": "dry-run"` restores preview mode.
+
+Sandbox connectivity and cold/warm performance require the operator dry-run.
+Exit 75 from the cycle postpones retention until a later exit-0 cycle. Producer
+locks are held only for final validation and removal; a coincident cycle can
+still exit 73 on runner-lock contention.
+
 ## Roll back atomically
 
 Keep the previous release and its release-specific config. Stop the recurring
