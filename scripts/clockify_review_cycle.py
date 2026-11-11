@@ -963,6 +963,16 @@ def select_slices(config: Mapping[str, Any], state: Mapping[str, Any], *, today:
     while start < limit and len(planned) < maximum:
         month_end = (start.replace(day=28) + dt.timedelta(days=4)).replace(day=1)
         end = min(start + dt.timedelta(days=2), month_end, limit)
+        record = slices.get(start.isoformat())
+        if isinstance(record, Mapping):
+            stored_until = record.get("until")
+            try:
+                stored_end = _date(stored_until, "stored slice until")
+            except CycleError:
+                pass
+            else:
+                if stored_until == stored_end.isoformat() and start < stored_end <= end:
+                    end = stored_end
         planned.append((start.isoformat(), end.isoformat()))
         start = end
     return planned

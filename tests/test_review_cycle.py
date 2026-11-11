@@ -143,6 +143,57 @@ class ReviewCycleTests(unittest.TestCase):
         selected = cycle.select_slices(config, state, today=dt.date(2026, 9, 2))
         self.assertEqual([("2026-08-28", "2026-08-30")], selected)
 
+    def test_select_slices_reuses_held_until_and_continues_from_it(self):
+        state = {
+            "scheduled_through": "2026-11-05",
+            "slices": {
+                "2026-11-05": {
+                    "until": "2026-11-06",
+                    "status": "published_with_preparation_gaps",
+                },
+            },
+        }
+        for maximum in (1, 2):
+            with self.subTest(max_slices=maximum):
+                self.assertEqual(
+                    [("2026-11-05", "2026-11-06"),
+                     ("2026-11-06", "2026-11-08")][:maximum],
+                    cycle.select_slices(
+                        {"max_slices": maximum}, state, today=dt.date(2026, 11, 10)
+                    ),
+                )
+
+    def test_select_slices_without_stored_record_keeps_two_day_bound(self):
+        self.assertEqual(
+            [("2026-11-05", "2026-11-07")],
+            cycle.select_slices(
+                {}, {"scheduled_through": "2026-11-05"},
+                today=dt.date(2026, 11, 10),
+            ),
+        )
+
+    def test_select_slices_ignores_invalid_stored_until(self):
+        cases = [
+            ("2026-11-05", value, "2026-11-10", "2026-11-07")
+            for value in (None, 20261106, "invalid", "2026-11-31", "20261106",
+                          "2026-11-04", "2026-11-05", "2026-11-08", "2026-11-11")
+        ]
+        cases.extend([
+            ("2026-11-05", "2026-11-07", "2026-11-06", "2026-11-06"),
+            ("2026-11-30", "2026-12-02", "2026-12-05", "2026-12-01"),
+        ])
+        for start, stored_until, limit, expected_until in cases:
+            with self.subTest(start=start, stored_until=stored_until, limit=limit):
+                self.assertEqual(
+                    [(start, expected_until)],
+                    cycle.select_slices(
+                        {"catchup_until": limit},
+                        {"scheduled_through": start,
+                         "slices": {start: {"until": stored_until}}},
+                        today=dt.date.fromisoformat(limit),
+                    ),
+                )
+
     def test_nonblocking_lock_returns_locked_without_mutation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
