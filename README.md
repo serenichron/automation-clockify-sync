@@ -104,17 +104,30 @@ cap true without state shared between runs, in whatever order days are
 processed or reprocessed. The effective per-day limit is therefore the lower
 of the two multipliers.
 
-`project_clients` maps each Clockify project ID suffix to its client. A routed
-project missing from the map is treated as its own client; an existing entry
-on an undeclared project blocks nobody. Refresh the map when a project is
-added in Clockify.
+`project_clients` maps each Clockify project ID suffix to its client. A
+project missing from the map is treated as its own client: its minutes are
+billed, so no session of another client may reuse them. An existing entry
+without any project has no client and blocks nobody. Refresh the map when a
+project is added in Clockify, or two projects of one client will exclude each
+other.
+
+Contested time is split in whole minutes, and the rounding remainder is carried
+to the next contested stretch between the same clients, across the days of one
+run. The same day can therefore split differently by a minute when it is
+processed in a slice that starts on another day.
+
+The caps are checked twice: when overlapping time is granted, and again on the
+final rows. If a later step drops an activity (a reviewer's skip, a failed
+regression), the parallel time its wall-clock time paid for is shortened too.
 
 The caps measure what a run proposes. A session that overlaps an existing
 Clockify entry of the *same* client is still kept for review with an
 `existing_clockify_overlap` warning, because it may be the same work already
 posted. `allocation.billing_caps` in `work-accounting-result.json` lists every
 shortened activity, the minutes cut by each rule, and what the final rows
-measure, including violations that remain because of fixed entries.
+measure together with the Clockify entries the run saw: cross-client seconds,
+and the days and months above the limit actually enforced. What remains there
+comes from fixed entries.
 
 Omitting the declaration keeps the previous allocation, and replay uses the
 saved routing, so results produced before it existed reproduce unchanged.

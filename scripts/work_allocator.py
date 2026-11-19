@@ -587,9 +587,10 @@ class BillingPolicy:
             return ""
         return self.project_clients.get(suffix) or f"project:{suffix}"
 
-    def declared_client(self, project_suffix: Any) -> str:
-        """Return the client only when the project is declared; "" otherwise."""
-        return self.project_clients.get(str(project_suffix or "").strip(), "")
+    @property
+    def enforced_day_multiplier(self) -> Fraction:
+        """The per-day limit while each day also has to hold the month cap."""
+        return min(self.day_multiplier, self.month_multiplier)
 
     def document(self) -> dict[str, Any]:
         return {
@@ -929,9 +930,19 @@ class CapLedger:
         ]
 
 
-def measure_billing(rows: Iterable[tuple[str, dt.datetime, dt.datetime]], policy: BillingPolicy) -> dict[str, Any]:
-    """Measure billed rows the way the read-only timesheet checker does."""
+def measure_billing(
+    rows: Iterable[tuple[str, dt.datetime, dt.datetime]],
+    policy: BillingPolicy,
+    *,
+    day_multiplier: Fraction | None = None,
+) -> dict[str, Any]:
+    """Measure billed rows the way the read-only timesheet checker does.
+
+    ``day_multiplier`` replaces the policy's day cap for ``days_over_cap``,
+    for a caller that enforces a stricter per-day limit.
+    """
     rows = list(rows)
+    day_limit = policy.day_multiplier if day_multiplier is None else day_multiplier
     ledger = CapLedger(policy)
     for client, start, end in rows:
         ledger.add(client, start, end)
@@ -955,7 +966,7 @@ def measure_billing(rows: Iterable[tuple[str, dt.datetime, dt.datetime]], policy
         "cross_client_seconds": cross,
         "days_over_cap": [
             row for row in days
-            if row["billed_seconds"] > policy.day_multiplier * row["wall_seconds"]
+            if row["billed_seconds"] > day_limit * row["wall_seconds"]
         ],
         "months_over_cap": [
             {"client": client, "month": month, "billed_seconds": billed, "wall_seconds": wall}

@@ -2607,8 +2607,10 @@ def _billing_fixed_rows(
     for block in existing:
         if block.get("kind") != "existing_clockify" or block.get("billable") is False:
             continue
-        # Only a declared project names a client; an unknown one blocks nobody.
-        client = policy.declared_client(block.get("project_id_suffix"))
+        # An entry on an undeclared project has a payer of its own: the minute
+        # is billed and no other client's session may reuse it.  An entry
+        # without any project has no client and no rate, so it bills nobody.
+        client = policy.client_for_project(block.get("project_id_suffix"))
         if client and block["end"] > block["start"]:
             rows.append((client, block["start"], block["end"]))
     rows.extend(_billing_meeting_rows(meeting_proposals, policy))
@@ -2750,6 +2752,152 @@ def _apply_exclusive_billing(
     }
 
 
+def _clip_overlap_warnings(
+    warnings: Iterable[Mapping[str, Any]], start: dt.datetime, end: dt.datetime,
+    *, counterpart_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Keep overlap warnings true after one side of the overlap was shortened."""
+    clipped: list[dict[str, Any]] = []
+    for warning in warnings:
+        low, high = _parse_dt(warning.get("overlap_start")), _parse_dt(warning.get("overlap_end"))
+        if low is None or high is None or (
+            counterpart_id is not None and warning.get("counterpart_id") != counterpart_id
+        ):
+            clipped.append(dict(warning))
+            continue
+        low, high = max(low, start), min(high, end)
+        if high <= low:
+            continue
+        clipped.append({
+            **warning,
+            "overlap_start": low.isoformat(),
+            "overlap_end": high.isoformat(),
+            "overlap_duration_seconds": int((high - low).total_seconds()),
+        })
+    return clipped
+
+
+def _enforce_final_billing_caps(
+    proposals: list[dict[str, Any]],
+    allocation: work_allocator.AllocationResult,
+    billing: dict[str, Any],
+    policy: work_allocator.BillingPolicy,
+    skipped: list[dict[str, Any]],
+    recovery_records: list[dict[str, Any]],
+    activity_context: Mapping[str, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], work_allocator.AllocationResult]:
+    """Re-check the caps on the rows that are actually proposed.
+
+    Recovery time was granted against the wall-clock time of every allocation.
+    A later step may drop an activity (a reviewer's skip, a failed regression),
+    and the parallel time its wall-clock time paid for must go with it.
+    Nothing changes when the granted time still fits.
+    """
+    demands = {demand.activity_id: demand for demand in allocation.evidence}
+    ledger = work_allocator.CapLedger(policy)
+    for client, start, end in _billing_meeting_rows(
+        (row for row in proposals if (row.get("provenance") or {}).get("canonical_meeting_id")),
+        policy,
+    ):
+        ledger.add(client, start, end)
+    for segment in allocation.allocations:
+        if billing["clients"].get(segment.activity_id):
+            ledger.add(billing["clients"][segment.activity_id], segment.start, segment.end)
+
+    def priority(row: Mapping[str, Any]) -> tuple[Any, ...]:
+        demand = demands.get(str(row.get("activity_id") or ""))
+        return (
+            -work_allocator._confidence_score(demand.confidence) if demand else 0.0,
+            -demand.attention_signal if demand else 0.0,
+            str(row.get("activity_id") or ""),
+            str(row.get("start") or ""),
+            str(row.get("candidate_key") or ""),
+        )
+
+    cut: dict[str, int] = {}
+    shortened: dict[str, tuple[dt.datetime, dt.datetime] | None] = {}
+    for row in sorted(proposals, key=priority):
+        activity_id = str(row.get("activity_id") or "")
+        client = billing["clients"].get(activity_id, "")
+        if not client or (row.get("provenance") or {}).get("allocation_capacity_recovery") is not True:
+            continue
+        start, end = _parse_dt(row.get("start")), _parse_dt(row.get("end"))
+        if start is None or end is None or end <= start:
+            continue
+        length = int((end - start).total_seconds())
+        allowed = ledger.acceptable_seconds(client, start, end)
+        if allowed < length:
+            allowed -= allowed % 60
+            cut[activity_id] = cut.get(activity_id, 0) + length // 60 - allowed // 60
+            shortened[str(row["candidate_key"])] = (
+                (start, start + dt.timedelta(seconds=allowed)) if allowed > 0 else None
+            )
+        if allowed > 0:
+            ledger.add(client, start, start + dt.timedelta(seconds=allowed))
+    if not shortened:
+        return proposals, allocation
+
+    kept: list[dict[str, Any]] = []
+    for row in proposals:
+        key = str(row.get("candidate_key") or "")
+        if key in shortened:
+            if shortened[key] is None:
+                continue
+            start, end = shortened[key]
+            seconds = int((end - start).total_seconds())
+            row.update({
+                "end": _iso(end),
+                "duration_minutes": seconds // 60,
+                "duration_seconds": seconds,
+            })
+            row["provenance"]["burst_end"] = _iso(end)
+            row["review_warnings"] = _clip_overlap_warnings(row.get("review_warnings", []), start, end)
+        kept.append(row)
+    for row in kept:
+        for key, interval in shortened.items():
+            if interval is None:
+                row["review_warnings"] = [
+                    warning for warning in row.get("review_warnings", [])
+                    if warning.get("counterpart_id") != key
+                ]
+            else:
+                row["review_warnings"] = _clip_overlap_warnings(
+                    row.get("review_warnings", []), *interval, counterpart_id=key
+                )
+    _refresh_capacity_recovery_warnings(kept, skipped, recovery_records)
+    remaining = {str(row.get("activity_id") or "") for row in kept}
+    for activity_id, minutes in sorted(cut.items()):
+        demand = demands[activity_id]
+        billable = max(0, demand.effort.recommended_minutes - minutes)
+        demands[activity_id] = dataclasses.replace(demand, effort=work_allocator.EffortEstimate(
+            min(demand.effort.minimum_minutes, billable),
+            billable,
+            max(demand.effort.maximum_minutes, billable),
+        ))
+        billing["adjustments"].append({
+            "activity_id": activity_id,
+            "client": billing["clients"][activity_id],
+            "rule": "caps",
+            "requested_minutes": demand.effort.recommended_minutes,
+            "billable_minutes": billable,
+            "cut_minutes": minutes,
+        })
+        if activity_id not in remaining and not any(
+            row.get("activity_id") == activity_id and row.get("reason") == BILLING_CAP_PARALLEL_REASON
+            for row in skipped
+        ):
+            skipped.append({
+                "id": activity_id,
+                "activity_id": activity_id,
+                "reason": BILLING_CAP_PARALLEL_REASON,
+                "evidence_ids": list(activity_context[activity_id]["evidence_ids"]),
+            })
+    return kept, dataclasses.replace(
+        allocation,
+        evidence=tuple(demands[demand.activity_id] for demand in allocation.evidence),
+    )
+
+
 def _billing_caps_report(
     policy: work_allocator.BillingPolicy,
     billing: Mapping[str, Any],
@@ -2758,12 +2906,18 @@ def _billing_caps_report(
 ) -> dict[str, Any]:
     """Summarise what the guards changed and what the final rows measure."""
     rows = _billing_fixed_rows(existing, proposals, policy)
-    measured = work_allocator.measure_billing(rows, policy)
+    measured = work_allocator.measure_billing(
+        rows, policy, day_multiplier=policy.enforced_day_multiplier
+    )
     adjustments = sorted(
         billing["adjustments"], key=lambda row: (row["rule"], row["activity_id"])
     )
     return {
-        "policy": {**policy.document(), "month_scope": work_allocator.MONTH_SCOPE_PER_DAY},
+        "policy": {
+            **policy.document(),
+            "month_scope": work_allocator.MONTH_SCOPE_PER_DAY,
+            "enforced_day_multiplier": str(policy.enforced_day_multiplier),
+        },
         "contested_wall_minutes": billing["shares"].contested_seconds // 60,
         "cut_minutes": {
             "cross_client": sum(row["cut_minutes"] for row in adjustments if row["rule"] == "cross_client"),
@@ -2771,11 +2925,14 @@ def _billing_caps_report(
         },
         "adjustments": adjustments,
         "client_days": measured["client_days"],
-        # Sessions can no longer cause these; what is left comes from fixed
-        # entries (Clockify history, overlapping recorded meetings).
+        # Measured on the final rows together with the Clockify entries the
+        # run saw, against the per-day limit actually enforced.  Sessions can
+        # no longer cause these; what is left comes from fixed entries
+        # (Clockify history, overlapping recorded meetings).
         "remaining_violations": {
             "cross_client_seconds": measured["cross_client_seconds"],
             "days_over_cap": measured["days_over_cap"],
+            "months_over_cap": measured["months_over_cap"],
         },
     }
 
@@ -4494,15 +4651,20 @@ def run_accounting(
         )
         capped_minutes = 0
         for start, end in slices:
+            if (conflict.activity_id, _iso(start), _iso(end)) in recovery_identities:
+                continue
             if billing_client and billing_ledger is not None:
                 # Recovered time overlaps what this client is already billed
                 # for, so it is the only place parallel billing can grow.
                 allowed = billing_ledger.acceptable_seconds(billing_client, start, end)
                 allowed -= allowed % 60
+                capped_end = start + dt.timedelta(seconds=allowed)
+                if allowed > 0 and (conflict.activity_id, _iso(start), _iso(capped_end)) in recovery_identities:
+                    continue
                 capped_minutes += _minutes(start, end) - allowed // 60
                 if allowed <= 0:
                     continue
-                end = start + dt.timedelta(seconds=allowed)
+                end = capped_end
             identity = (conflict.activity_id, _iso(start), _iso(end))
             if identity in recovery_identities:
                 continue
@@ -4739,6 +4901,11 @@ def run_accounting(
                     "evidence_fingerprint": target[1],
                     "regression_case_ids": sorted(failure["regression_case_ids"]),
                 })
+    if billing is not None and billing_policy is not None:
+        proposals, allocation = _enforce_final_billing_caps(
+            proposals, allocation, billing, billing_policy, skipped,
+            recovery_records, activity_context,
+        )
     for index, proposal in enumerate(proposals, 1):
         proposal["id"] = f"P{index:03d}"
     ambiguous.sort(key=lambda value: (str(value.get("exception_kind")), str(value.get("id"))))

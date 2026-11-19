@@ -288,7 +288,7 @@ class RoutingDeclarationTests(unittest.TestCase):
         self.assertEqual((Fraction(3, 2), Fraction(5, 4)), (policy.day_multiplier, policy.month_multiplier))
         self.assertEqual("project:abc123", policy.client_for_project("abc123"))
         self.assertEqual("", policy.client_for_project(""))
-        self.assertEqual("", policy.declared_client("abc123"))
+        self.assertEqual(Fraction(5, 4), policy.enforced_day_multiplier)
 
     def test_invalid_declarations_are_rejected(self):
         for declaration in ([], {"day_multiplier": 0.9}, {"month_multiplier": "many"},
@@ -385,7 +385,9 @@ class PipelineBillingCapTests(unittest.TestCase):
         self.assertGreater(ratio(day[0]), 1, "parallel same-client work may still exceed wall-clock time")
         self.assertEqual(105, result["allocation"]["billing_caps"]["cut_minutes"]["caps"])
 
-    def test_one_client_month_stays_at_or_below_the_month_cap(self):
+    def test_every_day_of_a_run_holds_the_month_multiplier_so_the_month_does_too(self):
+        # The pipeline has no month-to-date state: it holds 1.25 on each day,
+        # which bounds the month.  Month-to-date budgeting is CapLedgerTests'.
         events, work = [], []
         for day in (10, 11, 12):
             for index in range(2):
@@ -417,13 +419,90 @@ class PipelineBillingCapTests(unittest.TestCase):
         self.assertEqual({"cross_client": 0, "caps": 0}, report["cut_minutes"])
         self.assertEqual(["TST Prep"], [row["client"] for row in report["remaining_violations"]["days_over_cap"]])
 
-    def test_an_undeclared_clockify_project_blocks_nobody(self):
+    def test_a_clockify_entry_on_an_undeclared_project_still_blocks_other_clients(self):
+        # Whoever pays for that entry, it is not the session's client.
         booked = existing(stamp(9), stamp(10), "ffffff")
         sc = session("sc", stamp(9), stamp(10))
 
         result = self.run_pipeline([booked, sc], [(sc, SC, 30)])
 
+        self.assertEqual([], result["proposals"])
+        self.assertEqual(
+            ["billing cap: the observed time is billed to another client"],
+            [row["reason"] for row in result["skipped"] if row["reason"].startswith("billing cap")],
+        )
+        report = result["allocation"]["billing_caps"]
+        self.assertEqual(30, report["cut_minutes"]["cross_client"])
+        self.assertEqual(0, report["remaining_violations"]["cross_client_seconds"])
+
+    def test_a_clockify_entry_without_a_project_bills_no_client_and_blocks_nobody(self):
+        booked = existing(stamp(9), stamp(10), "")
+        sc = session("sc", stamp(9), stamp(10))
+
+        result = self.run_pipeline([booked, sc], [(sc, SC, 30)])
+
         self.assertEqual(30, sum(row["duration_minutes"] for row in result["proposals"]))
+
+    def test_the_report_counts_an_overlap_with_an_undeclared_project_as_cross_client(self):
+        policy = work_allocator.billing_policy_from_routing(
+            json.loads((fixtures.ROOT / "routing.json").read_text()))
+        block = {"kind": "existing_clockify", "project_id_suffix": "ffffff", "start": at(9), "end": at(10)}
+        proposal = {"clockify_project_suffix": "775f9f", "client_project": SC,
+                    "start": stamp(9, 30), "end": stamp(10), "billable": True}
+
+        report = pipeline._billing_caps_report(
+            policy, {"adjustments": [], "shares": work_allocator.exclusive_shares([])}, [proposal], [block])
+
+        self.assertEqual(1800, report["remaining_violations"]["cross_client_seconds"])
+
+    def test_dropping_a_rejected_activity_does_not_leave_its_parallel_time_above_the_cap(self):
+        # A and C give the day 120 wall-clock minutes, which pays for B's 30
+        # parallel minutes.  Once the reviewer's skip removes C, only 60 remain.
+        first = session("tst-a", stamp(9), stamp(10))
+        parallel = session("tst-b", stamp(9), stamp(10))
+        later = session("tst-c", stamp(10), stamp(11))
+        work = analysis((first, TSTP, 60), (parallel, TSTP, 30), (later, TSTP, 60))
+        run_dir, initial = fixtures.WorkAccountingPipelineTests.make_run(self, [first, parallel, later], work)
+        self.assertEqual(150, sum(row["duration_minutes"] for row in initial["proposals"]))
+        rejected = next(row for row in initial["proposals"] if row["start"] >= stamp(10))
+        corrections_path = run_dir.parent.parent / "review-corrections.jsonl"
+        fixtures.WorkAccountingPipelineTests.append_correction(self, corrections_path, rejected, "skip")
+
+        rerun = pipeline.run_accounting(
+            run_dir, root=fixtures.ROOT, analysis_fixture=run_dir.parent.parent / "analysis.json",
+            corrections_path=corrections_path,
+        )
+
+        self.assertFalse(any(row["activity_id"] == rejected["activity_id"] for row in rerun["proposals"]))
+        day = self.measured(rerun)["client_days"][0]
+        self.assertEqual((75 * 60, 3600), (day["billed_seconds"], day["wall_seconds"]))
+        report = rerun["allocation"]["billing_caps"]
+        self.assertEqual(15, report["cut_minutes"]["caps"])
+        self.assertEqual([], report["remaining_violations"]["days_over_cap"])
+        for row in rerun["proposals"]:
+            self.assertEqual(row["duration_seconds"], row["duration_minutes"] * 60)
+            self.assertEqual(row["end"], row["provenance"]["burst_end"])
+            for warning in row["review_warnings"]:
+                fixtures.sheet_publisher._validate_review_warning(warning, {})
+                if "overlap_end" in warning:
+                    self.assertLessEqual(warning["overlap_end"], row["end"])
+        recovery = rerun["allocation"]["capacity_recoveries"][0]
+        self.assertEqual(15, recovery["recovered_minutes"])
+        saved = {row["activity_id"]: row for row in rerun["allocation"]["evidence"]}
+        self.assertEqual(15, saved[recovery["activity_id"]]["effort"]["recommended_minutes"]
+                         - recovery["allocator_allocated_minutes"])
+
+    def test_the_report_measures_against_the_limit_actually_enforced(self):
+        # 80 billed over 60 wall-clock minutes is below 1.5 but above the 1.25 each day must hold.
+        booked = existing(stamp(9), stamp(10), "bc17f7")
+        tst = session("tst", stamp(9), stamp(9, 20))
+
+        result = self.run_pipeline([booked, tst], [(tst, TSTP, 20)])
+
+        report = result["allocation"]["billing_caps"]
+        self.assertEqual("5/4", report["policy"]["enforced_day_multiplier"])
+        self.assertEqual(["TST Prep"], [row["client"] for row in report["remaining_violations"]["days_over_cap"]])
+        self.assertEqual(["TST Prep"], [row["client"] for row in report["remaining_violations"]["months_over_cap"]])
 
     def test_a_billable_route_without_a_project_id_is_still_one_client(self):
         routing = json.loads((fixtures.ROOT / "routing.json").read_text())
@@ -518,7 +597,7 @@ class PipelineBillingCapTests(unittest.TestCase):
         schema = json.loads((fixtures.ROOT / "schemas" / "work-accounting-result-v1.json").read_text())
         fixtures.assert_schema_valid(schema, first)
         report = first["allocation"]["billing_caps"]
-        self.assertEqual({"day_multiplier": "3/2", "month_multiplier": "5/4",
+        self.assertEqual({"day_multiplier": "3/2", "month_multiplier": "5/4", "enforced_day_multiplier": "5/4",
                           "timezone": "Europe/Bucharest", "month_scope": "per_day"}, report["policy"])
         self.assertEqual(
             json.loads((fixtures.ROOT / "routing.json").read_text())["billing_caps"],
