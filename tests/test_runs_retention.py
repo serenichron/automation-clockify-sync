@@ -35,6 +35,9 @@ SHA_B = "b" * 40
 DAY = 86400
 SLICE_HASH = "0123456789abcdef" * 4
 FILLERS = ("zzzzzzzz-latest-1", "zzzzzzzz-latest-2", "zzzzzzzz-latest-3")
+# Fillers are the most recently modified non-young runs, so H4 holds them and
+# test runs created at the 30-day default stay eligible.
+FILLER_DAYS = 15
 
 SHIM = r'''#!{python}
 import json, os, sys
@@ -112,6 +115,7 @@ class Sandbox:
         self.coverage = self.state / "source-coverage.json"
         self.own = self.state / "runs-retention"
         self.inventory_path = self.own / "inventory.json"
+        self.journal_path = self.own / "deletions.jsonl"
         self.bin = base / "bin"
         self.control = base / "systemctl-control.json"
         self.counter = base / "systemctl-calls"
@@ -142,7 +146,7 @@ class Sandbox:
         }
         self.write_config()
         for name in FILLERS:
-            self.make_run(name)
+            self.make_run(name, days=FILLER_DAYS)
 
     def _release(self, sha: str) -> Path:
         target = self.base / "releases" / sha / "ops/systemd/user"
@@ -171,13 +175,14 @@ class Sandbox:
         age(path, days)
         return path
 
-    def run(self, sha: str = SHA_A) -> tuple[int, str, dict]:
+    def run(self, sha: str = SHA_A, extra_env: dict | None = None) -> tuple[int, str, dict]:
         release = self.releases[sha]
         environment = {
             "HOME": str(self.home),
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "FAKE_SYSTEMCTL": str(self.control),
             "LANG": "C.UTF-8",
+            **(extra_env or {}),
         }
         result = subprocess.run(
             [sys.executable, str(release / "ops/systemd/user" / SCRIPT.name),
@@ -207,6 +212,11 @@ class Sandbox:
     def names(self) -> set:
         return {entry.name for entry in self.runs.iterdir() if entry.is_dir()}
 
+    def journal(self) -> list:
+        if not self.journal_path.exists():
+            return []
+        return [json.loads(line) for line in self.journal_path.read_text().splitlines()]
+
 
 def candidates(record: dict) -> set:
     return {item["name"] for item in record.get("remaining_candidates", [])}
@@ -225,6 +235,28 @@ class RetentionTestCase(unittest.TestCase):
             if path.is_dir() and not path.is_symlink():
                 path.chmod(0o700)
         self.tmp.cleanup()
+
+    def run_in_process(self, patcher) -> tuple[int, dict]:
+        """Run main() in-process so a test can inject a fault at a chosen point."""
+        box = self.box
+        release = box.releases[SHA_A]
+        script = release / "ops/systemd/user" / SCRIPT.name
+        environment = {"HOME": str(box.home), "FAKE_SYSTEMCTL": str(box.control),
+                       "PATH": f"{box.bin}:{os.environ.get('PATH', '/usr/bin')}"}
+        with mock.patch.dict(os.environ, environment):
+            spec = importlib.util.spec_from_file_location(f"retention_{uuid.uuid4().hex}", script)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            argv = [str(script), "--config", str(box.config_path), "--release", str(release)]
+            previous = os.umask(0o022)
+            os.umask(previous)
+            try:
+                with patcher(module), mock.patch.object(sys, "argv", argv), \
+                        mock.patch("sys.stdout"), mock.patch("sys.stderr"):
+                    code = module.main()
+            finally:
+                os.umask(previous)
+        return code, box.records()[-1]
 
     def assertAbortedBeforeDelete(self, before: set, code: int, record: dict,
                                   reason: str = "") -> None:
@@ -273,6 +305,8 @@ class ClassificationTests(RetentionTestCase):
         box.make_run("youngchild-0001", {"source.txt": "youngsrc-00000001"}, days=1)
         box.make_run("youngsrc-00000001")
         box.make_run("youngsrc-00000002")
+        # The young run is also the most recent, so H4 needs one slot more for the fillers.
+        box.write_config(latest_keep=len(FILLERS) + 1)
         _, _, record = box.run()
         self.assertEqual({"youngsrc-00000002"}, candidates(record))
         self.assertEqual(1, record["young"]["count"])
@@ -333,6 +367,8 @@ class ClassificationTests(RetentionTestCase):
         inner = box.make_run("age-mixed-0003", {"a.txt": "a", "sub/b.txt": "b"})
         moment = time.time() - 2 * DAY
         os.utime(inner / "sub/b.txt", (moment, moment))
+        # Both young runs are also the most recent, so H4 needs two slots more.
+        box.write_config(latest_keep=len(FILLERS) + 2)
         _, _, record = box.run()
         self.assertEqual({"age-old-00002"}, candidates(record))
         self.assertEqual(2, record["young"]["count"])
@@ -340,6 +376,8 @@ class ClassificationTests(RetentionTestCase):
     def test_min_age_days_below_seven_rejected_and_seven_accepted(self) -> None:
         box = self.box
         box.make_run("minage-run-0001", days=8)
+        for name in FILLERS:  # keep H4 on the fillers, which must be newer than the candidate
+            age(box.runs / name, 7.5)
         box.write_config(min_age_days=6)
         code, _, record = box.run()
         self.assertEqual(1, code)
@@ -387,9 +425,19 @@ class HoldRuleTests(RetentionTestCase):
 
     def test_h4_three_greatest_names_are_held(self) -> None:
         box = self.box
-        box.make_run("zzzzzzzz-latest-0")  # fourth-greatest name
+        box.make_run("zzzzzzzz-latest-0")  # greatest-but-one name, but modified earliest
         _, _, record = box.run()
         self.assertEqual({"zzzzzzzz-latest-0"}, candidates(record))
+        self.assertEqual(3, record["held"]["H4"]["count"])
+
+    def test_h4_holds_the_most_recently_modified_runs_not_the_greatest_names(self) -> None:
+        box = self.box
+        # Mixed prefixes: these sort before the fillers but were modified later.
+        recent = {"20261101-recent-run", "aaaaaaaa-recent-02", "collected-recent-3"}
+        for name in recent:
+            box.make_run(name, days=FILLER_DAYS - 0.5)
+        _, _, record = box.run()
+        self.assertEqual(set(FILLERS), candidates(record))
         self.assertEqual(3, record["held"]["H4"]["count"])
 
     def test_h5_run_reports_held_while_coverage_absent_and_released_after(self) -> None:
@@ -497,6 +545,55 @@ class GateAndModeTests(RetentionTestCase):
         _, _, record = box.run()
         self.assertEqual("dry-run", record["effective_mode"])
         self.assertIn("gate-eligible-001", box.names())
+
+    def test_delete_mode_pass_never_arms_the_gate(self) -> None:
+        box = self.box
+        box.make_run("gate-eligible-001")
+        box.write_config(mode="delete")
+        before = box.names()
+        for _ in range(3):
+            code, _, record = box.run()
+            self.assertEqual((0, "delete", "dry-run", "dry-run"),
+                             (code, record["mode"], record["effective_mode"], record["outcome"]))
+            self.assertIn("dry-run required", record["reason"])
+        self.assertEqual(before, box.names())
+
+    def test_delete_pass_removes_only_candidates_of_the_armed_dry_run(self) -> None:
+        box = self.box
+        box.make_run("previewed-run-001")
+        armed = box.prime()
+        box.make_run("unreviewed-run-01")  # eligible now, absent from the reviewed preview
+        code, _, record = box.run()
+        self.assertEqual((0, "deleted", "delete"),
+                         (code, record["outcome"], record["effective_mode"]))
+        self.assertEqual(armed["id"], record["gate_record_id"])
+        self.assertEqual(["previewed-run-001"], [item["name"] for item in record["deleted"]])
+        self.assertEqual(["unreviewed-run-01"],
+                         [item["name"] for item in record["unpreviewed_candidates"]])
+        self.assertEqual({"unreviewed-run-01", *FILLERS}, box.names())
+
+    def test_previewed_candidate_that_is_no_longer_eligible_is_kept(self) -> None:
+        box = self.box
+        box.make_run("previewed-run-001")
+        box.make_run("previewed-run-002")
+        box.prime()
+        (box.state / "refs.txt").write_text("previewed-run-002")
+        code, _, record = box.run()
+        self.assertEqual((0, "deleted"), (code, record["outcome"]))
+        self.assertEqual(["previewed-run-001"], [item["name"] for item in record["deleted"]])
+        self.assertIn("previewed-run-002", box.names())
+
+    def test_delete_pass_with_no_previewed_candidate_left_deletes_nothing(self) -> None:
+        box = self.box
+        box.make_run("previewed-run-001")
+        box.prime()
+        (box.state / "refs.txt").write_text("previewed-run-001")  # no longer eligible
+        box.make_run("unreviewed-run-01")
+        code, _, record = box.run()
+        self.assertEqual((0, "delete"), (code, record["effective_mode"]))
+        self.assertEqual("nothing-eligible", record["outcome"])
+        self.assertEqual([], record["deleted"])
+        self.assertEqual({"previewed-run-001", "unreviewed-run-01"} | set(FILLERS), box.names())
 
     def test_same_release_dry_run_then_delete_removes_only_eligible(self) -> None:
         box = self.box
@@ -680,6 +777,128 @@ class PartialDeleteTests(RetentionTestCase):
         self.assertIn("partial-delete-failure", output)
 
 
+class DeletionJournalTests(RetentionTestCase):
+    def test_journal_records_intent_and_completion_of_each_removal(self) -> None:
+        box = self.box
+        box.make_run("journal-run-0001", {"a.txt": "x" * 10})
+        box.make_run("journal-run-0002", {"a.txt": "y" * 20})
+        box.prime()
+        code, _, record = box.run()
+        self.assertEqual((0, "deleted"), (code, record["outcome"]))
+        self.assertEqual(0o600, stat.S_IMODE(box.journal_path.stat().st_mode))
+        events = [(item["record_id"], item["event"], item["name"]) for item in box.journal()]
+        self.assertEqual([
+            (record["id"], "intent", "journal-run-0001"),
+            (record["id"], "removed", "journal-run-0001"),
+            (record["id"], "intent", "journal-run-0002"),
+            (record["id"], "removed", "journal-run-0002"),
+        ], events)
+        self.assertEqual({SHA_A}, {item["release_sha"] for item in box.journal()})
+        self.assertEqual([10, 10, 20, 20], [item["bytes"] for item in box.journal()])
+
+    def test_pass_killed_during_deletion_can_be_reconstructed_from_the_journal(self) -> None:
+        box = self.box
+        for name in ("killed-run-0001", "killed-run-0002", "killed-run-0003"):
+            box.make_run(name)
+        box.prime()
+
+        def patcher(module):
+            real = shutil.rmtree
+            calls = []
+
+            def rmtree(*args, **kwargs):
+                calls.append(args[0])
+                if len(calls) == 2:
+                    # Stands in for SIGTERM at TimeoutStartSec or the OOM killer:
+                    # nothing after this point runs, so no final record is written.
+                    raise KeyboardInterrupt
+                real(*args, **kwargs)
+            rmtree.avoids_symlink_attacks = True
+            return mock.patch.object(module.shutil, "rmtree", rmtree)
+
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_in_process(patcher)
+        last = box.records()[-1]
+        self.assertEqual(("started", "delete"), (last["outcome"], last["effective_mode"]))
+        self.assertEqual(3, len(last["remaining_candidates"]))  # the record alone overstates
+        events = [(item["record_id"], item["event"], item["name"]) for item in box.journal()]
+        self.assertEqual([
+            (last["id"], "intent", "killed-run-0001"),
+            (last["id"], "removed", "killed-run-0001"),
+            (last["id"], "intent", "killed-run-0002"),
+        ], events)
+        self.assertEqual({"killed-run-0002", "killed-run-0003", *FILLERS}, box.names())
+
+    def test_unwritable_journal_aborts_before_the_first_removal(self) -> None:
+        box = self.box
+        box.make_run("journal-blocked-01")
+        box.prime()
+        box.journal_path.mkdir()
+        before = box.names()
+        code, _, record = box.run()
+        self.assertAbortedBeforeDelete(before, code, record)
+
+
+class ConcurrentWriterTests(RetentionTestCase):
+    def test_work_accounting_starting_mid_deletion_stops_before_the_next_removal(self) -> None:
+        box = self.box
+        for name in ("writer-run-00001", "writer-run-00002", "writer-run-00003"):
+            box.make_run(name)
+        box.prime()
+
+        def patcher(module):
+            real = shutil.rmtree
+
+            def rmtree(*args, **kwargs):
+                real(*args, **kwargs)
+                # The work-accounting unit (no shared lock with manual starts) begins now.
+                box.systemctl({"active": {"clockify-work-accounting.service": "active"}})
+            rmtree.avoids_symlink_attacks = True
+            return mock.patch.object(module.shutil, "rmtree", rmtree)
+
+        code, record = self.run_in_process(patcher)
+        self.assertEqual(1, code)
+        self.assertEqual("partial-delete-failure", record["outcome"])
+        self.assertIn("not quiescent: clockify-work-accounting.service", record["reason"])
+        self.assertEqual(["writer-run-00001"], [item["name"] for item in record["deleted"]])
+        self.assertEqual(["writer-run-00002", "writer-run-00003"],
+                         [item["name"] for item in record["remaining_candidates"]])
+        self.assertEqual({"writer-run-00002", "writer-run-00003", *FILLERS}, box.names())
+
+    def test_unit_that_ran_and_finished_mid_deletion_stops_the_pass(self) -> None:
+        box = self.box
+        for name in ("writer-run-00001", "writer-run-00002"):
+            box.make_run(name)
+        box.prime()
+
+        def patcher(module):
+            real = shutil.rmtree
+
+            def rmtree(*args, **kwargs):
+                real(*args, **kwargs)
+                box.systemctl({"invocation": "e" * 32})  # a new, already finished invocation
+            rmtree.avoids_symlink_attacks = True
+            return mock.patch.object(module.shutil, "rmtree", rmtree)
+
+        code, record = self.run_in_process(patcher)
+        self.assertEqual((1, "partial-delete-failure"), (code, record["outcome"]))
+        self.assertIn("unit markers changed during deletion", record["reason"])
+        self.assertIn("writer-run-00002", box.names())
+
+
+class CoverageFallbackTests(RetentionTestCase):
+    def test_coverage_path_from_environment_is_used_and_absence_holds_run_reports(self) -> None:
+        box = self.box
+        box.make_run("h5-report-run-01", {"run-report.json": "{}"})
+        box.make_run("h5-plain-run-002")
+        box.write_config(coverage_file=None)  # default comes from the unit environment
+        missing = box.state / "elsewhere/source-coverage.json"
+        _, _, record = box.run(extra_env={"CLOCKIFY_AUTOPILOT_COVERAGE_STATE": str(missing)})
+        self.assertTrue(box.coverage.exists())  # the built-in default is present but unused
+        self.assertEqual({"h5-plain-run-002"}, candidates(record))
+        self.assertEqual(1, record["held"]["H5"]["count"])
+
+
 class InventoryAndCacheTests(RetentionTestCase):
     def test_inventory_mode_atomic_replace_and_record_cap(self) -> None:
         box = self.box
@@ -787,7 +1006,7 @@ class InventoryAndCacheTests(RetentionTestCase):
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
 
-            def observe(scan, record):
+            def observe(scan, record, journal):
                 seen["records"] = json.loads(box.inventory_path.read_text())["records"]
                 record["outcome"] = "deleted"
 
@@ -824,28 +1043,6 @@ def cache_keys(box: Sandbox) -> list:
 
 
 class DeadlineAndCheckpointTests(RetentionTestCase):
-    def run_in_process(self, patcher) -> tuple[int, dict]:
-        """Run main() in-process so a test can inject a deadline at a chosen point."""
-        box = self.box
-        release = box.releases[SHA_A]
-        script = release / "ops/systemd/user" / SCRIPT.name
-        environment = {"HOME": str(box.home), "FAKE_SYSTEMCTL": str(box.control),
-                       "PATH": f"{box.bin}:{os.environ.get('PATH', '/usr/bin')}"}
-        with mock.patch.dict(os.environ, environment):
-            spec = importlib.util.spec_from_file_location(f"retention_{uuid.uuid4().hex}", script)
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            argv = [str(script), "--config", str(box.config_path), "--release", str(release)]
-            previous = os.umask(0o022)
-            os.umask(previous)
-            try:
-                with patcher(module), mock.patch.object(sys, "argv", argv), \
-                        mock.patch("sys.stdout"), mock.patch("sys.stderr"):
-                    code = module.main()
-            finally:
-                os.umask(previous)
-        return code, box.records()[-1]
-
     def test_deadline_inside_reference_scan_records_abort_and_exits_nonzero(self) -> None:
         box = self.box
         box.make_run("deadline-cand-0001")
@@ -913,7 +1110,7 @@ class DeadlineAndCheckpointTests(RetentionTestCase):
         def patcher(module):
             original = module.delete_candidates
 
-            def wrapped(scan, record):
+            def wrapped(scan, record, journal):
                 real = shutil.rmtree
 
                 def rmtree(*args, **kwargs):
@@ -921,7 +1118,7 @@ class DeadlineAndCheckpointTests(RetentionTestCase):
                     scan.deadline = 0  # expire right after the first removal
                 rmtree.avoids_symlink_attacks = True
                 with mock.patch.object(module.shutil, "rmtree", rmtree):
-                    return original(scan, record)
+                    return original(scan, record, journal)
             return mock.patch.object(module, "delete_candidates", wrapped)
 
         code, record = self.run_in_process(patcher)
@@ -1010,8 +1207,15 @@ class UnitArtifactTests(unittest.TestCase):
              "--release", "${CLOCKIFY_AUTOPILOT_ROOT}"],
             command,
         )
-        self.assertEqual(["%h/.config/serenichron/clockify-review-cycle-override.env"],
+        # Same order as the cycle, so CLOCKIFY_AUTOPILOT_COVERAGE_STATE resolves alike.
+        self.assertEqual(["%h/.config/serenichron/clockify-review-cycle.env",
+                          "%h/.config/serenichron/clockify-review-cycle-override.env"],
                          repeated(RETENTION_UNIT, "EnvironmentFile"))
+        cycle_files = repeated(CYCLE_UNIT, "EnvironmentFile")
+        self.assertEqual(repeated(RETENTION_UNIT, "EnvironmentFile"),
+                         [item for item in cycle_files
+                          if item in repeated(RETENTION_UNIT, "EnvironmentFile")])
+        self.assertEqual("3G", service["MemoryMax"])
         for key in ("UMask", "NoNewPrivileges", "PrivateTmp", "ProtectSystem", "ProtectHome",
                     "WorkingDirectory", "Restart"):
             self.assertEqual(cycle["Service"][key], service[key], key)

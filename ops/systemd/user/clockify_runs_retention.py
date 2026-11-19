@@ -194,6 +194,41 @@ class Inventory:
             )
 
 
+class DeletionJournal:
+    """Append-only, fsynced log so a pass killed mid-deletion can be reconstructed."""
+
+    def __init__(self, directory: Path, record: dict):
+        self.directory = directory
+        self.path = directory / "deletions.jsonl"
+        self.record = record
+
+    def append(self, event: str, candidate: dict, **extra) -> None:
+        release_tool._canonical(self.path, must_exist=False)
+        entry = {
+            "record_id": self.record["id"], "release_sha": self.record["release_sha"],
+            "time": release_tool._now(), "event": event,
+            "name": candidate["name"], "bytes": candidate["bytes"], **extra,
+        }
+        descriptor = os.open(
+            self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+            0o600,
+        )
+        try:
+            details = os.fstat(descriptor)
+            if (not stat.S_ISREG(details.st_mode) or details.st_uid != os.getuid()
+                    or stat.S_IMODE(details.st_mode) != 0o600):
+                raise RetentionAbort(f"unsafe deletion journal: {self.path}")
+            os.write(descriptor, (json.dumps(entry, sort_keys=True) + "\n").encode())
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        directory = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+
 def unit_markers() -> dict:
     markers = {}
     for unit in UNITS:
@@ -518,7 +553,11 @@ class Scan:
                 held["H3"].add(name)
             if not coverage_exists and (path / "run-report.json") in self.snapshot:
                 held["H5"].add(name)
-        held["H4"].update(sorted(directories)[-self.config["latest_keep"]:])
+        # Names mix prefixes (slices, collectors, timestamps), so recency is by mtime.
+        by_recency = sorted(
+            directories, key=lambda item: (self.info[item]["newest_mtime_ns"], item)
+        )
+        held["H4"].update(by_recency[-self.config["latest_keep"]:])
         retained = direct | young | set().union(*held.values())
         pending = retained.copy()
         rounds = 0
@@ -602,7 +641,7 @@ class Scan:
         self.check_deadline()
 
 
-def delete_candidates(scan: Scan, record: dict) -> None:
+def delete_candidates(scan: Scan, record: dict, journal: DeletionJournal) -> None:
     if not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
         raise RetentionAbort("fd-based shutil.rmtree is unavailable")
     with ExitStack() as stack:
@@ -628,9 +667,14 @@ def delete_candidates(scan: Scan, record: dict) -> None:
             for candidate in scan.candidates:
                 scan.check_deadline()
                 name = candidate["name"]
+                # Writers without a shared lock (the work-accounting unit) are
+                # excluded by re-proving quiescence right before every removal.
+                if unit_markers() != scan.markers:
+                    raise RetentionAbort("unit markers changed during deletion")
                 details = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
                 if signature(details) != scan.snapshot[runs / name]:
                     raise RetentionAbort(f"candidate changed before deletion: {name}")
+                journal.append("intent", candidate)
                 try:
                     record["deletion_started"] = True
                     shutil.rmtree(name, dir_fd=descriptor)
@@ -639,9 +683,14 @@ def delete_candidates(scan: Scan, record: dict) -> None:
                     record["outcome"] = "partial-delete-failure"
                     record["reason"] = str(exc)
                     record["possibly_partial_candidate"] = name
+                    try:
+                        journal.append("failed", candidate, reason=str(exc))
+                    except (OSError, ValueError) as journal_exc:
+                        record["journal_error"] = str(journal_exc)
                     return
                 record["deleted"].append(candidate)
                 record["remaining_candidates"].pop(0)
+                journal.append("removed", candidate)
         finally:
             os.close(descriptor)
     record["outcome"] = "deleted"
@@ -699,35 +748,54 @@ def main() -> int:
             if release_tool._canonical(Path(__file__)) != expected_script:
                 raise RetentionAbort("executed script does not belong to the declared release")
             history = inventory.records()
-            gate = any(
-                item.get("outcome") == "dry-run"
-                and item.get("effective_mode") == "dry-run"
-                and item.get("release_sha") == record["release_sha"]
-                and item.get("schema") == SCHEMA
-                and item.get("tokenizer_version") == TOKENIZER_VERSION
-                and item.get("MIN_TOKEN") == MIN_TOKEN
-                for item in history
-            )
+            # Only a pass configured as dry-run arms the gate. A delete-mode pass
+            # that fell back to preview never does, so a preview nobody asked to
+            # review cannot authorize deletion. The latest armed preview is used.
+            gate = None
+            for item in reversed(history):
+                if (item.get("outcome") == "dry-run"
+                        and item.get("mode") == "dry-run"
+                        and item.get("effective_mode") == "dry-run"
+                        and item.get("release_sha") == record["release_sha"]
+                        and item.get("schema") == SCHEMA
+                        and item.get("tokenizer_version") == TOKENIZER_VERSION
+                        and item.get("MIN_TOKEN") == MIN_TOKEN
+                        and isinstance(item.get("remaining_candidates"), list)
+                        and all(isinstance(entry, dict) and isinstance(entry.get("name"), str)
+                                for entry in item["remaining_candidates"])):
+                    gate = item
+                    break
             scan = Scan(config, own_dir)
             record.update(scan.scan())
             record["scan_duration_seconds"] = (
                 time.monotonic_ns() - scan.start_monotonic_ns
             ) / 1_000_000_000
-            record["remaining_candidates"] = scan.candidates.copy()
             scan.check_deadline()
-            if config["mode"] == "delete" and gate:
+            if config["mode"] == "delete" and gate is not None:
                 record["effective_mode"] = "delete"
+                record["gate_record_id"] = gate.get("id")
+                # Delete only what the operator could review and is still eligible now.
+                previewed = {entry["name"] for entry in gate["remaining_candidates"]}
+                record["unpreviewed_candidates"] = [
+                    item for item in scan.candidates if item["name"] not in previewed
+                ]
+                scan.candidates = [item for item in scan.candidates if item["name"] in previewed]
+                if not scan.candidates and scan.eligible:
+                    record["reason"] = "no eligible directory was a candidate in the armed dry-run"
             elif config["mode"] == "delete":
-                record["reason"] = "same-release successful dry-run required"
+                record["reason"] = "same-release successful dry-run required (configured mode dry-run)"
+            record["remaining_candidates"] = scan.candidates.copy()
             # Durable intent precedes shared locks and the first destructive operation.
             record["outcome"] = "started"
+            if record["effective_mode"] == "delete":
+                record["journal"] = str(own_dir / "deletions.jsonl")
             inventory.write(record)
-            if not scan.eligible:
+            if not scan.candidates:
                 record["outcome"] = "nothing-eligible"
             elif record["effective_mode"] == "dry-run":
                 record["outcome"] = "dry-run"
             else:
-                delete_candidates(scan, record)
+                delete_candidates(scan, record, DeletionJournal(own_dir, record))
             post_totals(scan, record)
             # Cache failures must not obscure an irreversible deletion outcome.
             try:
