@@ -4,6 +4,7 @@ Wants=network-online.target
 After=network-online.target
 Wants=clockify-review-cycle-update.service
 After=clockify-review-cycle-update.service
+OnSuccess=clockify-runs-retention.service
 
 [Service]
 Type=oneshot

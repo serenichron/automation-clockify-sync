@@ -304,6 +304,85 @@ Only the recurring service has `[Install] WantedBy=default.target`. The canary
 is manual-only and the updater is pulled in by the recurring service. No
 `.timer` artifact exists.
 
+## Run-directory retention
+
+After an exit-0 cycle, `OnSuccess` starts
+`clockify-runs-retention.service`. It inventories run directories, keeps direct
+and transitive references, runs younger than 14 days, and H1–H5 reader holds
+(autopilot results, incomplete slices, collector derivations, the three most
+recently modified runs, and run reports while source coverage is absent).
+Top-level regular files stay in place and supply references. The unit loads
+`clockify-review-cycle.env` and then `clockify-review-cycle-override.env`, in
+the cycle's order, and the coverage default is their
+`CLOCKIFY_AUTOPILOT_COVERAGE_STATE`, else the live `state/source-coverage.json`
+that the legacy runner also uses; `coverage_file` in the config overrides both.
+If that file does not exist, every run with a top-level `run-report.json` is
+kept (H5), because the runner would rebuild coverage from those reports.
+
+The default is **dry-run**. Private history and a bounded token cache live in
+`state/runs-retention/`, excluded from reference matching. Scans hold no producer
+locks. Deletion takes the override, release-record, and runner
+(`state/autopilot-runner.lock`, the work-accounting runner's
+`CLOCKIFY_AUTOPILOT_LOCK`) locks in that order and holds them until the last
+removal, then requires unchanged unit markers and filesystem snapshots. The
+unit markers, including `clockify-work-accounting.service`, are checked again
+immediately before every removal. Missing inputs, links, special files, scan
+errors, lock contention, or changed evidence abort before deletion. A removal
+failure stops the pass and records deleted, remaining, and possibly partially
+removed candidates. A token over 16 MiB also aborts to bound scan memory, and
+the unit has `MemoryMax=3G`.
+
+Before and after each removal the pass appends an fsynced line (`intent`,
+`removed` or `failed`, with the inventory record id, release SHA, name and
+size) to `state/runs-retention/deletions.jsonl`. If the pass is killed during
+deletion (for example SIGTERM at `TimeoutStartSec` or the OOM killer),
+`inventory.json` keeps only its `started` record, which lists every candidate
+as remaining; the journal lines with that record id show which candidates were
+removed and which one may be partially removed (an `intent` without
+`removed`).
+
+One-time operator steps, after the release is authorized for integration and
+activation, are as follows.
+
+1. Integrate the change to master and let the existing updater materialize and
+   activate that release. Confirm the SHA in
+   `~/.config/serenichron/clockify-review-cycle-override.env` and confirm the
+   selected release contains the retention script.
+2. Compare installed units with the release copies, preserving host overrides.
+   Install the updated `clockify-review-cycle.service` and the new
+   `clockify-runs-retention.service` into `~/.config/systemd/user/` with mode
+   `0644`, then run `systemctl --user daemon-reload`. Retention has no install
+   target or timer.
+3. Run `systemctl --user start clockify-runs-retention.service`. Inspect
+   `journalctl --user -u clockify-runs-retention.service --since today` and
+   `~/Work/automation-clockify-sync/state/runs-retention/inventory.json`.
+   Confirm systemctl connectivity inside the sandbox, a completed dry-run,
+   hold counts, candidate ages, closure, and duration. Compare with the manual
+   archive inventory at `~/Work/_ops/clockify-runs-archive/20261110/`.
+4. To enable deletion after reviewing that dry-run, create or update the
+   user-owned mode-`0600` JSON file
+   `~/.config/serenichron/clockify-runs-retention.json` with `"mode": "delete"`,
+   preserving any other settings. An absent config uses built-in defaults.
+   Unknown keys fail closed. `min_age_days` must be at least 7,
+   `latest_keep` at least 1, and `deadline_seconds` between 1 and 1500.
+   Only a successful pass whose configured mode is `dry-run` arms deletion, for
+   the same release SHA, schema and tokenizer. A delete-mode pass without such a
+   preview runs as a dry-run and never arms the gate itself. A delete pass
+   removes only directories that were candidates in the latest armed dry-run
+   (its `remaining_candidates`) and are still eligible in its own fresh scan;
+   other eligible directories are listed as `unpreviewed_candidates` and kept.
+   Because the updater moves to each new master SHA, deletion stops after every
+   release change until the operator repeats steps 3 and 4: set
+   `"mode": "dry-run"`, start the unit, review the new preview, then set
+   `"mode": "delete"` again. The armed preview must still be among the last
+   `max_records` (default 60) inventory records; once it rotates out, deletion
+   stops until a new preview. Setting `"mode": "dry-run"` restores preview mode.
+
+Sandbox connectivity and cold/warm performance require the operator dry-run.
+Exit 75 from the cycle postpones retention until a later exit-0 cycle. Producer
+locks are held only for final validation and removal; a coincident cycle can
+still exit 73 on runner-lock contention.
+
 ## Roll back atomically
 
 Keep the previous release and its release-specific config. Stop the recurring
