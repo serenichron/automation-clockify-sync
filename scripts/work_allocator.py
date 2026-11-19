@@ -4,9 +4,12 @@ Evidence is deliberately kept separate from allocated Clockify time.  Evidence
 may overlap; allocations never do.  This module is pure stdlib code and has no
 Clockify or filesystem side effects.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
+import datetime as dt
 from datetime import datetime, timedelta
+from fractions import Fraction
 from typing import Any, Iterable, Mapping, Sequence
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 class AllocationError(ValueError):
@@ -508,3 +511,508 @@ def allocate_work(
 
 # A short alias makes the primary pure operation convenient for pipeline callers.
 allocate = allocate_work
+
+
+# ---------------------------------------------------------------------------
+# Billing guards for parallel agent sessions
+# ---------------------------------------------------------------------------
+#
+# Two rules, decided on 2026-11-19, bound how much session time may be billed:
+#
+# * The same wall-clock minute is never billed to two clients.  Where sessions
+#   for different clients were observed at the same time, the contested time is
+#   split between those clients in proportion to their estimated effort there.
+#   Time already taken by another client's fixed entry (an existing Clockify
+#   entry or a recorded meeting) is not available to a session at all.
+# * Per client and day, billed time may not exceed ``day_multiplier`` times the
+#   wall-clock time covered; per client and calendar month it may not exceed
+#   ``month_multiplier`` times the sum of the daily wall-clock times.  Parallel
+#   sessions for one client may therefore still overlap, up to these caps.
+#
+# This module is pure stdlib code with no Clockify or filesystem side effects.
+# It measures the same quantities as the read-only timesheet checker: a row is
+# attributed to the local day of its start, a day's wall-clock time is the union
+# of that client's rows, and a month's wall-clock time is the sum of its days.
+
+BILLING_CAPS_ROUTING_KEY = "billing_caps"
+DEFAULT_DAY_MULTIPLIER = Fraction(3, 2)
+DEFAULT_MONTH_MULTIPLIER = Fraction(5, 4)
+DEFAULT_TIMEZONE = "Europe/Bucharest"
+# Each day must satisfy the month multiplier on its own.  A month is a
+# weighted average of its days, so this holds the month cap without any state
+# shared between runs, whatever order days are processed or reprocessed in.
+MONTH_SCOPE_PER_DAY = "per_day"
+# The month is checked on everything added so far.  Only valid when one caller
+# feeds a whole month in chronological order (the offline replay does).
+MONTH_SCOPE_CUMULATIVE = "cumulative"
+MINUTE = 60
+
+Interval = tuple[dt.datetime, dt.datetime]
+
+
+class BillingCapsError(AllocationError):
+    """Raised for an invalid billing-cap declaration or interval."""
+
+
+def _multiplier(value: Any, default: Fraction, field: str) -> Fraction:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise BillingCapsError(f"{BILLING_CAPS_ROUTING_KEY}.{field} must be a number")
+    try:
+        parsed = Fraction(str(value))
+    except (ValueError, ZeroDivisionError) as exc:
+        raise BillingCapsError(f"{BILLING_CAPS_ROUTING_KEY}.{field} must be a number") from exc
+    if parsed < 1:
+        raise BillingCapsError(f"{BILLING_CAPS_ROUTING_KEY}.{field} must be at least 1")
+    return parsed
+
+
+@dataclass(frozen=True)
+class BillingPolicy:
+    day_multiplier: Fraction = DEFAULT_DAY_MULTIPLIER
+    month_multiplier: Fraction = DEFAULT_MONTH_MULTIPLIER
+    project_clients: Mapping[str, str] = dataclass_field(default_factory=dict)
+    timezone: str = DEFAULT_TIMEZONE
+
+    def client_for_project(self, project_suffix: Any) -> str:
+        """Return the billed client of a routed project, or "" without a project.
+
+        A routed project missing from the declared map is its own client.  That
+        keeps its minutes exclusive against every other client instead of
+        silently merging it into one.
+        """
+        suffix = str(project_suffix or "").strip()
+        if not suffix:
+            return ""
+        return self.project_clients.get(suffix) or f"project:{suffix}"
+
+    def declared_client(self, project_suffix: Any) -> str:
+        """Return the client only when the project is declared; "" otherwise."""
+        return self.project_clients.get(str(project_suffix or "").strip(), "")
+
+    def document(self) -> dict[str, Any]:
+        return {
+            "day_multiplier": str(self.day_multiplier),
+            "month_multiplier": str(self.month_multiplier),
+            "timezone": self.timezone,
+        }
+
+
+def billing_policy_from_routing(routing: Mapping[str, Any] | None) -> BillingPolicy | None:
+    """Read the routing declaration; without one the guards are off.
+
+    A run replays against its own routing snapshot, so results produced
+    before the declaration existed keep reproducing unchanged.
+    """
+    if BILLING_CAPS_ROUTING_KEY not in (routing or {}):
+        return None
+    declaration = (routing or {}).get(BILLING_CAPS_ROUTING_KEY)
+    timezone = str((routing or {}).get("timezone") or DEFAULT_TIMEZONE)
+    if not isinstance(declaration, Mapping):
+        raise BillingCapsError(f"{BILLING_CAPS_ROUTING_KEY} must be an object")
+    unknown = set(declaration) - {"day_multiplier", "month_multiplier", "project_clients"}
+    if unknown:
+        raise BillingCapsError(f"{BILLING_CAPS_ROUTING_KEY} has unsupported fields: {sorted(unknown)}")
+    clients = declaration.get("project_clients", {})
+    if not isinstance(clients, Mapping) or any(
+        not isinstance(key, str) or not key or not isinstance(value, str) or not value
+        for key, value in clients.items()
+    ):
+        raise BillingCapsError(f"{BILLING_CAPS_ROUTING_KEY}.project_clients must map project suffixes to client names")
+    try:
+        ZoneInfo(timezone)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise BillingCapsError("routing timezone is invalid") from exc
+    return BillingPolicy(
+        day_multiplier=_multiplier(declaration.get("day_multiplier"), DEFAULT_DAY_MULTIPLIER, "day_multiplier"),
+        month_multiplier=_multiplier(declaration.get("month_multiplier"), DEFAULT_MONTH_MULTIPLIER, "month_multiplier"),
+        project_clients=dict(clients),
+        timezone=timezone,
+    )
+
+
+def _check_billing_interval(start: dt.datetime, end: dt.datetime) -> None:
+    if not isinstance(start, dt.datetime) or not isinstance(end, dt.datetime):
+        raise BillingCapsError("interval bounds must be datetimes")
+    if start.tzinfo is None or end.tzinfo is None:
+        raise BillingCapsError("interval bounds must be timezone-aware")
+    if end <= start:
+        raise BillingCapsError("interval must have positive duration")
+
+
+def interval_seconds(intervals: Iterable[Interval]) -> int:
+    return sum(int((end - start).total_seconds()) for start, end in intervals)
+
+
+def merge_intervals(intervals: Iterable[Interval]) -> list[Interval]:
+    """Return the union; touching intervals become one span."""
+    merged: list[Interval] = []
+    for start, end in sorted(intervals):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def intersect_intervals(left: Iterable[Interval], right: Iterable[Interval]) -> list[Interval]:
+    result: list[Interval] = []
+    others = merge_intervals(right)
+    for start, end in merge_intervals(left):
+        for other_start, other_end in others:
+            low, high = max(start, other_start), min(end, other_end)
+            if low < high:
+                result.append((low, high))
+    return result
+
+
+def _floor_minute(value: dt.datetime) -> dt.datetime:
+    return value.replace(second=0, microsecond=0)
+
+
+def _ceil_minute(value: dt.datetime) -> dt.datetime:
+    floored = _floor_minute(value)
+    return floored if floored == value else floored + dt.timedelta(minutes=1)
+
+
+@dataclass(frozen=True)
+class BillingClaim:
+    """Observed session time one client could be billed for.
+
+    ``density`` is the estimated effort per second of the claim (0..1).  It
+    weighs the client's share of time that another client claims as well.
+    """
+
+    client: str
+    start: dt.datetime
+    end: dt.datetime
+    density: Fraction = Fraction(1)
+
+    def __post_init__(self) -> None:
+        _check_billing_interval(self.start, self.end)
+        if not self.client:
+            raise BillingCapsError("a claim needs a client")
+        if self.density < 0:
+            raise BillingCapsError("claim density must not be negative")
+
+
+@dataclass(frozen=True)
+class ExclusiveShares:
+    """Per client, the time its sessions may use; no two clients share any."""
+
+    owned: Mapping[str, tuple[Interval, ...]]
+    contested_seconds: int
+    blocked_seconds: Mapping[str, int]
+
+    def clip(self, client: str, intervals: Iterable[Interval]) -> list[Interval]:
+        return intersect_intervals(intervals, self.owned.get(client, ()))
+
+
+def exclusive_shares(
+    claims: Sequence[BillingClaim],
+    blocked: Sequence[tuple[str, dt.datetime, dt.datetime]] = (),
+) -> ExclusiveShares:
+    """Give every claimed second to at most one client.
+
+    ``blocked`` holds fixed entries as ``(client, start, end)``: a client may
+    not use time covered by another client's fixed entry.  The remaining time
+    claimed by several clients is split per contiguous run, in whole minutes,
+    proportionally to the claims' weights; rounding is carried to the next run
+    with the same contenders so the proportion holds over a day.
+    """
+    for client, start, end in blocked:
+        _check_billing_interval(start, end)
+    points = sorted({
+        point
+        for claim in claims for point in (claim.start, claim.end)
+    } | {
+        point
+        for _client, start, end in blocked for point in (start, end)
+    })
+    owned: dict[str, list[Interval]] = {}
+    blocked_seconds: dict[str, int] = {}
+    contested_seconds = 0
+    carry: dict[tuple[tuple[str, ...], str], Fraction] = {}
+    run: list[tuple[dt.datetime, dt.datetime, dict[str, Fraction]]] = []
+    run_key: tuple[str, ...] = ()
+
+    def close_run() -> None:
+        nonlocal run, run_key, contested_seconds
+        if not run:
+            return
+        start, end = run[0][0], run[-1][1]
+        contested_seconds += int((end - start).total_seconds())
+        weight = {
+            client: sum(
+                (weights[client] * int((high - low).total_seconds()) for low, high, weights in run),
+                Fraction(0),
+            )
+            for client in run_key
+        }
+        if not any(weight.values()):
+            weight = {client: Fraction(1) for client in run_key}
+        total = sum(weight.values(), Fraction(0))
+        # Whoever was already working keeps the head of the run and whoever
+        # continues afterwards gets its tail, so shares stay contiguous.
+        touching = [claim for claim in claims if claim.start < end and start < claim.end]
+        order = sorted(run_key, key=lambda client: (
+            min(claim.start for claim in touching if claim.client == client),
+            max(claim.end for claim in touching if claim.client == client),
+            client,
+        ))
+        grid_start, grid_end = _ceil_minute(start), _floor_minute(end)
+        minutes = max(0, int((grid_end - grid_start).total_seconds()) // MINUTE)
+        if minutes == 0:
+            # Shorter than one aligned minute: it cannot be divided into
+            # billable whole minutes, so the contender owed the most takes it.
+            length = Fraction(int((end - start).total_seconds()), MINUTE)
+            entitlement = {
+                client: length * weight[client] / total + carry.get((run_key, client), Fraction(0))
+                for client in run_key
+            }
+            winner = max(order, key=lambda client: (entitlement[client], -order.index(client)))
+            for client in run_key:
+                carry[(run_key, client)] = entitlement[client] - (length if client == winner else 0)
+            owned.setdefault(winner, []).append((start, end))
+            run, run_key = [], ()
+            return
+        entitlement = {
+            client: Fraction(minutes) * weight[client] / total + carry.get((run_key, client), Fraction(0))
+            for client in run_key
+        }
+        share = {client: 0 for client in run_key}
+        for _ in range(minutes):
+            winner = max(order, key=lambda client: (entitlement[client] - share[client], -order.index(client)))
+            share[winner] += 1
+        for client in run_key:
+            carry[(run_key, client)] = entitlement[client] - share[client]
+        holders = [client for client in order if share[client]]
+        cursor = start
+        for index, client in enumerate(holders):
+            chunk_end = (
+                end if index == len(holders) - 1
+                else (grid_start if index == 0 else cursor) + dt.timedelta(minutes=share[client])
+            )
+            owned.setdefault(client, []).append((cursor, chunk_end))
+            cursor = chunk_end
+        run, run_key = [], ()
+
+    for low, high in zip(points, points[1:]):
+        weights: dict[str, Fraction] = {}
+        for claim in claims:
+            if claim.start <= low and high <= claim.end:
+                weights[claim.client] = weights.get(claim.client, Fraction(0)) + claim.density
+        if not weights:
+            close_run()
+            continue
+        blockers = {client for client, start, end in blocked if start <= low and high <= end}
+        eligible = tuple(sorted(client for client in weights if not blockers - {client}))
+        for client in weights:
+            if client not in eligible:
+                blocked_seconds[client] = blocked_seconds.get(client, 0) + int((high - low).total_seconds())
+        if len(eligible) < 2:
+            close_run()
+            if eligible:
+                owned.setdefault(eligible[0], []).append((low, high))
+            continue
+        if run and (run_key != eligible or run[-1][1] != low):
+            close_run()
+        run_key = eligible
+        run.append((low, high, {client: weights[client] for client in eligible}))
+    close_run()
+    return ExclusiveShares(
+        owned={client: tuple(merge_intervals(intervals)) for client, intervals in owned.items()},
+        contested_seconds=contested_seconds,
+        blocked_seconds=blocked_seconds,
+    )
+
+
+@dataclass
+class _Day:
+    billed: int
+    intervals: list[Interval]
+
+    def wall(self, extra: Interval | None = None) -> int:
+        return interval_seconds(merge_intervals([*self.intervals, *([extra] if extra else [])]))
+
+
+class CapLedger:
+    """Running billed and wall-clock totals per client and day.
+
+    Fixed entries and non-overlapping allocations are added unconditionally.
+    Time that would overlap what the client is already billed for is offered
+    through ``acceptable_seconds`` and only granted within the caps.
+    """
+
+    def __init__(
+        self,
+        policy: BillingPolicy,
+        *,
+        month_scope: str = MONTH_SCOPE_PER_DAY,
+        month_context: Mapping[tuple[str, int, int], tuple[int, int]] | None = None,
+    ) -> None:
+        if month_scope not in {MONTH_SCOPE_PER_DAY, MONTH_SCOPE_CUMULATIVE}:
+            raise BillingCapsError("unsupported month scope")
+        self.policy = policy
+        self.month_scope = month_scope
+        self._zone = ZoneInfo(policy.timezone)
+        self._days: dict[tuple[str, dt.date], _Day] = {}
+        # (client, year, month) -> (billed seconds, wall seconds) known from elsewhere.
+        self._month_context = dict(month_context or {})
+
+    def day_of(self, start: dt.datetime) -> dt.date:
+        return start.astimezone(self._zone).date()
+
+    def add(self, client: str, start: dt.datetime, end: dt.datetime) -> None:
+        _check_billing_interval(start, end)
+        day = self._days.setdefault((client, self.day_of(start)), _Day(0, []))
+        day.billed += int((end - start).total_seconds())
+        day.intervals.append((start, end))
+
+    def _month_totals(self, client: str, day: dt.date) -> tuple[int, int]:
+        billed, wall = self._month_context.get((client, day.year, day.month), (0, 0))
+        for (other_client, other_day), state in self._days.items():
+            if other_client == client and other_day != day and (other_day.year, other_day.month) == (day.year, day.month):
+                billed += state.billed
+                wall += state.wall()
+        return billed, wall
+
+    def _fits(self, client: str, start: dt.datetime, length: int, *, month: bool) -> bool:
+        day_key = self.day_of(start)
+        state = self._days.get((client, day_key)) or _Day(0, [])
+        candidate = (start, start + dt.timedelta(seconds=length))
+        wall_before, wall_after = state.wall(), state.wall(candidate)
+        if length == wall_after - wall_before:
+            # Pure wall-clock time: it adds nothing billed in parallel.
+            return True
+        billed_after = state.billed + length
+        if billed_after > self.policy.day_multiplier * wall_after:
+            return False
+        if not month:
+            return True
+        if self.month_scope == MONTH_SCOPE_PER_DAY:
+            return billed_after <= self.policy.month_multiplier * wall_after
+        month_billed, month_wall = self._month_totals(client, day_key)
+        return month_billed + billed_after <= self.policy.month_multiplier * (month_wall + wall_after)
+
+    def _longest(self, client: str, start: dt.datetime, end: dt.datetime, *, month: bool) -> int:
+        total = int((end - start).total_seconds())
+        if self._fits(client, start, total, month=month):
+            return total
+        length = (total - 1) // MINUTE * MINUTE
+        while length > 0:
+            if self._fits(client, start, length, month=month):
+                return length
+            length -= MINUTE
+        return 0
+
+    def acceptable_seconds(self, client: str, start: dt.datetime, end: dt.datetime) -> int:
+        """Longest prefix of the interval the caps allow: all of it, else whole minutes."""
+        _check_billing_interval(start, end)
+        return self._longest(client, start, end, month=True)
+
+    def acceptable_seconds_day_only(self, client: str, start: dt.datetime, end: dt.datetime) -> int:
+        """The same prefix under the day cap alone; tells which cap bound."""
+        _check_billing_interval(start, end)
+        return self._longest(client, start, end, month=False)
+
+    def client_days(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "client": client,
+                "day": day.isoformat(),
+                "billed_seconds": state.billed,
+                "wall_seconds": state.wall(),
+            }
+            for (client, day), state in sorted(self._days.items())
+        ]
+
+
+def measure_billing(rows: Iterable[tuple[str, dt.datetime, dt.datetime]], policy: BillingPolicy) -> dict[str, Any]:
+    """Measure billed rows the way the read-only timesheet checker does."""
+    rows = list(rows)
+    ledger = CapLedger(policy)
+    for client, start, end in rows:
+        ledger.add(client, start, end)
+    days = ledger.client_days()
+    months: dict[tuple[str, str], list[int]] = {}
+    for row in days:
+        totals = months.setdefault((row["client"], row["day"][:7]), [0, 0])
+        totals[0] += row["billed_seconds"]
+        totals[1] += row["wall_seconds"]
+    points = sorted({point for _client, start, end in rows for point in (start, end)})
+    cross = 0
+    for low, high in zip(points, points[1:]):
+        if len({client for client, start, end in rows if start <= low and high <= end}) > 1:
+            cross += int((high - low).total_seconds())
+    return {
+        "client_days": days,
+        "client_months": [
+            {"client": client, "month": month, "billed_seconds": billed, "wall_seconds": wall}
+            for (client, month), (billed, wall) in sorted(months.items())
+        ],
+        "cross_client_seconds": cross,
+        "days_over_cap": [
+            row for row in days
+            if row["billed_seconds"] > policy.day_multiplier * row["wall_seconds"]
+        ],
+        "months_over_cap": [
+            {"client": client, "month": month, "billed_seconds": billed, "wall_seconds": wall}
+            for (client, month), (billed, wall) in sorted(months.items())
+            if billed > policy.month_multiplier * wall
+        ],
+    }
+
+
+def cap_entries(
+    entries: Sequence[Mapping[str, Any]],
+    policy: BillingPolicy,
+    *,
+    month_scope: str = MONTH_SCOPE_CUMULATIVE,
+) -> dict[str, Any]:
+    """Apply both rules to already-billed entries; an offline what-if only.
+
+    Entries are ``{"id", "client", "start", "end"}`` with aware datetimes and
+    are processed in chronological order: where one client's entries overlap
+    beyond a cap, the later entry is the one shortened.
+    """
+    ordered = sorted(entries, key=lambda row: (row["start"], row["end"], str(row["id"])))
+    shares = exclusive_shares([BillingClaim(str(row["client"]), row["start"], row["end"]) for row in ordered])
+    ledger = CapLedger(policy, month_scope=month_scope)
+    kept: list[dict[str, Any]] = []
+    cut = {"cross_client": 0, "day_cap": 0, "month_cap": 0}
+    per_client: dict[str, dict[str, int]] = {}
+    pieces: list[tuple[dt.datetime, dt.datetime, Mapping[str, Any]]] = []
+    for row in ordered:
+        client = str(row["client"])
+        totals = per_client.setdefault(client, {"billed_before": 0, "billed_after": 0, **{key: 0 for key in cut}})
+        original = int((row["end"] - row["start"]).total_seconds())
+        own = shares.clip(client, [(row["start"], row["end"])])
+        lost = original - interval_seconds(own)
+        totals["billed_before"] += original
+        totals["cross_client"] += lost
+        cut["cross_client"] += lost
+        pieces.extend((start, end, row) for start, end in own)
+    for start, end, row in sorted(pieces, key=lambda piece: (piece[0], piece[1], str(piece[2]["id"]))):
+        client = str(row["client"])
+        totals = per_client[client]
+        length = int((end - start).total_seconds())
+        allowed = ledger.acceptable_seconds(client, start, end)
+        day_only = ledger.acceptable_seconds_day_only(client, start, end)
+        totals["day_cap"] += length - day_only
+        totals["month_cap"] += day_only - allowed
+        cut["day_cap"] += length - day_only
+        cut["month_cap"] += day_only - allowed
+        if allowed:
+            piece_end = start + dt.timedelta(seconds=allowed)
+            ledger.add(client, start, piece_end)
+            totals["billed_after"] += allowed
+            kept.append({"id": row["id"], "client": client, "start": start, "end": piece_end})
+    return {
+        "entries": kept,
+        "contested_wall_seconds": shares.contested_seconds,
+        "cut_seconds": cut,
+        "clients": per_client,
+        "client_days": ledger.client_days(),
+    }

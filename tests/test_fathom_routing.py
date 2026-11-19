@@ -213,7 +213,7 @@ class FathomRoutingTests(unittest.TestCase):
         self.assertEqual("5f5b5121a551633f6dfa31e6", routing["member_id"])
         self.assertEqual(routing["clockify_user_id"], routing["member_id"])
         self.assertEqual(
-            "1ad004089560be9903043677650d559a2a25bbfdb7a945ceb7ab5682e6f2996c",
+            "1a88cbcccf43a00bf05b801c3db91a40662e3782866562023a6ccc0d6c5e5fe2",
             hashlib.sha256(raw).hexdigest(),
         )
         self.assertEqual(

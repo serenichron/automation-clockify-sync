@@ -82,6 +82,50 @@ attention, gaps are not filled, and outcomes share the available pool. Keep the
 placement and overlap warnings visible for review. Omitting this setting keeps
 the historical Codex-only recipe; replay uses the saved routing, not live config.
 
+### Parallel-session billing caps
+
+The `billing_caps` declaration in the routing snapshot bounds how much time
+parallel agent sessions may bill (decided 2026-11-19):
+
+- The same wall-clock minute is never billed to two clients. Where sessions for
+  different clients were observed at the same time, the contested time is split
+  between them in whole minutes, in proportion to the effort each activity is
+  estimated to have spent there. Time covered by another client's existing
+  Clockify entry or recorded meeting is not available to a session at all.
+- Per client and day, billed time stays at or below `day_multiplier` (1.5)
+  times the wall-clock time covered, and per client and calendar month at or
+  below `month_multiplier` (1.25). Parallel sessions for one client may still
+  overlap up to these caps; capped time goes to activities in the allocator's
+  priority order.
+
+A run knows only its own days, so each day must also hold the month multiplier
+on its own. A month is a weighted average of its days, which keeps the month
+cap true without state shared between runs, in whatever order days are
+processed or reprocessed. The effective per-day limit is therefore the lower
+of the two multipliers.
+
+`project_clients` maps each Clockify project ID suffix to its client. A routed
+project missing from the map is treated as its own client; an existing entry
+on an undeclared project blocks nobody. Refresh the map when a project is
+added in Clockify.
+
+The caps measure what a run proposes. A session that overlaps an existing
+Clockify entry of the *same* client is still kept for review with an
+`existing_clockify_overlap` warning, because it may be the same work already
+posted. `allocation.billing_caps` in `work-accounting-result.json` lists every
+shortened activity, the minutes cut by each rule, and what the final rows
+measure, including violations that remain because of fixed entries.
+
+Omitting the declaration keeps the previous allocation, and replay uses the
+saved routing, so results produced before it existed reproduce unchanged.
+
+To estimate the effect on entries already in Clockify, run the offline replay
+on exported entries (it reads local JSON only):
+
+```bash
+python3 scripts/clockify_billing_caps_replay.py <entries-dir> --from 2026-09-01 --to 2026-10-31
+```
+
 Fresh Clockify collection includes entries that started before the requested
 period but overlap it. Only relevant rows are persisted; pagination is based on
 the original response size. Older sealed checkpoints retain their exact request

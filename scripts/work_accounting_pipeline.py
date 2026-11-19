@@ -13,6 +13,7 @@ import copy
 import dataclasses
 import datetime as dt
 from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 import hashlib
 import json
 import os
@@ -2580,6 +2581,205 @@ def _refresh_capacity_recovery_warnings(
         })
 
 
+BILLING_CAP_EXCLUSIVE_REASON = "billing cap: the observed time is billed to another client"
+BILLING_CAP_PARALLEL_REASON = "billing cap: parallel time for this client and day is used up"
+
+
+def _billing_client(
+    policy: work_allocator.BillingPolicy, project_suffix: Any, project_name: Any,
+) -> str:
+    """Return who a billable row is billed to; "" only without any project."""
+    client = policy.client_for_project(project_suffix)
+    if client:
+        return client
+    # A route without a Clockify project ID is still one distinct payer.
+    name = str(project_name or "").strip()
+    return f"project-name:{name}" if name else ""
+
+
+def _billing_fixed_rows(
+    existing: Iterable[Mapping[str, Any]],
+    meeting_proposals: Iterable[Mapping[str, Any]],
+    policy: work_allocator.BillingPolicy,
+) -> list[tuple[str, dt.datetime, dt.datetime]]:
+    """Billed time sessions cannot move: Clockify entries and recorded meetings."""
+    rows: list[tuple[str, dt.datetime, dt.datetime]] = []
+    for block in existing:
+        if block.get("kind") != "existing_clockify" or block.get("billable") is False:
+            continue
+        # Only a declared project names a client; an unknown one blocks nobody.
+        client = policy.declared_client(block.get("project_id_suffix"))
+        if client and block["end"] > block["start"]:
+            rows.append((client, block["start"], block["end"]))
+    rows.extend(_billing_meeting_rows(meeting_proposals, policy))
+    return rows
+
+
+def _billing_meeting_rows(
+    meeting_proposals: Iterable[Mapping[str, Any]],
+    policy: work_allocator.BillingPolicy,
+) -> list[tuple[str, dt.datetime, dt.datetime]]:
+    rows: list[tuple[str, dt.datetime, dt.datetime]] = []
+    for proposal in meeting_proposals:
+        if proposal.get("billable", True) is False:
+            continue
+        client = _billing_client(
+            policy, proposal.get("clockify_project_suffix"), proposal.get("client_project")
+        )
+        start, end = _parse_dt(proposal.get("start")), _parse_dt(proposal.get("end"))
+        if client and start is not None and end is not None and end > start:
+            rows.append((client, start, end))
+    return rows
+
+
+def _apply_exclusive_billing(
+    allocation_demands: list[dict[str, Any]],
+    activity_context: Mapping[str, dict[str, Any]],
+    fixed_rows: list[tuple[str, dt.datetime, dt.datetime]],
+    policy: work_allocator.BillingPolicy,
+    skipped: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Clip every billable demand to the time only its client is billed for.
+
+    A demand no other client contends with is returned untouched, so runs
+    without parallel cross-client work allocate exactly as before.
+    """
+    clients: dict[str, str] = {}
+    observed: dict[str, list[tuple[dt.datetime, dt.datetime]]] = {}
+    claims: list[work_allocator.BillingClaim] = []
+    for demand in allocation_demands:
+        activity_id = str(demand["activity_id"])
+        route = activity_context[activity_id]["route"]
+        client = (
+            _billing_client(policy, route.get("project_suffix"), route.get("project_name"))
+            if route.get("billable", True) else ""
+        )
+        clients[activity_id] = client
+        if not client:
+            continue
+        intervals = []
+        for interval in demand["allowed_intervals"]:
+            start, end = _parse_dt(interval.get("start")), _parse_dt(interval.get("end"))
+            if start is not None and end is not None and end > start:
+                intervals.append((start, end))
+        intervals = work_allocator.merge_intervals(intervals)
+        observed[activity_id] = intervals
+        capacity_seconds = work_allocator.interval_seconds(intervals)
+        recommended = int((demand.get("effort") or {}).get("recommended_minutes") or 0)
+        density = (
+            min(Fraction(1), Fraction(recommended * 60, capacity_seconds))
+            if capacity_seconds else Fraction(0)
+        )
+        claims.extend(
+            work_allocator.BillingClaim(client, start, end, density)
+            for start, end in intervals
+        )
+    shares = work_allocator.exclusive_shares(claims, fixed_rows)
+    demands: list[dict[str, Any]] = []
+    adjustments: list[dict[str, Any]] = []
+    unclipped: dict[str, dict[str, Any]] = {}
+    for demand in allocation_demands:
+        activity_id = str(demand["activity_id"])
+        client = clients[activity_id]
+        if not client:
+            demands.append(demand)
+            continue
+        clipped = shares.clip(client, observed[activity_id])
+        if work_allocator.interval_seconds(clipped) == work_allocator.interval_seconds(observed[activity_id]):
+            demands.append(demand)
+            continue
+        context = activity_context[activity_id]
+        requested = int((demand.get("effort") or {}).get("recommended_minutes") or 0)
+        intervals = [{"start": _iso(start), "end": _iso(end)} for start, end in clipped]
+        capacity = _interval_capacity_minutes(intervals)
+        billable = min(requested, capacity)
+        if billable < requested:
+            adjustments.append({
+                "activity_id": activity_id,
+                "client": client,
+                "rule": "cross_client",
+                "requested_minutes": requested,
+                "billable_minutes": billable,
+                "cut_minutes": requested - billable,
+            })
+        if capacity == 0:
+            skipped.append({
+                "id": activity_id,
+                "activity_id": activity_id,
+                "reason": BILLING_CAP_EXCLUSIVE_REASON,
+                "evidence_ids": list(context["evidence_ids"]),
+            })
+            continue
+        clipped_demand = {**demand, "allowed_intervals": intervals}
+        if requested > capacity:
+            clipped_demand["effort"] = {
+                "minimum_minutes": capacity,
+                "recommended_minutes": capacity,
+                "maximum_minutes": capacity,
+            }
+            warning = next(
+                (
+                    value for value in context["review_warnings"]
+                    if value.get("type") == "observed_capacity_cap"
+                ),
+                None,
+            )
+            if warning is None:
+                context["review_warnings"].append({
+                    "type": "observed_capacity_cap",
+                    "requested_minutes": requested,
+                    "observed_capacity_minutes": capacity,
+                    "proposed_minutes": capacity,
+                })
+            else:
+                warning.update({
+                    "observed_capacity_minutes": capacity,
+                    "proposed_minutes": capacity,
+                })
+        if context["borrowed_timing_context"]:
+            # A shared human pool keeps its literal bounds in the saved demand;
+            # only this run's placement is narrowed.
+            unclipped[activity_id] = demand
+        demands.append(clipped_demand)
+    return {
+        "demands": demands,
+        "clients": clients,
+        "shares": shares,
+        "adjustments": adjustments,
+        "unclipped": unclipped,
+    }
+
+
+def _billing_caps_report(
+    policy: work_allocator.BillingPolicy,
+    billing: Mapping[str, Any],
+    proposals: Iterable[Mapping[str, Any]],
+    existing: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Summarise what the guards changed and what the final rows measure."""
+    rows = _billing_fixed_rows(existing, proposals, policy)
+    measured = work_allocator.measure_billing(rows, policy)
+    adjustments = sorted(
+        billing["adjustments"], key=lambda row: (row["rule"], row["activity_id"])
+    )
+    return {
+        "policy": {**policy.document(), "month_scope": work_allocator.MONTH_SCOPE_PER_DAY},
+        "contested_wall_minutes": billing["shares"].contested_seconds // 60,
+        "cut_minutes": {
+            "cross_client": sum(row["cut_minutes"] for row in adjustments if row["rule"] == "cross_client"),
+            "caps": sum(row["cut_minutes"] for row in adjustments if row["rule"] == "caps"),
+        },
+        "adjustments": adjustments,
+        "client_days": measured["client_days"],
+        # Sessions can no longer cause these; what is left comes from fixed
+        # entries (Clockify history, overlapping recorded meetings).
+        "remaining_violations": {
+            "cross_client_seconds": measured["cross_client_seconds"],
+            "days_over_cap": measured["days_over_cap"],
+        },
+    }
+
+
 def _proposal(
     activity: Mapping[str, Any],
     route: Mapping[str, Any],
@@ -4208,7 +4408,31 @@ def run_accounting(
             "type": "estimated_session_placement",
             "reason": "Estimated effort placed within shared same-session human observations; exact outcome boundaries are not observed.",
         })
+    try:
+        billing_policy = work_allocator.billing_policy_from_routing(routing)
+    except work_allocator.BillingCapsError as exc:
+        raise WorkAccountingError(f"billing caps declaration is invalid: {exc}") from exc
+    billing: dict[str, Any] | None = None
+    billing_ledger: work_allocator.CapLedger | None = None
+    if billing_policy is not None:
+        billing = _apply_exclusive_billing(
+            allocation_demands, activity_context,
+            _billing_fixed_rows(existing, meeting_proposals, billing_policy),
+            billing_policy, skipped,
+        )
+        allocation_demands = billing["demands"]
     allocation = work_allocator.allocate_work(allocation_demands, fixed)
+    if billing is not None:
+        # The caps are measured on what this run bills.  Clockify entries of
+        # the same client stay out of the budget: a session overlapping one is
+        # either the same work already posted, which the credit steps below
+        # resolve, or a row kept for review with an overlap warning.
+        billing_ledger = work_allocator.CapLedger(billing_policy)
+        for client, start, end in _billing_meeting_rows(meeting_proposals, billing_policy):
+            billing_ledger.add(client, start, end)
+        for segment in allocation.allocations:
+            if billing["clients"].get(segment.activity_id):
+                billing_ledger.add(billing["clients"][segment.activity_id], segment.start, segment.end)
     proposals = list(meeting_proposals)
     activity_segment_counts: dict[str, int] = {}
     for segment in allocation.allocations:
@@ -4241,7 +4465,16 @@ def run_accounting(
     }
     recovery_records: list[dict[str, Any]] = []
     residual_conflicts: list[work_allocator.ContestedTime] = []
-    for conflict in allocation.contested_time:
+    contested_order = list(allocation.contested_time)
+    if billing is not None:
+        # Capped time is scarce, so it is handed out in the allocator's own
+        # priority order; a rerun then favours the same activities.
+        contested_order.sort(key=lambda row: (
+            -work_allocator._confidence_score(demands_by_activity[row.activity_id].confidence),
+            -demands_by_activity[row.activity_id].attention_signal,
+            row.activity_id,
+        ))
+    for conflict in contested_order:
         demand = demands_by_activity[conflict.activity_id]
         context = activity_context[conflict.activity_id]
         if context.get("shared_timing_context"):
@@ -4256,12 +4489,27 @@ def run_accounting(
             conflict.unallocated_minutes,
         )
         unique_slices: list[tuple[dt.datetime, dt.datetime]] = []
+        billing_client = (
+            billing["clients"].get(conflict.activity_id, "") if billing is not None else ""
+        )
+        capped_minutes = 0
         for start, end in slices:
+            if billing_client and billing_ledger is not None:
+                # Recovered time overlaps what this client is already billed
+                # for, so it is the only place parallel billing can grow.
+                allowed = billing_ledger.acceptable_seconds(billing_client, start, end)
+                allowed -= allowed % 60
+                capped_minutes += _minutes(start, end) - allowed // 60
+                if allowed <= 0:
+                    continue
+                end = start + dt.timedelta(seconds=allowed)
             identity = (conflict.activity_id, _iso(start), _iso(end))
             if identity in recovery_identities:
                 continue
             recovery_identities.add(identity)
             unique_slices.append((start, end))
+            if billing_client and billing_ledger is not None:
+                billing_ledger.add(billing_client, start, end)
         recovered_minutes = sum(
             _minutes(start, end) for start, end in unique_slices
         )
@@ -4271,6 +4519,16 @@ def run_accounting(
             - conflict.allocated_minutes
             - recovered_minutes,
         )
+        if capped_minutes and billing is not None:
+            capped_minutes = min(capped_minutes, residual_minutes)
+            billing["adjustments"].append({
+                "activity_id": conflict.activity_id,
+                "client": billing_client,
+                "rule": "caps",
+                "requested_minutes": conflict.requested_minutes,
+                "billable_minutes": conflict.allocated_minutes + recovered_minutes,
+                "cut_minutes": capped_minutes,
+            })
         if recovered_minutes:
             recovery_warning = {
                 "type": "allocation_capacity_recovery",
@@ -4306,16 +4564,55 @@ def run_accounting(
                 "recovered_minutes": recovered_minutes,
                 "residual_minutes": residual_minutes,
             })
-        if residual_minutes:
+        # Minutes withheld by a billing cap are a decision, not a conflict
+        # for review; only effort the observed time cannot hold stays contested.
+        if residual_minutes - capped_minutes:
             residual_conflicts.append(dataclasses.replace(
                 conflict,
                 allocated_minutes=(
                     conflict.allocated_minutes + recovered_minutes
                 ),
-                unallocated_minutes=residual_minutes,
+                unallocated_minutes=residual_minutes - capped_minutes,
             ))
+    saved_evidence = list(allocation.evidence)
+    if billing is not None:
+        recovery_records.sort(key=lambda row: str(row["activity_id"]))
+        residual_conflicts.sort(key=lambda row: row.activity_id)
+        capped_billable = {
+            row["activity_id"]: row["billable_minutes"]
+            for row in billing["adjustments"] if row["rule"] == "caps"
+        }
+        for activity_id, billable in sorted(capped_billable.items()):
+            if not billable:
+                skipped.append({
+                    "id": activity_id,
+                    "activity_id": activity_id,
+                    "reason": BILLING_CAP_PARALLEL_REASON,
+                    "evidence_ids": list(activity_context[activity_id]["evidence_ids"]),
+                })
+        saved_evidence = []
+        for demand in allocation.evidence:
+            if demand.activity_id in billing["unclipped"]:
+                literal = work_allocator._as_activity(billing["unclipped"][demand.activity_id])
+                demand = dataclasses.replace(
+                    demand,
+                    allowed_intervals=literal.allowed_intervals,
+                    allowed_start=None,
+                    allowed_end=None,
+                )
+            if demand.activity_id in capped_billable:
+                # The saved demand states the billable effort, so later consumers
+                # do not read the withheld minutes as recoverable capacity.
+                billable = capped_billable[demand.activity_id]
+                demand = dataclasses.replace(demand, effort=work_allocator.EffortEstimate(
+                    min(demand.effort.minimum_minutes, billable),
+                    billable,
+                    max(demand.effort.maximum_minutes, billable),
+                ))
+            saved_evidence.append(demand)
     allocation = dataclasses.replace(
         allocation,
+        evidence=tuple(saved_evidence),
         contested_time=tuple(residual_conflicts),
     )
 
@@ -4466,6 +4763,10 @@ def run_accounting(
     serialized_allocation["capacity_recoveries"] = copy.deepcopy(
         recovery_records
     )
+    if billing is not None and billing_policy is not None:
+        serialized_allocation["billing_caps"] = _billing_caps_report(
+            billing_policy, billing, proposals, existing
+        )
     serialized_allocation["deterministic_inputs"] = {
         "point_observation_clustering": copy.deepcopy(
             POINT_OBSERVATION_CLUSTERING_INPUT
@@ -4475,6 +4776,10 @@ def run_accounting(
         serialized_allocation["deterministic_inputs"]["session_timing_pool_sources"] = list(session_pool_sources)
     if AUDITED_DAILY_KEY in routing:
         serialized_allocation["deterministic_inputs"][AUDITED_DAILY_KEY] = copy.deepcopy(routing[AUDITED_DAILY_KEY])
+    if work_allocator.BILLING_CAPS_ROUTING_KEY in routing:
+        serialized_allocation["deterministic_inputs"][work_allocator.BILLING_CAPS_ROUTING_KEY] = copy.deepcopy(
+            routing[work_allocator.BILLING_CAPS_ROUTING_KEY]
+        )
     if (analysis.get("review_prompt_version") == semantic_analyzer.COMMISSIONED_REVIEW_PROMPT_VERSION
             or any(activity.get("review_prompt_version") == semantic_analyzer.COMMISSIONED_REVIEW_PROMPT_VERSION
                    for activity in analysis.get("activities", []))):
