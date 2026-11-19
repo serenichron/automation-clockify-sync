@@ -110,7 +110,8 @@ class ClaudeSessionTimingTests(unittest.TestCase):
         result = self.make_run([*anchors, completed], [(anchors[0], completed)], sources=None)
         self.assertEqual([], result["proposals"])
         self.assertEqual(["timing_evidence"], [row["exception_kind"] for row in result["ambiguous"]])
-        self.assertEqual({"point_observation_clustering"}, set(result["allocation"]["deterministic_inputs"]))
+        self.assertEqual({"point_observation_clustering", "billing_caps"},
+                         set(result["allocation"]["deterministic_inputs"]))
         before = (self.run_dir / "work-accounting-result.json").read_bytes()
         pipeline.run_accounting(self.run_dir, root=fixtures.ROOT, routing_path=self.routing_path,
                                 analysis_fixture=self.run_dir / "semantic-analysis.json")

@@ -742,6 +742,11 @@ class RecurringNativeCreditTests(unittest.TestCase):
             root = Path(tmp)
             _current, declaration, proof = self.fixture(root)
             run_dir, analysis, ledger_doc, _report = self.accounting_run_fixture(root, proof)
+            # The posted prior is the same client's work: declare the fixture's
+            # project as that client, or it would be another client's time.
+            routing = json.loads((accounting_fixtures.ROOT / "routing.json").read_text())
+            routing["billing_caps"]["project_clients"]["123456"] = "Serenichron"
+            (run_dir / "routing.json").write_text(json.dumps(routing))
             with mock.patch.object(collector, "clockify_get", side_effect=AssertionError("network forbidden")):
                 baseline = pipeline.run_accounting(run_dir, root=accounting_fixtures.ROOT, analysis_fixture=analysis)
             self.assertEqual(1, len(baseline["proposals"]))

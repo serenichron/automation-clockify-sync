@@ -156,12 +156,15 @@ class CommissionedTaskTimingTests(unittest.TestCase):
         other["object"] = "separate commissioned deliverable"
         analysis["activities"].append(other)
         _, result = self.make_run(first + second, analysis)
-        self.assertEqual(20, sum(row["duration_minutes"] for row in result["proposals"]))
+        # Both tasks ran in the same ten minutes for one client: the second is
+        # still recovered as its own overlapping row, but only up to the
+        # billing cap (1.25 x 10 wall-clock minutes), not a second full ten.
+        self.assertEqual(12, sum(row["duration_minutes"] for row in result["proposals"]))
         self.assertEqual(1, len(result["allocation"]["capacity_recoveries"]))
         overlaps = [w for row in result["proposals"] for w in row["review_warnings"]
                     if w["type"] == "review_proposal_overlap"]
         self.assertEqual(1, len(overlaps))
-        self.assertEqual(600, overlaps[0]["overlap_duration_seconds"])
+        self.assertEqual(120, overlaps[0]["overlap_duration_seconds"])
 
 
 class FreshV9FeedbackReplayTests(unittest.TestCase):
